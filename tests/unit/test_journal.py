@@ -427,6 +427,21 @@ def test_record_trade_is_idempotent_per_deal_id(journal):
     assert journal.realized_pnl_total() == Decimal("-0.0240")
 
 
+def test_has_trade_tells_whether_a_deal_is_already_booked(journal):
+    assert journal.has_trade("DEAL-1") is False
+    journal.record_trade(make_trade(), "DEAL-1", DAY)
+    assert journal.has_trade("DEAL-1") is True
+    assert journal.has_trade("DEAL-2") is False
+
+
+def test_has_trade_rejects_an_empty_deal_id_and_reports_read_failures(journal):
+    with pytest.raises(ValueError):
+        journal.has_trade("")
+    journal.close()
+    with pytest.raises(JournalReadError):
+        journal.has_trade("DEAL-1")
+
+
 def test_record_trade_different_deals_accumulate_in_order(journal):
     a, b = make_trade(net_pnl=Decimal("-1.5")), make_trade(net_pnl=Decimal("0.5"), exit_reason="MANUAL")
     assert journal.record_trade(a, "DEAL-1", DAY) and journal.record_trade(b, "DEAL-2", DAY)

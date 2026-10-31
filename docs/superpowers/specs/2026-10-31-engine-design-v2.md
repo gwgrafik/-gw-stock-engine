@@ -187,7 +187,7 @@ Reguły:
 
 ### Pozycja
 
-`FLAT` → `ENTERING` → `OPEN` (pozycja potwierdzona przez brokera) → `EXITING` → `FLAT`, plus `BLOCKED` (rozbieżność z brokerem: tylko decyzja rekoncyliacji lub właściciela). Do `BLOCKED` prowadzą `ENTERING`, `OPEN` i `EXITING`, a także `FLAT`, gdy uzgadnianie ma dowody, których nie umie przypisać: obcą pozycję na naszym instrumencie, pozycję sprzeczną z dziennikiem (zlecenie `UNKNOWN`, a pozycja `FLAT`) albo zamknięcie w historii bez dopasowanego zlecenia; z `BLOCKED` wychodzi się do `FLAT` lub `OPEN`. Stan pozycji zmienia się wyłącznie na podstawie odpowiedzi i listy pozycji brokera, nigdy na podstawie samego wysłania zlecenia.
+`FLAT` → `ENTERING` → `OPEN` (pozycja potwierdzona przez brokera) → `EXITING` → `FLAT`, plus `BLOCKED` (rozbieżność z brokerem: tylko decyzja rekoncyliacji lub właściciela). Do `BLOCKED` prowadzą `ENTERING`, `OPEN` i `EXITING`, a także `FLAT`, gdy uzgadnianie ma dowody, których nie umie przypisać: obcą pozycję na naszym instrumencie, pozycję sprzeczną z dziennikiem (zlecenie `UNKNOWN`, a pozycja `FLAT`) albo zamknięcie w historii bez dopasowanego zlecenia; z `BLOCKED` wychodzi się do `FLAT` lub `OPEN` (decyzja uzgadniania lub właściciela), a do `EXITING` wyłącznie przy awaryjnym spłaszczeniu (kill switch twardy) pozycji dowodnie naszej: zapis w dzienniku ma `deal_id`, a broker właśnie pokazuje ten deal na liście pozycji (obcej pozycji bez `deal_id` nie dotykamy nigdy; zwykłe spłaszczenie o 17:25 pozycji `BLOCKED` nie zamyka). Stan pozycji zmienia się wyłącznie na podstawie odpowiedzi i listy pozycji brokera, nigdy na podstawie samego wysłania zlecenia.
 
 ## 7. Uzgadnianie z brokerem
 

@@ -69,6 +69,7 @@ POSITION_EDGES = [
     (P.EXITING, P.OPEN),  # zamknięcie się nie powiodło, pozycja nadal otwarta
     (P.BLOCKED, P.FLAT),  # tylko decyzja rekoncyliacji lub właściciela
     (P.BLOCKED, P.OPEN),
+    (P.BLOCKED, P.EXITING),  # wyłącznie awaryjne spłaszczenie dowodnie naszej pozycji (deal_id na liście brokera)
 ]
 
 
@@ -217,8 +218,8 @@ def test_position_self_transition_is_invalid():
             check_position_transition(s, s)
 
 
-def test_blocked_exits_only_to_flat_or_open():
-    assert ALLOWED_POSITION_TRANSITIONS[P.BLOCKED] == {P.FLAT, P.OPEN}
+def test_blocked_exits_only_to_flat_open_or_the_emergency_exit():
+    assert ALLOWED_POSITION_TRANSITIONS[P.BLOCKED] == {P.FLAT, P.OPEN, P.EXITING}
 
 
 # --- sprawdzanie typów: gołe napisy i obcy enum nie przechodzą ------------------------------------

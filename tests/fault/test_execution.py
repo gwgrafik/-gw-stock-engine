@@ -507,6 +507,54 @@ async def test_size_mismatch_risk_closes_a_fill_larger_than_the_risk_allows(
     assert booked.size == D("0.0401")
 
 
+async def test_a_failing_entry_by_deal_write_never_skips_the_guards(
+    executor, quote, rules, journal, fake, kill, monkeypatch
+):
+    # przegląd T12, test A: wypełnienie 0.0401 (ryzyko 1.0025 > 1.00) i 10 pkt poślizgu, zapis entry_by_deal zawodzi
+    fake.fill_size_factor, fake.fill_slippage = D("10.025"), D("10")
+    order = []
+    real = journal.set_meta
+
+    def set_meta(key, value):
+        if key.startswith("entry_by_deal:"):
+            order.append("entry_by_deal")
+            raise JournalWriteError("SQLITE_BUSY")
+        return real(key, value)
+
+    monkeypatch.setattr(journal, "set_meta", set_meta)
+    fake.on_call("close_position", lambda: order.append("close_position"))
+    rec = await executor.enter(EntrySignal(Side.BUY, D("25"), D("0.004"), quote), rules, DAY)
+    assert rec.state is O.CONFIRMED
+    assert order == ["close_position", "entry_by_deal"]  # straże i zamknięcie przed zapisem pomocniczym
+    assert codes(journal)[:2] == ["SLIPPAGE_GUARD", "SIZE_MISMATCH_RISK"]
+    assert position(journal).state is P.FLAT and journal.trades()[0].decision_bid == BID  # kontekst przez wskaźnik
+    assert kill.level() is KillLevel.SOFT and kill.reason() == "JOURNAL_WRITE_FAILED"
+
+
+async def test_entry_by_deal_write_failure_without_a_guard_only_soft_kills(
+    executor, signal, rules, journal, fake, kill, monkeypatch
+):
+    real = journal.set_meta
+
+    def set_meta(key, value):
+        if key.startswith("entry_by_deal:"):
+            raise JournalWriteError("SQLITE_BUSY")
+        return real(key, value)
+
+    monkeypatch.setattr(journal, "set_meta", set_meta)
+    rec = await executor.enter(signal, rules, DAY)
+    assert rec.state is O.CONFIRMED and position(journal).state is P.OPEN and "close_position" not in fake.calls
+    assert kill.level() is KillLevel.SOFT and kill.reason() == "JOURNAL_WRITE_FAILED"
+
+
+async def test_a_failing_guard_event_write_still_flattens(executor, quote, rules, journal, fake, kill, monkeypatch):
+    fake.fill_slippage = D("10")
+    failing_raw(journal, monkeypatch, lambda s, p: s == "event" and "SLIPPAGE_GUARD" in p)
+    await executor.enter(EntrySignal(Side.BUY, D("30"), SIZE, quote), rules, DAY)
+    assert fake.calls.count("close_position") == 1 and position(journal).state is P.FLAT
+    assert kill.level() is KillLevel.SOFT and kill.reason() == "JOURNAL_WRITE_FAILED"
+
+
 async def test_both_guards_are_checked_and_the_position_is_closed_once(executor, quote, rules, journal, fake):
     fake.fill_slippage, fake.fill_size_factor = D("10"), D("10.025")
     await executor.enter(EntrySignal(Side.BUY, D("25"), D("0.004"), quote), rules, DAY)
@@ -542,6 +590,7 @@ async def test_confirmed_entry_without_stop_gets_the_stop_from_the_entry(
     [event] = events(journal, "STOP_ATTACHED")
     assert event["deal_id"] == "DEAL-1" and D(event["stop_level"]) == STOP and event["attempt"] == 1
     assert kill.level() is KillLevel.NONE and position(journal).state is P.OPEN
+    assert [level for level, _ in alerts(executor._notifier, "STOP_ATTACHED")] == ["INFO"]
 
 
 async def test_unprotected_position_gets_stop_else_hard_kill(executor, signal, rules, journal, fake, kill, clock):
@@ -575,23 +624,72 @@ async def test_protection_retries_then_succeeds_without_kill(executor, signal, r
     assert fake.positions["DEAL-1"].stop_level == STOP
 
 
-async def test_a_journal_failure_during_protection_still_ends_hard(
-    executor, signal, rules, journal, fake, kill, monkeypatch
-):
-    await entered(executor, signal, rules, fake)
-    fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
-    fake.fail_next("set_stop", BrokerError("HTTP 500"))
+def failing_raw(journal, monkeypatch, predicate):
+    """`append_raw` rzuca JournalWriteError dla zapisów spełniających `predicate(source, payload)`."""
     real = journal.append_raw
 
     def append_raw(source, payload, ts):
-        if source == "broker.set_stop":
+        if predicate(source, payload):
             raise JournalWriteError("disk full")
         return real(source, payload, ts)
 
     monkeypatch.setattr(journal, "append_raw", append_raw)
-    with pytest.raises(JournalWriteError):
-        await executor.protect_unprotected(fake.positions["DEAL-1"])
-    assert kill.level() is KillLevel.HARD and kill.reason() == "UNPROTECTED_POSITION"  # nigdy bez stopu i bez HARD
+
+
+@pytest.mark.parametrize("set_stop_failures", [2, 3], ids=["third_attempt_works", "all_fail"])
+async def test_protection_runs_every_attempt_even_when_journaling_fails(
+    executor, signal, rules, journal, fake, kill, notifier, monkeypatch, set_stop_failures
+):
+    await entered(executor, signal, rules, fake)
+    fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
+    for _ in range(set_stop_failures):
+        fake.fail_next("set_stop", BrokerError("HTTP 500"))
+    failing_raw(journal, monkeypatch, lambda s, p: s == "broker.set_stop" or "STOP_ATTACHED" in p)
+    protected = await executor.protect_unprotected(fake.positions["DEAL-1"])
+    assert fake.calls.count("set_stop") == 3  # nieudany zapis surowego błędu nie przerywa kolejnych prób
+    assert alerts(notifier, "JOURNAL_WRITE_FAILED")
+    if set_stop_failures == 2:
+        assert protected is True and fake.positions["DEAL-1"].stop_level == STOP
+        assert kill.level() is KillLevel.SOFT and kill.reason() == "JOURNAL_WRITE_FAILED"
+    else:
+        assert protected is False and kill.level() is KillLevel.HARD and kill.reason() == "UNPROTECTED_POSITION"
+        assert fake.calls.count("close_position") == 1 and position(journal).state is P.FLAT
+
+
+async def test_protection_failed_event_write_never_skips_the_emergency_close(
+    executor, signal, rules, journal, fake, kill, monkeypatch
+):
+    await entered(executor, signal, rules, fake)
+    fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
+    for _ in range(3):
+        fake.fail_next("set_stop", BrokerError("HTTP 500"))
+    failing_raw(journal, monkeypatch, lambda s, p: s == "event" and "PROTECTION_FAILED" in p)
+    assert await executor.protect_unprotected(fake.positions["DEAL-1"]) is False
+    assert fake.calls.count("close_position") == 1 and position(journal).state is P.FLAT
+    assert kill.level() is KillLevel.HARD and kill.reason() == "UNPROTECTED_POSITION"
+
+
+async def test_cancellation_during_protection_ends_hard_without_claiming_an_emergency_flatten(
+    executor, signal, rules, journal, fake, kill, notifier, monkeypatch
+):
+    await entered(executor, signal, rules, fake)
+    fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
+    started = asyncio.Event()
+
+    async def hang(_deal_id, _level):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(fake, "set_stop", hang)
+    task = asyncio.create_task(executor.protect_unprotected(fake.positions["DEAL-1"]))
+    await asyncio.wait_for(started.wait(), TEST_GUARD_S)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert kill.level() is KillLevel.HARD and kill.reason() == "UNPROTECTED_POSITION"  # silnik spłaszczy przy HARD
+    assert "close_position" not in fake.calls
+    [(level, message)] = alerts(notifier, "UNPROTECTED_POSITION:")
+    assert level == "ERROR" and "not run" in message
 
 
 @pytest.mark.parametrize(
@@ -791,6 +889,40 @@ async def test_flatten_history_lagging_books_on_the_third_attempt(
     assert len(journal.trades()) == 1 and position(journal).state is P.FLAT
 
 
+async def test_ambiguous_closure_in_the_history_is_not_booked(executor, signal, rules, journal, fake, notifier,
+                                                              monkeypatch):  # fmt: skip
+    await entered(executor, signal, rules, fake)
+
+    async def twice(_since):
+        fake.calls.append("closed_since")
+        return [
+            ClosedDeal("DEAL-1", "DE40", BID, "MANUAL", T_ENTRY), ClosedDeal("DEAL-1", "DE40", STOP, "STOP", T_ENTRY)
+        ]
+
+    monkeypatch.setattr(fake, "closed_since", twice)
+    assert await executor.flatten(position(journal), "FORCED") is None
+    assert position(journal).state is P.EXITING and journal.trades() == []
+    assert events(journal, "AMBIGUOUS_CLOSURE")[0]["count"] == 2 and alerts(notifier, "AMBIGUOUS_CLOSURE")
+
+
+async def test_a_booking_error_in_settle_leaves_the_position_exiting(executor, signal, rules, journal, fake, notifier):
+    await entered(executor, signal, rules, fake)
+    journal.set_meta(f"entry_ctx:{CID}", "{}")  # kontekst nieczytelny: rekord zdegradowany potrzebuje brokera
+    fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
+    assert await executor.flatten(position(journal), "FORCED") is None
+    assert position(journal).state is P.EXITING and journal.trades() == []
+    assert events(journal, "BOOKING_FAILED")[0]["error"] == "BookingError" and alerts(notifier, "BOOKING_FAILED")
+
+
+async def test_an_unknown_history_start_leaves_exiting_without_reading_the_history(executor, journal, fake):
+    rec = PositionRecord("DE40", P.OPEN, "DEAL-1", Side.BUY, SIZE, FILL, STOP, None)
+    journal.upsert_position(rec)
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "DE40", Side.BUY, SIZE, FILL, STOP, T_ENTRY)
+    assert await executor.flatten(rec, "FORCED") is None
+    assert fake.calls == ["close_position"] and position(journal).state is P.EXITING
+    assert events(journal, "CLOSE_SENT_AWAIT_HISTORY")[0]["why"] == "HISTORY_START_UNKNOWN"
+
+
 async def test_history_that_never_shows_leaves_exiting_and_the_real_reconciler_books_it_later(
     executor, mgr, signal, rules, journal, fake, clock, kill, risk_cfg, notifier, monkeypatch
 ):
@@ -909,8 +1041,8 @@ async def test_book_without_entry_context_books_a_cost_fallback_record(
     level = D("25700.0")
     assert journal.trades() == [
         TradeRecord("DE40", side, D("0.010"), level, level, level, D("25720.0"), D(gross), D("0.00"), D("0.01"),
-                    D("0.00"), D("0.00"), D(net), T_ENTRY, T_ENTRY, T_ENTRY, closed.ts, 0, "FORCED")
-    ]  # fmt: skip
+                    D("0.00"), D("0.00"), D(net), T_ENTRY, T_ENTRY, T_ENTRY, closed.ts, 0, "MANUAL")
+    ]  # fmt: skip  # zamknięcie MANUAL bez zamiaru wyjścia silnika: właściciel
     assert journal.realized_pnl(DAY) == D(net)
     [event] = events(journal, "COST_FALLBACK")
     assert event["deal_id"] == "DEAL-9" and event["reason"] == "NO_ENTRY_CONTEXT"
@@ -1105,6 +1237,40 @@ async def test_rebooking_after_a_crash_still_enforces_the_loss_limits(executor, 
     assert kill.level() is KillLevel.SOFT and kill.reason() == "DAILY_LOSS"
 
 
+async def test_enforce_loss_limits_reapplies_a_kill_lost_in_a_crash(
+    tmp_path, executor, journal, kill, clock, data_dir, notifier, monkeypatch, build, mgr, fake, gate, cost_cfg,
+    strat_cfg, risk_cfg, calendar,
+):
+    journal.add_realized_pnl(DAY, D("-1.29"))
+    monkeypatch.setattr(journal, "set_kill", write_failure)  # kill switch włącza się tylko w pamięci
+    await executor.book(seeded_position(journal), SEEDED_CLOSE)
+    assert kill.level() is KillLevel.SOFT and journal.kill_state().level is KillLevel.NONE
+    journal.close()  # przerwanie procesu: poziom z pamięci przepada
+
+    from gwstock.journal import Journal
+    from gwstock.risk import KillSwitch
+
+    reopened = Journal.open(str(tmp_path / "journal.sqlite"))
+    try:
+        fresh_kill = KillSwitch(reopened, clock, data_dir, notifier)
+        assert fresh_kill.level() is KillLevel.NONE
+        fresh = Executor(mgr, fake, reopened, gate, fresh_kill, CostModel(cost_cfg), clock, strat_cfg, risk_cfg,
+                         calendar, notifier, live=True)  # fmt: skip
+        fresh.enforce_loss_limits(DAY)
+        assert fresh_kill.level() is KillLevel.SOFT and fresh_kill.reason() == "DAILY_LOSS"
+        assert reopened.kill_state().level is KillLevel.SOFT  # tym razem utrwalone
+        audit = len(reopened.events("kill.audit"))
+        fresh.enforce_loss_limits(DAY)  # idempotentne: bez nowego wiersza audytu
+        assert len(reopened.events("kill.audit")) == audit and fresh_kill.reason() == "DAILY_LOSS"
+    finally:
+        reopened.close()
+
+
+async def test_enforce_loss_limits_on_a_quiet_day_changes_nothing(executor, journal, kill):
+    executor.enforce_loss_limits(DAY)
+    assert kill.level() is KillLevel.NONE and journal.events() == []
+
+
 async def test_unreadable_pnl_after_booking_soft_kills(executor, journal, kill, monkeypatch):
     def locked():
         raise JournalReadError("database is locked")
@@ -1113,6 +1279,56 @@ async def test_unreadable_pnl_after_booking_soft_kills(executor, journal, kill, 
     await executor.book(seeded_position(journal), SEEDED_CLOSE)  # zaksięgowane: limitów nie da się sprawdzić
     assert len(journal.trades()) == 1
     assert kill.level() is KillLevel.SOFT and kill.reason() == "KILL_CHECK_FAILED"
+
+
+async def test_rebooking_an_already_booked_deal_reads_nothing_from_the_broker(executor, journal, fake):
+    pos = PositionRecord("DE40", P.EXITING, "DEAL-9", Side.BUY, D("0.010"), D("25700.0"), None, T_ENTRY)
+    closed = ClosedDeal("DEAL-9", "DE40", D("25720.0"), "MANUAL", T_ENTRY + timedelta(hours=1))
+    await executor.book(pos, closed)  # COST_FALLBACK: wartość punktu od brokera
+    fake.calls.clear()
+    fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
+    await executor.book(pos, closed)  # np. uzgadnianie po restarcie: no-op, mimo że broker nie odpowiada
+    assert fake.calls == [] and len(journal.trades()) == 1
+
+
+@pytest.mark.parametrize(
+    ("reason", "intent", "expected"),
+    [("MANUAL", None, "MANUAL"), ("FORCED", None, "FORCED"), ("MANUAL", "FORCED", "FORCED"),
+     ("STOP", "FORCED", "STOP")],
+    ids=["owner_close", "broker_forced", "engine_exit", "stop_during_engine_exit"],
+)  # fmt: skip
+async def test_exit_reason_tells_engine_exits_from_owner_and_broker_closes(executor, journal, reason, intent, expected):
+    if intent is not None:
+        journal.set_meta("exit_intent:DEAL-9", intent)
+    pos = PositionRecord("DE40", P.EXITING, "DEAL-9", Side.BUY, D("0.010"), D("25700.0"), None, T_ENTRY)
+    await executor.book(pos, ClosedDeal("DEAL-9", "DE40", D("25720.0"), reason, T_ENTRY + timedelta(hours=1)))
+    assert [t.exit_reason for t in journal.trades()] == [expected]
+
+
+async def test_flatten_records_the_exit_intent_before_the_close(executor, signal, rules, journal, fake):
+    await entered(executor, signal, rules, fake)
+    seen = []
+    fake.on_call("close_position", lambda: seen.append(journal.get_meta("exit_intent:DEAL-1")))
+    await executor.flatten(position(journal), "FORCED")
+    assert seen == ["FORCED"] and journal.trades()[0].exit_reason == "FORCED"
+
+
+async def test_a_failing_exit_intent_write_never_blocks_the_flatten(
+    executor, signal, rules, journal, fake, kill, monkeypatch
+):
+    await entered(executor, signal, rules, fake)
+    real = journal.set_meta
+
+    def set_meta(key, value):
+        if key.startswith("exit_intent:"):
+            raise JournalWriteError("disk full")
+        return real(key, value)
+
+    monkeypatch.setattr(journal, "set_meta", set_meta)
+    closed = await executor.flatten(position(journal), "FORCED")
+    assert closed.reason == "MANUAL" and position(journal).state is P.FLAT
+    assert journal.trades()[0].exit_reason == "MANUAL"  # bez zapisanego zamiaru: zamknięcie wywołaniem
+    assert kill.level() is KillLevel.SOFT and kill.reason() == "JOURNAL_WRITE_FAILED"
 
 
 async def test_record_trade_failure_propagates_from_book_without_any_event(executor, journal, kill, monkeypatch):
@@ -1225,13 +1441,96 @@ async def test_emergency_flatten_stops_retrying_while_the_market_is_closed(
     assert event["outcome"] == "MARKET_CLOSED" and event["attempts"] == 1
 
 
-async def test_emergency_flatten_leaves_a_blocked_position_to_the_owner(executor, journal, fake, notifier):
-    journal.upsert_position(PositionRecord("DE40", P.BLOCKED, "DEAL-1", Side.BUY, SIZE, FILL, None, T_ENTRY))
+@pytest.mark.parametrize("case", ["foreign", "not_at_broker", "list_unreadable"])
+async def test_emergency_flatten_leaves_a_blocked_position_that_is_not_provably_ours(
+    executor, journal, fake, kill, notifier, case
+):
+    kill.hard("HARD_STOP_FILE")
+    stored = PositionRecord("DE40", P.BLOCKED, "DEAL-1", Side.BUY, SIZE, FILL, None, T_ENTRY)
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "DE40", Side.BUY, SIZE, FILL, None, T_ENTRY)
+    if case == "foreign":
+        stored = PositionRecord("DE40", P.BLOCKED)  # obca pozycja: bez deal_id
+    elif case == "not_at_broker":
+        del fake.positions["DEAL-1"]
+    else:
+        for _ in range(5):
+            fake.fail_next("list_positions", BrokerError("HTTP 502"))
+    journal.upsert_position(stored)
     await executor.emergency_flatten()
-    assert fake.calls == [] and position(journal).state is P.BLOCKED
+    assert "close_position" not in fake.calls and position(journal) == stored
+    assert fake.calls == ([] if case == "foreign" else ["list_positions"] * (5 if case == "list_unreadable" else 1))
     [event] = events(journal, "EMERGENCY_FLATTEN_INCOMPLETE")
-    assert event["state"] == "BLOCKED" and event["attempts"] == 0
-    assert alerts(notifier, "EMERGENCY_FLATTEN_INCOMPLETE")
+    assert event["state"] == "BLOCKED"
+    assert alerts(notifier, "EMERGENCY_FLATTEN_INCOMPLETE") and kill.level() is KillLevel.HARD
+
+
+async def test_emergency_flatten_closes_our_blocked_deal_when_the_broker_lists_it(executor, journal, fake, kill):
+    # uzgadnianie zostawiło nasz deal BLOCKED (SIZE_MISMATCH: dziennik 0.007, broker 0.008); kill switch HARD
+    journal.upsert_position(PositionRecord("DE40", P.BLOCKED, "DEAL-1", Side.BUY, SIZE, FILL, STOP, T_ENTRY))
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "DE40", Side.BUY, D("0.008"), FILL, STOP, T_ENTRY)
+    kill.hard("DAILY_LOSS_2X")
+    seen = []
+    fake.on_call("close_position", lambda: seen.append(position(journal).state))
+    await executor.emergency_flatten()
+    # bez kontekstu wejścia (pozycja z uzgadniania): wartość punktu do rekordu zdegradowanego od brokera
+    assert fake.calls == ["list_positions", "close_position", "closed_since", "instrument_rules"]
+    assert seen == [P.EXITING] and position(journal) == PositionRecord("DE40", P.FLAT)
+    [booked] = journal.trades()
+    assert booked.size == D("0.008") and booked.exit_fill == BID  # księga z widoku brokera: to zamknęliśmy
+    [event] = events(journal, "BLOCKED_EMERGENCY_FLATTEN")
+    assert D(event["journal"]["size"]) == SIZE and D(event["broker"]["size"]) == D("0.008")
+
+
+@pytest.mark.parametrize("via", ["emergency", "protection"])
+async def test_the_emergency_close_is_sent_even_when_the_exiting_write_fails(
+    executor, signal, rules, journal, fake, kill, notifier, monkeypatch, via
+):
+    await entered(executor, signal, rules, fake)
+    monkeypatch.setattr(journal, "upsert_position", write_failure)
+    if via == "emergency":
+        kill.hard("HARD_STOP_FILE")
+        await executor.emergency_flatten()
+    else:
+        fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
+        for _ in range(3):
+            fake.fail_next("set_stop", BrokerError("HTTP 500"))
+        assert await executor.protect_unprotected(fake.positions["DEAL-1"]) is False
+    assert fake.calls.count("close_position") == 1 and "DEAL-1" not in fake.positions  # ekspozycja zamknięta
+    assert len(journal.trades()) == 1  # księgowanie działa; zapisy pozycji zawiodły
+    assert position(journal).state is P.OPEN  # dziennik dogoni uzgadnianie (OPEN, deal zniknął, zamknięcie)
+    assert alerts(notifier, "JOURNAL_WRITE_FAILED") and kill.level() is KillLevel.HARD
+
+
+async def test_a_booking_journal_failure_never_aborts_the_emergency_flatten(
+    executor, signal, rules, journal, fake, kill, notifier, monkeypatch
+):
+    await entered(executor, signal, rules, fake)
+    kill.hard("HARD_STOP_FILE")
+    monkeypatch.setattr(journal, "record_trade", write_failure)
+    await executor.emergency_flatten()  # bez wyjątku: ekspozycja zamknięta, księgowanie zrobi uzgadnianie
+    assert fake.calls.count("close_position") == 1 and "DEAL-1" not in fake.positions
+    assert position(journal).state is P.EXITING and journal.trades() == []
+    assert events(journal, "EMERGENCY_FLATTEN_INCOMPLETE")[0]["outcome"] == "BOOKING_FAILED"
+    assert alerts(notifier, "JOURNAL_WRITE_FAILED during emergency flatten")
+
+
+async def test_normal_flatten_never_closes_before_the_exiting_write(
+    executor, signal, rules, journal, fake, monkeypatch
+):
+    await entered(executor, signal, rules, fake)
+    monkeypatch.setattr(journal, "upsert_position", write_failure)
+    with pytest.raises(JournalWriteError):
+        await executor.flatten(position(journal), "FORCED")
+    assert "close_position" not in fake.calls  # spec §8: EXITING przed zamknięciem (po restarcie bez ślepej wysyłki)
+
+
+@pytest.mark.parametrize("stored", ["missing", "blocked_with_deal"])
+async def test_normal_flatten_still_refuses_blocked(executor, journal, fake, stored):
+    ours = PositionRecord("DE40", P.BLOCKED, "DEAL-1", Side.BUY, SIZE, FILL, STOP, T_ENTRY)
+    journal.upsert_position(ours)
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "DE40", Side.BUY, SIZE, FILL, STOP, T_ENTRY)
+    assert await executor.flatten(ours, "FORCED") is None
+    assert fake.calls == [] and position(journal) == ours
 
 
 # --- różne ----------------------------------------------------------------------------------------------

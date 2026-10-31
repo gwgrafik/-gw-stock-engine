@@ -1,6 +1,7 @@
 """Wspólne fixtures testów. Uruchamiać z korzenia repozytorium (ścieżka względna `config/`).
 
-Kolejne zadania dopisują tu swoje fixtures (`journal`, `mgr`, `req`, `gate`, `kill`, `reconciler`, `signal`, `executor`).
+Kolejne zadania dopisują tu swoje fixtures (`journal`, `mgr`, `req`, `gate`, `kill`, `reconciler`, `signal`,
+`executor`).
 """
 
 from collections.abc import Iterator

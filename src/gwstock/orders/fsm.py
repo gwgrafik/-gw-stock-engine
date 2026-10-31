@@ -52,7 +52,8 @@ ALLOWED_ORDER_TRANSITIONS: Mapping[OrderState, frozenset[OrderState]] = MappingP
 # ENTERING potwierdzone przez brokera. FLAT -> BLOCKED: uzgadnianie przy FLAT ma dowody, których nie umie przypisać
 # (obca pozycja na naszym instrumencie; pozycja sprzeczna z decyzją menedżera, gdy zlecenie jest UNKNOWN, a dziennik
 # FLAT; zamknięcie w historii bez dopasowanego zlecenia, UNMATCHED_CLOSED_DEAL): nie przyjmujemy, blokujemy.
-# BLOCKED opuszcza wyłącznie decyzja rekoncyliacji lub właściciela.
+# BLOCKED opuszcza decyzja rekoncyliacji lub właściciela (FLAT, OPEN) albo awaryjne spłaszczenie (EXITING) przy kill
+# switchu twardym, wyłącznie pozycji dowodnie naszej: zapis ma deal_id, a broker właśnie pokazuje ten deal na liście.
 ALLOWED_POSITION_TRANSITIONS: Mapping[PositionState, frozenset[PositionState]] = MappingProxyType({
     # ENTERING: wejście zapisane (INTENT); BLOCKED: uzgadnianie (obca pozycja lub niedopasowane zamknięcie)
     _P.FLAT: frozenset({_P.ENTERING, _P.BLOCKED}),
@@ -62,7 +63,8 @@ ALLOWED_POSITION_TRANSITIONS: Mapping[PositionState, frozenset[PositionState]] =
     _P.OPEN: frozenset({_P.EXITING, _P.FLAT, _P.BLOCKED}),
     # OPEN: zamknięcie się nie powiodło, pozycja nadal otwarta
     _P.EXITING: frozenset({_P.FLAT, _P.BLOCKED, _P.OPEN}),
-    _P.BLOCKED: frozenset({_P.FLAT, _P.OPEN}),
+    # EXITING: tylko awaryjne spłaszczenie naszego deal_id potwierdzonego listą brokera (wykonawca, Zadanie 12)
+    _P.BLOCKED: frozenset({_P.FLAT, _P.OPEN, _P.EXITING}),
 })
 
 

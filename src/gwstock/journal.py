@@ -738,6 +738,12 @@ class Journal:
 
         return self._write(op)
 
+    def has_trade(self, deal_id: str) -> bool:
+        """Czy zamknięcie `deal_id` jest już zaksięgowane (tani odczyt przed ponownym księgowaniem)."""
+        _check_str(deal_id, "has_trade.deal_id", non_empty=True)
+        row = self._read(lambda c: c.execute("SELECT 1 FROM trades WHERE deal_id = ?", (deal_id,)).fetchone())
+        return row is not None
+
     def trades(self) -> list[TradeRecord]:
         """Księga w kolejności zaksięgowania."""
         rows = self._read(lambda c: c.execute(f"SELECT {_TRADE_COLS} FROM trades ORDER BY id").fetchall())
