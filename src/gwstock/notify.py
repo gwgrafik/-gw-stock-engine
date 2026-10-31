@@ -22,7 +22,7 @@ from typing import Protocol, runtime_checkable
 from gwstock.clock import Clock, SystemClock
 
 # Wszystko, co `str.splitlines()` uznaje za koniec linii (poza samym "\r\n", który obsługuje osobny wariant).
-_LINE_BREAKS = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85  ]")
+_LINE_BREAKS = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 _WHITESPACE = re.compile(r"\s+")
 
 

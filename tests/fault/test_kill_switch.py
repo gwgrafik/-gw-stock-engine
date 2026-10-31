@@ -45,6 +45,29 @@ def set_kill_calls(journal, monkeypatch) -> list[tuple[KillLevel, str]]:
     return calls
 
 
+def flaky_kill_state(monkeypatch, journal, *, down: bool = True) -> dict:
+    """Podstawia `journal.kill_state`: rzuca JournalReadError, dopóki `state["down"]`; `state["calls"]` liczy odczyty."""
+    state = {"down": down, "calls": 0}
+    real = journal.kill_state
+
+    def kill_state():
+        state["calls"] += 1
+        if state["down"]:
+            raise JournalReadError("database is locked")
+        return real()
+
+    monkeypatch.setattr(journal, "kill_state", kill_state)
+    return state
+
+
+class ExplodingClock:
+    def now_utc(self):
+        raise RuntimeError("clock exploded")
+
+    async def sleep(self, seconds):
+        pass
+
+
 def break_method(monkeypatch, obj, name: str, exc: Exception) -> None:
     def fail(*a, **k):
         raise exc
@@ -360,6 +383,7 @@ def test_journal_write_failure_still_engages_in_memory_and_alerts(kill, journal,
     assert len(notifier.alerts) == 1
     level, message = notifier.alerts[0]
     assert level == engage.upper() and "JOURNAL_WRITE_FAILED" in message and "x" in message
+    assert "NOT_PERSISTED" in message  # poziom jest tylko w pamięci
 
 
 def test_journal_write_failure_retries_on_the_next_call_and_then_goes_quiet(
@@ -439,13 +463,29 @@ def test_unexpected_internal_error_does_not_stop_the_kill(kill, monkeypatch):
 
 
 def test_unreadable_clock_does_not_stop_the_kill(journal, data_dir, notifier):
-    class BrokenClock:
-        def now_utc(self):
-            raise RuntimeError("clock exploded")
-
-    ks = KillSwitch(journal, BrokenClock(), data_dir, notifier)
+    ks = KillSwitch(journal, ExplodingClock(), data_dir, notifier)
     ks.soft("x")
     assert ks.level() is KillLevel.SOFT and journal.kill_state().reason == "x"
+
+
+def test_aware_non_utc_clock_value_is_converted_to_utc_not_replaced(journal, data_dir, notifier):
+    class OffsetClock:
+        def now_utc(self):
+            return datetime(2026, 11, 2, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+
+    KillSwitch(journal, OffsetClock(), data_dir, notifier).soft("x")
+    assert journal.kill_state().since == datetime(2026, 11, 2, 8, 0, tzinfo=timezone.utc)
+
+
+def test_naive_clock_value_falls_back_to_system_time(journal, data_dir, notifier):
+    class NaiveClock:
+        def now_utc(self):
+            return datetime(2026, 11, 2, 10, 0)
+
+    before = datetime.now(timezone.utc)
+    KillSwitch(journal, NaiveClock(), data_dir, notifier).soft("x")
+    since = journal.kill_state().since
+    assert before - timedelta(seconds=1) <= since <= datetime.now(timezone.utc) + timedelta(seconds=1)
 
 
 def test_unreadable_kill_state_at_startup_starts_soft_and_never_downgrades_what_it_cannot_see(
@@ -455,13 +495,171 @@ def test_unreadable_kill_state_at_startup_starts_soft_and_never_downgrades_what_
     ks = KillSwitch(journal, clock, data_dir, notifier)  # nie rzuca
     assert ks.level() is KillLevel.SOFT
     assert len(notifier.alerts) == 1 and "KILL_STATE_UNREADABLE" in notifier.alerts[0][1]
+    assert "NOT_PERSISTED" in notifier.alerts[0][1]  # właściciel widzi, że to poziom tylko w pamięci
 
     ks.soft("x")  # zapisanego stanu nie znamy (mógł być HARD): soft go nie nadpisuje
     assert set_kill_calls == [] and ks.level() is KillLevel.SOFT
     ks.hard("y")  # HARD nie obniży niczego, więc jest zapisywany
     assert set_kill_calls == [(KillLevel.HARD, "y")]
-    ks.soft("z")  # stan znany: zwykłe zasady (HARD zostaje)
+    ks.soft("z")  # HARD zostaje
     assert ks.level() is KillLevel.HARD
+
+
+def test_unreadable_start_that_recovers_persists_the_next_kill_across_a_restart(
+    tmp_path, clock, data_dir, notifier, monkeypatch
+):
+    path = str(tmp_path / "restart.sqlite")
+    j1 = Journal.open(path)
+    try:
+        state = flaky_kill_state(monkeypatch, j1)  # chwilowa blokada bazy przy starcie
+        ks = KillSwitch(j1, clock, data_dir, notifier)
+        assert ks.level() is KillLevel.SOFT
+        state["down"] = False  # baza wróciła
+        ks.soft("MISMATCH_TIMEOUT")  # prawdziwy wyzwalacz, który sam z siebie się nie powtórzy
+        stored = j1.kill_state()
+        assert (stored.level, stored.reason) == (KillLevel.SOFT, "MISMATCH_TIMEOUT")
+        assert any(a["event"] == "RECOVERED" for a in audit(j1))
+        assert "INFO" in [level for level, _ in notifier.alerts]  # zapis po odzyskaniu odczytu jest ogłoszony
+    finally:
+        j1.close()
+
+    j2 = Journal.open(path)  # restart procesu
+    try:
+        ks2 = KillSwitch(j2, clock, data_dir, notifier)
+        assert ks2.level() is KillLevel.SOFT and ks2.reason() == "MISMATCH_TIMEOUT"
+    finally:
+        j2.close()
+
+
+def test_unreadable_start_with_a_stored_hard_restores_hard_after_recovery(
+    tmp_path, clock, data_dir, notifier, monkeypatch
+):
+    path = str(tmp_path / "restart.sqlite")
+    j0 = Journal.open(path)
+    KillSwitch(j0, clock, data_dir, notifier).hard("original")
+    j0.close()
+    notifier.alerts.clear()
+
+    j = Journal.open(path)
+    try:
+        state = flaky_kill_state(monkeypatch, j)
+        calls: list[tuple[KillLevel, str]] = []
+        real_set = j.set_kill
+        monkeypatch.setattr(j, "set_kill", lambda lv, r, ts: (calls.append((lv, r)), real_set(lv, r, ts))[1])
+        ks = KillSwitch(j, clock, data_dir, notifier)
+        assert ks.level() is KillLevel.SOFT  # nie znamy zapisanego HARD
+        state["down"] = False
+        ks.soft("later")  # odczyt wrócił: HARD z dziennika wchodzi do pamięci, soft niczego nie obniża
+        assert ks.level() is KillLevel.HARD and ks.reason() == "original"
+        stored = j.kill_state()
+        assert (stored.level, stored.reason) == (KillLevel.HARD, "original")  # nic nie zostało obniżone
+        assert calls == []  # i nic nie trzeba było nadpisywać
+        hard_alerts = [m for level, m in notifier.alerts if level == "HARD"]
+        assert len(hard_alerts) == 1 and "original" in hard_alerts[0] and "restored" in hard_alerts[0]
+    finally:
+        j.close()
+
+
+def test_still_unreadable_state_is_never_overwritten_and_every_alert_says_not_persisted(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
+):
+    journal.set_kill(KillLevel.SOFT, "old", clock.now_utc())  # zapisany stan, którego silnik nie umie odczytać
+    set_kill_calls.clear()
+    real_state = journal.kill_state
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    ks.soft("a")
+    ks.soft("b")
+    ks.soft("a")  # powtórzenie: nadal tani no-op (bez alarmu), ale odczyt stanu jest ponawiany
+    assert ks.level() is KillLevel.SOFT
+    assert len(notifier.alerts) == 3  # start, "a", "b"
+    assert all("NOT_PERSISTED" in message for _, message in notifier.alerts)
+    assert set_kill_calls == []  # nic nie nadpisane
+    assert (real_state().level, real_state().reason) == (KillLevel.SOFT, "old")
+    assert state["calls"] == 4  # start + trzy wywołania soft
+
+
+def test_hard_written_while_the_state_is_unreadable_is_persisted_and_ends_the_uncertainty(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
+):
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    ks.hard("y")
+    assert set_kill_calls == [(KillLevel.HARD, "y")]
+    assert "NOT_PERSISTED" not in notifier.alerts[-1][1]  # HARD zapisany, nie ma już czego ostrzegać
+    calls = state["calls"]
+    ks.soft("z")
+    ks.scan_files()
+    assert state["calls"] == calls  # niepewność skończona: odczytu nie ponawiamy
+
+
+def test_scan_files_retries_the_stored_state_read_and_persists_after_recovery(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
+):
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    ks.scan_files()
+    ks.scan_files()
+    assert state["calls"] == 3 and set_kill_calls == [] and len(notifier.alerts) == 1  # ponawia odczyt, nie spamuje
+
+    state["down"] = False
+    ks.scan_files()  # bez żadnego pliku STOP
+    assert set_kill_calls == [(KillLevel.SOFT, "KILL_STATE_UNREADABLE")]
+    stored = journal.kill_state()
+    assert (stored.level, stored.reason) == (KillLevel.SOFT, "KILL_STATE_UNREADABLE")
+    assert notifier.alerts[-1][0] == "INFO"
+    calls = state["calls"]
+    ks.scan_files()
+    assert state["calls"] == calls and len(set_kill_calls) == 1  # i znów cicho
+
+
+def test_scan_files_restores_a_stored_hard_after_recovery(journal, clock, data_dir, notifier, monkeypatch):
+    journal.set_kill(KillLevel.HARD, "original", clock.now_utc())
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    assert ks.level() is KillLevel.SOFT
+    state["down"] = False
+    ks.scan_files()
+    assert ks.level() is KillLevel.HARD and ks.reason() == "original"
+    assert journal.kill_state().level is KillLevel.HARD
+
+
+def test_recovered_stored_state_of_equal_level_keeps_its_own_reason_and_is_not_rewritten(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
+):
+    journal.set_kill(KillLevel.SOFT, "DAILY_LOSS", clock.now_utc())
+    set_kill_calls.clear()
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    state["down"] = False
+    ks.scan_files()
+    assert ks.level() is KillLevel.SOFT and ks.reason() == "DAILY_LOSS"  # prawdziwa przyczyna wraca z dziennika
+    assert set_kill_calls == []  # dziennik już miał ten poziom
+    ks.soft("DAILY_LOSS")  # i zgłoszenie tej samej przyczyny jest znów no-opem
+    assert len(notifier.alerts) == 2 and notifier.alerts[-1][0] == "SOFT" and "restored" in notifier.alerts[-1][1]
+
+
+def test_recovered_read_but_failing_write_stays_unsynced_and_keeps_retrying(
+    journal, clock, data_dir, notifier, monkeypatch
+):
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    state["down"] = False
+    real_set = journal.set_kill
+    write = {"down": True}
+
+    def set_kill(level, reason, ts):
+        if write["down"]:
+            raise JournalWriteError("disk full")
+        return real_set(level, reason, ts)
+
+    monkeypatch.setattr(journal, "set_kill", set_kill)
+    ks.soft("x")
+    assert ks.level() is KillLevel.SOFT and journal.kill_state().level is KillLevel.NONE
+    assert any("JOURNAL_WRITE_FAILED" in m and "NOT_PERSISTED" in m for _, m in notifier.alerts)
+    write["down"] = False
+    ks.scan_files()
+    assert journal.kill_state().level is KillLevel.SOFT
 
 
 def test_clear_after_an_unreadable_start_is_the_explicit_way_out(
@@ -574,14 +772,15 @@ def test_file_notifier_never_raises_when_the_parent_cannot_be_created(tmp_path, 
     assert "SOFT" in err and "still visible" in err
 
 
+def test_file_notifier_with_a_broken_clock_still_writes_the_message(tmp_path):
+    path = tmp_path / "alerts.log"
+    FileNotifier(path, ExplodingClock()).alert("HARD", "kill switch HARD: x")
+    ts, level, message = path.read_text(encoding="utf-8").rstrip("\n").split(" ", 2)
+    assert re.fullmatch(ISO, ts) and level == "HARD"  # czas z zegara systemowego
+    assert message == "kill switch HARD: x"  # treść alarmu nie ginie razem z zegarem
+
+
 def test_file_notifier_survives_even_a_closed_stderr_and_a_broken_clock(tmp_path, monkeypatch):
-    class BrokenClock:
-        def now_utc(self):
-            raise RuntimeError("clock exploded")
-
-        async def sleep(self, seconds):
-            pass
-
     class DeadStream:
         def write(self, text):
             raise OSError("closed")
@@ -592,7 +791,7 @@ def test_file_notifier_survives_even_a_closed_stderr_and_a_broken_clock(tmp_path
     target = tmp_path / "alerts.log"
     target.mkdir()
     monkeypatch.setattr("sys.stderr", DeadStream())
-    FileNotifier(target, BrokenClock()).alert("SOFT", "nobody listens")  # nie rzuca
+    FileNotifier(target, ExplodingClock()).alert("SOFT", "nobody listens")  # nie rzuca
 
 
 def test_kill_switch_with_a_file_notifier_that_cannot_write_still_engages(tmp_path, journal, clock, data_dir, capsys):

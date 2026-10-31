@@ -146,7 +146,7 @@ BAD_FIELDS = [
     ("side", "BUY"), ("side", None),
     ("size", D(0)), ("size", D(-1)), ("size", 0.001), ("size", None), ("size", "0.001"), ("size", D("NaN")),
     ("size", D("Infinity")), ("size", True),
-    ("stop_distance", None), ("stop_distance", 30), ("stop_distance", 30.0), ("stop_distance", "30"),
+    ("stop_distance", 30), ("stop_distance", 30.0), ("stop_distance", "30"),
     ("stop_distance", D("NaN")), ("stop_distance", D("-Infinity")),
     ("entry_price", D(0)), ("entry_price", D(-1)), ("entry_price", None), ("entry_price", 25782.3),
     ("entry_price", D("NaN")),
@@ -167,7 +167,8 @@ def test_bad_candidate_field_is_format_and_never_raises(gate, name, value):
 def test_object_that_is_not_a_candidate_is_format(gate, junk):
     v = gate.check_entry(junk, ACCT)
     assert not v.passed
-    assert v.reasons == [FORMAT, STALE_DATA]  # także wiek notowania jest wtedy nie do odczytania
+    # brak stopu to też NO_STOP (spec §9: "brak stopu"), a wiek notowania jest wtedy nie do odczytania
+    assert v.reasons == [FORMAT, NO_STOP, STALE_DATA]
 
 
 def test_candidate_for_another_instrument_is_format(gate):
@@ -176,6 +177,11 @@ def test_candidate_for_another_instrument_is_format(gate):
 
 
 # --- NO_STOP ---------------------------------------------------------------------------------------
+
+
+def test_missing_stop_is_both_format_and_no_stop(gate):
+    # spec §9 podpina "brak stopu" pod NO_STOP; zły TYP stopu (30.0, "30", NaN) zostaje samym FORMAT
+    assert reasons(gate, cand(stop_distance=None)) == [FORMAT, NO_STOP]
 
 
 @pytest.mark.parametrize("stop", ["0", "-5", "-0", "0.000"])
@@ -372,6 +378,17 @@ def test_profit_does_not_offset_the_open_risk_or_the_candidate(gate, journal):
     journal.upsert_position(position(stop=None))  # nieznany stop: 1,00
     c = cand(size=D("0.01"), stop_distance=D("60"), entry_price=D("1000"))  # ryzyko kandydata 0,60
     assert reasons(gate, c) == [DAILY_LOSS, DUPLICATE]  # 1,00 + 0,60 = 1,60 > 1,50, mimo zysku dnia
+
+
+def test_open_risk_is_computed_exactly(gate, journal):
+    # 30 cyfr znaczących: `abs()` w domyślnym kontekście (28 cyfr) zaokrągliłoby odległość i zgubiło ostatnią cyfrę
+    journal.upsert_position(
+        PositionRecord(
+            "DE40", PositionState.OPEN, "DEAL-1", Side.BUY, D("1"), D("60.0000000000000000000000000001"),
+            D("30"), datetime(2026, 11, 2, 8, 0, tzinfo=timezone.utc),
+        )
+    )
+    assert gate._open_risk(D("1")) == D("30.0000000000000000000000000001")
 
 
 def test_flat_position_adds_no_open_risk(gate, journal):

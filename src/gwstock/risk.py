@@ -14,8 +14,9 @@ Kontrole (próg, granica, powód):
   ocenia NO_STOP). Cokolwiek innego (też brak obiektu kandydata) to FORMAT. Kontrole zależne od złego pola są
   wtedy pomijane (powód FORMAT już blokuje), więc zły typ nie powoduje wyjątku ani lawiny powodów.
   Obcy instrument jest FORMAT-em, bo v1 handluje jednym instrumentem, a kalendarz i okno dotyczą tylko jego.
-- NO_STOP: `stop_distance <= 0` (odległość stopu to jedyna informacja o stopie: zero lub minus to brak stopu
-  albo stop po złej stronie).
+- NO_STOP: `stop_distance` jest `None` (brak stopu) albo `<= 0` (odległość stopu to jedyna informacja o stopie:
+  zero lub minus to brak stopu albo stop po złej stronie). Brak stopu to więc FORMAT + NO_STOP; stop złego typu
+  (np. float, napis, NaN) to samo FORMAT.
 - LOSS_PER_TRADE: `size × stop_distance × value_per_point > max_loss_per_trade` (równo przechodzi, o grosz więcej
   blokuje).
 - LEVERAGE: `notional = size × entry_price × value_per_point`; `capital = min(virtual_capital, account.equity)`;
@@ -60,8 +61,14 @@ Kill switch (`KillSwitch`) to awaryjny wyłącznik. Poziom jest w pamięci (decy
   mimo jednego wiersza stanu.
 - `clear(requested_by)` wymaga niepustego `requested_by`, odmawia (ValueError), dopóki leży `data/STOP` lub
   `data/HARD_STOP` (inaczej `scan_files` włączyłby kill switch od razu) albo nie da się tego sprawdzić.
-- Nie da się odczytać zapisanego stanu przy starcie: start od SOFT (nie znamy poprzedniego poziomu), a zapisany
-  stan nie jest nadpisywany poziomem niższym od HARD, dopóki go nie znamy.
+- Nie da się odczytać zapisanego stanu przy starcie: start od SOFT (`KILL_STATE_UNREADABLE`, nie znamy poprzedniego
+  poziomu). Dopóki stanu nie znamy, `soft` nie nadpisuje dziennika (mógł tam być HARD), a każdy alarm niesie znacznik
+  NOT_PERSISTED: poziom jest tylko w pamięci. Odczyt jest ponawiany przy każdym `soft`/`hard`/`scan_files`; po
+  sukcesie zapisany poziom wchodzi do pamięci (HARD wraca, nigdy nie obniżamy), a poziom z pamięci, jeśli jest
+  wyższy od zapisanego, trafia do dziennika (wiersz stanu + audyt). HARD zapisuje się od razu (niczego nie obniży).
+- `data/HARD_STOP`, którego obecności nie da się sprawdzić (błąd systemu plików inny niż brak pliku), włącza tylko
+  SOFT (`STOP_FILE_UNREADABLE`), nie HARD: HARD zamyka pozycje, a niepewny odczyt pliku nie jest na to dość mocnym
+  dowodem. Świadomy fail-safe: blokujemy wejścia, nie robimy nieodwracalnych ruchów.
 """
 
 from __future__ import annotations
@@ -108,6 +115,7 @@ HARD_STOP_FILE = "HARD_STOP_FILE"
 STOP_FILE_UNREADABLE = "STOP_FILE_UNREADABLE"
 KILL_STATE_UNREADABLE = "KILL_STATE_UNREADABLE"
 JOURNAL_WRITE_FAILED = "JOURNAL_WRITE_FAILED"
+NOT_PERSISTED = "NOT_PERSISTED"
 UNSPECIFIED = "UNSPECIFIED"
 
 # Iloczyny pieniężne liczymy dokładnie: zaokrąglenie (domyślne 28 cyfr) mogłoby zamienić "o grosz więcej" w "równo".
@@ -290,7 +298,7 @@ class RiskGate:
 
         checks: list[tuple[str, Callable[[], bool]]] = [
             (FORMAT, lambda: format_bad),
-            (NO_STOP, lambda: stop_d is not None and stop_d <= 0),
+            (NO_STOP, lambda: stop is None or (stop_d is not None and stop_d <= 0)),
             (LOSS_PER_TRADE, loss_per_trade),
             (LEVERAGE, leverage),
             (MARGIN, margin),
@@ -364,7 +372,7 @@ class RiskGate:
             return _ZERO
         if position.size is None or position.open_level is None or position.stop_level is None or vpp is None:
             return self._cfg.max_loss_per_trade  # nieznany stop = pełna dozwolona strata
-        distance = abs(_EXACT.subtract(position.open_level, position.stop_level))
+        distance = _EXACT.abs(_EXACT.subtract(position.open_level, position.stop_level))
         return _product(position.size, distance, vpp)
 
 
@@ -422,7 +430,14 @@ class KillSwitch:
         self._engage(KillLevel.HARD, reason)
 
     def scan_files(self) -> None:
-        """`data/HARD_STOP` włącza HARD, `data/STOP` włącza SOFT; pliku, którego nie da się sprawdzić, nie pomijamy."""
+        """`data/HARD_STOP` włącza HARD, `data/STOP` włącza SOFT.
+
+        Pliku, którego obecności nie da się sprawdzić, nie pomijamy: włącza SOFT (`STOP_FILE_UNREADABLE`), także dla
+        HARD_STOP (świadomy fail-safe, zob. dokumentacja modułu). Ponawia też odczyt nieznanego stanu startowego
+        i niedokończony zapis stanu do dziennika.
+        """
+        with self._lock:
+            self._resolve_unknown()
         for name, engage, reason in (
             ("HARD_STOP", self.hard, HARD_STOP_FILE),
             ("STOP", self.soft, STOP_FILE),
@@ -467,7 +482,7 @@ class KillSwitch:
             )
             self._alert(
                 "CLEAR",
-                f"kill switch cleared by {who} (was {previous_level.name}: {previous_reason})" + _failed(failures),
+                f"kill switch cleared by {who} (was {previous_level.name}: {previous_reason})" + self._suffix(failures),
             )
 
     # --- wnętrze ---
@@ -482,9 +497,11 @@ class KillSwitch:
             self._level, self._reason = KillLevel.SOFT, KILL_STATE_UNREADABLE
             self._reasons = {KILL_STATE_UNREADABLE}
             self._state_unknown = True
+            self._unsynced = True  # poziom jest tylko w pamięci
             self._alert(
                 "SOFT",
-                f"kill switch SOFT at startup: {KILL_STATE_UNREADABLE} ({type(exc).__name__}: {exc})",
+                f"kill switch SOFT at startup: {KILL_STATE_UNREADABLE} ({type(exc).__name__}: {exc})"
+                + self._suffix([]),
             )
             return
         if level != KillLevel.NONE:
@@ -500,7 +517,39 @@ class KillSwitch:
             if level > self._level:
                 self._level = level
 
+    def _resolve_unknown(self) -> None:
+        """Ponawia odczyt zapisanego stanu, którego nie udało się odczytać przy starcie (woła się pod blokadą).
+
+        Po sukcesie: zapisany poziom nie niższy od bieżącego wchodzi do pamięci (HARD wraca; dziennik już go ma, więc
+        bez zapisu); niższy od bieżącego (np. NONE) zostaje zastąpiony poziomem z pamięci, który trafia do dziennika.
+        Nigdy nie obniżamy poziomu. Dopóki odczyt zawodzi, nic się nie zmienia, a poziom zostaje tylko w pamięci.
+        """
+        if not self._state_unknown:
+            return
+        try:
+            state = self._journal.kill_state()
+            stored_level, stored_reason = KillLevel(state.level), str(state.reason)
+        except Exception:
+            return  # nadal nieczytelny: kolejna próba przy następnym soft/hard/scan_files
+        self._state_unknown = False
+        ts = self._now()
+        memory_level, memory_reason = self._level, self._reason
+        if stored_level >= memory_level:
+            self._level, self._reason, self._reasons = stored_level, stored_reason, {stored_reason}
+            self._unsynced = False  # dziennik już ma ten stan
+            self._audit("RECOVERED", stored_level, stored_reason, memory_level, memory_reason, ts)
+            self._alert(
+                stored_level.name,
+                f"kill switch {stored_level.name} restored from the journal after an unreadable start: "
+                f"{stored_reason} (memory was {memory_level.name}: {memory_reason})",
+            )
+            return
+        self._audit("RECOVERED", memory_level, memory_reason, stored_level, stored_reason, ts)
+        self._unsynced = True
+        self._retry_unsynced()  # zapis poziomu z pamięci do dziennika (po sukcesie alarm INFO)
+
     def _apply(self, level: KillLevel, reason: str) -> None:
+        self._resolve_unknown()
         previous_level, previous_reason = self._level, self._reason
         if level < previous_level:  # poziom nie spada: tylko ślad audytowy, raz na przyczynę
             if reason not in self._suppressed:
@@ -529,20 +578,25 @@ class KillSwitch:
 
         ts = self._now()
         failures: list[str] = []
-        if not self._state_unknown or level == KillLevel.HARD:  # HARD niczego zapisanego nie obniży
+        if self._state_unknown and level < KillLevel.HARD:
+            self._unsynced = True  # zapisanego stanu nie znamy (mógł być HARD): niczego nie nadpisujemy
+        else:
             try:
                 self._journal.set_kill(level, reason, ts)
                 self._unsynced = False
+                self._state_unknown = False  # zapisany HARD jest nie niższy od niczego, co tam było
             except Exception as exc:
                 self._unsynced = True
                 failures.append(f"set_kill {type(exc).__name__}: {exc}")
         failures += self._audit(event, level, reason, previous_level, previous_reason, ts)
-        self._alert(level.name, text + _failed(failures))
+        self._alert(level.name, text + self._suffix(failures))
 
     def _retry_unsynced(self) -> None:
         """Ponawia utrwalenie stanu, gdy wcześniejszy zapis zawiódł; po sukcesie jedna informacja, bez spamu."""
         if not self._unsynced:
             return
+        if self._state_unknown and self._level < KillLevel.HARD:
+            return  # nie nadpisujemy stanu, którego nie znamy
         ts = self._now()
         try:
             self._journal.set_kill(self._level, self._reason, ts)
@@ -552,7 +606,7 @@ class KillSwitch:
         self._audit("PERSISTED", self._level, self._reason, self._level, self._reason, ts)
         self._alert(
             "INFO",
-            f"kill switch {self._level.name} ({self._reason}) is now persisted in the journal after a write failure",
+            f"kill switch {self._level.name} ({self._reason}) is now persisted in the journal after an earlier failure",
         )
 
     def _audit(
@@ -583,6 +637,13 @@ class KillSwitch:
         except Exception as exc:
             return [f"audit {type(exc).__name__}: {exc}"]
 
+    def _suffix(self, failures: list[str]) -> str:
+        """Znaczniki dla alarmu: JOURNAL_WRITE_FAILED (co zawiodło) i NOT_PERSISTED (poziom tylko w pamięci)."""
+        text = f" {JOURNAL_WRITE_FAILED}: ({'; '.join(failures)})" if failures else ""
+        if self._unsynced:
+            text += f" {NOT_PERSISTED}: the level is held in memory only and is lost on restart until it is written"
+        return text
+
     def _alert(self, level: str, message: str) -> None:
         try:
             self._notifier.alert(level, message)
@@ -592,14 +653,8 @@ class KillSwitch:
     def _now(self) -> datetime:
         try:
             ts = self._clock.now_utc()
-            if isinstance(ts, datetime) and ts.utcoffset() == timedelta(0):
-                return ts
+            if isinstance(ts, datetime) and ts.utcoffset() is not None:
+                return ts.astimezone(timezone.utc)
         except Exception:
             pass
-        return datetime.now(timezone.utc)  # zepsuty zegar nie może zatrzymać kill switcha
-
-
-def _failed(failures: list[str]) -> str:
-    if not failures:
-        return ""
-    return f" {JOURNAL_WRITE_FAILED}: the state may exist in memory only ({'; '.join(failures)})"
+        return datetime.now(timezone.utc)  # zepsuty lub naiwny zegar nie może zatrzymać kill switcha
