@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import pytest
 
 from gwstock.broker import capitalcom
@@ -458,6 +459,14 @@ async def test_second_401_after_relogin_raises_session_expired(server, broker):
     with pytest.raises(SessionExpired, match="401"):
         await broker.keepalive()
     assert server.sequence() == ["POST /session", "GET /ping", "POST /session", "GET /ping"]
+    # sesja porzucona: dalsze wywołania nie wychodzą do brokera, aż silnik sam zaloguje się ponownie
+    for call in (broker.keepalive, broker.list_accounts):
+        with pytest.raises(SessionExpired, match="not logged in"):
+            await call()
+    assert len(server.log) == 4
+    await broker.login()
+    await broker.keepalive()
+    assert server.log[-1].status == 200
 
 
 @pytest.mark.parametrize("failure", ["status", "timeout", "refused"])
@@ -1033,7 +1042,8 @@ async def test_candles_5m_request_uses_utc_window_without_zone_suffix(server, br
     start = OPEN.astimezone(berlin)  # 09:00 w Berlinie = 08:00 UTC; parametr jest w UTC
     await broker.candles_5m("DE40", start, start + 2 * M5)
     [req] = server.requests("GET", "/prices/DE40")
-    assert req.query == {"resolution": "MINUTE_5", "from": "2026-11-02T08:00:00", "to": "2026-11-02T08:15:00", "max": "5"}
+    # `to` = min(end + przesunięcie, teraz): nigdy w przyszłości; `max` z obciętego okna (2 sloty + zapas)
+    assert req.query == {"resolution": "MINUTE_5", "from": "2026-11-02T08:00:00", "to": "2026-11-02T08:10:00", "max": "4"}
 
 
 async def test_candles_use_snapshot_time_utc_only(server, broker, clock):
@@ -1127,7 +1137,7 @@ async def test_candle_stamp_as_period_end_shifts_start_back_by_one_period(server
     got = await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)
     assert [c.start for c in got] == [OPEN, OPEN + M5]  # znaczniki 08:05 i 08:10 = końce świec 08:00 i 08:05
     [req] = server.requests("GET", "/prices/DE40")
-    assert (req.query["from"], req.query["to"]) == ("2026-11-02T08:05:00", "2026-11-02T08:20:00")
+    assert (req.query["from"], req.query["to"]) == ("2026-11-02T08:05:00", "2026-11-02T08:10:00")  # = teraz
     day = datetime(2026, 11, 1, tzinfo=UTC)
     server.set_candles("DE40", "DAY", [candle(day), candle(day + timedelta(days=1))])
     daily = await broker.daily_candles("DE40", 2)
@@ -1135,12 +1145,13 @@ async def test_candle_stamp_as_period_end_shifts_start_back_by_one_period(server
     assert [c.start for c in daily] == [day - timedelta(days=1), day]
 
 
-async def test_candles_5m_reject_naive_datetimes_without_request(server, broker):
+async def test_candles_5m_reject_naive_datetimes_without_request(server, broker, clock):
     await broker.login()
     with pytest.raises(ValueError):
         await broker.candles_5m("DE40", OPEN.replace(tzinfo=None), OPEN + M5)
     with pytest.raises(ValueError):
         await broker.candles_5m("DE40", OPEN, (OPEN + M5).replace(tzinfo=None))
+    clock.advance((OPEN + 1000 * M5 - clock.now_utc()).total_seconds())
     with pytest.raises(ValueError, match="1000"):
         await broker.candles_5m("DE40", OPEN, OPEN + 1000 * M5)
     assert server.count("GET", "/prices/DE40") == 0
@@ -1260,3 +1271,219 @@ async def test_spacer_never_waits_longer_than_its_longest_pause_after_the_clock_
     spacer.pause_until(clock.now + timedelta(seconds=1))  # pauza po 429 mieści się w limicie oczekiwania
     await spacer.acquire()
     assert clock.sleeps == [1.0, 0.2, 1.0]
+
+
+# --- runda poprawek 1: anulowanie, okno świec bez przyszłości, drobne zabezpieczenia -----------------
+
+
+async def wait_for_request(server, method: str, path: str, count: int = 1) -> None:
+    """Czeka (czas rzeczywisty, najwyżej 5 s), aż serwer przyjmie `count` żądań `method path`."""
+    for _ in range(500):
+        if server.count(method, path) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{method} {path} never arrived")
+
+
+async def cancel(task: asyncio.Task) -> None:
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize("step", ["PUT", "GET"])
+async def test_cancelled_select_account_drops_the_session(server, broker, step):
+    await broker.login()
+    server.delay_next("/session", 2.0, method=step)
+    task = asyncio.create_task(broker.select_account("ACC-EMPTY"))
+    await wait_for_request(server, step, "/session")
+    await cancel(task)  # np. asyncio.wait_for silnika: rachunek sesji u brokera jest teraz niepewny
+    assert broker._session_account_id is None
+    sent = len(server.log)
+    with pytest.raises(SessionExpired, match="not logged in"):
+        await broker.account()
+    assert len(server.log) == sent  # nic nie wychodzi na niepewnym rachunku, aż do nowego logowania
+    await broker.login()
+    assert (await broker.account()).account_id == "ACC-FUNDED"
+
+
+@pytest.mark.parametrize("step", ["POST", "PUT", "GET"])
+async def test_cancelled_login_drops_the_session_including_the_previous_one(server, make_broker, step):
+    broker = make_broker(account_id="ACC-EMPTY")
+    await broker.login()  # pełna, poprawna sesja na ACC-EMPTY
+    server.delay_next("/session", 2.0, method=step)
+    task = asyncio.create_task(broker.login())
+    await wait_for_request(server, step, "/session", count=2)
+    await cancel(task)
+    assert (broker._tokens, broker._session_account_id) == (None, None)
+    sent = len(server.log)
+    with pytest.raises(SessionExpired, match="not logged in"):
+        await broker.keepalive()
+    assert len(server.log) == sent
+    await broker.login()
+    assert (await broker.account()).account_id == "ACC-EMPTY"
+
+
+async def test_relogin_never_sends_other_requests_before_the_switch_is_verified(server, make_broker):
+    broker = make_broker(account_id="ACC-EMPTY")
+    await broker.login()
+    server.expire_token()
+    server.delay_next("/session", 0.3, method="PUT")  # przełączenie w toku, gdy przychodzą inne żądania
+    first = asyncio.create_task(broker.keepalive())
+    await wait_for_request(server, "PUT", "/session", count=2)
+    await asyncio.gather(first, broker.list_accounts(), broker.quote("DE40"))
+    verified_at = max(i for i, r in enumerate(server.log) if (r.method, r.path) == ("GET", "/session"))
+    for i, req in enumerate(server.log):
+        if req.path != "/session" and req.auth_ok:
+            assert req.account == "ACC-EMPTY" and i > verified_at, server.sequence()
+    assert server.count("POST", "/session") == 2
+
+
+async def test_opening_range_read_at_0810_never_asks_for_the_future(server, broker, clock):
+    assert server.reject_future_to  # serwer testowy odrzuca `to` z przyszłości (wariant ostrożny, C9)
+    await broker.login()
+    server.set_candles("DE40", "MINUTE_5", [candle(OPEN), candle(OPEN + M5), candle(OPEN + 2 * M5)])
+    advance_to(clock, OPEN + 2 * M5)  # 08:10:00 UTC = 09:10 w Berlinie
+    got = await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)
+    assert [c.start for c in got] == [OPEN, OPEN + M5]
+    [req] = server.requests("GET", "/prices/DE40")
+    assert (req.query["to"], req.status) == ("2026-11-02T08:10:00", 200)
+
+
+async def test_fake_server_really_rejects_a_future_to(server, broker, clock):
+    await broker.login()
+    advance_to(clock, OPEN + 2 * M5)
+    params = {"resolution": "MINUTE_5", "from": "2026-11-02T08:00:00", "to": "2026-11-02T08:15:00", "max": "5"}
+    with pytest.raises(BrokerError, match="HTTP 400 error.invalid.to"):
+        await broker._request("GET", "/prices/DE40", params=params)
+
+
+@pytest.mark.parametrize("now", [OPEN + 2 * M5, OPEN + 2 * M5 + timedelta(seconds=7, microseconds=500)])
+async def test_flipped_stamp_semantics_never_asks_for_the_future(server, broker, clock, monkeypatch, now):
+    monkeypatch.setattr(capitalcom, "CANDLE_STAMP_IS_PERIOD_START", False)
+    await broker.login()
+    server.set_candles("DE40", "MINUTE_5", [candle(OPEN + M5), candle(OPEN + 2 * M5)])  # znaczniki = końce świec
+    advance_to(clock, now)
+    got = await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)
+    assert [c.start for c in got] == [OPEN, OPEN + M5]
+    [req] = server.requests("GET", "/prices/DE40")
+    assert req.status == 200 and req.query["to"] == now.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+async def test_window_entirely_in_the_future_sends_nothing(server, broker, clock):
+    await broker.login()  # teraz 07:30, okno 08:00–08:10
+    assert await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5) == []
+    assert server.count("GET", "/prices/DE40") == 0
+
+
+class YieldingClock:
+    """Zegar testowy, którego `sleep` oddaje sterowanie pętli (FakeClock tego nie robi)."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+        self.sleeps: list[float] = []
+
+    def now_utc(self) -> datetime:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        await asyncio.sleep(0)
+        self.now += timedelta(seconds=seconds)
+
+
+async def test_spacer_honours_a_pause_raised_while_a_request_is_already_waiting():
+    clock = YieldingClock(T0)
+    spacer = capitalcom._Spacer(clock, 0.2, max_wait_s=1.0)
+    await spacer.acquire()  # T0
+    waiting = asyncio.create_task(spacer.acquire())  # będzie czekać do T0 + 0,2
+    await asyncio.sleep(0)
+    assert clock.sleeps == [0.2]
+    spacer.pause_until(T0 + timedelta(seconds=1))  # 429 zauważone przez inne żądanie w trakcie tego czekania
+    await waiting
+    assert clock.now == T0 + timedelta(seconds=1) and clock.sleeps == [0.2, 0.8]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda s: s.accounts[1]["balance"].update(balance=Decimal("9E+999999"), available=Decimal("-9E+999999")),
+    ],
+)
+async def test_out_of_range_account_numbers_are_broker_errors(server, broker, mutate):
+    await broker.login()
+    mutate(server)
+    for call in (broker.list_accounts, broker.account):
+        with pytest.raises(BrokerError, match="GET /accounts: unexpected response") as info:
+            await call()
+        assert type(info.value) is BrokerError and info.value.__context__ is None
+
+
+async def test_out_of_range_rule_numbers_are_broker_errors(server, broker):
+    await broker.login()
+    dealing(server, "minStopOrProfitDistance")["value"] = Decimal("9E+999999")  # % × mid przekracza zakres
+    with pytest.raises(BrokerError, match="GET /markets/DE40: unexpected response") as info:
+        await broker.instrument_rules("DE40")
+    assert type(info.value) is BrokerError
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        prices_reply({**candle(OPEN), "openPrice": {"bid": Decimal("9E+999999"), "ask": Decimal("9E+999999")}}),
+        prices_reply({**candle(OPEN), "snapshotTimeUTC": "9999-12-31T00:00:00"}),  # start + 1 dzień poza zakresem
+    ],
+)
+async def test_out_of_range_candle_numbers_and_times_are_broker_errors(server, broker, reply):
+    await broker.login()
+    server.fail_next("/prices/DE40", 200, reply)
+    with pytest.raises(BrokerError, match="GET /prices/DE40: unexpected response") as info:
+        await broker.daily_candles("DE40", 1)
+    assert type(info.value) is BrokerError
+
+
+async def test_session_with_raise_for_status_cannot_bypass_relogin(server, capital_credentials, clock):
+    async with aiohttp.ClientSession(raise_for_status=True) as http:
+        broker = CapitalComBroker(capital_credentials, http, clock, base_url=server.base_url)
+        await broker.login()
+        server.expire_token()
+        await broker.keepalive()
+        server.markets.pop("DE40")
+        with pytest.raises(BrokerError, match="HTTP 404 error.not-found.epic"):
+            await broker.quote("DE40")
+    assert server.count("POST", "/session") == 2
+
+
+async def test_waiting_login_raises_when_the_shared_session_is_gone(broker, monkeypatch):
+    original = broker._login_locked
+
+    async def login_then_dropped() -> None:
+        await original()
+        broker._drop_session()  # np. nieudane select_account tuż po logowaniu, zanim czekający to sprawdzi
+
+    monkeypatch.setattr(broker, "_login_locked", login_then_dropped)
+    results = await asyncio.gather(broker.login(), broker.login(), return_exceptions=True)
+    assert results[0] is None and isinstance(results[1], BrokerError)
+    with pytest.raises(SessionExpired):
+        await broker.keepalive()
+
+
+async def test_select_account_refuses_any_account_but_the_bound_one(server, make_broker):
+    broker = make_broker(account_id="ACC-EMPTY")
+    await broker.login()
+    sent = len(server.log)
+    with pytest.raises(BrokerError, match="bound account") as info:
+        await broker.select_account("ACC-FUNDED")  # kolejne ponowne logowanie i tak wróciłoby na ACC-EMPTY
+    assert type(info.value) is BrokerError and "ACC-FUNDED" not in str(info.value)
+    await broker.select_account("ACC-EMPTY")  # związany i aktywny: nic nie wysyła
+    assert len(server.log) == sent
+    assert (await broker.account()).account_id == "ACC-EMPTY"
+
+
+@pytest.mark.parametrize("stamp_utc", ["2026-11-02T08:00:00.999", "2026-11-02T08:02:00", "2026-11-02T08:00:30"])
+async def test_five_minute_stamps_off_the_five_minute_grid_are_broker_errors(server, broker, clock, stamp_utc):
+    await broker.login()
+    server.fail_next("/prices/DE40", 200, prices_reply({**candle(OPEN), "snapshotTimeUTC": stamp_utc}))
+    advance_to(clock, OPEN + 2 * M5)
+    with pytest.raises(BrokerError, match="5-minute boundary"):
+        await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)

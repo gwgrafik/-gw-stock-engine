@@ -9,7 +9,9 @@ Kształty odpowiedzi według `docs/ops/capitalcom-api-notes.md` (§2.2–2.9, §
 - `GET /markets/{epic}`: `instrument` (lotSize, marginFactor, marginFactorUnit, openingHours w UTC), `dealingRules`
   z obiektami `{unit, value}`, `snapshot` z `updateTime` bez strefy i BEZ `updateTimeUTC` (jak w odczycie live);
 - `GET /prices/{epic}`: świece z `snapshotTime` (czas lokalny CET) i `snapshotTimeUTC`, bid/ask osobno dla
-  open/close/high/low; filtracja `from`/`to` po `snapshotTimeUTC`, `max` domyślnie 10.
+  open/close/high/low; filtracja `from`/`to` po `snapshotTimeUTC`, `max` domyślnie 10; z `reject_future_to=True`
+  (domyślnie) `to` późniejsze niż zegar testu → 400 `error.invalid.to` (zachowanie brokera nieznane, C9: serwer
+  testowy zakłada wariant ostrożny, więc testy dowodzą, że adapter nigdy nie pyta o przyszłość).
 
 Sterowanie: `log` (metoda, ścieżka, zapytanie, nazwy obecnych nagłówków, treść; hasła i klucze nigdy nie są
 zapisywane, treść `POST /session` jest zredagowana), `count(...)`, `expire_token()` (każde następne żądanie
@@ -33,7 +35,7 @@ import secrets
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -201,6 +203,7 @@ class LoggedRequest:
     body: Any
     at: datetime  # zegar testu w chwili przyjęcia
     auth_ok: bool  # czy para tokenów należała do żywej sesji
+    account: str | None = None  # rachunek sesji tej pary tokenów w chwili przyjęcia (None: brak sesji)
     status: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -225,6 +228,7 @@ class FakeCapitalServer:
         self.log: list[LoggedRequest] = []
         self.issued_tokens: list[str] = []
         self.rotate_tokens_on_switch = False
+        self.reject_future_to = True
         self.login_min_interval = timedelta(seconds=1)
         self._sessions: dict[tuple[str, str], str] = {}
         self._last_login_at: datetime | None = None
@@ -354,6 +358,7 @@ class FakeCapitalServer:
                 body=self._redact(request.method, path, body),
                 at=self.clock.now_utc(),
                 auth_ok=self.session_account(request) is not None,
+                account=self.session_account(request),
             )
             self.log.append(entry)
             delay = self._pop(self._delays, request.method, path)
@@ -532,6 +537,9 @@ class FakeCapitalServer:
         for name, value in (("from", start), ("to", end)):
             if value is not None and not _STAMP.fullmatch(value):
                 return self.reply({"errorCode": f"error.invalid.{name}"}, 400)
+        if self.reject_future_to and end is not None:
+            if datetime.strptime(end, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) > self.clock.now_utc():
+                return self.reply({"errorCode": "error.invalid.to"}, 400)
         items = [
             c
             for c in self.prices.get((epic, resolution), [])

@@ -7,8 +7,8 @@ Zasady:
   parsowane do logiki;
 - brak pola, zły typ albo nieoczekiwana jednostka to `ParseError` z nazwą pola, nigdy z treścią odpowiedzi
   (poza krótkimi kodami wyliczeniowymi jak jednostka `PERCENTAGE`); adapter zamienia go na `BrokerError`;
-- błędy konstruktorów typów domenowych (`ValueError`/`TypeError` z `gwstock.types`) też stają się `ParseError`
-  z nazwą pola.
+- błędy konstruktorów typów domenowych (`ValueError`/`TypeError` z `gwstock.types`, także `ArithmeticError`) też
+  stają się `ParseError` z nazwą pola; arytmetyka parserów poza zakresem (`decimal.Overflow`) zamienia adapter.
 """
 
 from __future__ import annotations
@@ -155,6 +155,8 @@ def build(cls: type, where: str, *args: Any) -> Any:
     except (TypeError, ValueError) as exc:
         head = str(exc).split(":", 1)[0]
         problem = head if _FIELD.fullmatch(head) else type(exc).__name__
+    except ArithmeticError as exc:
+        problem = f"value (out of range: {type(exc).__name__})"
     raise ParseError(f"{where}: invalid {problem}")
 
 

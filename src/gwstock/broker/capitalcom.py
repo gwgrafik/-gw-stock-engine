@@ -15,11 +15,15 @@ Zasady:
   jedno `PUT /session` tuż po logowaniu, przed jakimkolwiek innym wywołaniem, i kontrola `GET /session`; rachunek
   spoza listy logowania → `BrokerError` bez dalszych wywołań; bez `account_id` adapter niczego nie przełącza;
 - jedno logowanie naraz (`asyncio.Lock`): równoległe `login()` i równoległe odpowiedzi 401 dzielą jedno
-  `POST /session`; 401 → jedno ponowne logowanie i jedna powtórka żądania, drugie 401 albo nieudane ponowne
-  logowanie → `SessionExpired`; bez ważnej sesji żądanie nie wychodzi do brokera (`SessionExpired`), aż silnik
-  zaloguje się ponownie, więc nic nie zapętla się samo;
+  `POST /session`; 401 → jedno ponowne logowanie i jedna powtórka żądania; nieudane ponowne logowanie albo drugie
+  401 zaraz po nim → `SessionExpired` i sesja PORZUCONA: każde następne żądanie → `SessionExpired` bez wysyłki, aż
+  silnik sam wywoła `login()` (ponawianie i ochrona przed blokadą konta należą do Watchdoga, T14), więc nic nie
+  zapętla się samo;
+- logowanie albo `select_account` przerwane w dowolnym miejscu (błąd, przekroczenie czasu, ANULOWANIE) nie
+  zostawia sesji: rachunek sesji u brokera byłby wtedy niepewny;
 - limity na zegarze silnika (`Clock`): ≥ 0,2 s między dowolnymi żądaniami (5/s, połowa limitu brokera, spec §13),
-  ≥ 1 s między `POST /session`, ≥ 0,1 s między zleceniami (`order=True`, część 2); kolejność FIFO;
+  ≥ 1 s między `POST /session`, ≥ 0,1 s między zleceniami (`order=True`, część 2); kolejność FIFO; każde żądanie
+  wysyłane z `raise_for_status=False`, więc wstrzyknięta sesja HTTP nie omija obsługi 401 i mapowania błędów;
 - HTTP 429 nie jest ponawiany automatycznie ani razu: `BrokerError` i wstrzymanie wszystkich żądań na
   `RATE_LIMIT_PAUSE_S` (spec §13 „przy limitach wstrzymuje zapytania”); o ponowieniu decyduje silnik;
 - błędy: przekroczenie czasu → `BrokerTimeout`, błąd połączenia → `BrokerError`, 5xx i 429 → `BrokerError` ze
@@ -50,6 +54,7 @@ import aiohttp
 
 from gwstock.broker.base import Capabilities
 from gwstock.broker.capitalcom_parse import (
+    Bar,
     ParseError,
     build,
     dumps,
@@ -309,16 +314,20 @@ class _Spacer:
 
     async def acquire(self) -> None:
         async with self._lock:
-            now = self._clock.now_utc()
-            if self._next is not None and now < self._next:
-                wait = (self._next - now).total_seconds()
+            # pętla: pauza (`pause_until`) podniesiona w trakcie czekania też musi zostać odczekana
+            while self._next is not None:
+                wait = (self._next - self._clock.now_utc()).total_seconds()
+                if wait <= 0:
+                    break
                 if wait <= self._max_wait_s:
                     await self._clock.sleep(wait)
-                    now = max(self._clock.now_utc(), self._next)
-                else:  # zegar cofnął się: odczekaj najdłuższą uprawnioną przerwę i licz od nowa
-                    await self._clock.sleep(self._max_wait_s)
-                    now = self._clock.now_utc()
-            self._next = now + self._interval
+                    continue
+                # zegar cofnął się: odczekaj najdłuższą uprawnioną przerwę; jeśli termin nadal jest nierealnie
+                # daleko (nie pauza podniesiona w międzyczasie), licz od nowa od bieżącej chwili
+                await self._clock.sleep(self._max_wait_s)
+                if (self._next - self._clock.now_utc()).total_seconds() > self._max_wait_s:
+                    break
+            self._next = self._clock.now_utc() + self._interval
 
     def pause_until(self, moment: datetime) -> None:
         if self._next is None or moment > self._next:
@@ -369,6 +378,26 @@ def _api_time(moment: datetime) -> str:
 def _stamp_shift(period: timedelta) -> timedelta:
     """Jedyne miejsce, które czyta `CANDLE_STAMP_IS_PERIOD_START`: znacznik świecy = jej początek + przesunięcie."""
     return timedelta(0) if CANDLE_STAMP_IS_PERIOD_START else period
+
+
+def _assemble_candles(
+    epic: str, bars: list[Bar], period: timedelta, shift: timedelta, now: datetime, on_grid: bool
+) -> list[Candle]:
+    """Świece z odczytanych słupków: start = znacznik − przesunięcie, tylko zakończone, rosnąco, bez duplikatów.
+
+    `on_grid`: znacznik musi leżeć na siatce okresu (5 min: pełne 5 minut, zero sekund); inaczej `ParseError`
+    (np. znacznik `.999` końca okresu nie może przejść po cichu). Sprzeczne duplikaty → `ParseError`. Arytmetyka
+    poza zakresem (`OverflowError`) przechodzi do `_parse`, który zamienia ją na `BrokerError`.
+    """
+    by_start: dict[datetime, Candle] = {}
+    for i, bar in enumerate(bars):
+        if on_grid and (bar.stamp - bar.stamp.replace(hour=0, minute=0, second=0, microsecond=0)) % period:
+            raise ParseError(f"prices[{i}].snapshotTimeUTC: not on a {period.seconds // 60}-minute boundary")
+        start = bar.stamp - shift
+        candle = build(Candle, "prices", epic, start, bar.open, bar.high, bar.low, bar.close)
+        if by_start.setdefault(start, candle) != candle:
+            raise ParseError(f"prices[{i}]: conflicting candles for one period")
+    return [by_start[s] for s in sorted(by_start) if s + period <= now]
 
 
 class CapitalComBroker:
@@ -427,9 +456,9 @@ class CapitalComBroker:
             if self._login_seq == seen:
                 await self._login_locked()
                 return
-            shared_failure = self._last_login_error if self._tokens is None else None
-        if shared_failure is not None:
-            raise self._error(BrokerError, f"login: the concurrent login attempt failed ({shared_failure})")
+            failure = None if self._tokens is not None else (self._last_login_error or "the session was dropped")
+        if failure is not None:  # wspólna próba zawiodła albo jej sesję już porzucono: logowanie się nie udało
+            raise self._error(BrokerError, f"login: no session after the concurrent login attempt ({failure})")
 
     async def keepalive(self) -> None:
         """`GET /ping` z tokenami sesji (sesja żyje 10 minut od ostatniego użycia; silnik woła co 5 minut)."""
@@ -440,9 +469,10 @@ class CapitalComBroker:
     async def _login_locked(self) -> None:
         try:
             tokens, account_id, accounts = await self._open_session()
-        except BrokerError as exc:
+        except BaseException as exc:  # także anulowanie w trakcie POST/PUT/GET: nie zostaje żadna sesja, ani stara
             self._drop_session()
-            self._last_login_error = str(exc)
+            interrupted = f"login interrupted ({type(exc).__name__})"
+            self._last_login_error = str(exc) if isinstance(exc, BrokerError) else interrupted
             self._login_seq += 1
             raise
         self._tokens = tokens
@@ -528,11 +558,19 @@ class CapitalComBroker:
         """Przełącza sesję na rachunek (`PUT /session` raz, kontrola `GET /session`); tylko dla `bind-account`.
 
         Rachunek spoza listy logowania → `BrokerError` bez wysyłki; rachunek już aktywny → nic nie wysyła (broker
-        mógłby odrzucić przełączenie na ten sam rachunek). Każda porażka po wysłaniu `PUT` porzuca sesję, bo rachunek
-        sesji jest wtedy niepewny (następne żądania → `SessionExpired`, aż do nowego logowania).
+        mógłby odrzucić przełączenie na ten sam rachunek). Przy związanym rachunku (`creds.account_id`) inny rachunek
+        → `BrokerError` bez wysyłki (ponowne logowanie i tak przełączyłoby z powrotem). Każde wyjście po wysłaniu `PUT`
+        inne niż potwierdzony sukces (także anulowanie) porzuca sesję, bo rachunek sesji jest wtedy niepewny
+        (następne żądania → `SessionExpired`, aż do nowego logowania).
         """
         if not isinstance(account_id, str):
             raise TypeError(f"account_id: expected a string, got {type(account_id).__name__}")
+        if self._creds.account_id is not None and account_id != self._creds.account_id:
+            raise self._error(
+                BrokerError,
+                "select_account: refused, this adapter has a bound account (creds.account_id) and the next re-login "
+                "would switch back to it; nothing was sent",
+            )
         if self._tokens is None:
             raise self._error(SessionExpired, "select_account: not logged in (login required)")
         if account_id not in self._login_accounts:
@@ -543,16 +581,17 @@ class CapitalComBroker:
             )
         if account_id == self._session_account_id:
             return
+        verified = False
         try:
             await self._request("PUT", "/session", body={"accountId": account_id})
             active = self._parse("GET /session", parse_session_account, await self._request("GET", "/session"))
-        except BrokerError:
-            self._drop_session()
-            raise
-        if active != account_id:
-            self._drop_session()
-            raise self._error(BrokerError, "select_account: GET /session reports another account after the switch")
-        self._session_account_id = account_id
+            if active != account_id:
+                raise self._error(BrokerError, "select_account: GET /session reports another account after the switch")
+            self._session_account_id = account_id
+            verified = True
+        finally:
+            if not verified:  # każde inne wyjście po wysłaniu PUT (błąd, timeout, anulowanie): rachunek niepewny
+                self._drop_session()
 
     # --- transport -------------------------------------------------------------------------------
 
@@ -571,7 +610,8 @@ class CapitalComBroker:
     ) -> dict[str, Any]:
         """Żądanie z tokenami sesji; zwraca obiekt JSON odpowiedzi 2xx albo rzuca wyjątek z `gwstock.types`.
 
-        401 → jedno wspólne ponowne logowanie i jedna powtórka; drugie 401 → `SessionExpired`. Nigdy więcej prób.
+        401 → jedno wspólne ponowne logowanie i jedna powtórka; drugie 401 → `SessionExpired` i porzucenie sesji.
+        Nigdy więcej prób.
         """
         where = f"{method} {path}"
         resp, used = await self._send_authed(method, path, params, body, order)
@@ -579,7 +619,11 @@ class CapitalComBroker:
             await self._relogin_after_401(where, used)
             resp, used = await self._send_authed(method, path, params, body, order)
             if resp.status == 401:
-                raise self._error(SessionExpired, f"{where}: HTTP 401 again right after a fresh login")
+                failure = f"{where}: HTTP 401 again right after a fresh login; session dropped"
+                if self._tokens is used:
+                    self._drop_session()
+                    self._last_login_error = failure
+                raise self._error(SessionExpired, failure)
         self._adopt_tokens(resp, used)
         if 200 <= resp.status < 300:
             return self._decode(where, resp)
@@ -622,7 +666,13 @@ class CapitalComBroker:
         try:
             async with asyncio.timeout(self._timeout_s):
                 async with self._session.request(
-                    method, self._api + path, params=params, data=data, headers=sent, allow_redirects=False
+                    method,
+                    self._api + path,
+                    params=params,
+                    data=data,
+                    headers=sent,
+                    allow_redirects=False,
+                    raise_for_status=False,
                 ) as resp:
                     raw = await resp.read()
                     return _Response(resp.status, resp.headers.get("CST"), resp.headers.get("X-SECURITY-TOKEN"), raw)
@@ -670,6 +720,8 @@ class CapitalComBroker:
             return parser(*args)
         except ParseError as exc:
             problem = str(exc)
+        except ArithmeticError as exc:  # np. saldo 9E+999999 (decimal.Overflow) albo data poza zakresem
+            problem = f"a number or time is out of range ({type(exc).__name__})"
         raise self._error(BrokerError, f"{where}: unexpected response: {problem}")
 
     def _status_error(self, where: str, resp: _Response, *, rejectable: bool = False) -> BrokerError:
@@ -750,8 +802,12 @@ class CapitalComBroker:
     async def candles_5m(self, epic: str, start: datetime, end: datetime) -> list[Candle]:
         """Zakończone świece 5-minutowe z `start <= c.start < end`, rosnąco (`GET /prices?resolution=MINUTE_5`).
 
-        Zapytanie obejmuje okno o jeden okres szersze (włączność `to` nieznana, C9), a wynik jest filtrowany
-        lokalnie po `snapshotTimeUTC`. Pusta lista jest poprawna (świec jeszcze nie ma).
+        Szukane znaczniki to półotwarte [start + przesunięcie, end + przesunięcie), więc `from` = start + przesunięcie
+        i `to` = end + przesunięcie wystarczają bez względu na to, czy broker traktuje `to` włącznie (C9). `to` jest
+        dodatkowo obcięte do teraz (pełne sekundy): pytanie o przyszłość mogłoby zostać odrzucone, a zakończona świeca
+        ma znacznik ≤ teraz − 5 min (≤ teraz przy znaczniku = koniec okresu; przy wyłącznym `to` świeca o znaczniku
+        równym dokładnie teraz przyjdzie w następnym odczycie). Okno puste po obcięciu → [] bez zapytania. Wynik jest
+        filtrowany lokalnie po `snapshotTimeUTC`; pusta lista jest poprawna (świec jeszcze nie ma).
         """
         path = f"/prices/{_check_epic(epic)}"
         start, end = _utc_arg("start", start), _utc_arg("end", end)
@@ -759,12 +815,15 @@ class CapitalComBroker:
             return []
         shift = _stamp_shift(_FIVE_MINUTES)
         first = (start + shift).replace(microsecond=0)
-        last = (end + shift).replace(microsecond=0) + _FIVE_MINUTES
+        last = min(end + shift, self._clock.now_utc()).replace(microsecond=0)
+        if last < first:
+            return []
         points = (last - first) // _FIVE_MINUTES + 2
         if points > MAX_PRICE_POINTS:
             raise ValueError(f"candles_5m: the range needs {points} candles, more than {MAX_PRICE_POINTS} per request")
         params = {"resolution": "MINUTE_5", "from": _api_time(first), "to": _api_time(last), "max": str(points)}
-        candles = self._candles(path, epic, await self._request("GET", path, params=params), _FIVE_MINUTES)
+        payload = await self._request("GET", path, params=params)
+        candles = self._candles(path, epic, payload, _FIVE_MINUTES, on_grid=True)
         return [c for c in candles if start <= c.start < end]
 
     async def daily_candles(self, epic: str, count: int) -> list[Candle]:
@@ -779,22 +838,17 @@ class CapitalComBroker:
         if not 1 <= count <= MAX_PRICE_POINTS - 2:
             raise ValueError(f"daily_candles: count must be between 1 and {MAX_PRICE_POINTS - 2}, got {count}")
         params = {"resolution": "DAY", "max": str(count + 2)}
-        candles = self._candles(path, epic, await self._request("GET", path, params=params), _ONE_DAY)
+        # granica doby świecy DE40 jest nieznana (C9), więc znaczników dziennych nie sprawdzamy względem siatki
+        candles = self._candles(path, epic, await self._request("GET", path, params=params), _ONE_DAY, on_grid=False)
         if len(candles) < count:
             raise self._error(BrokerError, f"GET {path}: only {len(candles)} completed daily candles, {count} needed")
         return candles[-count:]
 
-    def _candles(self, path: str, epic: str, payload: dict[str, Any], period: timedelta) -> list[Candle]:
-        """Świece zakończone (start + okres <= teraz), posortowane, bez duplikatów; sprzeczne duplikaty → błąd."""
+    def _candles(
+        self, path: str, epic: str, payload: dict[str, Any], period: timedelta, *, on_grid: bool
+    ) -> list[Candle]:
+        """Świece zakończone (start + okres <= teraz), posortowane, bez duplikatów (patrz `_assemble_candles`)."""
         where = f"GET {path}"
         bars = self._parse(where, parse_bars, payload)
-        shift = _stamp_shift(period)
         now = self._clock.now_utc()
-        by_start: dict[datetime, Candle] = {}
-        for bar in bars:
-            start = bar.stamp - shift
-            candle = self._parse(where, build, Candle, "prices", epic, start, bar.open, bar.high, bar.low, bar.close)
-            known = by_start.setdefault(start, candle)
-            if known != candle:
-                raise self._error(BrokerError, f"{where}: unexpected response: conflicting candles for one period")
-        return [by_start[s] for s in sorted(by_start) if s + period <= now]
+        return self._parse(where, _assemble_candles, epic, bars, period, _stamp_shift(period), now, on_grid)
