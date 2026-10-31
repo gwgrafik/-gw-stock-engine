@@ -9,7 +9,7 @@ Podstawa: `docs/research/2026-10-31-silnik-tradingowy-akcje-usa.md`, `docs/resea
 
 1. Alpaca wykluczona (praktycznie tylko USA).
 2. Trading 212 wykluczony: warunki API (pkt 4.2(a)) zabraniają handlu algorytmicznego, czyli dokładnie tego, co budujemy.
-3. Pierwszy adapter to **Capital.com demo**. Konto live nie dostaje żadnych środków, dopóki nie przejdziemy bramki A.
+3. Pierwszy adapter to **Capital.com demo**. Konto live nie dostaje żadnych środków, dopóki nie przejdziemy bramki A. **Uwaga:** warunki Capital.com dla klientów z NL są ostrzejsze w sprawie robotów niż wersja czytana wcześniej (sekcja 2), więc wybór pozostaje warunkowy do pisemnej odpowiedzi supportu.
 4. Wariant **A**: CFD na indeksy, jeden instrument, bez filtra relative volume (notowania CFD nie niosą wolumenu giełdy).
 5. Właściciel **mieszka w Holandii** i tymczasowo jest w Polsce. Wcześniejsze założenie o polskiej rezydencji podatkowej było błędne. Podatki, ochrona inwestora i dostępność brokerów są oceniane dla rezydenta NL (research w toku, sekcja 16).
 
@@ -52,9 +52,12 @@ Prawdziwe pieniądze i jakakolwiek ścieżka kodu live; akcje (prawdziwe i CFD) 
 | Spread w migawce poza sesją: US100 1,8 pkt, US500 0,6 pkt, DE40 2,0 pkt, ok. 0,007–0,010% wartości (poziomy indeksów to założenie agenta) | Koszt wejścia jest ułamkiem R; mierzymy go na własnym strumieniu bid/ask | M (obliczenie agenta) |
 | Finansowanie long US100: −0,02237% dziennie od pełnej wartości, naliczane ok. 21:00 UTC (źródła rozbieżne: 21:00 lub 22:00) | Spłaszczenie przed naliczeniem; brak pozycji przez noc | L–M |
 | Demo prawdopodobnie nie modeluje poślizgu; brak źródeł o wierności demo | Demo sprawdza hydraulikę, nie koszty ani przewagę | L (brak źródeł) |
-| Regulamin (v19, luty 2024, STARY) w pkt 8.12(b) i 13.1.1(h) zakazuje „robots, high speed trading system" w kontekście nadużyć; wprost API nie jest zakazane, a Capital.com publikuje API | Pisemne potwierdzenie z supportu przed jakimikolwiek środkami na live (sekcja 16) | H dla tej wersji |
-| Podmiot: Capital Com SV Investments Ltd (CySEC 319/17) wg v19; trwa przejęcie klientów FxPro, więc podmiot trzeba potwierdzić | Pytanie do supportu | M |
-| Ochrona: fundusz CySEC do 20 000 EUR plus polisa do 1 mln EUR (od 1.06.2025) | Brak wpływu na projekt, informacja dla właściciela | M |
+| Dla klienta z NL obowiązują warunki **Capital Com Group Ltd (CySEC 463/25), T&C v2.1 z września 2026** (wersja niderlandzka v2.0 z czerwca 2026), a nie v19 z lutego 2024. Pkt 8.12.3(b): roboty i algorytmy tylko „gdy wyraźnie dozwolone"; pkt 8.24.8 dopuszcza systemy dostępne w platformie, np. MetaTrader; w wyciągniętym tekście nie ma słowa „API". Jednocześnie Capital.com publikuje i promuje API oraz własny serwer MCP | Zewnętrzny bot w Pythonie nie jest oczywiście objęty. **Pisemne potwierdzenie jest warunkiem bramki A**, a pytanie obejmuje też demo (sekcja 16) | M |
+| Który podmiot dostaje nowego klienta z NL, nie jest potwierdzone: warunki dla NL wystawia Capital Com Group Ltd (CySEC 463/25), a wcześniej wskazywany Capital Com SV Investments (319/17) dotyczył starszej umowy; trwa też przejęcie klientów FxPro | Pytanie do supportu; dane w profilu (adres w NL, BSN) muszą być prawdziwe | M |
+| Ochrona: fundusz CySEC do 20 000 EUR; polisa do 1 mln EUR obejmuje tylko klientów Capital Com Group Ltd. Kifid i holenderski system rekompensat **nie** obejmują firm z paszportem; droga odwoławcza to firma, Ombudsman Cypru, potem sąd w Cyprze (wyjątek tylko dla rezydentów PL i DE) | Brak wpływu na silnik; informacja dla właściciela | M |
+| Podatek w NL (informacja ogólna): wynik z CFD osoby prywatnej domyślnie w box 3, czyli zryczałtowany zwrot od wartości majątku na 1 stycznia (6,00% dla „innych aktywów" w 2026, stawka 36%, kwota wolna 59 357 EUR); pojedyncze transakcje nie są opodatkowane ani odliczane; ryzyko box 1 wynika z orzecznictwa o „przewidywalnej korzyści", a znane wyroki o botach dotyczyły arbitrażu kryptowalut z trafnością 75–81%; reforma (rzeczywisty zwrot od 2028) nie jest uchwalona | Księga zachowuje pełne dane transakcji; konsultacja z doradcą w NL przed bramką A | M |
+| AFM stosuje te same limity ESMA dla CFD (indeksy 20:1, zamknięcie przy 50% depozytu, ochrona przed saldem ujemnym); nie znaleziono zakazu handlu algorytmicznego dla klientów detalicznych | Limity z sekcji 9 są zgodne z regulacją | M |
+| Czasowy pobyt w Polsce nie zmienia rezydencji podatkowej w NL; warunki Capital.com (pkt 3.6.2, 13.1.1(b), 4.4.2) wymagają prawdziwych danych o zamieszkaniu i ostrzegają, że dostęp z innego kraju „może nie być dozwolony" | Prawdziwe dane w profilu; pytanie do supportu o logowania z Polski; silnik uruchamiany z serwera w UE | M |
 | Wolne ok. 700 MB, swap w użyciu; limit cgroup z `oom_score_adj` jądro respektuje przy braku pamięci | Limit kontenera i zabicie naszego procesu w pierwszej kolejności (sekcja 13) | H (dokumentacja) |
 
 ## 3. Architektura
@@ -340,7 +343,7 @@ DE40 (godziny dzienne czasu środkowoeuropejskiego, spread ok. 2,0 pkt) jako dru
 
 | # | Pytanie | Jak rozstrzygnąć |
 |---|---|---|
-| 1 | Capital.com: który podmiot i która wersja umowy obowiązują rezydenta NL w listopadzie 2026; czy handel przez API przez nienadzorowany program jest dozwolony (pkt 8.12(b), 13.1.1(h)); czy GSL jest dostępny; opłata za nieaktywność | E-mail do supportu (`docs/ops/capital-com-support-email.md`) |
+| 1 | Capital.com: czy handel przez publiczne API przez nienadzorowany program jest dozwolony wobec pkt 8.12.3(b) i 8.24.8 T&C v2.1 (także na demo) i który punkt to dopuszcza; który podmiot obsługuje rezydenta NL; dostępność GSL; opłata za nieaktywność | E-mail do supportu (`docs/ops/capital-com-support-email.md`) |
 | 2 | Czy klucz API dla demo powstaje bez zakończonej weryfikacji KYC | Test na koncie (właściciel) |
 | 3 | US100: minimalna wielkość, krok, wartość punktu, depozyt, minimalna odległość stopu, godziny i przerwy handlu, nazwa instrumentu w API | `GET /markets/{instrument}` na demo |
 | 4 | Tryb konta (agregacja czy hedging) i zachowanie drugiego wejścia na tym samym instrumencie | Test na demo |
@@ -350,13 +353,14 @@ DE40 (godziny dzienne czasu środkowoeuropejskiego, spread ok. 2,0 pkt) jako dru
 | 8 | Format i dostępność historii świec 5-minutowych i dziennych przez REST; opóźnienie świec OHLC ze strumienia | Test na demo |
 | 9 | Pomiar pamięci procesu pod limitem cgroup oraz rachunkowość swapu (`--memory-swap`) w jądrze VPS | Pomiar na VPS po zgodzie właściciela |
 | 10 | Czy zaokrąglenie czasu wejścia o 09:35 ET i zachowanie stopów przy luce są zgodne z modelem | Dziennik z kilku sesji demo |
-| 11 | Dostępność i warunki dla rezydenta NL czasowo przebywającego w Polsce (adres w profilu, logowanie z innego kraju UE) | E-mail do supportu, research ogólny w toku |
+| 11 | Dostęp z Polski podczas czasowego pobytu (pkt 3.6.2) i czy demo wygasa | E-mail do supportu oraz próbne logowanie do demo z Polski |
 | 12 | Czy `GET /prices` zwraca dane potrzebne do ATR i świec zapasowych bez limitów utrudniających | Test na demo |
 | 13 | Faktyczna różnica spreadu i poślizgu demo względem live | Mikro-live po bramce A; demo sprawdza hydraulikę |
 | 14 | Źródło danych do rozszerzeń o akcje (jeśli kiedyś) | Decyzja właściciela po zmierzeniu kosztów |
 | 15 | Rachunek na koncie live: waluta bazowa i przewalutowania | E-mail, decyzja właściciela |
 | 16 | Czy hosting na współdzielonym VPS wystarczy, czy potrzebny osobny host | Pomiar pamięci (pytanie 9) i decyzja właściciela |
 | 17 | Czy integracja GitHub może wypychać pliki `.github/workflows` | Próba przy implementacji; w razie odmowy właściciel dodaje plik |
+| 18 | Plan B, jeśli Capital.com odmówi lub odpowie niejednoznacznie: trasy, które regulamin wprost dopuszcza lub które mają jawne API dla klientów detalicznych (MetaTrader u Capital.com, cTrader u brokerów UE, Saxo OpenAPI, LYNX/IBKR) i ich ograniczenia (pamięć VPS, minimalny kapitał) | Decyzja właściciela po odpowiedzi supportu; adaptery są wymienne dzięki interfejsowi `Broker` |
 
 ## 17. Kryteria akceptacji v1
 
@@ -373,7 +377,7 @@ DE40 (godziny dzienne czasu środkowoeuropejskiego, spread ok. 2,0 pkt) jako dru
 | Ryzyko | Skutek | Łagodzenie |
 |---|---|---|
 | Strategia nie ma przewagi netto | Wynik bliski zera lub ujemny | To spodziewany wynik; bramki mierzą jakość pomiaru; silnik jako instrument pomiarowy |
-| Regulamin Capital.com (stary, niejasny zapis o „robotach") | Zawieszenie dostępu API lub konta | Pisemne potwierdzenie z supportu przed jakimikolwiek środkami na live; demo bez środków |
+| Regulamin Capital.com dla NL (T&C v2.1): algorytmy tylko „gdy wyraźnie dozwolone", w tekście brak słowa „API" | Zawieszenie dostępu API lub konta, trudna droga odwoławcza (Cypr) | Pisemne potwierdzenie przed jakimikolwiek środkami na live i przed dłuższym używaniem demo; plan B (pytanie 18); demo bez środków |
 | Odwołanie lub zmiana API bez uprzedzenia, zmiana podmiotu (FxPro) | Silnik przestaje działać | Interfejs `Broker` z deklaracją zdolności; adapter wymienny; kill switch miękki |
 | Ten sam klucz na demo i live | Przypadkowy handel na live | Stała hosta demo, brak adaptera live, konto live bez środków |
 | Błąd w automacie stanów lub uzgadnianiu | Duplikaty, pozycje osierocone | TDD, `FakeBroker` z awariami, niezmienniki, recenzja `order-state-auditor` |
