@@ -1,6 +1,6 @@
 """Wspólne fixtures testów. Uruchamiać z korzenia repozytorium (ścieżka względna `config/`).
 
-Kolejne zadania dopisują tu swoje fixtures (`journal`, `mgr`, `req`, `gate`, `kill`, `reconciler`).
+Kolejne zadania dopisują tu swoje fixtures (`journal`, `mgr`, `req`, `gate`, `kill`, `reconciler`, `signal`, `executor`).
 """
 
 from collections.abc import Iterator
@@ -14,10 +14,13 @@ from gwstock.broker.fake import FakeBroker
 from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.clock import FakeClock
 from gwstock.config import CostConfig, RiskConfig, StrategyConfig, load_config
+from gwstock.costs import CostModel
+from gwstock.execution import Executor
 from gwstock.journal import Journal, PositionRecord
 from gwstock.orders.manager import OrderManager
 from gwstock.reconcile import Reconciler
 from gwstock.risk import KillSwitch, RiskGate
+from gwstock.strategy import EntrySignal
 from gwstock.types import ClosedDeal, EntryRequest, InstrumentRules, Quote, Side
 
 
@@ -182,3 +185,32 @@ def gate(
 ) -> RiskGate:
     """Bramka ryzyka z żywym kill switchem; domyślny `clock` to 08:30 w Berlinie, czyli przed oknem wejścia."""
     return RiskGate(risk_cfg, strat_cfg, journal, calendar, clock, kill)
+
+
+@pytest.fixture
+def signal(quote: Quote) -> EntrySignal:
+    """Sygnał BUY DE40: stop 30 pkt, wielkość 0.007 (ryzyko 0,21 EUR), notowanie decyzji = fixture `quote`."""
+    return EntrySignal(Side.BUY, Decimal("30"), Decimal("0.007"), quote)
+
+
+@pytest.fixture
+def executor(
+    mgr: OrderManager,
+    fake: FakeBroker,
+    journal: Journal,
+    gate: RiskGate,
+    kill: KillSwitch,
+    cost_cfg: CostConfig,
+    clock: FakeClock,
+    strat_cfg: StrategyConfig,
+    risk_cfg: RiskConfig,
+    calendar: ExchangeCalendar,
+    notifier: RecordingNotifier,
+) -> Executor:
+    """Wykonawca w trybie LIVE (wysyła zlecenia do FakeBroker): prawdziwy menedżer, bramka, kill switch i koszty.
+
+    Domyślny `clock` (08:30 w Berlinie) jest przed oknem wejścia: testy wejścia nadpisują `clock`.
+    """
+    return Executor(
+        mgr, fake, journal, gate, kill, CostModel(cost_cfg), clock, strat_cfg, risk_cfg, calendar, notifier, live=True
+    )
