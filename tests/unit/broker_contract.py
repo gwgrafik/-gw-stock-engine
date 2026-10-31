@@ -1,10 +1,13 @@
 """Wspólne testy kontraktowe interfejsu `Broker` (FakeBroker, a w Zadaniu 13 adapter Capital.com).
 
 Klasa nie zaczyna się od `Test`, więc pytest nie zbiera jej samej. Podklasa `Test...(BrokerContract)` nadpisuje:
-- fixture `broker`: świeży, niezalogowany adapter, bez otwartych pozycji, z instrumentem `epic`
-  i co najmniej jednym rachunkiem;
+- fixture `broker`: świeży, niezalogowany adapter, bez otwartych pozycji i zleceń oczekujących,
+  z instrumentem `epic` i co najmniej jednym rachunkiem;
 - fixture `close_market`: funkcja bez argumentów, która zamyka rynek instrumentu po stronie brokera
-  (FakeBroker: `set_market_closed(True)`; adapter: stan lokalnego serwera testowego).
+  (FakeBroker: `set_market_closed(True)`; adapter: stan lokalnego serwera testowego);
+- fixture `add_working_order`: funkcja `(epic, side, size, level) -> WorkingOrder`, która umieszcza zlecenie
+  oczekujące po stronie brokera i zwraca to, co broker ma potem raportować; podklasa, która nie umie
+  go utworzyć, wywołuje w tej fixture `pytest.skip(powód)` (pomija tylko ten jeden test).
 Każdy test sam wywołuje `login()`. Testy nie zależą od zegara silnika: czasy pochodzą od brokera.
 """
 
@@ -24,6 +27,7 @@ from gwstock.types import (
     MarketClosed,
     OpenPosition,
     Side,
+    WorkingOrder,
 )
 
 
@@ -38,6 +42,13 @@ class BrokerContract:
     @pytest.fixture
     def close_market(self) -> Callable[[], None]:
         raise NotImplementedError("subclass must override the `close_market` fixture")
+
+    @pytest.fixture
+    def add_working_order(self) -> Callable[[str, Side, Decimal, Decimal], WorkingOrder]:
+        raise NotImplementedError(
+            "subclass must override the `add_working_order` fixture "
+            "(call pytest.skip(...) in it if the test broker cannot hold a working order)"
+        )
 
     async def _request(self, broker: Broker, side: Side) -> EntryRequest:
         rules = await broker.instrument_rules(self.epic)
@@ -130,3 +141,14 @@ class BrokerContract:
         await broker.login()
         with pytest.raises(BrokerError):
             await broker.select_account("ACC-does-not-exist")
+
+    async def test_working_orders_are_empty_by_default(self, broker):
+        await broker.login()
+        assert await broker.list_working_orders() == []
+
+    async def test_working_order_at_broker_is_listed(self, broker, add_working_order):
+        await broker.login()
+        rules = await broker.instrument_rules(self.epic)
+        q = await broker.quote(self.epic)
+        order = add_working_order(self.epic, Side.BUY, rules.min_size, q.bid - Decimal("100"))
+        assert await broker.list_working_orders() == [order]

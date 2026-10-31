@@ -20,6 +20,7 @@ from gwstock.types import (
     Quote,
     SessionExpired,
     Side,
+    WorkingOrder,
 )
 from tests.unit.broker_contract import BrokerContract
 
@@ -48,6 +49,10 @@ class TestFakeBrokerContract(BrokerContract):
     @pytest.fixture
     def close_market(self, fake):
         return lambda: fake.set_market_closed(True)
+
+    @pytest.fixture
+    def add_working_order(self, fake):
+        return fake.add_working_order
 
 
 # --- testy z planu -------------------------------------------------------------
@@ -307,6 +312,7 @@ CALLS = {
     "open_position": lambda b: b.open_position(entry()),
     "confirm": lambda b: b.confirm("REF-1"),
     "list_positions": lambda b: b.list_positions(),
+    "list_working_orders": lambda b: b.list_working_orders(),
     "close_position": lambda b: b.close_position("DEAL-1"),
     "set_stop": lambda b: b.set_stop("DEAL-1", Decimal("25700")),
     "closed_since": lambda b: b.closed_since(T0),
@@ -495,6 +501,45 @@ async def test_netting_opposite_entry_is_not_simulated(clock, rules, quote):
     await open_and_confirm(fake)
     with pytest.raises(NotImplementedError):
         await fake.open_position(entry(Side.SELL))
+
+
+# --- zlecenia oczekujące -----------------------------------------------------------
+
+
+async def test_working_orders_get_deterministic_ids_and_are_listed_in_order(fake):
+    first = fake.add_working_order("DE40", Side.BUY, Decimal("0.001"), Decimal("25700"))
+    second = fake.add_working_order("DE40", Side.SELL, Decimal("0.002"), Decimal("25900"))
+    assert first == WorkingOrder("WO-1", "DE40", Side.BUY, Decimal("0.001"), Decimal("25700"))
+    assert second.order_id == "WO-2"
+    listed = await fake.list_working_orders()
+    assert listed == [first, second]
+    listed.clear()  # zwrócona lista to kopia: klient nie zmienia stanu brokera
+    assert fake.working_orders == [first, second]
+    assert fake.calls == ["list_working_orders"]  # add_working_order to sterowanie, nie wywołanie brokera
+
+
+async def test_working_order_on_another_instrument_is_listed_too(fake):
+    # rachunek widzi zlecenia na wszystkich instrumentach; odróżnienie "naszego" to zadanie uzgadniania
+    order = fake.add_working_order("US100", Side.BUY, Decimal("0.01"), Decimal("20000"))
+    assert await fake.list_working_orders() == [order]
+
+
+
+def test_invalid_working_order_is_refused_without_using_an_id(fake):
+    with pytest.raises(TypeError, match="size"):
+        fake.add_working_order("DE40", Side.BUY, 0.001, Decimal("25700"))
+    assert fake.working_orders == []
+    assert fake.add_working_order("DE40", Side.BUY, Decimal("0.001"), Decimal("25700")).order_id == "WO-1"
+
+async def test_list_working_orders_honours_on_call_and_fail_next(fake):
+    order = fake.add_working_order("DE40", Side.BUY, Decimal("0.001"), Decimal("25700"))
+    seen = []
+    fake.on_call("list_working_orders", lambda: seen.append("called"))
+    fake.fail_next("list_working_orders", BrokerTimeout())
+    with pytest.raises(BrokerTimeout):
+        await fake.list_working_orders()
+    assert await fake.list_working_orders() == [order]
+    assert seen == ["called", "called"]
 
 
 # --- zgodność z interfejsem ---------------------------------------------------------

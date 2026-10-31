@@ -20,6 +20,7 @@ from gwstock.types import (
     Quote,
     SessionExpired,
     Side,
+    WorkingOrder,
 )
 
 TS = datetime(2026, 11, 2, 7, 30, tzinfo=timezone.utc)
@@ -98,3 +99,17 @@ def test_broker_exceptions_share_base_and_rejection_keeps_reason():
     assert rejected.reason == "POSITION_NOT_FOUND" and "POSITION_NOT_FOUND" in str(rejected)
     for exc in (BrokerTimeout(), rejected, SessionExpired(), MarketClosed()):
         assert isinstance(exc, BrokerError)
+
+
+def test_working_order_keeps_decimal_size_and_level():
+    order = WorkingOrder("WO-1", "DE40", Side.SELL, Decimal("0.001"), Decimal("25900"))
+    assert (order.side, order.size, order.level) == (Side.SELL, Decimal("0.001"), Decimal("25900"))
+
+
+def test_working_order_rejects_plain_string_side_float_size_and_non_finite_level():
+    with pytest.raises(TypeError, match="side"):
+        WorkingOrder("WO-1", "DE40", "SELL", Decimal("0.001"), Decimal("25900"))
+    with pytest.raises(TypeError, match="size"):
+        WorkingOrder("WO-1", "DE40", Side.SELL, 0.001, Decimal("25900"))
+    with pytest.raises(ValueError, match="level"):
+        WorkingOrder("WO-1", "DE40", Side.SELL, Decimal("0.001"), Decimal("Infinity"))

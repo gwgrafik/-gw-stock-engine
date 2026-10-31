@@ -12,8 +12,11 @@ Model:
 - rachunki: aktywny jest `accounts[0]`, dopóki `select_account` albo `login` z `account_id` nie wybierze innego
   (każdy `login` zaczyna nową sesję); z wpisów `accounts` liczą się id, waluta, status i `equity` (saldo);
   `margin_used` aktywnego = Σ size × open_level × value_per_point × margin_rate, `available` = equity − margin_used;
+- zlecenia oczekujące: tylko te dodane przez `add_working_order` (id "WO-{n}", dowolny epic); nie wykonują się
+  i nie zajmują depozytu;
 - uproszczenia: pozycje są wspólne dla wszystkich rachunków, saldo nie zmienia się po zamknięciu, sesja wygasa
-  tylko przez `expire_session()`; testy mogą zmieniać `positions` bezpośrednio (np. obca pozycja, brak stopu).
+  tylko przez `expire_session()`; testy mogą zmieniać `positions` i `working_orders` bezpośrednio
+  (np. obca pozycja, brak stopu).
 
 Kolejność obsługi każdej metody brokera:
 1. nazwa metody trafia do `calls`;
@@ -51,6 +54,7 @@ from gwstock.types import (
     Quote,
     SessionExpired,
     Side,
+    WorkingOrder,
 )
 
 BROKER_METHODS = frozenset(name for name, member in vars(Broker).items() if inspect.iscoroutinefunction(member))
@@ -90,11 +94,13 @@ class FakeBroker:
             AccountInfo("ACC-1", "EUR", "ENABLED", Decimal(40), Decimal(40), Decimal(0)),
         ]
         self.positions: dict[str, OpenPosition] = {}
+        self.working_orders: list[WorkingOrder] = []
         self.calls: list[str] = []
         self._closed: list[ClosedDeal] = []
         self._references: dict[str, str] = {}
         self._ref_seq = 0
         self._deal_seq = 0
+        self._order_seq = 0
         self._failures: dict[str, deque[_Failure]] = {}
         self._callbacks: dict[str, list[Callable[[], None]]] = {}
         self._session_expired = False
@@ -140,6 +146,13 @@ class FakeBroker:
         if pos is None:
             raise ValueError(f"trigger_stop: no open position {deal_id!r}")
         self._closed.append(ClosedDeal(deal_id, pos.epic, level, "STOP", self._clock.now_utc()))
+
+    def add_working_order(self, epic: str, side: Side, size: Decimal, level: Decimal) -> WorkingOrder:
+        """Umieszcza zlecenie oczekujące u brokera (np. obce, złożone ręcznie); dowolny instrument."""
+        order = WorkingOrder(f"WO-{self._order_seq + 1}", epic, side, size, level)  # błędne dane nie zużywają id
+        self._order_seq += 1
+        self.working_orders.append(order)
+        return order
 
     def expire_session(self) -> None:
         """Do następnego `login()` każda metoda brokera (także `keepalive`) rzuca `SessionExpired`."""
@@ -228,6 +241,11 @@ class FakeBroker:
         with self._call("list_positions"):
             positions = list(self.positions.values())
         return positions
+
+    async def list_working_orders(self) -> list[WorkingOrder]:
+        with self._call("list_working_orders"):
+            orders = list(self.working_orders)
+        return orders
 
     async def close_position(self, deal_id: str) -> None:
         with self._call("close_position"):

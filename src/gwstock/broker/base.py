@@ -20,6 +20,7 @@ from gwstock.types import (
     InstrumentRules,
     OpenPosition,
     Quote,
+    WorkingOrder,
 )
 
 
@@ -61,6 +62,10 @@ class Broker(Protocol):
         ...
 
     async def list_positions(self) -> list[OpenPosition]: ...
+
+    async def list_working_orders(self) -> list[WorkingOrder]:
+        """Wszystkie zlecenia oczekujące aktywnego rachunku (tylko odczyt: v1 ich nie składa ani nie anuluje)."""
+        ...
 
     async def close_position(self, deal_id: str) -> None: ...
 

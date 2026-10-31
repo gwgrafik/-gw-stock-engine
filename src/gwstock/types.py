@@ -159,6 +159,22 @@ class OpenPosition:
 
 
 @dataclass(frozen=True)
+class WorkingOrder:
+    """Zlecenie oczekujące u brokera (LIMIT/STOP); v1 ich nie składa, tylko wykrywa obce."""
+
+    order_id: str
+    epic: str
+    side: Side
+    size: Decimal
+    level: Decimal
+
+    def __post_init__(self) -> None:
+        _require_side(self)
+        _require_decimal(self, "size")
+        _require_decimal(self, "level")
+
+
+@dataclass(frozen=True)
 class ClosedDeal:
     deal_id: str
     epic: str
