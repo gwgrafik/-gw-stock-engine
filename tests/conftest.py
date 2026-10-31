@@ -4,13 +4,15 @@ Kolejne zadania dopisują tu swoje fixtures (`journal`, `mgr`, `req`, `gate`, `k
 `executor`).
 """
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import aiohttp
 import pytest
 
+from gwstock.broker.capitalcom import CapitalComBroker, Credentials
 from gwstock.broker.fake import FakeBroker
 from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.clock import FakeClock
@@ -23,6 +25,7 @@ from gwstock.reconcile import Reconciler
 from gwstock.risk import KillSwitch, RiskGate
 from gwstock.strategy import EntrySignal
 from gwstock.types import ClosedDeal, EntryRequest, InstrumentRules, Quote, Side
+from tests.unit.fake_capital_server import TEST_API_KEY, TEST_IDENTIFIER, TEST_PASSWORD, FakeCapitalServer
 
 
 @pytest.fixture
@@ -215,3 +218,48 @@ def executor(
     return Executor(
         mgr, fake, journal, gate, kill, CostModel(cost_cfg), clock, strat_cfg, risk_cfg, calendar, notifier, live=True
     )
+
+
+@pytest.fixture
+async def fake_capital_server(clock: FakeClock) -> AsyncIterator[FakeCapitalServer]:
+    """Lokalny serwer udający REST API Capital.com na 127.0.0.1 (zegar testu = fixture `clock`)."""
+    server = FakeCapitalServer(clock)
+    await server.start()
+    yield server
+    await server.close()
+
+
+@pytest.fixture
+def capital_credentials() -> Credentials:
+    """Dane logowania, które zna `fake_capital_server`; bez związanego rachunku (jak `bind-account`)."""
+    return Credentials(api_key=TEST_API_KEY, identifier=TEST_IDENTIFIER, api_password=TEST_PASSWORD)
+
+
+@pytest.fixture
+def capital_sent() -> list[tuple[str, str, datetime]]:
+    """Wysłane żądania adaptera jako (metoda, ścieżka względem /api/v1, zegar testu w chwili wysyłki)."""
+    return []
+
+
+@pytest.fixture
+async def capital_http(clock: FakeClock, capital_sent: list) -> AsyncIterator[aiohttp.ClientSession]:
+    """Sesja HTTP adaptera; każde wysłane żądanie trafia do `capital_sent` z czasem zegara testu."""
+
+    async def on_request_start(session, context, params) -> None:
+        capital_sent.append((params.method, params.url.path.removeprefix("/api/v1"), clock.now_utc()))
+
+    trace = aiohttp.TraceConfig()
+    trace.on_request_start.append(on_request_start)
+    async with aiohttp.ClientSession(trace_configs=[trace]) as session:
+        yield session
+
+
+@pytest.fixture
+def capital_broker(
+    fake_capital_server: FakeCapitalServer,
+    capital_credentials: Credentials,
+    capital_http: aiohttp.ClientSession,
+    clock: FakeClock,
+) -> CapitalComBroker:
+    """Adapter Capital.com na lokalnym serwerze testowym, z zegarem testu; niezalogowany."""
+    return CapitalComBroker(capital_credentials, capital_http, clock, base_url=fake_capital_server.base_url)
