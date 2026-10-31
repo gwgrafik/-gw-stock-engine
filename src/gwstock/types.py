@@ -122,16 +122,25 @@ class Candle:
 
 @dataclass(frozen=True)
 class InstrumentRules:
+    """Reguły instrumentu od brokera.
+
+    `stop_step` to krok odległości stopu w punktach (DE40: `minStepDistance` = 0,1; hipoteza, że dotyczy stopu,
+    do potwierdzenia na próbie `smoke`). 0 oznacza brak kroku, czyli stop nie jest zaokrąglany.
+    """
+
     epic: str
     min_size: Decimal
     size_step: Decimal
     value_per_point: Decimal
     margin_rate: Decimal
     min_stop_distance: Decimal
+    stop_step: Decimal = Decimal("0")
 
     def __post_init__(self) -> None:
-        for name in ("min_size", "size_step", "value_per_point", "margin_rate", "min_stop_distance"):
+        for name in ("min_size", "size_step", "value_per_point", "margin_rate", "min_stop_distance", "stop_step"):
             _require_decimal(self, name)
+        if self.stop_step < 0:
+            raise ValueError(f"InstrumentRules.stop_step: expected >= 0, got {self.stop_step}")
 
 
 @dataclass(frozen=True)

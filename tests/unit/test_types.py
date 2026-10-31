@@ -113,3 +113,46 @@ def test_working_order_rejects_plain_string_side_float_size_and_non_finite_level
         WorkingOrder("WO-1", "DE40", Side.SELL, 0.001, Decimal("25900"))
     with pytest.raises(ValueError, match="level"):
         WorkingOrder("WO-1", "DE40", Side.SELL, Decimal("0.001"), Decimal("Infinity"))
+
+
+def test_instrument_rules_stop_step_defaults_to_zero_and_keeps_positional_construction():
+    # istniejące wywołania pozycyjne (6 argumentów) muszą działać bez zmian; brak kroku = 0 (bez zaokrąglania stopu)
+    rules = InstrumentRules("DE40", Decimal("0.001"), Decimal("0.001"), Decimal("1"), Decimal("0.05"), Decimal("2.6"))
+    assert rules.stop_step == Decimal("0")
+    assert isinstance(rules.stop_step, Decimal)
+
+
+def test_instrument_rules_stop_step_is_the_optional_trailing_seventh_field():
+    positional = InstrumentRules(
+        "DE40", Decimal("0.001"), Decimal("0.001"), Decimal("1"), Decimal("0.05"), Decimal("2.6"), Decimal("0.1")
+    )
+    keyword = InstrumentRules(
+        epic="DE40",
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.001"),
+        value_per_point=Decimal("1"),
+        margin_rate=Decimal("0.05"),
+        min_stop_distance=Decimal("2.6"),
+        stop_step=Decimal("0.1"),
+    )
+    assert positional.stop_step == Decimal("0.1")
+    assert positional == keyword
+
+
+def test_instrument_rules_stop_step_rejects_float_negative_and_non_finite():
+    base = ("DE40", Decimal("0.001"), Decimal("0.001"), Decimal("1"), Decimal("0.05"), Decimal("2.6"))
+    with pytest.raises(TypeError, match="stop_step"):
+        InstrumentRules(*base, 0.1)
+    with pytest.raises(ValueError, match="stop_step"):
+        InstrumentRules(*base, Decimal("-0.1"))
+    with pytest.raises(ValueError, match="stop_step"):
+        InstrumentRules(*base, Decimal("NaN"))
+    with pytest.raises(ValueError, match="stop_step"):
+        InstrumentRules(*base, Decimal("Infinity"))
+
+
+def test_instrument_rules_accepts_explicit_zero_stop_step():
+    rules = InstrumentRules(
+        "DE40", Decimal("0.001"), Decimal("0.001"), Decimal("1"), Decimal("0.05"), Decimal("2.6"), Decimal("0")
+    )
+    assert rules.stop_step == Decimal("0")
