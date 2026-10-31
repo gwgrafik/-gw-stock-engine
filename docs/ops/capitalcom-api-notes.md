@@ -1,0 +1,847 @@
+# Notatki o API Capital.com (rozpoznanie dokumentacji)
+
+Odczyt dokumentacji: 2026-10-31. Dokument jest jedynym źródłem dla Zadania 4 (typy, `Broker`, `FakeBroker`), Zadania 8 (uzgadnianie) i Zadania 13 (adapter Capital.com). Reguły instrumentu DE40 zmierzone na koncie live są w `docs/ops/capitalcom-live-readout-2026-11-01.md` i tu nie są powielane.
+
+Dokument nie zawiera kluczy, haseł, tokenów, numerów rachunków ani sald. Wszystkie identyfikatory w przykładach to symbole zastępcze w nawiasach ostrych, a liczby w polach salda to `<number>`. Ceny, czasy i wielkości w przykładach JSON są poglądowe (kształt z oficjalnej specyfikacji, ceny DE40 z odczytu [S4]); wartości reguł DE40 pochodzą wyłącznie z [S4].
+
+## 0. Źródła i znaczenie statusów
+
+| Skrót | Źródło | Wiarygodność |
+|---|---|---|
+| [S1] | Oficjalna dokumentacja <https://open-api.capital.com/> (strona Redoc; odczytałem renderowany tekst oraz wbudowaną w stronę specyfikację OpenAPI 3.0.0, wersja 1.0.0) | Oficjalne. Przykłady w specyfikacji są poglądowe: nie zawierają każdego pola, które zwraca żywe API |
+| [S2] | Centrum pomocy i strony Capital.com: <https://help.capital.com/hc/en-us/articles/27299104990482-Trading-hours-extended-on-key-indices>, <https://capital.com/en-eu/learn/market-guides/what-is-indices-trading> oraz strona rynku <https://capital.com/en-int/markets/indices/germany-40-index-1> | Oficjalne, ale marketingowo-pomocnicze, nie część kontraktu API |
+| [S3] | Niezależny konektor StockSharp, plik `CapitalCom/Native/Model/Rest.cs`: <https://github.com/StockSharp/Connectors/blob/main/CapitalCom/Native/Model/Rest.cs> | **Nieoficjalne.** Używam wyłącznie jako wskazówki, że pole istnieje w żywych odpowiedziach, choć nie ma go w oficjalnym przykładzie. Każde takie pole jest oznaczone `do potwierdzenia` |
+| [S4] | `docs/ops/capitalcom-live-readout-2026-11-01.md` | Pomiar własny na koncie live (tylko odczyt) |
+
+Status każdej pozycji, dokładnie jeden z dwóch napisów:
+
+- `udokumentowane` oznacza, że oficjalna dokumentacja [S1] wprost podaje to, o co pytamy (ścieżkę, nagłówek, pole, wartość).
+- `do potwierdzenia w dry_run lub w odczytach live` oznacza, że dokumentacja milczy, podaje tylko przykład, z którego da się coś wywnioskować, albo informacja pochodzi z [S3]. Adapter ma wtedy zachować ostrożność, a wartość rozstrzyga `dry_run` (odczyty), próba `smoke` (pierwsza transakcja na wielkości minimalnej) lub Zadanie 18. Lista takich pozycji z numerami C1 do C22 jest w sekcji 6.
+
+Czego nie udało się przeczytać: repozytorium z kolekcją Postman (<https://github.com/capital-com-sv/capital-api-postman>) zwróciło w moim środowisku 403, więc nie było źródłem. Wszystkie ścieżki, nagłówki i przykłady poniżej pochodzą ze specyfikacji [S1].
+
+## 1. Zasady ogólne
+
+### 1.1 Adresy i nagłówki
+
+- Baza live: `https://api-capital.backend-capital.com`, wszystkie ścieżki REST mają prefiks `/api/v1`. Baza demo: `https://demo-api-capital.backend-capital.com` (klucz właściciela jest odrzucany na hoście demo, bo nie ma konta demo [S4]; adapter używa wyłącznie hosta live). `udokumentowane` [S1, "General information"].
+- Nagłówki, `udokumentowane` [S1]:
+
+| Nagłówek | Gdzie | Znaczenie |
+|---|---|---|
+| `X-CAP-API-KEY` | tylko `GET /session/encryptionKey` i `POST /session` | Klucz API z Settings > API integrations |
+| `CST` | wszystkie żądania po zalogowaniu | Token autoryzacji klienta, zwracany w nagłówkach odpowiedzi `POST /session` |
+| `X-SECURITY-TOKEN` | wszystkie żądania po zalogowaniu | Token rachunku ("shows which financial account is used for the trades"), zwracany jak wyżej |
+| `Content-Type: application/json` | żądania z ciałem | Ciało to JSON |
+
+Cytat [S1]: "On starting the session you will receive the `CST` and `X-SECURITY-TOKEN` parameters in the response headers. `CST` is an authorization token, `X-SECURITY-TOKEN` shows which financial account is used for the trades. These headers should be passed on subsequent requests to the API. Both tokens are valid for 10 minutes after the last use."
+
+- Tokeny żyją tylko w pamięci procesu (spec §13). Klucz idzie wyłącznie w `X-CAP-API-KEY` i tylko do `/session*`.
+- Dokumentacja deklaruje nagłówki `CST` i `X-SECURITY-TOKEN` także w odpowiedziach innych operacji (np. `ping`, `PUT /session`). Adapter powinien aktualizować tokeny z nagłówków odpowiedzi, jeśli są obecne. Czy tokeny faktycznie się zmieniają po `PUT /session`: C18, `do potwierdzenia w dry_run lub w odczytach live`.
+
+### 1.2 Sesja i limity
+
+Cytaty [S1, "Do you have any limitations on your API?"], wszystkie `udokumentowane`:
+
+- "Session is active for 10 minutes. In case your inactivity is longer than this period then an error will occur upon next request." Każde udane żądanie przedłuża sesję ("valid for 10 minutes after the last use"). Spec §13: ping co 5 minut.
+- "The maximum request rate is 10 per second per user." Silnik trzyma się połowy: 5 zapytań/s ogółem (spec §13).
+- "The maximum request rate is 1 per 0.1 seconds per user when opening positions or creating orders. Otherwise the position/order requests are going to be rejected." Odstęp co najmniej 0,1 s między `POST /positions`, `POST /workingorders`.
+- "`POST /session` endpoint limit is 1 request per second per API key." Logowania są serializowane; odpowiedź przy przekroczeniu: HTTP 429, `{"errorCode": "error.too-many.requests"}`.
+- "`POST /positions` and `POST /workingorders` endpoint limit is 1000 requests per hour in the Demo account." Dotyczy demo, nie live.
+- "You have max 100 attempts per 24hrs to successfully generate API keys." (generowanie klucza w panelu, nie logowanie).
+- WebSocket: sesja 10 minut, do 40 instrumentów (sekcja 2.21).
+- Czy limity nie-sesyjne zwracają 429, jaki kod błędu i czy jest nagłówek `Retry-After`: dokumentacja milczy, C20, `do potwierdzenia w dry_run lub w odczytach live`. Adapter mapuje HTTP 429 na wyjątek limitu i wstrzymuje zapytania niekrytyczne (spec §13).
+
+Budżet silnika v1 (REST polling, decyzja w `progress.md` Rulings): `GET /markets/{epic}` co 5 s (0,2/s) + `GET /positions` co 10 s (0,1/s) + `ping` co 5 min + okazjonalnie świece i historia. Razem ok. 0,3 do 0,5 zapytania/s, daleko poniżej 5/s.
+
+### 1.3 Format czasu, liczb i odpowiedzi
+
+- Parametry zapytań `from` i `to` mają format `YYYY-MM-DDTHH:MM:SS` bez milisekund i bez sufiksu strefy; filtracja jest po polach UTC (`snapshotTimeUTC` dla cen, `dateUTC` dla historii), więc `from`/`to` to czas UTC. `udokumentowane` [S1: "Date format: YYYY-MM-DDTHH:MM:SS (e.g. 2022-04-01T01:01:00). Filtration by date based on snapshotTimeUTC parameter"].
+- Znaczniki czasu w odpowiedziach to napisy `2022-04-05T09:46:01.872` (milisekundy, **bez** sufiksu strefy). Pola o nazwie z końcówką UTC (`createdDateUTC`, `snapshotTimeUTC`, `updateTimeUTC`, `dateUTC`, `dateUtc`) są w UTC. Pola bez tej końcówki (`createdDate`, `snapshotTime`, `updateTime`, `date`) to czas lokalny o nieznanym przesunięciu: w przykładach różnica wynosi +1 h (ceny, luty), +2 h (ceny, kwiecień) i +3 h (pozycje, kwiecień; `timezoneOffset: 3`), czyli zależy od przykładu i jest zależna od czasu letniego. **Reguła dla adaptera: czytać wyłącznie pola UTC i traktować napis jako UTC (`tzinfo=UTC`); nigdy nie używać pól lokalnych.** Znaczenie pól lokalnych: C19, `do potwierdzenia w dry_run lub w odczytach live`.
+- Wielkość liter w nazwach jest niespójna: `dateUTC` (aktywność), `dateUtc` (transakcje), `createdDateUTC`, `updateTimeUTC`. Parser ma używać dokładnych nazw z tabel poniżej.
+- Znaczniki czasu WebSocket i `GET /time` to milisekundy epoki Unix (liczby).
+- Liczby w odpowiedziach to liczby JSON (ceny, wielkości, `upl`), w historii transakcji `size` jest **napisem** (`"1.05"`). Adapter parsuje JSON z `parse_float=Decimal` i nie używa `float` w obliczeniach. Przy wysyłce liczb (`size`, `stopDistance`) zaokrąglamy do kroku instrumentu (sekcja 2.16) i serializujemy tak, by nie wprowadzać zapisu naukowego.
+- `Content-Type` odpowiedzi `POST /session` i `DELETE /session` jest w specyfikacji opisany jako `text/plain`, mimo że treść to JSON; pozostałe odpowiedzi to `application/json`. Adapter czyta treść jako JSON niezależnie od `Content-Type` (w `aiohttp`: `await resp.json(content_type=None)`). Czy to samo dotyczy żywych odpowiedzi: C19b, `do potwierdzenia w dry_run lub w odczytach live`.
+
+### 1.4 Błędy
+
+Format błędu: `{"errorCode": "<kod>"}` [S1]. Dokumentacja opisuje statusy 200, 400, 401, 404, 429. Kody występujące w specyfikacji, wszystkie `udokumentowane` jako przykłady:
+
+| HTTP | `errorCode` | Operacja |
+|---|---|---|
+| 400 | `error.null.api.key` | `POST /session` (brak `X-CAP-API-KEY`) |
+| 401 | `error.invalid.details` | `POST /session` (zły identyfikator, hasło lub klucz) |
+| 429 | `error.too-many.requests` | `POST /session` |
+| 400 | `error.invalid.accountId` | `PUT /session` |
+| 400 | `error.invalid.leverage.value` | `PUT /accounts/preferences` |
+| 400 | `error.invalid.stoploss.minvalue: <granica>`, `error.invalid.takeprofit.maxvalue: <granica>` | `POST /positions` |
+| 400 | `error.invalid.stoploss.maxvalue: <granica>`, `error.invalid.takeprofit.minvalue: <granica>` | `PUT /positions/{dealId}` |
+| 404 | `error.not-found.dealId` | `GET`, `PUT`, `DELETE /positions/{dealId}` |
+| 404 | `error.not-found.dealReference` | `GET /confirms/{dealReference}` |
+| 404 | `error.not-found.epic` | `GET /markets/{epic}` |
+| 400 | `error.invalid.resolution` | `GET /prices/{epic}` |
+| 400 | `error.invalid.from` | `GET /history/activity` |
+| 400 | `error.null.searchTerm`, `error.null.epic` | `GET /markets` |
+| 400 | `error.not-in-future.goodTillDate` | `POST /workingorders` (nieużywane w v1) |
+
+Uwagi:
+
+- Kody `stoploss`/`takeprofit` niosą po dwukropku liczbową granicę (np. `error.invalid.stoploss.minvalue: 17.146`). Z przykładów wynika, że to poziom ceny, nie odległość (przykłady dotyczą instrumentu o cenie ok. 24). Adapter wydziela część po `": "` i zapisuje ją w dzienniku; semantyka: C14, `do potwierdzenia w dry_run lub w odczytach live`.
+- Nie ma w dokumentacji kodu błędu dla: wygasłej sesji (powszechnie raportowany `error.invalid.session.token` nie występuje w [S1]), zbyt małej wielkości, niezgodnej z krokiem wielkości, niewystarczających środków, zamkniętego rynku przy `POST /positions`. Zasada dla adaptera: **każde HTTP 401 na żądaniu po zalogowaniu = ponowne logowanie raz (serializowane) i jedna powtórka żądania**; każdy nierozpoznany kod 4xx przy otwarciu to `BrokerRejected(<errorCode>)` z surową treścią w dzienniku. C13 i C14, `do potwierdzenia w dry_run lub w odczytach live`.
+- Na hoście demo odczyt właściciela dał `error.null.accountId` [S4]; kodu nie ma w [S1].
+
+## 2. Operacje
+
+### Przegląd i statusy operacji
+
+Dwie kolumny statusu: "Kształt" dotyczy ścieżki, metody, nagłówków, ciała żądania i struktury odpowiedzi; "Pola krytyczne" dotyczy semantyki pól, na których opiera się silnik. Status operacji = najsłabsza z dwóch wartości dla pól, które silnik faktycznie czyta.
+
+| Operacja | Kształt | Pola krytyczne | Sekcja |
+|---|---|---|---|
+| `GET /time` | udokumentowane | udokumentowane | 2.1 |
+| `GET /ping` | udokumentowane | udokumentowane | 2.2 |
+| `GET /session/encryptionKey` | udokumentowane | udokumentowane | 2.3 |
+| `POST /session` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.4 |
+| `GET /session` | udokumentowane | udokumentowane | 2.5 |
+| `PUT /session` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.6 |
+| `DELETE /session` | udokumentowane | udokumentowane | 2.7 |
+| `GET /accounts` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.8 |
+| `GET /accounts/preferences` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.9 |
+| `POST /positions` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.10 |
+| `GET /positions` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.11 |
+| `GET /positions/{dealId}` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.12 |
+| `PUT /positions/{dealId}` (stop) | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.13 |
+| `DELETE /positions/{dealId}` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.14 |
+| `GET /confirms/{dealReference}` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.15 |
+| `GET /markets/{epic}` (reguły, status rynku, notowanie, godziny) | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.16 |
+| `GET /markets?epics=` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.17 |
+| `GET /prices/{epic}` (świece 5-minutowe) | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.18 |
+| `GET /prices/{epic}` (świece dzienne) | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.18 |
+| `GET /history/activity` (cena i przyczyna zamknięcia) | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.19 |
+| `GET /history/transactions` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.20 |
+| WebSocket: połączenie, `marketData.*`, `OHLCMarketData.*`, `ping` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.21 |
+| Godziny otwarcia DE40 (`instrument.openingHours`) | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | 2.16.3 |
+
+Operacje `workingorders`, `marketnavigation`, `clientsentiment`, `watchlists`, `accounts/topUp` istnieją w API, ale v1 ich nie używa (spec §6: zlecenia oczekujące poza zakresem; `topUp` działa tylko na koncie demo). Nie opisuję ich dalej.
+
+### 2.1 `GET /api/v1/time`
+
+Test łączności i czas serwera. Bez autoryzacji ("Authentication is not required for this endpoint").
+
+```jsonc
+// 200
+{ "serverTime": 1649259764171 }   // milisekundy epoki
+```
+
+Błędy: brak. Do czego: opcjonalna kontrola dryfu zegara VPS względem serwera (nieużywana w v1). Status: `udokumentowane`.
+
+### 2.2 `GET /api/v1/ping`
+
+"Ping the service to keep a trading session alive." Nagłówki: `CST`, `X-SECURITY-TOKEN`.
+
+```jsonc
+// 200
+{ "status": "OK" }
+```
+
+Wygasła sesja daje błąd HTTP (kod nieudokumentowany, sekcja 1.4). Wywołanie co 5 minut (spec §13), co daje zapas względem 10 minut. Status: `udokumentowane`.
+
+### 2.3 `GET /api/v1/session/encryptionKey`
+
+Nagłówek: `X-CAP-API-KEY`. Zwraca klucz publiczny do szyfrowania hasła klucza API.
+
+```jsonc
+// 200
+{ "encryptionKey": "<klucz publiczny RSA, base64 DER>", "timeStamp": 1649058606014 }
+```
+
+Procedura szyfrowania według przykładu Java w [S1]: bajty `password + "|" + timeStamp` → Base64 → szyfrowanie RSA (`X509EncodedKeySpec`, padding PKCS1) kluczem `encryptionKey` → Base64; wynik idzie w polu `password` z `encryptedPassword: true`. Uwaga: tekst dokumentacji nazywa to "AES encryption", a kod używa RSA; obowiązuje kod.
+
+**Zalecenie dla Zadania 13:** v1 loguje się jawnym hasłem (`"encryptedPassword": false`, opcja w pełni udokumentowana, ruch idzie po TLS). Ścieżka szyfrowana wymaga biblioteki RSA (np. `cryptography`), a spec §3 dopuszcza tylko `aiohttp`, `tzdata` i `pytest`. Plan Zadania 13 wspomina "encryptionKey + POST /session": proszę to traktować jako wariant opcjonalny; podstawą jest hasło jawne. Status: `udokumentowane`.
+
+### 2.4 `POST /api/v1/session`
+
+Nagłówek: `X-CAP-API-KEY`. Limit: 1 żądanie na sekundę na klucz. Ciało:
+
+```jsonc
+{ "identifier": "<login>", "password": "<hasło klucza API>", "encryptedPassword": false }
+```
+
+| Pole | Typ | Wymagane | Opis [S1] |
+|---|---|---|---|
+| `identifier` | string | tak | "Client login identifier" |
+| `password` | string | tak | "API key custom password" (hasło ustawione przy generowaniu klucza, nie hasło do konta) |
+| `encryptedPassword` | boolean | nie | domyślnie `false` |
+
+Odpowiedź 200: nagłówki `CST` i `X-SECURITY-TOKEN` oraz ciało (schemat, wartości salda to symbole zastępcze):
+
+```jsonc
+{
+  "accountType": "CFD",
+  "accountInfo": { "balance": <number>, "deposit": <number>, "profitLoss": <number>, "available": <number> },
+  "currencyIsoCode": "EUR",
+  "currencySymbol": "€",
+  "currentAccountId": "<ACCOUNT_ID>",          // rachunek aktywny w sesji
+  "streamingHost": "wss://api-streaming-capital.backend-capital.com/",
+  "accounts": [
+    { "accountId": "<ACCOUNT_ID>", "accountName": "<nazwa>", "preferred": true,
+      "accountType": "CFD", "currency": "EUR", "symbol": "€",
+      "balance": { "balance": <number>, "deposit": <number>, "profitLoss": <number>, "available": <number> } }
+  ],
+  "clientId": "<CLIENT_ID>",
+  "timezoneOffset": 3,
+  "hasActiveDemoAccounts": false,
+  "hasActiveLiveAccounts": true,
+  "trailingStopsEnabled": false
+}
+```
+
+Błędy: 400 `error.null.api.key`, 401 `error.invalid.details`, 429 `error.too-many.requests`.
+
+Uwagi dla adaptera:
+
+- Aktywny rachunek sesji to `currentAccountId` (w przykładzie rachunek z `preferred: true`). Spec §9 wiąże rachunek docelowy poleceniem `bind-account`; jeśli `currentAccountId` różni się od związanego, adapter wykonuje jednorazowo `PUT /session` (sekcja 2.6) tuż po logowaniu, przed jakąkolwiek subskrypcją strumienia.
+- Struktura odpowiedzi i nagłówki: `udokumentowane`. Znaczenie pól `balance`, `deposit`, `profitLoss`, `available` nie jest opisane w [S1] (przykładowe liczby nie układają się w oczywiste równanie). Hipoteza robocza: `balance` = saldo, `deposit` = depozyt zabezpieczający w użyciu, `profitLoss` = niezrealizowany wynik, `available` = środki dostępne. C17, `do potwierdzenia w dry_run lub w odczytach live` (porównanie z panelem, bez zapisywania liczb w repo).
+- Kod błędu przy wygasłej sesji i sposób odnowienia: sekcja 1.4 (C13).
+
+### 2.5 `GET /api/v1/session`
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Zwraca szczegóły bieżącej sesji; służy do weryfikacji, który rachunek jest aktywny (po `PUT /session`).
+
+```jsonc
+// 200
+{
+  "clientId": "<CLIENT_ID>",
+  "accountId": "<ACCOUNT_ID>",                 // aktywny rachunek (uwaga: nazwa inna niż currentAccountId w POST)
+  "timezoneOffset": 3,
+  "locale": "en",
+  "currency": "EUR",
+  "streamEndpoint": "wss://api-streaming-capital.backend-capital.com/"
+}
+```
+
+Status: `udokumentowane`.
+
+### 2.6 `PUT /api/v1/session` (przełączenie rachunku)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Ciało: `{ "accountId": "<ACCOUNT_ID>" }` (wymagane).
+
+```jsonc
+// 200
+{ "trailingStopsEnabled": false, "dealingEnabled": true,
+  "hasActiveDemoAccounts": false, "hasActiveLiveAccounts": true }
+// 400
+{ "errorCode": "error.invalid.accountId" }
+```
+
+Cytat [S1]: "WebSocket streaming falls off when the financial account is changed with the help of the `PUT​ /session` endpoint." Dlatego jedyne dozwolone przełączenie to jednorazowe, tuż po logowaniu (spec §13). Pole `dealingEnabled` w odpowiedzi warto zapisać w dzienniku. Czy po przełączeniu zmienia się `X-SECURITY-TOKEN` (nagłówki odpowiedzi są zadeklarowane): C18, `do potwierdzenia w dry_run lub w odczytach live`; adapter po `PUT` czyta tokeny z odpowiedzi, jeśli są, i weryfikuje `GET /session` (`accountId` równe związanemu), inaczej `BrokerError` i zamknięcie.
+
+Status kształtu: `udokumentowane`.
+
+### 2.7 `DELETE /api/v1/session`
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Wylogowanie.
+
+```jsonc
+// 200
+{ "status": "SUCCESS" }
+```
+
+Status: `udokumentowane`.
+
+### 2.8 `GET /api/v1/accounts`
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Lista rachunków klienta (podstawa `list_accounts()` i `bind-account`).
+
+```jsonc
+// 200
+{ "accounts": [
+  { "accountId": "<ACCOUNT_ID>", "accountName": "<nazwa>", "status": "ENABLED",
+    "accountType": "CFD", "preferred": true,
+    "balance": { "balance": <number>, "deposit": <number>, "profitLoss": <number>, "available": <number> },
+    "currency": "EUR", "symbol": "€" }
+] }
+```
+
+Odczyt właściciela [S4]: dwa rachunki CFD w EUR, oba `ENABLED`. Mapowanie na `AccountInfo(account_id, currency, status, equity, available, margin_used)`: `accountId`, `currency`, `status`, `balance.available` jest jednoznaczne co do nazwy; `equity` i `margin_used` (hipoteza: `balance.balance` i `balance.deposit`) wymagają potwierdzenia, C17, `do potwierdzenia w dry_run lub w odczytach live`. Status kształtu: `udokumentowane`.
+
+### 2.9 `GET /api/v1/accounts/preferences`
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Tryb konta i dźwignie.
+
+```jsonc
+// 200 (liczby z przykładu dokumentacji, poglądowe)
+{ "hedgingMode": false,
+  "leverages": { "SHARES": {"current": 2, "available": [1,2,3,5]},
+                 "CURRENCIES": {"current": 1, "available": [1,10,20,30]},
+                 "INDICES": {"current": 10, "available": [1,10,20]},
+                 "CRYPTOCURRENCIES": {"current": 1, "available": [1,2]},
+                 "COMMODITIES": {"current": 5, "available": [1,5,10,20]} } }
+```
+
+`PUT /accounts/preferences` (ciało `leverages` i/lub `hedgingMode`) istnieje, ale **silnik go nie wywołuje**: zmiana dźwigni lub trybu to decyzja właściciela w panelu.
+
+Cytat [S1]: "The `hedgingMode` parameter value shows whether the hedging mode is engaged." Spec §6 i pytanie 4 wymagają sprawdzenia trybu w próbie `smoke`: `hedgingMode: false` to tryb bez hedgingu; zakładamy, że oznacza agregację pozycji (drugie wejście na tym samym instrumencie zmienia istniejącą pozycję, jak zakłada spec §6). Dokumentacja nie opisuje zachowania szczegółowo, C15, `do potwierdzenia w dry_run lub w odczytach live`. Dźwignia dla indeksów (`leverages.INDICES.current`) a depozyt 5% z [S4]: zależność nie jest opisana, C16b. Status kształtu: `udokumentowane`.
+
+### 2.10 `POST /api/v1/positions` (otwarcie pozycji ze stopem)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Limit: 1 żądanie na 0,1 s. Cytat [S1]: "Please note that when creating the position an order is created first with the 'o_' prefix in the `dealReference` parameter".
+
+Ciało (pola z [S1]):
+
+| Pole | Typ | Wymagane | Opis |
+|---|---|---|---|
+| `direction` | string | tak | `BUY` lub `SELL` |
+| `epic` | string | tak | np. `DE40` |
+| `size` | number | tak | wielkość transakcji (jednostki instrumentu, DE40: wielokrotność `minSizeIncrement`) |
+| `guaranteedStop` | boolean | nie | domyślnie `false`; v1 nie używa |
+| `trailingStop` | boolean | nie | domyślnie `false`; na DE40 niedostępny [S4] |
+| `stopLevel` | number | nie | poziom ceny uruchomienia stopu |
+| `stopDistance` | number | nie | "Distance between current and stop loss triggering price" |
+| `stopAmount` | number | nie | kwota straty uruchamiająca stop |
+| `profitLevel`, `profitDistance`, `profitAmount` | number | nie | analogicznie dla take profit (v1 nie używa) |
+
+Ciało wejścia v1 (stop atomowo, spec §8):
+
+```jsonc
+{ "epic": "DE40", "direction": "BUY", "size": 0.001, "guaranteedStop": false, "trailingStop": false, "stopDistance": 30.0 }
+```
+
+Odpowiedź 200 niesie **wyłącznie** referencję:
+
+```jsonc
+{ "dealReference": "o_<uuid>" }
+```
+
+Cytat [S1]: "a successful response does not always mean that the position has been successfully opened. The status of the position can be confirmed using `GET /confirms/{dealReference}`". Więc HTTP 200 tu nie jest potwierdzeniem; stan zlecenia pozostaje `SUBMITTING` do potwierdzenia (spec §6). Brak klucza idempotencji od klienta: nasz `gws-...` identyfikator łączymy z `dealReference` wyłącznie w dzienniku.
+
+Błędy 400: `error.invalid.stoploss.minvalue: <granica>`, `error.invalid.takeprofit.maxvalue: <granica>` (sekcja 1.4).
+
+Uwagi do potwierdzenia:
+
+- `stopDistance` liczony względem "current" ceny: nie wiadomo, czy względem notowania z chwili wysyłki, czy ceny wykonania; wynikowy poziom stopu odczytujemy po potwierdzeniu z pozycji (sekcja 2.11/2.12) i porównujemy z oczekiwanym `level ∓ stopDistance`. C6, `do potwierdzenia w dry_run lub w odczytach live`.
+- Odległość stopu musi spełniać `dealingRules.minStopOrProfitDistance` i `maxStopOrProfitDistance` (sekcja 2.16) oraz najpewniej krok `minStepDistance`; sama reguła krok-stopu: C16c, `do potwierdzenia w dry_run lub w odczytach live`.
+- Kody błędów dla niedoboru środków, wielkości poniżej minimum, niezgodnej z krokiem, rynku zamkniętego: C14, `do potwierdzenia w dry_run lub w odczytach live`.
+
+Status kształtu: `udokumentowane`.
+
+### 2.11 `GET /api/v1/positions` (lista pozycji, prymityw uzgadniania)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. "Returns all open positions for the active account".
+
+```jsonc
+// 200
+{ "positions": [
+  { "position": {
+      "contractSize": 1,
+      "createdDate": "2026-11-02T09:05:03.100",          // czas lokalny, NIE używać
+      "createdDateUTC": "2026-11-02T08:05:03.100",       // czas otwarcia (UTC)
+      "dealId": "<DEAL_ID>",                             // identyfikator pozycji
+      "dealReference": "p_<DEAL_ID>",
+      "workingOrderId": "<ORDER_ID>",                    // identyfikator zlecenia 'o_', które otworzyło pozycję
+      "size": 0.001,
+      "leverage": 20,
+      "upl": <number>,                                   // niezrealizowany wynik
+      "direction": "BUY",
+      "level": 25782.3,                                  // poziom otwarcia
+      "currency": "EUR",
+      "guaranteedStop": false
+      // [S3, nie w przykładzie S1]: "trailingStop", "stopLevel", "stopDistance", "stopAmount",
+      //                              "profitLevel", "profitDistance", "profitAmount"
+    },
+    "market": {
+      "instrumentName": "<nazwa>", "expiry": "-", "marketStatus": "TRADEABLE", "epic": "DE40",
+      "symbol": "<symbol>", "instrumentType": "INDICES", "lotSize": 1,
+      "high": <number>, "low": <number>, "percentageChange": <number>, "netChange": <number>,
+      "bid": 25780.3, "offer": 25782.3,
+      "updateTime": "...", "updateTimeUTC": "2026-11-02T08:05:03.700",
+      "delayTime": 0, "streamingPricesAvailable": true, "scalingFactor": 1, "marketModes": ["REGULAR"]
+    } }
+] }
+```
+
+Pola potrzebne silnikowi i ich status:
+
+| Potrzebne | Pole | Status |
+|---|---|---|
+| identyfikator pozycji | `position.dealId` | udokumentowane |
+| referencja | `position.dealReference` (przykłady: `"p_" + dealId`) | udokumentowane |
+| kierunek | `position.direction` (`BUY` lub `SELL`) | udokumentowane |
+| wielkość | `position.size` | udokumentowane |
+| poziom otwarcia | `position.level` (w przykładach dla BUY równe `market.offer`, czyli cena kupna) | udokumentowane |
+| czas otwarcia | `position.createdDateUTC` | udokumentowane |
+| instrument | `market.epic` | udokumentowane |
+| poziom stopu | `position.stopLevel` | do potwierdzenia w dry_run lub w odczytach live (C5; występuje w [S3], nie w oficjalnym przykładzie) |
+| odległość stopu | `position.stopDistance` | do potwierdzenia w dry_run lub w odczytach live (C5) |
+| brak stopu | brak pola lub `null` w `stopLevel`/`stopDistance` | do potwierdzenia w dry_run lub w odczytach live (C5) |
+
+Brak pozycji: `{"positions": []}` (przypuszczalnie; kształt pustej listy w [S1] nieopisany, C5b). Reguła spec §7: zniknięcie dealId z listy = pozycja zamknięta; cenę i przyczynę ustala historia (sekcja 2.19). Koszt: 1 zapytanie na 10 s. Status kształtu: `udokumentowane`.
+
+### 2.12 `GET /api/v1/positions/{dealId}`
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Parametr ścieżki `dealId` ("Permanent deal reference for a confirmed trade"). Odpowiedź ma ten sam kształt co jeden element listy z 2.11 (`position` + `market`). Błąd 404: `error.not-found.dealId` (także dla pozycji zamkniętej, przypuszczalnie; C5c). Służy do weryfikacji stopu zaraz po potwierdzeniu wejścia. Status kształtu: `udokumentowane`; pola stopu jak w 2.11 (`do potwierdzenia w dry_run lub w odczytach live`).
+
+### 2.13 `PUT /api/v1/positions/{dealId}` (ustawienie lub zmiana stopu)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Ciało (pola jak przy `POST /positions`, wszystkie opcjonalne): `guaranteedStop`, `trailingStop`, `stopLevel`, `stopDistance`, `stopAmount`, `profitLevel`, `profitDistance`, `profitAmount`.
+
+Do ustawienia stopu (procedura zabezpieczenia pozycji bez stopu, spec §7; `set_stop(deal_id, stop_level)`):
+
+```jsonc
+{ "stopLevel": 25750.0 }
+```
+
+```jsonc
+// 200
+{ "dealReference": "p_<DEAL_ID>" }
+// 400 przykłady
+{ "errorCode": "error.invalid.stoploss.maxvalue: <granica>" }
+{ "errorCode": "error.invalid.takeprofit.minvalue: <granica>" }
+// 404
+{ "errorCode": "error.not-found.dealId" }
+```
+
+Jak przy otwarciu, 200 niesie tylko referencję; wynik potwierdza `GET /confirms/p_<DEAL_ID>` lub ponowny odczyt pozycji. Czy pominięcie `profit*` kasuje istniejący take profit i czy `PUT` ze `stopLevel` zachowuje pozostałe ustawienia: C5d, `do potwierdzenia w dry_run lub w odczytach live` (v1 nie ustawia take profit, więc ryzyko jest małe). Modyfikacje pojawiają się w historii aktywności jako typ `EDIT_STOP_AND_LIMIT`. Status kształtu: `udokumentowane`.
+
+### 2.14 `DELETE /api/v1/positions/{dealId}` (zamknięcie pozycji)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Bez ciała i bez parametrów w [S1]; zamyka pozycję w całości (brak opisanego parametru wielkości, więc zamknięcia częściowe są nieobsługiwane).
+
+```jsonc
+// 200
+{ "dealReference": "p_<DEAL_ID>" }
+// 404
+{ "errorCode": "error.not-found.dealId" }
+```
+
+Zamknięcie następuje przypuszczalnie po cenie rynkowej; 200 niesie tylko referencję, więc po wywołaniu: `GET /confirms/p_<DEAL_ID>` oraz kontrola, że `dealId` zniknął z listy pozycji (spec §6: stan pozycji zmienia się tylko na podstawie odpowiedzi brokera). Przy timeoucie nie wysyłamy ponownie na ślepo (spec §8): najpierw lista pozycji. Odpowiedź potwierdzenia dla zamknięcia (pola `status`, `level`, ewentualny wynik) nie jest opisana, C3, `do potwierdzenia w dry_run lub w odczytach live`. Zachowanie przy rynku zamkniętym (kod błędu, kolejkowanie): C11b, `do potwierdzenia w dry_run lub w odczytach live`. Status kształtu: `udokumentowane`.
+
+### 2.15 `GET /api/v1/confirms/{dealReference}` (potwierdzenie po `dealReference`)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Parametr ścieżki: `dealReference` z `POST`/`PUT`/`DELETE` (prefiks `o_` dla zlecenia otwarcia, `p_` dla operacji na pozycji). Cytat [S1]: "In case of mentioning the order prefix formed because of the position creation the opened positions IDs will be shown in the `affectedDeals` array".
+
+```jsonc
+// 200 (kształt z przykładu dokumentacji dla otwarcia)
+{
+  "date": "2026-11-02T08:05:03.100",           // czas; strefa nieopisana, nie używać do logiki
+  "status": "OPEN",
+  "dealStatus": "ACCEPTED",
+  "epic": "DE40",
+  "dealReference": "o_<uuid>",
+  "dealId": "<ORDER_ID>",                       // w przykładzie to id zlecenia, nie pozycji
+  "affectedDeals": [ { "dealId": "<DEAL_ID>", "status": "OPENED" } ],   // id pozycji
+  "level": 25782.3,                             // cena wykonania
+  "size": 0.001,
+  "direction": "BUY",
+  "guaranteedStop": false,
+  "trailingStop": false
+  // [S3, nie w przykładzie S1]: "reason", "stopLevel", "profitLevel"
+}
+// 404
+{ "errorCode": "error.not-found.dealReference" }
+```
+
+Wnioski do potwierdzenia (wszystkie z przykładów i z [S3], nie ze zdania dokumentacji):
+
+- **Identyfikator pozycji.** W przykładzie `dealId` potwierdzenia (kończy się na `...43`) różni się od `affectedDeals[0].dealId` (`...45`), a przykład pozycji ma `workingOrderId` `...5c` i `dealId` `...5e`, a więc ta sama relacja "zlecenie, pozycja = zlecenie + 2". Wniosek: `dealId` pozycji (do `GET`/`PUT`/`DELETE /positions/{dealId}`) to `affectedDeals[i].dealId` ze statusem `OPENED`, nie główne `dealId` potwierdzenia. C2, `do potwierdzenia w dry_run lub w odczytach live`. Adapter ma zapisać w dzienniku oba identyfikatory i do `OpenPosition.deal_id` wziąć `affectedDeals`; w razie niejednoznaczności dopasować po `list_positions()` (kierunek, wielkość, czas).
+- **Wartości `status` i `dealStatus`.** [S1] pokazuje tylko `status: "OPEN"` i `dealStatus: "ACCEPTED"`. Odrzucenie to według [S3] `dealStatus: "REJECTED"` z polem `reason` (tekst). Pełna lista wartości: C4, `do potwierdzenia w dry_run lub w odczytach live`.
+- **Wyścig.** Potwierdzenie tuż po `POST` może jeszcze zwrócić 404 `error.not-found.dealReference` (konektor [S3] ponawia do 6 razy z odstępem 150 ms razy numer próby). Adapter: do 3 prób w ciągu kilku sekund, potem stan `UNKNOWN` i uzgadnianie przez listę pozycji (spec §6). C1, `do potwierdzenia w dry_run lub w odczytach live`.
+- **Zamknięcie.** Potwierdzenie `p_<DEAL_ID>` po `DELETE`: pola nieopisane (C3).
+
+Status kształtu: `udokumentowane`.
+
+### 2.16 `GET /api/v1/markets/{epic}` (reguły instrumentu, status rynku, notowanie, godziny otwarcia)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Parametr ścieżki `epic` (np. `DE40`). Błąd 404: `error.not-found.epic`.
+
+```jsonc
+// 200 (kształt z przykładu dokumentacji; wartości DE40 z [S4] gdzie znane)
+{
+  "instrument": {
+    "epic": "DE40", "symbol": "<symbol>", "expiry": "-", "name": "<nazwa>",
+    "lotSize": <number>,                 // DE40: nieodczytane w [S4]; oczekiwane 1 (C16)
+    "type": "INDICES",
+    "guaranteedStopAllowed": <bool>, "streamingPricesAvailable": true,
+    "currency": "EUR",
+    "marginFactor": 5, "marginFactorUnit": "PERCENTAGE",   // depozyt 5% wg [S4]; nazwa pola z przykładu [S1]
+    "openingHours": { "mon": ["00:00 - 21:59", "23:05 - 00:00"], "tue": [...], "wed": [...], "thu": [...],
+                      "fri": ["00:00 - 21:59"], "sat": [], "sun": ["23:05 - 00:00"], "zone": "UTC" },
+    "overnightFee": { "longRate": <number>, "shortRate": <number>,
+                      "swapChargeTimestamp": 1707948000000, "swapChargeInterval": 1440 }
+  },
+  "dealingRules": {             // `unit` z przykładu [S1]; `value` dla DE40 z [S4]
+    "minStepDistance":           { "unit": "POINTS",     "value": 0.1 },
+    "minDealSize":               { "unit": "POINTS",     "value": 0.001 },
+    "maxDealSize":               { "unit": "POINTS",     "value": 1000 },
+    "minSizeIncrement":          { "unit": "POINTS",     "value": 0.001 },
+    "minGuaranteedStopDistance": { "unit": "PERCENTAGE", "value": 0.1 },
+    "minStopOrProfitDistance":   { "unit": "PERCENTAGE", "value": 0.01 },
+    "maxStopOrProfitDistance":   { "unit": "PERCENTAGE", "value": <number> },
+    "marketOrderPreference": "AVAILABLE_DEFAULT_ON",
+    "trailingStopsPreference": "NOT_AVAILABLE"
+  },
+  "snapshot": {
+    "marketStatus": "TRADEABLE",
+    "netChange": <number>, "percentageChange": <number>,
+    "updateTime": "...",                 // czas lokalny
+    "delayTime": 0,
+    "bid": 25780.3, "offer": 25782.3, "high": <number>, "low": <number>,
+    "decimalPlacesFactor": <number>, "scalingFactor": 1, "marketModes": ["REGULAR"]
+    // [S3, nie w przykładzie S1]: "updateTimeUTC"
+  }
+}
+```
+
+#### 2.16.1 Gdzie leżą pola reguł (Zadanie 4: `InstrumentRules`)
+
+| Potrzebne | Ścieżka w odpowiedzi | Jednostka / uwagi | Status |
+|---|---|---|---|
+| minimalna wielkość | `dealingRules.minDealSize.value` | DE40: 0,001 [S4]. Pole `unit` ma w przykładach wartość `"POINTS"` także dla wielkości; traktować jako jednostki wielkości, nie punkty ceny | udokumentowane |
+| maksymalna wielkość | `dealingRules.maxDealSize.value` | DE40: 1000 [S4] | udokumentowane |
+| krok wielkości | `dealingRules.minSizeIncrement.value` | DE40: 0,001 [S4]. W oficjalnej specyfikacji nie ma pola `dealSize.increment`; właściwa nazwa to `minSizeIncrement`. Wielkość = `minDealSize` + k × krok (reguła wnioskowana z nazwy, odrzucenie niezgodnej wielkości: C14) | udokumentowane |
+| minimalna odległość stopu | `dealingRules.minStopOrProfitDistance` (`unit`, `value`) | DE40: `PERCENTAGE` 0,01 [S4], czyli 0,01% ceny (ok. 2,6 pkt przy cenie 25 780). Przy `unit == "PERCENTAGE"`: odległość w punktach = cena × `value` / 100; przy `"POINTS"`: `value` | udokumentowane |
+| maksymalna odległość stopu | `dealingRules.maxStopOrProfitDistance` | jak wyżej (w przykładzie 60%) | udokumentowane |
+| minimalna odległość stopu gwarantowanego | `dealingRules.minGuaranteedStopDistance` | DE40: 0,1% [S4]; v1 nie używa GSL | udokumentowane |
+| krok odległości | `dealingRules.minStepDistance` | DE40: 0,1 pkt [S4]; odległość stopu zaokrąglać do wielokrotności tego kroku | do potwierdzenia w dry_run lub w odczytach live (C16c: czy broker odrzuca niewielokrotności) |
+| depozyt (margin) | `instrument.marginFactor` + `instrument.marginFactorUnit` | DE40: depozyt 5% [S4] (zatem `marginFactor` = 5 i `PERCENTAGE`; nazwę pola potwierdza przykład [S1], wartość DE40 odczytu nie podaje wprost). `margin_rate = marginFactor / 100`, gdy jednostka to `PERCENTAGE` | udokumentowane |
+| wartość punktu | **brak pola** | Wartość 1 punktu = `size` × `lotSize` w walucie instrumentu. Dla DE40 oczekujemy `lotSize` = 1 i waluty EUR, czyli 1 EUR na punkt na jednostkę wielkości. Przykład [S2]: pozycja po "€10 per point" ma ekspozycję 16 000 × €10 = €160 000. Wielkość 0,001 to ok. 26 EUR wartości nominalnej [S4], co jest zgodne z 1 EUR na punkt | do potwierdzenia w dry_run lub w odczytach live (C16: wartość pochodna, sprawdzić z `upl` otwartej pozycji) |
+| status rynku | `snapshot.marketStatus` | `TRADEABLE` (przykład [S1]) i `CLOSED` (przykład listy `GET /markets` oraz odczyt weekendowy [S4]). Trzecia wartość `EDITS_ONLY` występuje wyłącznie w typach niezależnej biblioteki | wartości `TRADEABLE`, `CLOSED`: udokumentowane; pełna lista: do potwierdzenia w dry_run lub w odczytach live (C11) |
+| tryby rynku | `snapshot.marketModes` | `["REGULAR"]`, w przykładzie zamkniętego rynku `["VIEW_ONLY"]` | do potwierdzenia w dry_run lub w odczytach live (C11) |
+| zlecenie rynkowe dostępne | `dealingRules.marketOrderPreference` | DE40: `AVAILABLE_DEFAULT_ON` [S4] | udokumentowane |
+| stop trailing | `dealingRules.trailingStopsPreference` | DE40: `NOT_AVAILABLE` [S4] | udokumentowane |
+| waluta instrumentu | `instrument.currency` | DE40: EUR [S4] | udokumentowane |
+| finansowanie nocne | `instrument.overnightFee.{longRate,shortRate,swapChargeTimestamp,swapChargeInterval}` | `swapChargeInterval` w przykładzie 1440 (minuty); znacznik w ms epoki. Strona rynku w [S2] podaje godzinę naliczenia 21:00 UTC | udokumentowane (pola); godzina naliczenia dla DE40: do potwierdzenia w dry_run lub w odczytach live |
+
+Mapowanie na `InstrumentRules(epic, min_size, size_step, value_per_point, margin_rate, min_stop_distance)` (Zadanie 4): `min_size` ← `minDealSize.value`; `size_step` ← `minSizeIncrement.value`; `value_per_point` ← `lotSize` (oczekiwane 1 dla DE40, do odczytu: C16); `margin_rate` ← `marginFactor / 100`; `min_stop_distance` ← punkty z `minStopOrProfitDistance` przeliczone na aktualnej cenie (`cena × 0,0001` dla DE40, w fixture 2,6). Ponieważ minimum zależy od ceny, adapter przelicza je przy każdym odczycie reguł (raz na sesję wystarczy; cena zmienia się o ułamki procenta w ciągu dnia, więc dodajemy margines bezpieczeństwa, np. wybraną stopę w konfiguracji strategii).
+
+#### 2.16.2 Notowanie (bid, ask, znacznik czasu) przez REST
+
+Silnik v1 odpytuje REST (decyzja w `progress.md` Rulings: notowanie co ok. 5 s, WebSocket odroczony). Źródło notowania: `GET /markets/{epic}` → `snapshot.bid` (cena sprzedaży), `snapshot.offer` (cena kupna; w strumieniu WebSocket to samo pole nazywa się `ofr`), `snapshot.updateTime`. `udokumentowane` dla `bid`, `offer`, `marketStatus`.
+
+Znacznik czasu notowania:
+
+- Przykład odpowiedzi `GET /markets/{epic}` ma w `snapshot` tylko `updateTime` (czas lokalny). Wariant `GET /markets?searchTerm=` oraz obiekt `market` w `GET /positions` mają `updateTime` i `updateTimeUTC`; konektor [S3] ma `updateTimeUTC` także w `snapshot`. Wniosek: **spodziewane pole `snapshot.updateTimeUTC`**, ale nie ma go w oficjalnym przykładzie. C10, `do potwierdzenia w dry_run lub w odczytach live`.
+- Reguła fallback do czasu potwierdzenia: jeśli `snapshot.updateTimeUTC` jest, `Quote.ts` ← to pole; jeśli go nie ma, `Quote.ts` ← zegar silnika w chwili otrzymania udanej odpowiedzi, a straż "cisza notowań 60 s" (Rulings: brak udanego świeżego notowania w 60 s) liczy się od ostatniej udanej odpowiedzi z `marketStatus == "TRADEABLE"` i niezerowym `bid`/`offer`. Przy zamkniętym rynku (`CLOSED`) notowanie jest ostatnią migawką [S4], więc nie jest "świeże".
+- `snapshot.delayTime` (w przykładach 0): jednostka i znaczenie nieopisane (C10).
+
+Alternatywne, tańsze lub dokładniejsze źródła notowań: `GET /markets?epics=DE40` zwraca `marketDetails[]` o tym samym kształcie co ten endpoint (sekcja 2.17); `GET /positions` niesie `market.bid/offer/updateTimeUTC` dla otwartych pozycji (przydatne do straży poślizgu bez dodatkowego zapytania).
+
+#### 2.16.3 Godziny otwarcia DE40 (`instrument.openingHours`)
+
+Pole: `instrument.openingHours`, obiekt z kluczami `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun` (każdy to lista napisów `"HH:MM - HH:MM"`, pusta lista = zamknięte) oraz `zone` (w przykładzie `"UTC"`). Format z przykładu [S1] (instrument SILVER, nie DE40):
+
+```jsonc
+"openingHours": { "mon": ["00:00 - 21:59", "23:05 - 00:00"], "tue": [...], "wed": [...], "thu": [...],
+                  "fri": ["00:00 - 21:59"], "sat": [], "sun": ["23:05 - 00:00"], "zone": "UTC" }
+```
+
+Struktura pola: `udokumentowane` (przykład w [S1]). **Rzeczywiste wartości dla DE40 nie były odczytane**: odczyt z 2026-11-01 [S4] ich nie zapisał, a dokumentacja nie podaje ich dla DE40. Odczyt: `do potwierdzenia w dry_run lub w odczytach live` (C12): przy pierwszym `dry_run` zapisać do dziennika surowe `instrument.openingHours` dla `DE40` i sprawdzić, czy `zone` to `UTC`.
+
+Informacje pomocnicze [S2], nie kontrakt API: od 1 czerwca 2025 dzienna przerwa na Germany 40 skrócona do 5 minut (17:00 do 17:05 czasu Nowego Jorku), czyli 21:00 do 21:05 UTC przy czasie letnim USA i 22:00 do 22:05 UTC przy zimowym; handel od niedzieli wieczór do piątku wieczór. Cytat: "The usual one-hour daily break (5:00pm-6:00pm ET) has now been reduced to just five minutes (5:00-5:05pm ET)". Okno strategii v1 (09:00 do 17:25 Berlin) mieści się daleko od przerwy, więc godziny otwarcia z API służą diagnostyce, a **bramką wejścia jest `snapshot.marketStatus == "TRADEABLE"`** (plus kalendarz XETRA ze spec §4).
+
+Status kształtu: `udokumentowane`.
+
+### 2.17 `GET /api/v1/markets` (lista i wyszukiwanie)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Parametry: `searchTerm` (tekst) albo `epics` (lista rozdzielona przecinkami, maksymalnie 50). Gdy podano oba, liczy się tylko `searchTerm`. Bez parametrów zwraca wszystkie rynki.
+
+- Z `searchTerm`: `{"markets": [ { "epic", "symbol", "instrumentName", "instrumentType", "lotSize", "expiry", "marketStatus", "bid", "offer", "high", "low", "netChange", "percentageChange", "updateTime", "updateTimeUTC", "delayTime", "streamingPricesAvailable", "scalingFactor", "marketModes", "pipPosition", "tickSize" } ]}`.
+- Z `epics`: `{"marketDetails": [ { "instrument": {...}, "dealingRules": {...}, "snapshot": {...} } ]}` (ten sam kształt co sekcja 2.16, tablica).
+- Błędy 400: `error.null.searchTerm`, `error.null.epic`.
+
+Użycie w v1: jednorazowe potwierdzenie, że `epic` `DE40` istnieje (`epics=DE40`); poza tym `GET /markets/{epic}`. Pola `pipPosition` i `tickSize` (liczba miejsc i krok ceny) są tylko w wariancie z `searchTerm`; krok ceny DE40 jest też pośrednio w `minStepDistance`. Status kształtu: `udokumentowane`.
+
+### 2.18 `GET /api/v1/prices/{epic}` (historia cen: świece 5-minutowe i dzienne)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Parametry zapytania, wszystkie opcjonalne [S1]:
+
+| Parametr | Typ | Opis i domyślne |
+|---|---|---|
+| `resolution` | string | `MINUTE`, `MINUTE_5`, `MINUTE_15`, `MINUTE_30`, `HOUR`, `HOUR_4`, `DAY`, `WEEK`; domyślnie `MINUTE` |
+| `max` | integer | maksymalna liczba wartości w odpowiedzi; domyślnie 10, maksimum 1000 |
+| `from` | string | początek, `YYYY-MM-DDTHH:MM:SS` (UTC, filtracja po `snapshotTimeUTC`) |
+| `to` | string | koniec, ten sam format |
+
+Cytat [S1]: "By default returns the minute prices within the last 10 minutes". Odpowiedź (kształt z przykładu; ceny poglądowe):
+
+```jsonc
+// 200
+{ "prices": [
+  { "snapshotTime": "...",                         // czas lokalny, NIE używać
+    "snapshotTimeUTC": "2026-11-02T08:00:00",      // czas świecy (UTC)
+    "openPrice":  { "bid": 25780.3, "ask": 25782.3 },
+    "closePrice": { "bid": ..., "ask": ... },
+    "highPrice":  { "bid": ..., "ask": ... },
+    "lowPrice":   { "bid": ..., "ask": ... },
+    "lastTradedVolume": 187 }
+  ],
+  "instrumentType": "INDICES" }
+// 400
+{ "errorCode": "error.invalid.resolution" }
+```
+
+Format znaczników: **`snapshotTimeUTC` jest czasem UTC** (pole jest podstawą filtracji `from`/`to`), napis bez sufiksu strefy i bez milisekund (`YYYY-MM-DDTHH:MM:SS`). Ceny świecy są podane osobno dla strony sprzedaży (`bid`) i kupna (`ask`); pola `openPrice`, `closePrice`, `highPrice`, `lowPrice` są obiektami `{bid, ask}`. Mid dla `Candle` (Zadanie 4) liczymy jako `(bid + ask) / 2` osobno dla każdego z pól O, H, L, C; to przybliżenie (maksimum mid nie jest średnią maksimów bid i ask), dopuszczalne w v1. Niezależna biblioteka `capital-api-client@1.0.7` dodaje do obiektów cen pole `lastTraded` (nullable); w [S1] go nie ma.
+
+#### 2.18.1 Świece 5-minutowe (sygnał i zapasowy odczyt)
+
+Zapytanie dla pierwszej świecy sesji (zimą Berlin = UTC+1, więc 09:00 Berlin = 08:00 UTC; konwersja przez `zoneinfo`, nie stałą):
+
+```text
+GET /api/v1/prices/DE40?resolution=MINUTE_5&from=2026-11-02T08:00:00&to=2026-11-02T08:10:00&max=5
+```
+
+Co jest udokumentowane: parametry, `resolution=MINUTE_5`, `snapshotTimeUTC` jako podstawa filtracji, limit 1000. Przykład odpowiedzi "Use not default resolution, start date and max parameters" (dokładne żądanie nie jest podane; z odstępów wynika `MINUTE_15`, a parametry przykładowe to `from=2022-02-24T00:00:00` i `max`) zwraca cztery świece o `snapshotTimeUTC` `00:00:00`, `00:15:00`, `00:30:00`, `00:45:00`. Z tego **wnioskuję**, że znacznik to **początek** świecy (pierwsza świeca ma czas równy `from`). Czy `to` jest włączne, nie wiadomo. To wniosek z jednego przykładu, więc C9, `do potwierdzenia w dry_run lub w odczytach live`.
+
+Zasady bezpieczne do czasu potwierdzenia (Zadanie 13/14):
+
+- Świecę pierwszą uznajemy za gotową dopiero, gdy jest w odpowiedzi element o `snapshotTimeUTC` równym oczekiwanemu początkowi, a zegar silnika jest ≥ początek + 5 minut. Zapytanie o szerszy zakres i wybór po dokładnym `snapshotTimeUTC` zamiast polegania na `max`.
+- Nie wiadomo, czy odpowiedź zawiera świecę trwającą (niedomkniętą); filtrujemy: tylko świece z początkiem + 5 min ≤ teraz.
+- Odpowiedź bez elementu dla oczekiwanej świecy do 09:10 Berlin = `NO_SIGNAL_DATA` (Rulings, T14).
+- Opóźnienie dostępności świecy po jej zamknięciu: C9, `do potwierdzenia w dry_run lub w odczytach live`.
+
+#### 2.18.2 Świece dzienne (ATR14)
+
+```text
+GET /api/v1/prices/DE40?resolution=DAY&max=30
+GET /api/v1/prices/DE40?resolution=DAY&from=2026-10-01T00:00:00&to=2026-11-02T00:00:00&max=30
+```
+
+`resolution=DAY` jest w liście udokumentowanych. **Nieudokumentowane i do ustalenia w `dry_run` (C9):** (a) granica doby dziennej świecy DE40 (00:00 UTC? zamknięcie sesji CFD?) widoczna w `snapshotTimeUTC` pierwszej świecy dnia; (b) czy ostatnia świeca w odpowiedzi to dzień trwający (wtedy odrzucamy ją przy ATR); (c) co zwraca zapytanie z samym `max` bez `from`/`to` (domyślny zakres "ostatnie 10 minut" z [S1] dotyczy minut, nie dni); (d) czy dni bez handlu (weekend) są pomijane. ATR14 wymaga 15 zamkniętych świec dziennych (14 zakresów + poprzedni close); `count` w `daily_candles(epic, count)` żąda zapasu (np. 30) i filtruje.
+
+Status kształtu: `udokumentowane`.
+
+### 2.19 `GET /api/v1/history/activity` (historia aktywności: cena i przyczyna zamknięcia)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Parametry, wszystkie opcjonalne [S1]:
+
+| Parametr | Typ | Opis |
+|---|---|---|
+| `from`, `to` | string | `YYYY-MM-DDTHH:MM:SS`, filtracja po `dateUTC`. **Maksymalny zakres między `from` i `to` to 1 dzień**; jeśli podano tylko jedno, wybierany jest zakres 1-dniowy |
+| `lastPeriod` | integer | okno w sekundach wstecz od teraz (nie działa z `from`/`to`); domyślnie 600, maksimum 86400 |
+| `detailed` | boolean | `true` dodaje obiekt `details`; domyślnie `false` |
+| `dealId` | string | tylko aktywność dla danego `dealId` |
+| `filter` | string | filtr FIQL po `epic`, `source`, `status`, `type`, np. `source!=DEALER;type!=POSITION;status==REJECTED;epic==OIL_CRUDE,GOLD` (`;` = i, `,` = lub) |
+
+Cytat [S1] (changelog 2023-07-04): "Set maximum date range for parameters `from`, `to`, `lastPeriod` to 1 day for the `GET /history/activity`". Wartości wyliczeniowe [S1]:
+
+| Pole | Wartości |
+|---|---|
+| `source` | `CLOSE_OUT`, `DEALER`, `SL`, `SYSTEM`, `TP`, `USER` |
+| `status` | `ACCEPTED`, `CREATED`, `EXECUTED`, `EXPIRED`, `REJECTED`, `MODIFIED`, `MODIFY_REJECT`, `CANCELLED`, `CANCEL_REJECT`, `UNKNOWN` |
+| `type` | `POSITION`, `WORKING_ORDER`, `EDIT_STOP_AND_LIMIT`, `SWAP`, `SYSTEM` |
+
+Odpowiedź (z `detailed=true`, `dealId` filtrowane; kształt z przykładu [S1], wartości poglądowe):
+
+```jsonc
+// 200
+{ "activities": [
+  { "date": "...", "dateUTC": "2026-11-02T10:12:00.420",
+    "epic": "DE40", "dealId": "<DEAL_ID>",
+    "source": "SL", "type": "POSITION", "status": "ACCEPTED",
+    "details": { "dealReference": "p_<DEAL_ID>", "marketName": "<nazwa>", "currency": "EUR",
+                 "size": 0.001, "direction": "SELL", "level": 25750.0, "guaranteedStop": false }
+    // [S3, nie w przykładzie S1] dodatkowe pola w "details": "goodTillDate", "trailingStop", "stopLevel",
+    //                            "stopDistance", "stopAmount", "profitLevel", "profitDistance", "profitAmount"
+  },
+  { "date": "...", "dateUTC": "2026-11-02T08:05:03.100", "epic": "DE40", "dealId": "<DEAL_ID>",
+    "source": "USER", "type": "POSITION", "status": "ACCEPTED",
+    "details": { "dealReference": "p_<DEAL_ID>", "size": 0.001, "direction": "BUY", "level": 25782.3, ... } }
+] }
+// 400
+{ "errorCode": "error.invalid.from" }
+```
+
+**Gdzie są cena i przyczyna zamknięcia:**
+
+| Potrzebne | Pole | Status |
+|---|---|---|
+| cena zamknięcia | `activities[].details.level` we wpisie typu `POSITION`, status `ACCEPTED`, o kierunku `details.direction` przeciwnym do kierunku pozycji, z `dateUTC` późniejszym niż otwarcie; dostępne tylko przy `detailed=true` | do potwierdzenia w dry_run lub w odczytach live (C7) |
+| przyczyna zamknięcia | `activities[].source`: `SL` = stop loss (przypuszczalnie), `TP` = take profit, `USER` = polecenie użytkownika/API, `CLOSE_OUT` = zamknięcie przez system (np. brak depozytu), `DEALER`, `SYSTEM` | wartości wyliczenia: udokumentowane; **przypisanie `SL` do zadziałania stopu i `USER` do ręcznego/API zamknięcia: do potwierdzenia w dry_run lub w odczytach live** (C7) |
+| czas zamknięcia | `activities[].dateUTC` | udokumentowane (nazwa pola) |
+| identyfikator pozycji | `activities[].dealId` (ten sam dla otwarcia i zamknięcia w przykładzie) | udokumentowane |
+| referencja | `details.dealReference` (`p_<dealId>`) | udokumentowane |
+| rozmiar zamknięcia | `details.size` | udokumentowane |
+
+Dlaczego tylko "przypuszczalnie": dokumentacja wymienia wartości `SL` i `TP` w wyliczeniu `source`, ale **nie mówi wprost**, że zadziałanie stopu daje `source: "SL"`. Jedyny przykład pełnego cyklu (otwarcie `USER`, zamknięcie `CLOSE_OUT`, odrzucona edycja `SYSTEM`) nie pokazuje stopu. Reguła mapowania dla Zadań 4 i 8 (`ClosedDeal.reason`):
+
+- `source == "SL"` → `"STOP"`.
+- `source == "USER"` → ręczne lub nasze polecenie zamknięcia (rozróżniamy po tym, czy mamy lokalnie pozycję w `EXITING`: wtedy `"FORCED"`, inaczej `"MANUAL"`).
+- `source` inne (`CLOSE_OUT`, `TP`, `DEALER`, `SYSTEM`) → rozbieżność nierozpoznana: zapisujemy surowy wpis, księgujemy cenę z `details.level` jako zamknięcie o nieznanej przyczynie, alarm i `BLOCKED` zgodnie z spec §7.
+- Dodatkowa weryfikacja stopu: jeśli `details.level` jest w pobliżu lokalnie zapisanego poziomu stopu (±spread), to zamknięcie przez stop jest wiarygodne nawet gdy `source` nie jest `SL`.
+
+Uwagi praktyczne:
+
+- Zakres 1 dnia: zapytanie `from = początek dnia sesji UTC`, `to = teraz`, ale nie więcej niż 24 h; po każdej wykrytej zmianie i po zamknięciu sesji (spec §7). Dla zamknięcia po stopie preferuj `dealId=<DEAL_ID>&detailed=true` (zawęża wynik).
+- Opóźnienie pojawienia się wpisu po zamknięciu i kolejność wpisów: C7, `do potwierdzenia w dry_run lub w odczytach live`.
+- Parametr `filter` zawiera znaki `;`, `=`, `!`, `,`: przekazać przez parametry `aiohttp` (kodowanie URL), nie sklejać ręcznie. Dokładna składnia: wyłącznie przykład z [S1], C7b.
+- Koszt: zapytania o historię liczą się do limitu 10 zapytań/s (budżet silnika 5/s).
+
+Status kształtu: `udokumentowane`.
+
+### 2.20 `GET /api/v1/history/transactions` (historia transakcji)
+
+Nagłówki: `CST`, `X-SECURITY-TOKEN`. Parametry, opcjonalne [S1]: `from`, `to` (`YYYY-MM-DDTHH:MM:SS`, filtracja po `dateUTC`), `lastPeriod` (sekundy; domyślnie 600; limit górny nie podany), `type` (jedna z: `INACTIVITY_FEE`, `RESERVE`, `VOID`, `UNRESERVE`, `WRITE_OFF_OR_CREDIT`, `CREDIT_FACILITY`, `FX_COMMISSION`, `COMPLAINT_SETTLEMENT`, `DEPOSIT`, `WITHDRAWAL`, `REFUND`, `WITHDRAWAL_MONEY_BACK`, `TRADE`, `SWAP`, `TRADE_COMMISSION`, `TRADE_COMMISSION_GSL`, `NEGATIVE_BALANCE_PROTECTION`, `TRADE_CORRECTION`, `CHARGEBACK`, `ADJUSTMENT`, `BONUS`, `TRANSFER`, `CORPORATE_ACTION`, `CONVERSION`, `REBATE`, `TRADE_SLIPPAGE_PROTECTION`). Domyślnie transakcje z ostatnich 10 minut. Ograniczenie 1 dnia z changelogu dotyczy tylko `history/activity`; dla transakcji [S1] limitu zakresu nie podaje (C8).
+
+```jsonc
+// 200 (kształt z przykładu)
+{ "transactions": [
+  { "date": "...", "dateUtc": "2026-11-02T10:12:00.420",
+    "instrumentName": "<nazwa>", "transactionType": "TRADE", "note": "Trade closed",
+    "reference": "<REFERENCE>", "size": "<string z liczbą>", "currency": "EUR", "status": "PROCESSED" }
+] }
+```
+
+Co z tego wynika dla silnika:
+
+| Potrzebne | Pole | Status |
+|---|---|---|
+| zdarzenie zamknięcia | `transactionType == "TRADE"` i `note == "Trade closed"` | do potwierdzenia w dry_run lub w odczytach live (C8) |
+| czas | `dateUtc` (uwaga na wielkość liter; w przykładzie równe `date`) | udokumentowane (nazwa); strefa `date`: C19 |
+| wynik (kwota) | `size` jako **napis**; w przykładach to wartości rzędu 1,05 i 416,0 przy zleceniach 1 lot, więc wygląda na kwotę wyniku, nie wielkość pozycji; [S1] nie opisuje | do potwierdzenia w dry_run lub w odczytach live (C8) |
+| powiązanie z pozycją | `reference` (przykład: liczba, bez `dealId`) | do potwierdzenia w dry_run lub w odczytach live (C8) |
+| cena zamknięcia | **brak w oficjalnym przykładzie** | do potwierdzenia w dry_run lub w odczytach live (C8) |
+| przyczyna zamknięcia | **brak** | do potwierdzenia w dry_run lub w odczytach live (C8) |
+
+Wniosek: **cenę i przyczynę zamknięcia bierzemy z historii aktywności (sekcja 2.19), a historia transakcji służy do kontroli księgowej (kwota wyniku, opłaty `TRADE_COMMISSION`, finansowanie `SWAP`)**. Niezależna biblioteka `capital-api-client@1.0.7` (<https://cdn.jsdelivr.net/npm/capital-api-client@1.0.7/dist/index.d.ts>, nieoficjalna) opisuje transakcję także polami `transactionId`, `dateUTC`, `openLevel`, `closeLevel`, `cash`, `pnl`; jeśli żywe API je zwraca, byłyby użyteczne (cena zamknięcia w `closeLevel`), ale to nie wynika z [S1], więc nie wolno na tym polegać bez odczytu (C8). Status kształtu: `udokumentowane`.
+
+### 2.21 Strumień WebSocket (OHLC, notowania, ping): odroczony w v1
+
+Decyzja (Rulings, odchylenie D1): v1 używa pollingu REST; strumień zostaje na później. Dokumentacja jest opisana tu, by adapter mógł go dodać bez ponownego czytania.
+
+- Adres: `wss://api-streaming-capital.backend-capital.com/connect`. Zwracany też jako `streamingHost` (POST /session) i `streamEndpoint` (GET /session).
+- Każda wiadomość od klienta ma pola: `destination`, `correlationId`, `cst`, `securityToken` (wartości `CST` i `X-SECURITY-TOKEN`; **w ciele wiadomości, nie w nagłówkach**), `payload`.
+- Sesja strumienia trwa 10 minut; podtrzymanie: wiadomość `ping` co najmniej raz na 10 minut ("In order to keep the connection alive, ping service at least once every 10 minutes"). Limit 40 instrumentów na subskrypcję; strumień zrywa się po `PUT /session`.
+
+Subskrypcja notowań:
+
+```jsonc
+// żądanie
+{ "destination": "marketData.subscribe", "correlationId": "1", "cst": "<CST>", "securityToken": "<X-SECURITY-TOKEN>",
+  "payload": { "epics": ["DE40"] } }
+// odpowiedź
+{ "status": "OK", "destination": "marketData.subscribe", "correlationId": "1", "payload": { "subscriptions": { "DE40": "PROCESSED" } } }
+// zdarzenie
+{ "status": "OK", "destination": "quote",
+  "payload": { "epic": "DE40", "product": "CFD", "bid": <number>, "bidQty": <number>, "ofr": <number>, "ofrQty": <number>, "timestamp": 1660297190627 } }
+```
+
+Subskrypcja świec OHLC:
+
+```jsonc
+{ "destination": "OHLCMarketData.subscribe", "correlationId": "3", "cst": "<CST>", "securityToken": "<X-SECURITY-TOKEN>",
+  "payload": { "epics": ["DE40"], "resolutions": ["MINUTE_5"], "type": "classic" } }
+// odpowiedź: payload.subscriptions = { "DE40:MINUTE_5:classic": "PROCESSED" }
+// zdarzenie
+{ "status": "OK", "destination": "ohlc.event",
+  "payload": { "resolution": "MINUTE_5", "epic": "DE40", "type": "classic", "priceType": "bid",
+               "t": 1671714000000, "h": <number>, "l": <number>, "o": <number>, "c": <number> } }
+```
+
+`resolutions`: `MINUTE` (domyślnie), `MINUTE_5`, `MINUTE_15`, `MINUTE_30`, `HOUR`, `HOUR_4`, `DAY`, `WEEK`; `type`: `classic` (domyślnie) lub `heikin-ashi`. Wypisanie: `OHLCMarketData.unsubscribe` i `marketData.unsubscribe` (te same pola; `OHLCMarketData.unsubscribe` przyjmuje `epics`, opcjonalnie `resolutions` i `types`). Ping:
+
+```jsonc
+{ "destination": "ping", "correlationId": "5", "cst": "<CST>", "securityToken": "<X-SECURITY-TOKEN>" }
+// odpowiedź: { "status": "OK", "destination": "ping", "correlationId": "5", "payload": {} }
+```
+
+Do potwierdzenia przed użyciem strumienia (spec pytanie 8): `t` jako początek świecy w ms epoki, czy zdarzenie niesie także `priceType: "ask"`, czy zdarzenie przychodzi przy każdej zmianie świecy trwającej, opóźnienie względem REST. Status kształtu: `udokumentowane`; semantyka zdarzeń OHLC: `do potwierdzenia w dry_run lub w odczytach live` (C21).
+
+## 3. Skąd wziąć które pole (ściąga dla Zadań 4, 8, 13)
+
+| Potrzebne | Operacja i pole | Status |
+|---|---|---|
+| `dealReference` zlecenia | `POST /positions` → `dealReference` (`o_...`) | udokumentowane |
+| `dealId` pozycji | `GET /confirms/{dealReference}` → `affectedDeals[].dealId` (status `OPENED`); sprawdzić z `GET /positions` → `position.dealId` | do potwierdzenia w dry_run lub w odczytach live (C2) |
+| potwierdzenie wykonania | `GET /confirms/{dealReference}` → `dealStatus` (`ACCEPTED`), `status` (`OPEN`), `level`, `size`, `direction` | `ACCEPTED`, `OPEN`: udokumentowane; odrzucenie (`REJECTED`, `reason`): do potwierdzenia w dry_run lub w odczytach live (C4) |
+| kierunek pozycji | `GET /positions` → `position.direction` | udokumentowane |
+| wielkość pozycji | `GET /positions` → `position.size` | udokumentowane |
+| poziom otwarcia | `GET /positions` → `position.level`; cena wykonania także `confirms.level` | udokumentowane |
+| czas otwarcia | `GET /positions` → `position.createdDateUTC` | udokumentowane |
+| poziom stopu | `GET /positions` → `position.stopLevel` | do potwierdzenia w dry_run lub w odczytach live (C5) |
+| odległość stopu | `GET /positions` → `position.stopDistance`; przy wejściu wysyłamy `stopDistance` | wysyłka: udokumentowane; odczyt: do potwierdzenia w dry_run lub w odczytach live (C5, C6) |
+| cena zamknięcia | `GET /history/activity?detailed=true` → `details.level` wpisu zamykającego | do potwierdzenia w dry_run lub w odczytach live (C7) |
+| przyczyna zamknięcia (stop czy ręczne) | `GET /history/activity` → `source` (`SL` vs `USER`) | do potwierdzenia w dry_run lub w odczytach live (C7) |
+| status rynku | `GET /markets/{epic}` → `snapshot.marketStatus` | udokumentowane (`TRADEABLE`, `CLOSED`) |
+| minimalna wielkość | `dealingRules.minDealSize.value` | udokumentowane |
+| maksymalna wielkość | `dealingRules.maxDealSize.value` | udokumentowane |
+| krok wielkości | `dealingRules.minSizeIncrement.value` (nie `dealSize.increment`; takiego pola nie ma) | udokumentowane |
+| wartość punktu | brak pola; `lotSize` × `size` w walucie instrumentu | do potwierdzenia w dry_run lub w odczytach live (C16) |
+| depozyt | `instrument.marginFactor` (+ `marginFactorUnit`) | udokumentowane |
+| minimalna odległość stopu | `dealingRules.minStopOrProfitDistance` (`PERCENTAGE` 0,01 dla DE40) | udokumentowane |
+| godziny otwarcia | `instrument.openingHours` (dla DE40 nieodczytane) | struktura udokumentowana; wartości DE40: do potwierdzenia w dry_run lub w odczytach live (C12) |
+| notowanie (bid/ask) | `GET /markets/{epic}` → `snapshot.bid`, `snapshot.offer` | udokumentowane |
+| czas notowania (UTC) | `snapshot.updateTimeUTC` | do potwierdzenia w dry_run lub w odczytach live (C10) |
+| świece 5-minutowe | `GET /prices/DE40?resolution=MINUTE_5` → `prices[].snapshotTimeUTC`, `openPrice`..`lowPrice` `{bid, ask}` | udokumentowane (pola); znaczenie znacznika i granice: do potwierdzenia w dry_run lub w odczytach live (C9) |
+| świece dzienne | `GET /prices/DE40?resolution=DAY` | udokumentowane (parametr); granica doby i świeca trwająca: do potwierdzenia w dry_run lub w odczytach live (C9) |
+| rachunek aktywny w sesji | `POST /session` → `currentAccountId`; `GET /session` → `accountId` | udokumentowane |
+| lista rachunków | `GET /accounts` → `accounts[].{accountId, currency, status, balance.*}` | udokumentowane (pola); znaczenie `balance.*`: do potwierdzenia w dry_run lub w odczytach live (C17) |
+| tryb konta | `GET /accounts/preferences` → `hedgingMode` | udokumentowane |
+
+## 4. Sekwencje dla adaptera (Zadanie 13) i uzgadniania (Zadanie 8)
+
+**Logowanie.** `POST /session` (jawne hasło) → odczyt nagłówków `CST`, `X-SECURITY-TOKEN` oraz ciała JSON (niezależnie od `Content-Type`) → jeśli `currentAccountId` ≠ rachunek związany: jedno `PUT /session` z `accountId` → `GET /session` i kontrola `accountId`; rachunek spoza `accounts[]` = `BrokerError` bez dalszych wywołań. Jedno logowanie naraz (`asyncio.Lock`), odstęp ≥ 1 s między `POST /session`. `udokumentowane` (kroki), kolejność tokenów po `PUT`: C18.
+
+**Utrzymanie.** `GET /ping` co 5 minut; 401 na dowolnym żądaniu → jedno serializowane ponowne logowanie i jedna powtórka żądania; po ponownym logowaniu uruchomić uzgadnianie (spec §7).
+
+**Notowanie i świece.** `GET /markets/{epic}` co ok. 5 s (notowanie, status rynku); `GET /prices/DE40?resolution=MINUTE_5&from&to` dla zakresu otwarcia i zapasowych odczytów; `GET /prices/DE40?resolution=DAY&max=30` raz przed otwarciem (ATR14).
+
+**Wejście.** `INTENT` w dzienniku → `POST /positions` (ze `stopDistance`, odstęp ≥ 0,1 s od poprzedniego zlecenia) → `dealReference` w dzienniku → `GET /confirms/{dealReference}` (do 3 prób, krótkie odstępy) → przy `ACCEPTED`: `dealId` pozycji z `affectedDeals` → `GET /positions/{dealId}` i kontrola stopu (`stopLevel` obecny i zgodny z `level ∓ stopDistance`; brak = `PUT /positions/{dealId}` z `stopLevel`, a gdy zawiedzie, kill switch twardy). Timeout `POST` = `UNKNOWN` → `GET /positions` do 3 razy w 30 s (spec §6).
+
+**Wyjście.** `DELETE /positions/{dealId}` → `GET /confirms/p_<dealId>` → kontrola listy pozycji; timeout lub odmowa → uzgadnianie, nie ponawianie na ślepo.
+
+**Uzgadnianie co 10 s.** `GET /positions` → porównanie z dziennikiem (tabela spec §7). Pozycja lokalna zniknęła: `GET /history/activity?from=<początek dnia sesji UTC>&to=<teraz>&detailed=true&dealId=<dealId>` → wpis zamykający daje `details.level` i `source`; brak wpisu = `BLOCKED` i alarm.
+
+**Mapowanie na typy (Zadanie 4).**
+
+| Typ | Pola ← źródło |
+|---|---|
+| `Quote(epic, bid, ask, ts)` | `bid` ← `snapshot.bid`; `ask` ← `snapshot.offer`; `ts` ← `snapshot.updateTimeUTC` (fallback: zegar silnika; C10) |
+| `Candle(epic, start, open, high, low, close)` | `start` ← `snapshotTimeUTC` (UTC); OHLC ← `(bid + ask) / 2` z `openPrice` itd. |
+| `InstrumentRules(...)` | sekcja 2.16.1 |
+| `OpenPosition(deal_id, epic, side, size, open_level, stop_level, opened_at)` | `deal_id` ← `position.dealId`; `side` ← `position.direction`; `size` ← `position.size`; `open_level` ← `position.level`; `stop_level` ← `position.stopLevel` (C5); `opened_at` ← `position.createdDateUTC` |
+| `ClosedDeal(deal_id, epic, exit_level, reason, ts)` | `exit_level` ← `details.level`; `reason` wg reguły z 2.19; `ts` ← `dateUTC` (C7) |
+| `AccountInfo(...)` | sekcja 2.8 (C17) |
+| `EntryAck(deal_reference)` | `POST /positions` → `dealReference` |
+| `Capabilities` | `stop_attach="atomic"` (stop w treści `POST /positions`), `idempotency_key=None`, `keepalive_s=600` (sesja 10 minut; ping wcześniej), `reconcile="positions"`, `is_cfd=True` |
+
+## 5. Niespójności i pułapki dokumentacji
+
+1. Szyfrowanie hasła: tekst mówi "AES", kod przykładowy używa RSA PKCS1 (sekcja 2.3).
+2. `POST /session` ma ciało opisane jako `text/plain` (sekcja 1.3).
+3. Przykład `GET /accounts` powtarza ten sam `accountId` dla obu rachunków (poglądowy przykład); w żywej odpowiedzi identyfikatory są różne [S4].
+4. Nazwy: `dateUTC` (aktywność) kontra `dateUtc` (transakcje); `currentAccountId` (POST /session) kontra `accountId` (GET /session).
+5. W przykładach `unit` dla wielkości to `"POINTS"`, mimo że chodzi o jednostki wielkości.
+6. Przykłady pozycji nie zawierają pól stopu, choć tworzymy pozycje ze stopem; pola stopu w odpowiedziach są znane tylko z [S3].
+7. Przykłady historii aktywności nie pokazują zamknięcia przez stop, tylko przez `CLOSE_OUT`.
+8. Postman i przykładowy bot Java wskazane w dokumentacji nie były czytane.
+
+## 6. Lista pozycji do potwierdzenia (dla `dry_run`, próby `smoke`, Zadania 18)
+
+Kolumna "Gdzie": **odczyt** = da się rozstrzygnąć odczytem bez zleceń (`dry_run`, odczyty live); **smoke** = wymaga pierwszej transakcji na wielkości minimalnej (Zadanie 18) po zgodzie właściciela. Wszystkie pozycje mają status `do potwierdzenia w dry_run lub w odczytach live`. Warianty z literą (C5b, C5c, C5d, C7b, C11b, C16b, C16c, C19b) należą do pozycji nadrzędnej o tym samym numerze.
+
+| ID | Co sprawdzić | Gdzie | Spec |
+|---|---|---|---|
+| C1 | Czy `GET /confirms/{ref}` tuż po `POST` zwraca 404 i ile prób trzeba | smoke | pyt. 7 |
+| C2 | Który identyfikator z potwierdzenia jest `dealId` pozycji (`affectedDeals[].dealId` kontra `dealId`) | smoke | pyt. 7 |
+| C3 | Struktura potwierdzenia zamknięcia (`DELETE`): `status`, `level`, wynik | smoke | pyt. 7 |
+| C4 | Pełna lista `status`/`dealStatus` i wartości `reason` przy odrzuceniu | smoke | pyt. 7 |
+| C5 | Pola stopu w `GET /positions` (`stopLevel`, `stopDistance`, `profitLevel`, `trailingStop`); kształt pustej listy; 404 po zamknięciu; skutek `PUT` (C5b, C5c, C5d) | smoke | pyt. 7 |
+| C6 | Czy `stopDistance` liczy się od notowania, czy od ceny wykonania; zgodność `stopLevel` z `level ∓ stopDistance` | smoke | pyt. 7 |
+| C7 | Aktywność po zamknięciu przez stop: `source` (`SL`?), `details.level`, opóźnienie wpisu, składnia `filter` | smoke (stop), odczyt (kształt) | pyt. 7 |
+| C8 | Historia transakcji: znaczenie `size`, `reference`, brak ceny i `dealId`, zakres czasu, pola `openLevel`/`closeLevel`/`pnl` | smoke | pyt. 7 |
+| C9 | Świece: znacznik = początek świecy, wyłączność `to`, świeca trwająca w odpowiedzi, granica doby świec dziennych DE40, `max` bez `from`/`to`, opóźnienie świecy | odczyt | pyt. 8, 12 |
+| C10 | Obecność `snapshot.updateTimeUTC`, jednostka `delayTime`, częstotliwość odświeżania notowania | odczyt | pyt. 8 |
+| C11 | Wartości `marketStatus` i `marketModes`; zachowanie `POST` przy `CLOSED` (kod błędu); C11b zamknięcie przy `CLOSED` | odczyt (status), smoke (błąd) | pyt. 7 |
+| C12 | Wartości `instrument.openingHours` dla `DE40` i pole `zone` | odczyt | Zadanie 1 |
+| C13 | Kod i status HTTP przy wygasłej sesji | odczyt (odczekać ponad 10 min) | §13 |
+| C14 | Kody błędów `POST /positions`: za mała wielkość, zły krok, brak środków, zbyt mały stop, rynek zamknięty; semantyka liczby po dwukropku | smoke | pyt. 7 |
+| C15 | Tryb `hedgingMode` i skutek drugiego wejścia na tym samym instrumencie | smoke | pyt. 4 |
+| C16 | Wartość punktu (`size` × `lotSize` w EUR) z porównania `upl`; C16b zależność dźwigni od depozytu 5%; C16c krok `minStepDistance` | smoke | pyt. 3 |
+| C17 | Znaczenie `balance`, `deposit`, `profitLoss`, `available` | odczyt | Zadanie 4 |
+| C18 | Czy `CST`/`X-SECURITY-TOKEN` zmieniają się po `PUT /session` lub w odpowiedziach `ping` | odczyt | §13 |
+| C19 | Strefa pól lokalnych (`date`, `createdDate`, `snapshotTime`); C19b `Content-Type` odpowiedzi `POST /session` | odczyt | pyt. 8 |
+| C20 | Nagłówek `Retry-After` i kod błędu przy 429 poza logowaniem | odczyt (ostrożnie) | §13 |
+| C21 | Strumień WebSocket: znacznik `t`, `priceType`, opóźnienie względem REST | odczyt (po wdrożeniu strumienia) | pyt. 8 |
+| C22 | Czy `DELETE /positions/{dealId}` zamyka pozycję w całości i nie przyjmuje wielkości | smoke | pyt. 7 |
+
+Sugestia dla Zadania 18: pierwszy `dry_run` zapisuje do dziennika surowe odpowiedzi `GET /markets/DE40`, `GET /prices/DE40` (5 minut i dzień) i `GET /accounts/preferences` (bez zapisywania sald w repo), co zamyka C9 do C12, C17 i C19 bez żadnego zlecenia.
