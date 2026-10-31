@@ -11,11 +11,13 @@ from pathlib import Path
 import pytest
 
 from gwstock.broker.fake import FakeBroker
+from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.clock import FakeClock
 from gwstock.config import CostConfig, RiskConfig, StrategyConfig, load_config
 from gwstock.journal import Journal, PositionRecord
 from gwstock.orders.manager import OrderManager
 from gwstock.reconcile import Reconciler
+from gwstock.risk import KillSwitch, RiskGate
 from gwstock.types import ClosedDeal, EntryRequest, InstrumentRules, Quote, Side
 
 
@@ -131,3 +133,52 @@ def reconciler(
 ) -> Reconciler:
     """Uzgadnianie dla DE40 z atrapami kill switcha i księgującego, bez bramki wejścia."""
     return Reconciler(journal, fake, clock, kill_sink, risk_cfg, "DE40", booker=booker)
+
+
+class RecordingNotifier:
+    """Atrapa `Notifier`: zapisuje alarmy jako (poziom, treść); z ustawionym `fail` rzuca go po zapisie."""
+
+    def __init__(self) -> None:
+        self.alerts: list[tuple[str, str]] = []
+        self.fail: Exception | None = None
+
+    def alert(self, level: str, message: str) -> None:
+        self.alerts.append((level, message))
+        if self.fail is not None:
+            raise self.fail
+
+
+@pytest.fixture
+def notifier() -> RecordingNotifier:
+    return RecordingNotifier()
+
+
+@pytest.fixture
+def calendar() -> ExchangeCalendar:
+    return ExchangeCalendar(XETRA)
+
+
+@pytest.fixture
+def data_dir(tmp_path) -> Path:
+    """Katalog `data/` testu (tu leżą pliki `STOP` i `HARD_STOP`)."""
+    path = tmp_path / "data"
+    path.mkdir()
+    return path
+
+
+@pytest.fixture
+def kill(journal: Journal, clock: FakeClock, data_dir: Path, notifier: RecordingNotifier) -> KillSwitch:
+    return KillSwitch(journal, clock, data_dir, notifier)
+
+
+@pytest.fixture
+def gate(
+    risk_cfg: RiskConfig,
+    strat_cfg: StrategyConfig,
+    journal: Journal,
+    calendar: ExchangeCalendar,
+    clock: FakeClock,
+    kill: KillSwitch,
+) -> RiskGate:
+    """Bramka ryzyka z żywym kill switchem; domyślny `clock` to 08:30 w Berlinie, czyli przed oknem wejścia."""
+    return RiskGate(risk_cfg, strat_cfg, journal, calendar, clock, kill)
