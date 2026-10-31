@@ -267,6 +267,26 @@ Pisane przed kodem (TDD) dla automatu stanów, uzgadniania i ryzyka.
 
 Przy każdej deklaracji ukończenia obowiązuje weryfikacja uruchomieniem testów, a nie opis.
 
+### Gdzie biegną testy i CI
+
+| Rodzaj testu | Wymaga | Gdzie biegnie |
+|---|---|---|
+| Jednostkowe, awarie na `FakeBroker`, niezmienniki | Tylko Python, bez sieci i bez kluczy | Sesja deweloperska, VPS, CI |
+| Budowa obrazu Dockera i testy logiki uruchamiane w obrazie | Demon Dockera | CI i VPS |
+| Integracyjne na papierze (`integration_paper`) | Klucze paper i dostęp do Alpaca | **Tylko VPS** |
+| Pełne sesje paper (kryteria 2–3, bramka P) | Klucze, sieć, ciągła praca | **Tylko VPS** |
+
+CI to GitHub Actions (`.github/workflows/ci.yml`):
+
+- Wyzwalacze: `push`, `pull_request` i ręczne uruchomienie (`workflow_dispatch`).
+- Zadanie `tests`: macierz Python 3.12 i 3.13, instalacja z przypiętych wersji, `pytest -m "not integration_paper"`. Testy `integration_paper` mają znacznik i **nigdy nie biegną w CI**.
+- Zadanie `image`: budowa obrazu `python:3.12-slim` i uruchomienie w nim testów logiki, żeby wykryć braki w obrazie (np. bazę stref czasowych).
+- **CI nie dostaje żadnych sekretów Alpaca ani dostępu do VPS.** Klucze paper nigdy nie trafiają do sekretów GitHub. Wdrożenie na VPS jest ręczne (pobranie zmian i `docker compose`); automatyczny deploy z CI jest poza zakresem v1.
+- Higiena łańcucha dostaw: `permissions: contents: read`, akcje zewnętrzne przypięte do pełnego SHA commita.
+- Zielony CI na `main` jest warunkiem uznania zmiany za ukończoną i niezależnym potwierdzeniem testów uruchomionych lokalnie; nie zastępuje ich. Jeśli plan konta GitHub udostępnia ochronę gałęzi, ustawiamy wymóg zielonego CI przed scaleniem.
+- Wypchnięcie pliku workflow może wymagać dodatkowego uprawnienia integracji GitHub (pytanie 19). W razie odmowy właściciel dodaje plik przez interfejs GitHub, a jego treść podaje plan implementacji.
+- Limit minut CI zależy od planu konta; testy logiki są małe.
+
 ## 13. Wdrożenie i operacje
 
 - Jeden kontener `python:3.12-slim`, użytkownik bez uprawnień, system plików tylko do odczytu z tmpfs i wolumenem `/data` (SQLite). Limit pamięci 512 MB. Osobno od bota Solana, bez współdzielenia czegokolwiek.
@@ -277,6 +297,7 @@ Przy każdej deklaracji ukończenia obowiązuje weryfikacja uruchomieniem testó
 - Powiadomienia przez interfejs `Notifier`: w v1 log i plik alarmów; adapter Telegram jako późniejsze rozszerzenie.
 - Zużycie pamięci (założenie < 150 MB) mierzymy w kryteriach akceptacji, nie zakładamy.
 - W czasie awarii Alpaca silnik nie ponawia zleceń w pętli; przechodzi w kill switch miękki.
+- Wdrożenie na VPS jest ręczne i niezależne od CI (sekcja 12): CI nie ma ani kluczy, ani dostępu do serwera.
 
 ## 14. Struktura repozytorium i praca z Claude Code
 
@@ -285,6 +306,7 @@ pyproject.toml
 CLAUDE.md                     zasady pracy, komendy, zakazy
 .claude/settings.json         hooki fail-closed, reguły deny
 .claude/agents/               risk-reviewer, order-state-auditor, backtest-skeptic (tylko Read, Grep, Glob)
+.github/workflows/ci.yml      CI: testy logiki (Python 3.12 i 3.13) oraz w obrazie Dockera
 src/gwstock/                  config, clock, journal, broker, orders, reconcile, risk,
                               data, strategy, execution, costs, watchdog, report, app
 tests/                        unit, fault, integration_paper
@@ -303,7 +325,7 @@ Time-stop i wyjście po utracie momentum (parametry 180 s / +0,4% / stop −1,2%
 
 ## 16. Pytania otwarte i sposób rozstrzygnięcia
 
-Żadne nie blokuje pisania silnika na `FakeBroker`. Pytania 1–7 blokują bramkę A, pytania 8–13 i 17–18 rozstrzygamy testem na papierze przed pierwszym dniem pomiarowym, pytania 14–16 to doradca w Polsce.
+Żadne nie blokuje pisania silnika na `FakeBroker`. Pytania 1–7 blokują bramkę A, pytania 8–13 i 17–18 rozstrzygamy testem na papierze przed pierwszym dniem pomiarowym, pytania 14–16 to doradca w Polsce, a pytanie 19 rozstrzygamy przy pierwszej próbie wypchnięcia pliku workflow.
 
 | # | Pytanie | Kto / jak |
 |---|---|---|
@@ -323,10 +345,11 @@ Time-stop i wyjście po utracie momentum (parametry 180 s / +0,4% / stop −1,2%
 | 14–16 | Status podatkowy częstego handlu (art. 30b), kursy NBP, stanowisko KNF o reverse solicitation | Doradca podatkowy lub prawny w Polsce |
 | 17 | Czy noga stop z OTO dostaje właściwą ilość przy częściowym wypełnieniu wejścia | Test na papierze (losowe 10% częściowych wypełnień) |
 | 18 | Czy nogi OTO dziedziczą `client_order_id` albo jak je odnaleźć przez zlecenie nadrzędne | Test na papierze |
+| 19 | Czy integracja GitHub może wypychać pliki `.github/workflows` | Próba przy implementacji; w razie odmowy właściciel dodaje plik przez interfejs GitHub |
 
 ## 17. Kryteria akceptacji v1
 
-1. Wszystkie testy jednostkowe i awaryjne z sekcji 12 przechodzą; niezmienniki spełnione po każdym teście awarii.
+1. Wszystkie testy jednostkowe i awaryjne z sekcji 12 przechodzą (lokalnie i w CI, na Pythonie 3.12 i 3.13 oraz w obrazie Dockera); niezmienniki spełnione po każdym teście awarii.
 2. Pełna sesja na papierze na VPS bez ingerencji: skan → sygnał → wejście → stop → wyjście → spłaszczenie → raport.
 3. Zabicie procesu w środku wejścia i wyjścia: po restarcie brak zdublowanych zleceń i pozycji osieroconych, potwierdzone testem i na papierze.
 4. Ćwiczenia kill switcha: oba poziomy przez pliki, cisza strumienia i rozbieżność z brokerem zasymulowane.
