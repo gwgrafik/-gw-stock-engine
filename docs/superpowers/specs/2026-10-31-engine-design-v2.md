@@ -146,6 +146,8 @@ Są to **założenia projektowe, nie wyniki badań**. Przed pierwszą sesją `dr
 | `max_daily_loss` | 1,50 |
 | `max_total_drawdown` (od startu) | 12 |
 | `max_effective_leverage` (notional / `virtual_capital`) | 5 |
+| `margin_reserve_fraction` (rezerwa depozytu: blokada, gdy wymagany depozyt > dostępny × (1 − ułamek)) | 0,20 |
+| `range_minutes` (zakres otwarcia: minuty pierwszej świecy) | 5 |
 | `max_entries_per_day` | 1 |
 | `fixed_min_size_sessions` | 5 |
 | Odległość stopu | 0,10 × ATR14 |

@@ -1,0 +1,15 @@
+# dane robocze silnika (dziennik, ARM_LIVE, account.json) i notatki robocze agentów
+data/
+.superpowers/
+
+# Python
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.venv/
+venv*/
+
+# bazy, logi, sekrety
+*.sqlite*
+*.log
+.env

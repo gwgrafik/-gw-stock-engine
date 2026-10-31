@@ -1,0 +1,13 @@
+# Parametry strategii v1 (wartości startowe ze specyfikacji, sekcja 5).
+# Wartości ułamkowe i mnożniki są napisami (parsowane do Decimal); liczby TOML-float są odrzucane.
+# Zmiana któregokolwiek pola zmienia odcisk pre-rejestracji i tworzy nowy wariant (zwiększa K).
+
+instrument = "DE40"
+exchange_profile = "XETRA"
+range_minutes = 5                     # zakres otwarcia: minuty pierwszej świecy (09:00-09:05)
+stop_atr_fraction = "0.10"            # odległość stopu = 0,10 x ATR14
+min_stop_spread_multiple = "3"        # stop >= 3 x spread
+slippage_guard_fraction = "0.25"      # straż poślizgu: 25% odległości stopu
+flatten_before_close_min = 5          # spłaszczenie 5 minut przed zamknięciem (17:25)
+entry_deadline_after_range_min = 5    # wejście możliwe 09:05-09:10
+fixed_min_size_sessions = 5           # tyle pierwszych sesji live na stałej, minimalnej wielkości

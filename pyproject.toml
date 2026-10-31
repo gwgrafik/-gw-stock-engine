@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gwstock"
+version = "0.1.0"
+description = "Autonomiczny silnik handlowy (CFD na indeks DE40, Capital.com) jako narzędzie pomiarowe"
+requires-python = ">=3.12"
+dependencies = ["aiohttp"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "pyyaml"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration_live_readonly: testy na żywym koncie, tylko odczyt (uruchamiane ręcznie przez właściciela)",
+]

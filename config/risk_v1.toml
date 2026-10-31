@@ -1,0 +1,15 @@
+# Limity ryzyka v1 (wartości startowe ze specyfikacji, sekcja 5).
+# Kwoty i ułamki są napisami (parsowane do Decimal); liczby całkowite to liczniki i sekundy.
+
+virtual_capital = "40"                # EUR
+max_loss_per_trade = "1.00"           # EUR
+max_daily_loss = "1.50"               # EUR
+max_total_drawdown = "12"             # EUR od startu
+max_effective_leverage = "5"          # notional / virtual_capital
+max_entries_per_day = 1
+stale_quote_s = 60                    # cisza notowań (kill switch miękki)
+mismatch_tolerance_s = 60             # tolerancja rozbieżności z brokerem
+reconcile_interval_s = 10             # cykl uzgadniania w sesji
+ping_interval_s = 300                 # okres ping sesji (5 min)
+submit_timeout_s = 10                 # timeout SUBMITTING -> UNKNOWN
+margin_reserve_fraction = "0.20"      # brama MARGIN blokuje, gdy wymagany depozyt > dostępne x (1 - ułamek)

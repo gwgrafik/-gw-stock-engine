@@ -1,0 +1,5 @@
+# Konfiguracja uruchomieniowa. NIE wchodzi do odcisku pre-rejestracji.
+# live_allowed zmienia wyłącznie właściciel, razem z utworzeniem pliku data/ARM_LIVE (specyfikacja, sekcja 9).
+# Kod nigdy nie ustawia tej wartości. Brak pliku = false.
+
+live_allowed = false

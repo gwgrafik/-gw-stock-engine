@@ -1,0 +1,6 @@
+# Stawki kosztów v1 (specyfikacja, sekcja 10). Brak prowizji; finansowanie 0 (brak pozycji przez noc).
+
+entry_slippage_points = "0.5"         # poślizg na wejściu (punkty indeksu)
+stop_exit_extra_slippage_points = "1.0"  # dodatkowy poślizg przy wyjściu stopem (punkty)
+fx_markup = "0.004"                   # narzut walutowy (ułamek), liczony tylko gdy apply_fx_markup = true
+apply_fx_markup = false               # DE40 jest w EUR, konto w EUR: brak przewalutowania
