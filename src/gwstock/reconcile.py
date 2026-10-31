@@ -1,42 +1,65 @@
 """Uzgadnianie z brokerem (spec §7): broker jest źródłem prawdy, a dziennik dogania jego stan dla NASZEGO instrumentu.
 
 Przebieg `run_once` (zawsze w tej kolejności):
-1. bramka wejścia: gdy wejście jest w toku (`entry_gate()` zwraca True), przebieg jest pomijany bez żadnego
-   odczytu i zapisu (pozycja pojawiająca się w trakcie wejścia wyglądałaby na obcą);
-2. odczyty: dziennik (zlecenia nierozstrzygnięte, pozycja, znaczniki), potem broker: `list_positions`,
-   `list_working_orders` i tylko w razie potrzeby `closed_since`; każda odpowiedź brokera trafia do `append_raw`
-   (serializacja `dump`) przed interpretacją. Wyjątek brokera (`BrokerError`, w tym `SessionExpired`) albo dziennika
-   (`JournalWriteError`) przerywa przebieg, zanim zmieni się jakikolwiek stan: nieudany odczyt nigdy nie jest
-   dowodem braku pozycji i nie liczy się jako pusty odczyt;
-3. decyzja według macierzy §7, w całości przed pierwszym zapisem stanu;
-4. kill switch miękki (przed zapisami: awaria dziennika nie połknie alarmu), zdarzenia `reconcile.event`, zapisy:
-   naprawa SUBMITTING -> UNKNOWN i potwierdzenie z dziennika, licznik pustych odczytów, księgowanie zamknięcia
-   (przed FLAT), pozycja, zlecenia zamykane na podstawie pozycji (wiersz zlecenia na końcu, jak w menedżerze),
-   znacznik historii, znacznik rozbieżności. Przerwanie między zapisami zostawia stan, który kolejny przebieg
-   rozpoznaje i dokańcza (zlecenie nierozstrzygnięte z pozycją już OPEN/FLAT, pozycja OPEN po zaksięgowaniu).
+1. bramka wejścia: gdy wejście jest w toku (`entry_gate()` zwraca True), przebieg nie STARTUJE (bez żadnego
+   odczytu i zapisu; pozycja pojawiająca się w trakcie wejścia wyglądałaby na obcą);
+2. odczyty: migawka dziennika (zlecenia nierozstrzygnięte i pozycja instrumentu, znaczniki), potem broker:
+   `list_positions`, `list_working_orders` i tylko w razie potrzeby `closed_since`; każda odpowiedź brokera trafia
+   do `append_raw` (serializacja `dump`) przed interpretacją, a wyjątek odczytu do `broker.error` przed propagacją.
+   Wyjątek brokera (`BrokerError`, w tym `SessionExpired`) albo dziennika (`JournalWriteError`) przerywa przebieg,
+   zanim zmieni się jakikolwiek stan: nieudany odczyt nigdy nie jest dowodem braku pozycji ani pustym odczytem;
+3. decyzja według macierzy niżej, w całości przed pierwszym zapisem stanu;
+4. ponowne sprawdzenie (bez `await` między nim a pierwszym zapisem, więc atomowe w asyncio): bramka wejścia,
+   zlecenia nierozstrzygnięte i pozycja instrumentu muszą być takie jak w migawce; inaczej wynik `skipped=True`
+   bez żadnego zapisu, alarmu i zmiany znaczników (wejście lub wyjście zmieniło dziennik w trakcie odczytu
+   brokera; plan opiera się na nieaktualnej migawce). Bramka nie pozwala więc przebiegowi wystartować w trakcie
+   wejścia, a ponowne sprawdzenie nie pozwala mu zapisać ponad wejściem lub wyjściem, które zaszło w trakcie;
+   silnik (Zadanie 14) dodatkowo szereguje oba kierunki jedną blokadą;
+5. kill switch miękki (przed zapisami: awaria dziennika nie połknie alarmu), księgowanie zamknięcia (jedyny zapis
+   z `await`; idempotentny po `deal_id`, po nim migawka jest sprawdzana jeszcze raz), zdarzenia `reconcile.event`,
+   zapisy: naprawa SUBMITTING -> UNKNOWN i potwierdzenie z dziennika, licznik pustych odczytów, pozycja,
+   zlecenia zamykane na podstawie pozycji (wiersz zlecenia na końcu, jak w menedżerze), znacznik historii,
+   znacznik rozbieżności. Przerwanie między zapisami zostawia stan, który kolejny przebieg rozpoznaje i dokańcza.
+
+Macierz (J = pozycja w dzienniku, B = pozycje brokera na naszym instrumencie, D = deal_id zapisany w J):
+- INTENT: nic nie wysłano → NOT_PLACED ("ABANDONED_BEFORE_SEND"); SUBMITTING → UNKNOWN, dalej jak UNKNOWN;
+- UNKNOWN, J z D (OPEN/EXITING/BLOCKED; przerwanie między zapisami menedżera) → CONFIRMED(D), dalej macierz pozycji;
+- UNKNOWN, J ENTERING, jedno dopasowanie `match_entry_positions` → J OPEN z faktycznymi danymi brokera, CONFIRMED;
+  więcej dopasowań → BLOCKED + kill AMBIGUOUS_MATCH; brak dopasowania przy niepustym B (albo J FLAT i niepuste B:
+  sprzeczność z decyzją menedżera) → BLOCKED + kill FOREIGN_POSITION;
+- UNKNOWN, B puste: licznik pustych odczytów; po 3 i co najmniej 30 s od INTENT: historia od INTENT − 1 min;
+  zamknięcie na naszym instrumencie → BLOCKED + kill UNMATCHED_CLOSED_DEAL, inaczej NOT_PLACED (J ENTERING → FLAT);
+- UNKNOWN, J BLOCKED bez D: decyduje właściciel; więcej niż jedno zlecenie UNKNOWN → BLOCKED + kill;
+- brak zlecenia, J bez naszej pozycji: niepuste B → BLOCKED (bez pól) + kill FOREIGN_POSITION, nigdy nie dotykamy;
+  puste B → FLAT (także samoczynne BLOCKED → FLAT, gdy obca zniknęła); J OPEN/EXITING albo BLOCKED z polami
+  pozycji, ale bez D → BLOCKED do decyzji właściciela (nie da się sprawdzić ani zaksięgować);
+- D w B: zgodne kierunek i wielkość → odśwież pola (OPEN/EXITING bez zmiany stanu, BLOCKED → OPEN); różne →
+  BLOCKED z polami dziennika + kill SIDE_MISMATCH / SIZE_MISMATCH; brak stopu → `unprotected` (stop ustawia wykonawca);
+- D poza B: historia od max(znacznik, otwarcie) − 1 min, nie dawniej niż doba; jedno zamknięcie D → zaksięguj, FLAT;
+  więcej → BLOCKED + kill AMBIGUOUS_CLOSURE; brak → BLOCKED (zamknięcia nie wymyślamy);
+- inna pozycja w B obok D → BLOCKED + kill FOREIGN_POSITION; zlecenie oczekujące na naszym instrumencie →
+  `working_orders` + kill FOREIGN_WORKING_ORDER (nigdy nie anulujemy);
+- rozbieżność oczekująca (zlecenie nierozstrzygnięte albo J BLOCKED) dłużej niż `mismatch_tolerance_s` → kill
+  MISMATCH_TIMEOUT (znacznik `mismatch_since` w dzienniku).
 
 Niezmienniki (prawdziwe pieniądze):
-- uzgadnianie tylko CZYTA u brokera: nie zamyka pozycji, nie ustawia stopu, nie anuluje zleceń; pozycja bez stopu
-  trafia do `unprotected` (zabezpiecza ją wykonawca), zlecenie oczekujące do `working_orders` (decyduje właściciel);
+- uzgadnianie tylko CZYTA u brokera: nie zamyka pozycji, nie ustawia stopu, nie anuluje zleceń;
 - pozycji, której nie da się udowodnić jako naszej (nie wynika z naszego zlecenia ani z zapisu w dzienniku),
   nigdy nie przyjmujemy: BLOCKED i kill switch miękki; sprzeczne dowody tak samo;
-- BLOCKED z nierozstrzygniętym zleceniem rozstrzyga właściciel; pozostałe BLOCKED uzgadnianie zdejmuje samo, gdy
-  broker i dziennik znów się zgadzają (obca pozycja zniknęła, nasza wróciła na listę, jej zamknięcie jest
-  w historii); kill switch zostaje do decyzji właściciela;
+- BLOCKED z nierozstrzygniętym zleceniem albo z polami pozycji bez deal_id rozstrzyga właściciel; pozostałe BLOCKED
+  uzgadnianie zdejmuje samo, gdy broker i dziennik znów się zgadzają; kill switch zostaje do decyzji właściciela;
 - zamknięcie księgujemy przed przejściem do FLAT (błąd księgowania zostawia pozycję i powtarza się w następnym
-  przebiegu; księga jest idempotentna po `deal_id`), zamknięcia nigdy nie wymyślamy;
+  przebiegu), zamknięcia nigdy nie wymyślamy;
 - każda zmiana stanu przechodzi przez `check_order_transition` / `check_position_transition`; samo odświeżenie pól
   pozycji bez zmiany stanu nie jest przejściem automatu.
-
-Jeden wywołujący naraz (wątek decyzyjny silnika); równoległe wejście blokuje `entry_gate`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from gwstock.broker.base import Broker
 from gwstock.clock import Clock
@@ -45,12 +68,13 @@ from gwstock.journal import Journal, OrderRecord, PositionRecord
 from gwstock.orders.fsm import check_order_transition, check_position_transition
 from gwstock.orders.manager import UNKNOWN_CHECK_INTERVAL_S, UNKNOWN_CHECKS, match_entry_positions
 from gwstock.serialization import dump
-from gwstock.types import ClosedDeal, OpenPosition, OrderState, PositionState, WorkingOrder
+from gwstock.types import BrokerRejected, ClosedDeal, OpenPosition, OrderState, PositionState, WorkingOrder
 
 SOURCE_POSITIONS = "broker.list_positions"
 SOURCE_WORKING_ORDERS = "broker.list_working_orders"
 SOURCE_CLOSED = "broker.closed_since"
 SOURCE_EVENT = "reconcile.event"
+SOURCE_ERROR = "broker.error"  # wyjątek odczytu brokera (typ i treść), zapisany przed propagacją
 
 META_MISMATCH_SINCE = "mismatch_since"  # ISO-8601 pierwszego wykrycia rozbieżności oczekującej; "" = brak
 META_CLOSED_MARKER = "closed_marker"  # ISO-8601 czasu ostatniego zaksięgowanego zamknięcia
@@ -68,6 +92,8 @@ RECOVERED_FROM_SUBMITTING = "RECOVERED_FROM_SUBMITTING"
 _O = OrderState
 _P = PositionState
 _HELD = frozenset({_P.OPEN, _P.EXITING, _P.BLOCKED})  # stany, w których zapisany deal_id jest naszą pozycją
+
+T = TypeVar("T")
 
 
 class KillSink(Protocol):
@@ -162,16 +188,21 @@ class Reconciler:
         self._entry_gate = entry_gate
 
     async def run_once(self) -> ReconcileResult:
-        """Jeden przebieg uzgadniania. Wyjątki brokera i dziennika z odczytów propagują się bez zmiany stanu."""
-        if self._entry_gate is not None and self._entry_gate():
-            return ReconcileResult(False, ["SKIPPED_ENTRY_IN_FLIGHT"], [], [], skipped=True)
+        """Jeden przebieg uzgadniania. Wyjątki brokera i dziennika z odczytów propagują się bez zmiany stanu.
 
-        # 1. odczyty: dziennik, potem broker (surowa odpowiedź zapisana przed interpretacją)
-        orders = [o for o in self._journal.unresolved_orders() if o.epic == self._epic]
-        current = self._journal.current_position(self._epic) or PositionRecord(self._epic, _P.FLAT)
-        positions = await self._broker.list_positions()
+        `skipped=True`: wejście w toku (przed startem albo przed zapisami) albo dziennik zmienił się w trakcie
+        odczytu brokera; nic nie zapisano poza surowymi odpowiedziami brokera (wyjątek: zmiana wykryta dopiero po
+        księgowaniu; zamknięcie jest wtedy zaksięgowane, a księga jest idempotentna po `deal_id`).
+        """
+        if self._gate_closed():
+            return _skipped("SKIPPED_ENTRY_IN_FLIGHT")
+
+        # 1. odczyty: migawka dziennika, potem broker (surowa odpowiedź zapisana przed interpretacją)
+        orders, stored = self._snapshot()
+        current = stored or PositionRecord(self._epic, _P.FLAT)
+        positions = await self._read("list_positions", self._broker.list_positions())
         self._raw(SOURCE_POSITIONS, {"response": positions})
-        working = await self._broker.list_working_orders()
+        working = await self._read("list_working_orders", self._broker.list_working_orders())
         self._raw(SOURCE_WORKING_ORDERS, {"response": working})
         mine = [p for p in positions if p.epic == self._epic]
         working_ours = [w for w in working if w.epic == self._epic]
@@ -180,7 +211,7 @@ class Reconciler:
         plan = _Plan()
         live = self._plan_unresolved(plan, orders)
         ours, generic, final_check = self._plan_live_order(plan, live, current, mine)
-        closures = await self._read_history(ours if generic else None, mine, final_check)
+        closures = await self._read_history(plan, ours if generic else None, mine, final_check)
         if final_check is not None:
             self._plan_final_check(plan, final_check, current, closures)
         if generic:
@@ -192,11 +223,35 @@ class Reconciler:
         unresolved_left = any(o.order_id not in plan.resolved for o in live)
         self._plan_mismatch(plan, pending=unresolved_left or final.state is _P.BLOCKED)
 
-        # 3. alarm, zdarzenia, zapisy
-        await self._apply(plan, current)
+        # 3. ponowne sprawdzenie migawki, potem alarm i zapisy (bez `await` od sprawdzenia do pierwszego zapisu)
+        if self._gate_closed():
+            return _skipped("SKIPPED_ENTRY_IN_FLIGHT")
+        if self._snapshot() != (orders, stored):
+            return _skipped("SKIPPED_STATE_CHANGED")
+        if not await self._apply(plan, current, (orders, stored)):
+            return _skipped("SKIPPED_STATE_CHANGED")
         return ReconcileResult(
             final.state is _P.BLOCKED, plan.notes, plan.closed, plan.unprotected, working_orders=working_ours
         )
+
+    def _gate_closed(self) -> bool:
+        return self._entry_gate is not None and bool(self._entry_gate())
+
+    def _snapshot(self) -> tuple[list[OrderRecord], PositionRecord | None]:
+        """Zlecenia nierozstrzygnięte i zapisana pozycja NASZEGO instrumentu (to, na czym opiera się plan)."""
+        orders = [o for o in self._journal.unresolved_orders() if o.epic == self._epic]
+        return orders, self._journal.current_position(self._epic)
+
+    async def _read(self, call: str, pending: Awaitable[T]) -> T:
+        """Odczyt brokera; wyjątek trafia do `broker.error` (typ i treść) i propaguje się bez innych zapisów."""
+        try:
+            return await pending
+        except Exception as exc:
+            error: dict[str, Any] = {"call": call, "error": type(exc).__name__, "message": str(exc)}
+            if isinstance(exc, BrokerRejected):
+                error["reason"] = exc.reason
+            self._raw(SOURCE_ERROR, error)
+            raise
 
     # --- decyzje: zlecenia ----------------------------------------------------------------------
 
@@ -310,7 +365,9 @@ class Reconciler:
     ) -> None:
         """Macierz §7 dla pozycji, gdy nie ma zlecenia w toku albo zostało przyjęte (`ours`: nasza pozycja)."""
         if ours is None:
-            if current.state in (_P.OPEN, _P.EXITING):  # pozycja bez deal_id: nie da się jej sprawdzić ani zaksięgować
+            # Pozycja bez deal_id (OPEN/EXITING, albo już BLOCKED z polami pozycji): nie da się jej sprawdzić ani
+            # zaksięgować, więc zostaje BLOCKED do decyzji właściciela (nigdy samo do FLAT).
+            if current.state in (_P.OPEN, _P.EXITING) or (current.state is _P.BLOCKED and _has_fields(current)):
                 plan.position = replace(current, state=_P.BLOCKED)
                 plan.record("LOCAL_POSITION_WITHOUT_DEAL", journal=current.state)
                 if mine:
@@ -364,9 +421,8 @@ class Reconciler:
                 target = replace(ours, state=_P.BLOCKED)  # zamknięcia nie wymyślamy: rozbieżność oczekująca
                 plan.record("LOCAL_POSITION_MISSING", deal_id=ours.deal_id)
         if others:
-            target = replace(target, state=_P.BLOCKED) if target.state is not _P.FLAT else (
-                PositionRecord(self._epic, _P.BLOCKED)
-            )
+            # zachowuje pola naszej pozycji; po zaksięgowaniu (FLAT bez pól) BLOCKED bez pól zdejmie się sam
+            target = replace(target, state=_P.BLOCKED)
             plan.kill("FOREIGN_POSITION")
             plan.record("FOREIGN_POSITION", deal_ids=[p.deal_id for p in others], ours=ours.deal_id)
         plan.position = target
@@ -389,10 +445,11 @@ class Reconciler:
     # --- odczyty pomocnicze ---------------------------------------------------------------------
 
     async def _read_history(
-        self, ours: PositionRecord | None, mine: list[OpenPosition], final_check: OrderRecord | None
+        self, plan: _Plan, ours: PositionRecord | None, mine: list[OpenPosition], final_check: OrderRecord | None
     ) -> list[ClosedDeal]:
         """`closed_since` tylko gdy potrzebne: nasza pozycja zniknęła z listy albo zlecenie UNKNOWN ma zostać
-        NOT_PLACED. Jeden odczyt od najwcześniejszej potrzebnej chwili."""
+        NOT_PLACED. Jeden odczyt od najwcześniejszej potrzebnej chwili, nie dawniej niż `HISTORY_FALLBACK` (historia
+        brokera sięga 1 dnia; zamknięcie sprzed tej granicy jest nieosiągalne, więc pozycja zostaje BLOCKED)."""
         starts = []
         if ours is not None and not any(p.deal_id == ours.deal_id for p in mine):
             starts.append(self._history_start(ours))
@@ -400,8 +457,12 @@ class Reconciler:
             starts.append(final_check.created_at - HISTORY_MARGIN)
         if not starts:
             return []
-        since = min(starts)
-        closures = await self._broker.closed_since(since)
+        wanted = min(starts)
+        floor = self._clock.now_utc() - HISTORY_FALLBACK
+        since = max(wanted, floor)
+        if since > wanted:
+            plan.record("HISTORY_CLAMPED", wanted=wanted, since=since)
+        closures = await self._read("closed_since", self._broker.closed_since(since))
         self._raw(SOURCE_CLOSED, {"since": since, "response": closures})
         return closures
 
@@ -419,9 +480,17 @@ class Reconciler:
 
     # --- zapisy ---------------------------------------------------------------------------------
 
-    async def _apply(self, plan: _Plan, current: PositionRecord) -> None:
+    async def _apply(
+        self, plan: _Plan, current: PositionRecord, snapshot: tuple[list[OrderRecord], PositionRecord | None]
+    ) -> bool:
+        """Alarm i zapisy planu. Wywoływane tuż po sprawdzeniu migawki; jedyny `await` to księgowanie, po którym
+        migawka jest sprawdzana ponownie (False: zmieniła się, reszta zapisów pominięta; księga jest idempotentna)."""
         for reason in plan.kills:
             self._kill.soft(reason)
+        if plan.book is not None and self._booker is not None:
+            await self._booker.book(*plan.book)  # błąd: pozycja zostaje, następny przebieg ponowi
+            if self._gate_closed() or self._snapshot() != snapshot:
+                return False
         for event in plan.events:
             self._raw(SOURCE_EVENT, event)
         for write in plan.orders_before:
@@ -429,8 +498,6 @@ class Reconciler:
         if plan.empty_reads is not None:
             key, reads = plan.empty_reads
             self._journal.set_meta(key, str(reads))
-        if plan.book is not None and self._booker is not None:
-            await self._booker.book(*plan.book)  # błąd: pozycja zostaje, następny przebieg ponowi
         if plan.position is not None:
             self._move_position(current, plan.position)
         for write in plan.orders_after:
@@ -442,6 +509,7 @@ class Reconciler:
                 self._journal.set_meta(META_CLOSED_MARKER, latest.isoformat())
         if plan.mismatch_since is not None:
             self._journal.set_meta(META_MISMATCH_SINCE, plan.mismatch_since)
+        return True
 
     def _write_order(self, write: _OrderWrite) -> None:
         fields: dict[str, Any] = {"note": write.note, "updated_at": self._clock.now_utc()}
@@ -462,6 +530,15 @@ class Reconciler:
 
     def _raw(self, source: str, payload: dict[str, Any]) -> None:
         self._journal.append_raw(source, dump(payload), self._clock.now_utc())
+
+
+def _skipped(code: str) -> ReconcileResult:
+    return ReconcileResult(False, [code], [], [], skipped=True)
+
+
+def _has_fields(rec: PositionRecord) -> bool:
+    """Zapis zawiera dane pozycji (kierunek lub wielkość), czyli coś, czego nie wolno po cichu wyzerować."""
+    return rec.side is not None or rec.size is not None
 
 
 def _ours(current: PositionRecord) -> PositionRecord | None:

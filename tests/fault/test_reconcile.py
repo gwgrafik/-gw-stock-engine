@@ -9,6 +9,7 @@ Niezmienniki pod lupą (prawdziwe pieniądze):
 """
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -34,6 +35,13 @@ SECONDS = timedelta(seconds=1)
 
 
 # --- pomocnicze -------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def broker_is_only_read(fake):
+    """Po każdym teście: uzgadnianie wywołało u brokera wyłącznie odczyty (testy z menedżerem czyszczą `calls`)."""
+    yield
+    assert set(fake.calls) <= READ_ONLY, f"reconciler called a non-read broker method: {fake.calls}"
 
 
 def seed_order(journal, state, *, created_at=T0, order_id=OID, epic=EPIC, side=Side.BUY):
@@ -144,8 +152,25 @@ async def test_submitting_is_recovered_to_unknown_then_adopted(journal, fake, re
     assert not result.blocked and kill_sink.calls == []
 
 
-@pytest.mark.parametrize("pos", [PositionRecord(EPIC, P.ENTERING), None], ids=["entering", "no_position_row"])
-async def test_intent_is_abandoned_before_send(journal, fake, reconciler, kill_sink, pos):
+async def test_adopted_position_without_stop_is_reported_unprotected(journal, fake, reconciler, kill_sink):
+    seed_order(journal, O.UNKNOWN)
+    entering(journal)
+    naked = at_broker(stop=None, opened_at=T0 + SECONDS)
+    put(fake, naked)
+
+    result = await reconciler.run_once()
+
+    assert order(journal).state is O.CONFIRMED and position(journal) == held(stop=None, opened_at=T0 + SECONDS)
+    assert result.unprotected == [naked] and has_note(result, "UNPROTECTED")
+    assert not result.blocked and kill_sink.calls == [] and fake.calls == READS  # stop ustawia wykonawca
+
+
+@pytest.mark.parametrize(
+    ("pos", "expected"),
+    [(PositionRecord(EPIC, P.ENTERING), PositionRecord(EPIC, P.FLAT)), (None, None)],
+    ids=["entering_to_flat", "no_position_row_stays_absent"],
+)
+async def test_intent_is_abandoned_before_send(journal, fake, reconciler, kill_sink, pos, expected):
     seed_order(journal, O.INTENT)
     if pos is not None:
         journal.upsert_position(pos)
@@ -153,7 +178,7 @@ async def test_intent_is_abandoned_before_send(journal, fake, reconciler, kill_s
     result = await reconciler.run_once()
 
     assert order(journal).state is O.NOT_PLACED and order(journal).note == "ABANDONED_BEFORE_SEND"
-    assert position(journal) in (PositionRecord(EPIC, P.FLAT), None)
+    assert position(journal) == expected
     assert not result.blocked and kill_sink.calls == [] and fake.calls == READS
 
 
@@ -361,6 +386,39 @@ async def test_extra_position_on_our_epic_while_open_blocks(journal, fake, recon
     assert result.blocked and kill_sink.calls == ["FOREIGN_POSITION"] and fake.calls == READS
 
 
+async def test_closure_with_foreign_position_books_once_and_blocks_until_it_vanishes(
+    journal, fake, reconciler, booker, kill_sink, clock
+):
+    journal.upsert_position(held())
+    put(fake, at_broker())
+    clock.advance(30)
+    fake.trigger_stop("DEAL-1", STOP)
+    put(fake, at_broker("DEAL-9", opened_at=T0 - timedelta(hours=1)))
+
+    first = await reconciler.run_once()
+
+    assert len(first.closed) == 1 and len(booker.calls) == 1
+    assert position(journal) == PositionRecord(EPIC, P.BLOCKED)  # nasza zamknięta, obca zostaje: bez pól
+    assert first.blocked and kill_sink.calls == ["FOREIGN_POSITION"]
+    second = await reconciler.run_once()
+    assert second.blocked and second.closed == [] and len(booker.calls) == 1
+    del fake.positions["DEAL-9"]
+    third = await reconciler.run_once()
+    assert not third.blocked and position(journal) == PositionRecord(EPIC, P.FLAT) and len(booker.calls) == 1
+
+
+async def test_adoption_with_extra_foreign_position_confirms_and_blocks(journal, fake, reconciler, kill_sink):
+    seed_order(journal, O.UNKNOWN)
+    entering(journal)
+    put(fake, at_broker(opened_at=T0 + SECONDS), at_broker("DEAL-9", opened_at=T0 - timedelta(hours=1)))
+
+    result = await reconciler.run_once()
+
+    assert order(journal).state is O.CONFIRMED and order(journal).deal_id == "DEAL-1"  # pasuje tylko DEAL-1
+    assert position(journal) == held(P.BLOCKED, opened_at=T0 + SECONDS)  # nasza w zapisie, obca blokuje
+    assert result.blocked and kill_sink.calls == ["FOREIGN_POSITION"]
+
+
 async def test_blocked_foreign_position_clears_when_it_vanishes(journal, fake, reconciler, kill_sink):
     put(fake, at_broker("DEAL-9", opened_at=T0 - timedelta(hours=1)))
     assert (await reconciler.run_once()).blocked
@@ -455,6 +513,7 @@ async def test_blocked_position_recovers_to_open_when_broker_lists_it_again(jour
     result = await reconciler.run_once()
 
     assert position(journal) == held() and not result.blocked and kill_sink.calls == []
+    assert has_note(result, "BLOCK_CLEARED")
     assert not journal.get_meta("mismatch_since")
 
 
@@ -482,12 +541,16 @@ async def test_stale_history_for_other_epics_and_deals_is_ignored(journal, fake,
     assert position(journal) == held(P.BLOCKED) and has_note(result, "LOCAL_POSITION_MISSING")
 
 
-async def test_local_open_position_without_deal_id_is_blocked_not_cleared(journal, fake, reconciler, booker):
-    journal.upsert_position(PositionRecord(EPIC, P.OPEN))  # nie da się jej sprawdzić ani zaksięgować
+async def test_local_position_without_deal_id_stays_blocked_until_the_owner_decides(journal, fake, reconciler, booker):
+    no_deal = held(deal_id=None)  # pola pozycji są, deal_id brak: nie da się jej sprawdzić ani zaksięgować
+    journal.upsert_position(no_deal)
 
-    result = await reconciler.run_once()
+    first = await reconciler.run_once()
+    second = await reconciler.run_once()  # bez zaksięgowania nigdy samo do FLAT
 
-    assert position(journal) == PositionRecord(EPIC, P.BLOCKED) and result.blocked and booker.calls == []
+    assert position(journal) == replace(no_deal, state=P.BLOCKED)
+    assert first.blocked and second.blocked and booker.calls == []
+    assert has_note(first, "LOCAL_POSITION_WITHOUT_DEAL") and has_note(second, "LOCAL_POSITION_WITHOUT_DEAL")
 
 
 async def test_closed_marker_advances_and_bounds_the_next_history_read(journal, fake, reconciler, clock):
@@ -504,6 +567,48 @@ async def test_closed_marker_advances_and_bounds_the_next_history_read(journal, 
 
     assert payloads(journal, "broker.closed_since")[-1]["since"] == (marker - timedelta(minutes=1)).isoformat()
     assert journal.get_meta("closed_marker") == marker.isoformat()  # bez zamknięcia znacznik stoi
+
+
+async def test_closed_marker_never_moves_backwards(journal, fake, reconciler, clock):
+    later = T0 + 630 * SECONDS  # znacznik późniejszy niż zamknięcie, ale w zapasie zakresu historii (1 min)
+    journal.set_meta("closed_marker", later.isoformat())
+    journal.upsert_position(held())
+    put(fake, at_broker())
+    clock.advance(600)
+    fake.trigger_stop("DEAL-1", STOP)
+
+    result = await reconciler.run_once()
+
+    assert len(result.closed) == 1 and result.closed[0].ts == T0 + 600 * SECONDS
+    assert journal.get_meta("closed_marker") == later.isoformat()
+
+
+async def test_history_start_is_clamped_to_one_day(journal, fake, reconciler, clock, kill_sink):
+    journal.upsert_position(held(opened_at=T0 - timedelta(hours=1)))
+    put(fake, at_broker(opened_at=T0 - timedelta(hours=1)))
+    fake.trigger_stop("DEAL-1", STOP)  # zamknięcie sprzed ponad doby: poza zasięgiem historii brokera
+    clock.advance(2 * 24 * 3600)
+    now = T0 + timedelta(days=2)
+
+    result = await reconciler.run_once()
+
+    assert payloads(journal, "broker.closed_since")[-1]["since"] == (now - timedelta(days=1)).isoformat()
+    assert has_note(result, "HISTORY_CLAMPED") and has_note(result, "LOCAL_POSITION_MISSING")
+    assert position(journal) == held(P.BLOCKED, opened_at=T0 - timedelta(hours=1)) and result.closed == []
+    clock.advance(61)
+    await reconciler.run_once()
+    assert kill_sink.calls == ["MISMATCH_TIMEOUT"]  # alarm: nierozstrzygnięta rozbieżność
+
+
+async def test_final_check_history_start_is_clamped_to_one_day(journal, fake, reconciler, clock):
+    seed_order(journal, O.UNKNOWN, created_at=T0 - timedelta(days=3))  # porzucone dawno (np. długi przestój)
+    entering(journal)
+    for _ in range(3):
+        result = await reconciler.run_once()
+
+    assert payloads(journal, "broker.closed_since")[-1]["since"] == (T0 - timedelta(days=1)).isoformat()
+    assert has_note(result, "HISTORY_CLAMPED")
+    assert order(journal).state is O.NOT_PLACED
 
 
 # --- §7 wiersz 4: różnica wielkości lub kierunku → BLOCKED, alarm ---------------------------------------
@@ -562,6 +667,45 @@ async def test_unprotected_position_is_reported(journal, fake, reconciler, kill_
     assert fake.calls == READS  # brak set_stop
     assert position(journal) == held(stop=None)  # dziennik odzwierciedla brokera
     assert not result.blocked and kill_sink.calls == []
+
+
+# --- EXITING: wyjście silnika w toku (pozycja → EXITING przed wywołaniem zamykającym) ---------------------
+
+
+async def test_exiting_position_listed_with_changed_levels_stays_exiting(journal, fake, reconciler, kill_sink):
+    journal.upsert_position(held(P.EXITING))
+    moved = at_broker(stop=STOP + Decimal("5"))
+    put(fake, moved)
+
+    result = await reconciler.run_once()
+
+    assert position(journal) == held(P.EXITING, stop=STOP + Decimal("5"))  # odświeżone pola, stan bez zmiany
+    assert not result.blocked and kill_sink.calls == []
+
+
+async def test_exiting_position_gone_with_closure_is_booked_once_then_flat(journal, fake, reconciler, booker, clock):
+    journal.upsert_position(held(P.EXITING))
+    put(fake, at_broker())
+    clock.advance(30)
+    await fake.close_position("DEAL-1")  # wywołanie zamykające wykonawcy dotarło, odpowiedź już nie
+    fake.calls.clear()
+
+    result = await reconciler.run_once()
+
+    assert len(result.closed) == 1 and result.closed[0].reason == "MANUAL"
+    assert booker.calls == [(held(P.EXITING), result.closed[0])]
+    assert position(journal) == PositionRecord(EPIC, P.FLAT) and not result.blocked
+    again = await reconciler.run_once()
+    assert again.closed == [] and len(booker.calls) == 1
+
+
+async def test_exiting_position_gone_without_closure_is_blocked(journal, fake, reconciler, booker, kill_sink):
+    journal.upsert_position(held(P.EXITING))
+
+    result = await reconciler.run_once()
+
+    assert position(journal) == held(P.BLOCKED) and has_note(result, "LOCAL_POSITION_MISSING")
+    assert result.blocked and booker.calls == [] and kill_sink.calls == []
 
 
 # --- §7 akapit końcowy: nierozstrzygnięta rozbieżność > 60 s → kill switch miękki --------------------------
@@ -682,6 +826,19 @@ async def test_broker_error_mid_read_leaves_journal_untouched(journal, fake, rec
     assert order(journal).state is O.NOT_PLACED and order(journal).note == "NOT_FOUND_BY_RECONCILER READS=3"
 
 
+async def test_broker_read_error_is_journaled_before_propagating(journal, fake, reconciler, kill_sink):
+    fake.fail_next("list_working_orders", SessionExpired("401 session expired"))
+    before = snapshot(journal)
+
+    with pytest.raises(SessionExpired):
+        await reconciler.run_once()
+
+    assert payloads(journal, "broker.error") == [
+        {"call": "list_working_orders", "error": "SessionExpired", "message": "401 session expired"}
+    ]
+    assert snapshot(journal) == before and journal.events("reconcile.event") == [] and kill_sink.calls == []
+
+
 async def test_history_read_failure_neither_books_nor_blocks(journal, fake, reconciler, booker):
     journal.upsert_position(held())
     fake.fail_next("closed_since", SessionExpired("401"))
@@ -716,6 +873,104 @@ async def test_soft_kill_survives_a_failing_state_write(journal, fake, reconcile
 
     assert kill_sink.calls == ["FOREIGN_POSITION"]  # alarm przed zapisami: awaria dziennika go nie połyka
     assert position(journal) is None and fake.calls == READS
+
+
+# --- migawka dziennika sprawdzana ponownie tuż przed zapisami ---------------------------------------------
+
+
+def complete_entry(journal, fake):
+    """Wejście menedżera kończy się w trakcie odczytu: zlecenie CONFIRMED, pozycja OPEN u brokera i w dzienniku."""
+    now = T0
+    journal.insert_order(OrderRecord(OID, EPIC, Side.BUY, SIZE, Decimal("30"), O.CONFIRMED, "REF-1", "DEAL-1", now, now))
+    journal.upsert_position(held())
+    put(fake, at_broker())
+
+
+async def test_entry_completing_during_the_broker_read_is_not_overwritten(journal, fake, reconciler, kill_sink, booker):
+    fake.on_call("list_positions", lambda: complete_entry(journal, fake), once=True)
+
+    result = await reconciler.run_once()
+
+    assert result.skipped and has_note(result, "SKIPPED_STATE_CHANGED") and not result.blocked
+    assert position(journal) == held() and order(journal).state is O.CONFIRMED  # nic nie nadpisano
+    assert kill_sink.calls == [] and booker.calls == [] and journal.events("reconcile.event") == []
+    assert journal.get_meta("mismatch_since") is None
+    normal = await reconciler.run_once()  # następny przebieg widzi już nasze wejście
+    assert not normal.skipped and not normal.blocked and position(journal) == held()
+
+
+async def test_entry_starting_during_the_broker_read_skips_the_writes(journal, fake, clock, kill_sink, risk_cfg):
+    in_flight = {"value": False}
+    gated = Reconciler(journal, fake, clock, kill_sink, risk_cfg, EPIC, entry_gate=lambda: in_flight["value"])
+    put(fake, at_broker("DEAL-9", opened_at=T0 - timedelta(hours=1)))
+    fake.on_call("list_working_orders", lambda: in_flight.update(value=True), once=True)
+
+    result = await gated.run_once()
+
+    assert result.skipped and has_note(result, "SKIPPED_ENTRY_IN_FLIGHT")
+    assert position(journal) is None and kill_sink.calls == [] and journal.events("reconcile.event") == []
+
+
+async def test_exit_starting_during_the_broker_read_is_not_overwritten(journal, fake, reconciler, kill_sink):
+    journal.upsert_position(held())
+    put(fake, at_broker(stop=STOP + Decimal("5")))  # plan: odświeżyć OPEN nowym stopem
+    fake.on_call("list_working_orders", lambda: journal.upsert_position(held(P.EXITING)), once=True)
+
+    result = await reconciler.run_once()
+
+    assert result.skipped and position(journal) == held(P.EXITING)  # EXITING wykonawcy zostaje
+    assert kill_sink.calls == []
+
+
+async def test_order_change_during_the_broker_read_skips_the_writes(journal, fake, reconciler, clock):
+    seed_order(journal, O.UNKNOWN, created_at=T0 - timedelta(minutes=1))
+    entering(journal)
+    for _ in range(2):
+        await reconciler.run_once()
+    before = snapshot(journal)
+
+    def manager_annotates():  # pozycja bez zmian, zmienia się tylko wiersz zlecenia
+        journal.update_order(OID, note="CHECKS_INCOMPLETE CAUSE=open_position:BrokerTimeout", updated_at=T0)
+
+    fake.on_call("list_positions", manager_annotates, once=True)
+
+    result = await reconciler.run_once()  # plan: trzeci pusty odczyt → NOT_PLACED, na nieaktualnym rekordzie
+
+    assert result.skipped and order(journal).state is O.UNKNOWN
+    assert order(journal).note == "CHECKS_INCOMPLETE CAUSE=open_position:BrokerTimeout"
+    assert journal.get_meta(EMPTY_READS) == before[2][EMPTY_READS] == "2" and position(journal) == before[1]
+
+
+async def test_position_change_during_booking_stops_the_remaining_writes(journal, fake, clock, kill_sink, risk_cfg):
+    class ConcurrentBooker:
+        calls = 0
+
+        async def book(self, position, closed):
+            ConcurrentBooker.calls += 1
+            journal.upsert_position(held(P.EXITING))  # inny piszący zmienił pozycję w trakcie księgowania
+
+    rec = Reconciler(journal, fake, clock, kill_sink, risk_cfg, EPIC, booker=ConcurrentBooker())
+    journal.upsert_position(held())
+    put(fake, at_broker())
+    fake.trigger_stop("DEAL-1", STOP)
+
+    result = await rec.run_once()
+
+    assert ConcurrentBooker.calls == 1 and result.skipped and result.closed == []
+    assert position(journal) == held(P.EXITING) and journal.get_meta("closed_marker") is None
+
+
+async def test_unrelated_journal_change_during_the_read_does_not_skip(journal, fake, reconciler, kill_sink):
+    put(fake, at_broker("DEAL-9", opened_at=T0 - timedelta(hours=1)))
+    fake.on_call(
+        "list_positions",
+        lambda: seed_order(journal, O.UNKNOWN, order_id="gws-20261102-US500-1-entry", epic="US500"),
+        once=True,
+    )
+
+    result = await reconciler.run_once()
+
+    assert not result.skipped and result.blocked and kill_sink.calls == ["FOREIGN_POSITION"]
 
 
 async def test_broker_responses_are_journaled_before_any_decision(journal, fake, clock, risk_cfg, monkeypatch):

@@ -49,11 +49,12 @@ ALLOWED_ORDER_TRANSITIONS: Mapping[OrderState, frozenset[OrderState]] = MappingP
 })
 
 # Pozycja. Nie ma krawędzi FLAT -> OPEN/EXITING ani ENTERING -> EXITING: NASZA pozycja powstaje tylko przez
-# ENTERING potwierdzone przez brokera. FLAT -> BLOCKED: uzgadnianie wykryło u brokera obcą pozycję na naszym
-# instrumencie, gdy byliśmy FLAT (nie przyjmujemy jej, blokujemy). BLOCKED opuszcza wyłącznie decyzja rekoncyliacji
-# lub właściciela.
+# ENTERING potwierdzone przez brokera. FLAT -> BLOCKED: uzgadnianie przy FLAT ma dowody, których nie umie przypisać
+# (obca pozycja na naszym instrumencie; pozycja sprzeczna z decyzją menedżera, gdy zlecenie jest UNKNOWN, a dziennik
+# FLAT; zamknięcie w historii bez dopasowanego zlecenia, UNMATCHED_CLOSED_DEAL): nie przyjmujemy, blokujemy.
+# BLOCKED opuszcza wyłącznie decyzja rekoncyliacji lub właściciela.
 ALLOWED_POSITION_TRANSITIONS: Mapping[PositionState, frozenset[PositionState]] = MappingProxyType({
-    # ENTERING: wejście zapisane (INTENT); BLOCKED: obca pozycja wykryta przez uzgadnianie
+    # ENTERING: wejście zapisane (INTENT); BLOCKED: uzgadnianie (obca pozycja lub niedopasowane zamknięcie)
     _P.FLAT: frozenset({_P.ENTERING, _P.BLOCKED}),
     # OPEN: broker potwierdził; FLAT: wejście odrzucone lub niezłożone
     _P.ENTERING: frozenset({_P.OPEN, _P.FLAT, _P.BLOCKED}),

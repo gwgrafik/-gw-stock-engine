@@ -57,7 +57,7 @@ V1_ORDER_STATES = set(OrderState) - EXTENDED_ORDER_STATES
 
 POSITION_EDGES = [
     (P.FLAT, P.ENTERING),
-    (P.FLAT, P.BLOCKED),  # uzgadnianie wykryło obcą pozycję na naszym instrumencie, gdy byliśmy FLAT
+    (P.FLAT, P.BLOCKED),  # uzgadnianie przy FLAT: obca pozycja, sprzeczność z dziennikiem, niedopasowane zamknięcie
     (P.ENTERING, P.OPEN),  # broker potwierdził
     (P.ENTERING, P.FLAT),  # wejście odrzucone / niezłożone
     (P.ENTERING, P.BLOCKED),
