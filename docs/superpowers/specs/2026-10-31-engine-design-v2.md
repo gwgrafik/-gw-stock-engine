@@ -151,6 +151,7 @@ Są to **założenia projektowe, nie wyniki badań**. Przed pierwszym dniem na d
 | Tolerancja rozbieżności z brokerem | 60 s |
 | Cykl uzgadniania w sesji | 10 s |
 | Okres ping sesji | 5 min |
+| Termin wejścia po zakresie otwarcia | 5 min (wejście możliwe 09:35–09:40 ET; po terminie `NO_SIGNAL_DATA`) |
 
 **Wykonalność na koncie 20 USD.** Przy jednym kontrakcie wartość pozycji na US100 jest o rząd wielkości większa niż 20 USD, a przy dźwigni 20:1 (limit ESMA dla indeksów) i depozycie 5% minimalna pozycja wymaga zapewne kilkuset USD depozytu. Faktyczną minimalną wielkość zmierzymy na demo (`GET /markets/{instrument}`). To oznacza, że na koncie rzędu 20 USD ten wariant może być w ogóle niewykonalny na live, a demo sprawdza wyłącznie hydraulikę.
 
