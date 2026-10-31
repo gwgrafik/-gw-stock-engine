@@ -14,7 +14,8 @@ from gwstock.broker.fake import FakeBroker
 from gwstock.clock import FakeClock
 from gwstock.config import CostConfig, RiskConfig, StrategyConfig, load_config
 from gwstock.journal import Journal
-from gwstock.types import InstrumentRules, Quote
+from gwstock.orders.manager import OrderManager
+from gwstock.types import EntryRequest, InstrumentRules, Quote, Side
 
 
 @pytest.fixture
@@ -72,3 +73,14 @@ def journal(tmp_path) -> Iterator[Journal]:
     j = Journal.open(str(tmp_path / "journal.sqlite"))
     yield j
     j.close()
+
+
+@pytest.fixture
+def req() -> EntryRequest:
+    """Wejście BUY DE40, wielkość 0.007, stop 30 pkt; identyfikator z dnia fixture `clock`."""
+    return EntryRequest("gws-20261102-DE40-1-entry", "DE40", Side.BUY, Decimal("0.007"), Decimal("30"))
+
+
+@pytest.fixture
+def mgr(journal: Journal, fake: FakeBroker, clock: FakeClock, risk_cfg: RiskConfig) -> OrderManager:
+    return OrderManager(journal, fake, clock, risk_cfg)
