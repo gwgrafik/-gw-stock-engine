@@ -1,6 +1,7 @@
 """Testy FakeBroker: realistyczny broker testowy z pełnym sterowaniem (podstawa testów awarii)."""
 
 import inspect
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -17,6 +18,7 @@ from gwstock.types import (
     ClosedDeal,
     EntryRequest,
     MarketClosed,
+    OpenPosition,
     Quote,
     SessionExpired,
     Side,
@@ -25,6 +27,7 @@ from gwstock.types import (
 from tests.unit.broker_contract import BrokerContract
 
 UTC = timezone.utc
+T0 = datetime(2026, 11, 2, 7, 30, tzinfo=UTC)  # = clock.now_utc() na starcie fixture `clock`
 PROTOCOL_METHODS = {name for name, member in vars(Broker).items() if inspect.iscoroutinefunction(member)}
 
 
@@ -53,6 +56,14 @@ class TestFakeBrokerContract(BrokerContract):
     @pytest.fixture
     def add_working_order(self, fake):
         return fake.add_working_order
+
+    @pytest.fixture
+    def reject_next_entry(self, fake):
+        return fake.reject_next_entry
+
+    @pytest.fixture
+    def expire_session(self, fake):
+        return fake.expire_session
 
 
 # --- testy z planu -------------------------------------------------------------
@@ -148,10 +159,58 @@ async def test_references_and_deal_ids_are_deterministic(fake):
     assert (await fake.confirm("REF-2")).deal_id == "DEAL-2"
 
 
-async def test_confirm_returns_none_once_position_is_gone(fake):
-    ack = await fake.open_position(entry())
+async def test_confirm_returns_fill_snapshot_after_position_is_closed_or_stopped(fake):
+    await open_and_confirm(fake, entry(Side.BUY))
+    await open_and_confirm(fake, entry(Side.SELL))
     await fake.close_position("DEAL-1")
-    assert await fake.confirm(ack.deal_reference) is None
+    fake.trigger_stop("DEAL-2", Decimal("25812"))
+    assert await fake.list_positions() == []
+    assert await fake.confirm("REF-1") == OpenPosition(
+        "DEAL-1", "DE40", Side.BUY, Decimal("0.007"), Decimal("25782.3"), Decimal("25752.3"), T0
+    )
+    assert await fake.confirm("REF-2") == OpenPosition(
+        "DEAL-2", "DE40", Side.SELL, Decimal("0.007"), Decimal("25780.3"), Decimal("25810.3"), T0
+    )
+
+
+async def test_confirm_snapshot_keeps_fill_time_stop_after_set_stop(fake):
+    pos = await open_and_confirm(fake)
+    await fake.set_stop(pos.deal_id, Decimal("25700"))
+    assert (await fake.confirm("REF-1")).stop_level == Decimal("25752.3")
+    assert fake.positions[pos.deal_id].stop_level == Decimal("25700")
+
+
+# --- odrzucenie odroczone (dealStatus REJECTED w potwierdzeniu) -----------------------
+
+
+async def test_rejected_deal_is_acked_then_confirm_raises_and_no_position_exists(fake):
+    fake.reject_next_entry("INSUFFICIENT_FUNDS")
+    ack = await fake.open_position(entry())
+    assert ack.deal_reference == "REF-1" and fake.positions == {}
+    with pytest.raises(BrokerRejected) as info:
+        await fake.confirm("REF-1")
+    assert info.value.reason == "INSUFFICIENT_FUNDS"
+    pos = await open_and_confirm(fake)
+    assert pos.deal_id == "DEAL-1"  # odrzucone zlecenie nie zużyło identyfikatora pozycji
+
+
+async def test_deferred_rejections_are_fifo_and_wait_for_an_entry_that_reaches_the_broker(fake):
+    fake.reject_next_entry("FIRST")
+    fake.reject_next_entry("SECOND")
+    with pytest.raises(BrokerRejected) as native:
+        await fake.open_position(entry(size="0.0005"))  # odrzucone od razu: nie zużywa odroczonego
+    assert native.value.reason == "MIN_SIZE"
+    fake.fail_next("open_position", BrokerTimeout())  # żądanie zgubione przed brokerem: też nie zużywa
+    with pytest.raises(BrokerTimeout):
+        await fake.open_position(entry())
+    refs = [(await fake.open_position(entry())).deal_reference for _ in range(3)]
+    reasons = []
+    for ref in refs[:2]:
+        with pytest.raises(BrokerRejected) as info:
+            await fake.confirm(ref)
+        reasons.append(info.value.reason)
+    assert reasons == ["FIRST", "SECOND"]
+    assert (await fake.confirm(refs[2])).deal_id == "DEAL-1"
 
 
 # --- wstrzykiwanie awarii --------------------------------------------------------
@@ -180,6 +239,7 @@ async def test_applied_failure_on_close_still_closes(fake):
     with pytest.raises(BrokerTimeout):
         await fake.close_position("DEAL-1")
     assert await fake.list_positions() == []
+    assert await fake.closed_since(T0) == [ClosedDeal("DEAL-1", "DE40", Decimal("25780.3"), "MANUAL", T0)]
 
 
 async def test_queued_failures_are_consumed_fifo_one_per_call(fake):
@@ -219,6 +279,15 @@ async def test_on_call_sees_call_recorded_and_runs_even_if_call_then_fails(fake)
     with pytest.raises(BrokerTimeout):
         await fake.open_position(entry())
     assert seen == [["open_position"]]
+
+
+async def test_on_call_once_disarms_after_first_firing(fake):
+    fired = []
+    fake.on_call("list_positions", lambda: fired.append("once"), once=True)
+    fake.on_call("list_positions", lambda: fired.append("every"))
+    await fake.list_positions()
+    await fake.list_positions()
+    assert fired == ["once", "every", "every"]
 
 
 @pytest.mark.parametrize("method", ["open_postion", "set_quote", "capabilities"])
@@ -268,6 +337,20 @@ async def test_closed_since_includes_its_boundary_and_excludes_earlier_deals(fak
     assert await fake.closed_since(t2 + timedelta(seconds=1)) == []
 
 
+async def test_trigger_stop_can_report_a_forced_close(fake):
+    pos = await open_and_confirm(fake)
+    fake.trigger_stop(pos.deal_id, Decimal("25700"), reason="FORCED")
+    assert await fake.closed_since(T0) == [ClosedDeal(pos.deal_id, "DE40", Decimal("25700"), "FORCED", T0)]
+
+
+@pytest.mark.parametrize("reason", ["MANUAL", "SL"])
+async def test_trigger_stop_refuses_reasons_other_than_stop_or_forced(fake, reason):
+    pos = await open_and_confirm(fake)
+    with pytest.raises(ValueError, match=reason):
+        fake.trigger_stop(pos.deal_id, Decimal("25700"), reason=reason)
+    assert list(fake.positions) == [pos.deal_id]
+
+
 async def test_trigger_stop_of_unknown_deal_is_refused(fake):
     with pytest.raises(ValueError, match="DEAL-404"):
         fake.trigger_stop("DEAL-404", Decimal("25750"))
@@ -280,6 +363,13 @@ async def test_set_stop_moves_stop_of_open_position(fake):
     await open_and_confirm(fake)
     await fake.set_stop("DEAL-1", Decimal("25777.7"))  # bid 25780.3 − min 2.6: granica dozwolona
     assert fake.positions["DEAL-1"].stop_level == Decimal("25777.7")
+
+
+async def test_set_stop_replaces_a_derived_stop_with_a_broker_stop(fake):
+    pos = await open_and_confirm(fake)
+    fake.positions[pos.deal_id] = replace(pos, stop_derived=True)
+    await fake.set_stop(pos.deal_id, Decimal("25700"))
+    assert fake.positions[pos.deal_id].stop_derived is False
 
 
 @pytest.mark.parametrize(
@@ -302,7 +392,7 @@ async def test_set_stop_of_unknown_deal_is_rejected(fake):
 
 # --- sesja i stan rynku ---------------------------------------------------------
 
-T0 = datetime(2026, 11, 2, 7, 30, tzinfo=UTC)
+
 CALLS = {
     "keepalive": lambda b: b.keepalive(),
     "instrument_rules": lambda b: b.instrument_rules("DE40"),
@@ -353,9 +443,10 @@ async def test_market_closed_refuses_orders_until_reopened(fake):
 
 async def test_reads_keep_working_while_market_closed(fake):
     fake.set_daily_candles([candle(T0 - timedelta(days=1))])
+    fake.set_candles_5m([candle(T0 - timedelta(minutes=10))])
     fake.set_market_closed(True)
     assert len(await fake.daily_candles("DE40", 15)) == 1
-    assert await fake.candles_5m("DE40", T0, T0) == []
+    assert len(await fake.candles_5m("DE40", T0 - timedelta(hours=1), T0)) == 1
     assert (await fake.account()).account_id == "ACC-0"
     await fake.keepalive()
 
@@ -377,9 +468,34 @@ async def test_daily_candles_refuses_non_positive_count(fake):
         await fake.daily_candles("DE40", 0)
 
 
-async def test_candles_5m_returns_half_open_range_in_time_order(fake):
+async def test_daily_candles_return_only_completed_days(fake, clock):
+    today = datetime(2026, 11, 2, tzinfo=UTC)
+    fake.set_daily_candles([candle(today - timedelta(days=d)) for d in (2, 1, 0)])
+    completed = await fake.daily_candles("DE40", 30)
+    assert [c.start for c in completed] == [today - timedelta(days=2), today - timedelta(days=1)]
+    assert [c.start for c in await fake.daily_candles("DE40", 1)] == [today - timedelta(days=1)]
+    clock.advance((today + timedelta(days=1) - T0).total_seconds())  # dokładnie koniec dzisiejszej świecy
+    assert (await fake.daily_candles("DE40", 1))[0].start == today
+
+
+async def test_candles_5m_return_only_completed_candles(fake, clock):
+    starts = [T0 - timedelta(minutes=10), T0 - timedelta(minutes=5), T0, T0 + timedelta(minutes=10)]
+    fake.set_candles_5m([candle(s) for s in starts])
+    since, until = T0 - timedelta(hours=1), T0 + timedelta(hours=1)
+    # 07:25 kończy się dokładnie o 07:30 (= teraz): zwracana; 07:30 w trakcie; 07:40 w przyszłości
+    assert [c.start for c in await fake.candles_5m("DE40", since, until)] == starts[:2]
+    clock.advance(4 * 60 + 59)
+    assert len(await fake.candles_5m("DE40", since, until)) == 2
+    clock.advance(1)
+    assert [c.start for c in await fake.candles_5m("DE40", since, until)] == starts[:3]
+    clock.advance(15 * 60)
+    assert len(await fake.candles_5m("DE40", since, until)) == 4
+
+
+async def test_candles_5m_returns_half_open_range_in_time_order(fake, clock):
     starts = [datetime(2026, 11, 2, 8, m, tzinfo=UTC) for m in (10, 0, 5, 15)]
     fake.set_candles_5m([candle(s) for s in starts])
+    clock.advance(3600)  # 08:30: wszystkie cztery świece są zakończone, wynik zależy tylko od zakresu
     start, end = datetime(2026, 11, 2, 8, 0, tzinfo=UTC), datetime(2026, 11, 2, 8, 10, tzinfo=UTC)
     got = await fake.candles_5m("DE40", start, end)
     assert [c.start.minute for c in got] == [0, 5]
@@ -483,6 +599,7 @@ async def test_without_netting_second_entry_opens_separate_position(fake):
 async def test_netting_second_entry_increases_existing_position(clock, rules, quote):
     fake = FakeBroker(clock, rules, quote, netting=True)
     await open_and_confirm(fake, entry(size="0.007"))  # ask 25782.3, stop 25752.3
+    clock.advance(60)
     fake.set_quote(Quote("DE40", Decimal("25790.3"), Decimal("25792.3"), clock.now_utc()))
     ack = await fake.open_position(entry(size="0.003"))
     # (0.007 × 25782.3 + 0.003 × 25792.3) / 0.010 = 25785.3
@@ -493,7 +610,13 @@ async def test_netting_second_entry_increases_existing_position(clock, rules, qu
         Decimal("25785.3"),
         Decimal("25752.3"),
     )
-    assert ack.deal_reference == "REF-2" and await fake.confirm("REF-2") == pos
+    assert pos.opened_at == T0
+    # potwierdzenie to migawka TEGO zlecenia: jego wielkość, cena i czas; stop obowiązujący pozycję
+    filled_at = T0 + timedelta(minutes=1)
+    assert ack.deal_reference == "REF-2" and await fake.confirm("REF-2") == OpenPosition(
+        "DEAL-1", "DE40", Side.BUY, Decimal("0.003"), Decimal("25792.3"), Decimal("25752.3"), filled_at
+    )
+    assert (await fake.confirm("REF-1")).size == Decimal("0.007")
 
 
 async def test_netting_opposite_entry_is_not_simulated(clock, rules, quote):
@@ -524,12 +647,12 @@ async def test_working_order_on_another_instrument_is_listed_too(fake):
     assert await fake.list_working_orders() == [order]
 
 
-
 def test_invalid_working_order_is_refused_without_using_an_id(fake):
     with pytest.raises(TypeError, match="size"):
         fake.add_working_order("DE40", Side.BUY, 0.001, Decimal("25700"))
     assert fake.working_orders == []
     assert fake.add_working_order("DE40", Side.BUY, Decimal("0.001"), Decimal("25700")).order_id == "WO-1"
+
 
 async def test_list_working_orders_honours_on_call_and_fail_next(fake):
     order = fake.add_working_order("DE40", Side.BUY, Decimal("0.001"), Decimal("25700"))

@@ -49,16 +49,29 @@ class Broker(Protocol):
 
     async def quote(self, epic: str) -> Quote: ...
 
-    async def daily_candles(self, epic: str, count: int) -> list[Candle]: ...
+    async def daily_candles(self, epic: str, count: int) -> list[Candle]:
+        """Ostatnie `count` świec dziennych, od najstarszej. Tylko zakończone: świeca w trakcie nigdy nie wraca."""
+        ...
 
-    async def candles_5m(self, epic: str, start: datetime, end: datetime) -> list[Candle]: ...
+    async def candles_5m(self, epic: str, start: datetime, end: datetime) -> list[Candle]:
+        """Świece 5-minutowe z `start <= c.start < end`, od najstarszej.
+
+        Tylko zakończone (c.start + 5 min <= teraz): świeca w trakcie formowania nigdy nie jest zwracana.
+        """
+        ...
 
     async def open_position(self, req: EntryRequest) -> EntryAck:
         """Wejście rynkowe ze stopem atomowym; zwraca tylko referencję (potwierdzenie przez `confirm`)."""
         ...
 
     async def confirm(self, deal_reference: str) -> OpenPosition | None:
-        """Pozycja otwarta przez zlecenie o tej referencji; None, gdy referencja nieznana lub pozycji już nie ma."""
+        """Migawka wykonania zlecenia o tej referencji z chwili wypełnienia.
+
+        Pola: deal_id pozycji, open_level = cena wykonania TEGO zlecenia, size = wielkość potwierdzona dla tego
+        zlecenia, stop_level, opened_at = czas wypełnienia. Zwracana także wtedy, gdy pozycja została już
+        zamknięta, wybita stopem albo zagregowana z inną. None tylko dla nieznanej referencji.
+        Zlecenie odrzucone przez brokera po przyjęciu (dealStatus REJECTED): `BrokerRejected(reason)`.
+        """
         ...
 
     async def list_positions(self) -> list[OpenPosition]: ...

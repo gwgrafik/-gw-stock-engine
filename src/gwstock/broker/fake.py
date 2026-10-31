@@ -4,8 +4,14 @@ Model:
 - jeden instrument (`rules.epic`); inny epic → `BrokerRejected("EPIC_NOT_FOUND")`;
 - wejście: BUY po ask + `fill_slippage`, SELL po bid − `fill_slippage`; wielkość = żądana × `fill_size_factor`
   (bez zaokrąglania); stop dołączony atomowo: wypełnienie − `stop_distance` (BUY) lub + (SELL);
-- referencje "REF-{n}" i identyfikatory pozycji "DEAL-{n}" z osobnych liczników (od 1);
-  odrzucone wejście nie zużywa numeru;
+- referencje "REF-{n}" i identyfikatory pozycji "DEAL-{n}" z osobnych liczników (od 1); wejście odrzucone
+  od razu (walidacja, `MarketClosed`) nie zużywa żadnego numeru, odrzucenie odroczone zużywa tylko referencję;
+- `confirm(ref)` zwraca migawkę wykonania TEGO zlecenia z chwili wypełnienia (deal_id, cena wykonania jako
+  open_level, wielkość tego zlecenia, stop obowiązujący pozycję zaraz po wypełnieniu, czas wypełnienia), także
+  po zamknięciu, stopie, `set_stop` i agregacji; None tylko dla nieznanej referencji;
+- `reject_next_entry(reason)`: najbliższe wejście, które dotrze do brokera, dostaje referencję, ale nie tworzy
+  pozycji, a `confirm` tej referencji rzuca `BrokerRejected(reason)` (jak dealStatus REJECTED);
+- świece: zwracane są tylko zakończone (5 min: start + 5 min <= teraz; dzienne: start + 1 dzień <= teraz);
 - zamknięcie wywołaniem: BUY po bid, SELL po ask (bez poślizgu) → `ClosedDeal` "MANUAL"; `trigger_stop` → "STOP";
 - `netting=True`: drugie wejście w tym samym kierunku powiększa istniejącą pozycję (średni poziom ważony wielkością,
   stop bez zmian); bez niego każde wejście to osobna pozycja;
@@ -20,7 +26,8 @@ Model:
 
 Kolejność obsługi każdej metody brokera:
 1. nazwa metody trafia do `calls`;
-2. callbacki `on_call` (mogą zmienić stan brokera, np. `trigger_stop` tuż przed `close_position`);
+2. callbacki `on_call` (mogą zmienić stan brokera, np. `trigger_stop` tuż przed `close_position`;
+   `once=True` rozbraja callback po pierwszym wywołaniu);
 3. pierwsza zakolejkowana awaria `fail_next` tej metody (FIFO, jedna na wywołanie):
    `applied=False` → wyjątek bez skutku;
 4. kontrole brokera: wygasła sesja (`SessionExpired`, poza `login`), zamknięty rynek (`MarketClosed`, tylko
@@ -35,7 +42,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from gwstock.broker.base import Broker, Capabilities
@@ -58,12 +65,26 @@ from gwstock.types import (
 )
 
 BROKER_METHODS = frozenset(name for name, member in vars(Broker).items() if inspect.iscoroutinefunction(member))
+_FIVE_MINUTES = timedelta(minutes=5)
+_ONE_DAY = timedelta(days=1)
+_TRIGGER_REASONS = frozenset({"STOP", "FORCED"})
 
 
 @dataclass(frozen=True)
 class _Failure:
     exc: Exception
     applied: bool
+
+
+@dataclass(frozen=True, eq=False)
+class _Callback:
+    fn: Callable[[], None]
+    once: bool
+
+
+@dataclass(frozen=True)
+class _Rejected:
+    reason: str
 
 
 class FakeBroker:
@@ -97,12 +118,13 @@ class FakeBroker:
         self.working_orders: list[WorkingOrder] = []
         self.calls: list[str] = []
         self._closed: list[ClosedDeal] = []
-        self._references: dict[str, str] = {}
+        self._confirms: dict[str, OpenPosition | _Rejected] = {}
+        self._pending_rejections: deque[str] = deque()
         self._ref_seq = 0
         self._deal_seq = 0
         self._order_seq = 0
         self._failures: dict[str, deque[_Failure]] = {}
-        self._callbacks: dict[str, list[Callable[[], None]]] = {}
+        self._callbacks: dict[str, list[_Callback]] = {}
         self._session_expired = False
         self._market_closed = False
         self._active_account_id: str | None = None  # None: rachunek domyślny nowej sesji (accounts[0])
@@ -135,17 +157,29 @@ class FakeBroker:
         self._require_method(method)
         self._failures.setdefault(method, deque()).append(_Failure(exc, applied))
 
-    def on_call(self, method: str, callback: Callable[[], None]) -> None:
-        """Callback przy każdym wywołaniu `method`, tuż przed jej skutkiem (po zapisie w `calls`)."""
-        self._require_method(method)
-        self._callbacks.setdefault(method, []).append(callback)
+    def on_call(self, method: str, callback: Callable[[], None], once: bool = False) -> None:
+        """Callback przy wywołaniu `method`, tuż przed jej skutkiem (po zapisie w `calls`).
 
-    def trigger_stop(self, deal_id: str, level: Decimal) -> None:
-        """Stop u brokera wykonał się po `level` (przy luce może być gorszy niż stop_level)."""
+        Domyślnie przy każdym wywołaniu; `once=True`: tylko przy pierwszym, potem rozbrojony.
+        """
+        self._require_method(method)
+        self._callbacks.setdefault(method, []).append(_Callback(callback, once))
+
+    def reject_next_entry(self, reason: str) -> None:
+        """Odrzucenie odroczone (FIFO): wejście dostanie referencję, a `confirm` rzuci `BrokerRejected(reason)`."""
+        self._pending_rejections.append(reason)
+
+    def trigger_stop(self, deal_id: str, level: Decimal, reason: str = "STOP") -> None:
+        """Broker zamknął pozycję po `level`.
+
+        `reason`: "STOP" (stop u brokera; przy luce gorzej niż stop_level) albo "FORCED" (wymuszenie przez brokera).
+        """
+        if reason not in _TRIGGER_REASONS:
+            raise ValueError(f"trigger_stop: reason must be one of {sorted(_TRIGGER_REASONS)}, got {reason!r}")
         pos = self.positions.pop(deal_id, None)
         if pos is None:
             raise ValueError(f"trigger_stop: no open position {deal_id!r}")
-        self._closed.append(ClosedDeal(deal_id, pos.epic, level, "STOP", self._clock.now_utc()))
+        self._closed.append(ClosedDeal(deal_id, pos.epic, level, reason, self._clock.now_utc()))
 
     def add_working_order(self, epic: str, side: Side, size: Decimal, level: Decimal) -> WorkingOrder:
         """Umieszcza zlecenie oczekujące u brokera (np. obce, złożone ręcznie); dowolny instrument."""
@@ -192,13 +226,15 @@ class FakeBroker:
             self._require_epic(epic)
             if count < 1:
                 raise ValueError(f"daily_candles: count must be positive, got {count}")
-            candles = self._daily[-count:]
+            now = self._clock.now_utc()
+            candles = [c for c in self._daily if c.start + _ONE_DAY <= now][-count:]
         return candles
 
     async def candles_5m(self, epic: str, start: datetime, end: datetime) -> list[Candle]:
         with self._call("candles_5m"):
             self._require_epic(epic)
-            candles = [c for c in self._candles_5m if start <= c.start < end]
+            now = self._clock.now_utc()
+            candles = [c for c in self._candles_5m if start <= c.start < end and c.start + _FIVE_MINUTES <= now]
         return candles
 
     async def open_position(self, req: EntryRequest) -> EntryAck:
@@ -207,35 +243,20 @@ class FakeBroker:
             self._require_market_open()
             self._validate_entry(req)
             target = self._netting_target(req)
-            q = self._current_quote()
-            if req.side is Side.BUY:
-                fill = q.ask + self.fill_slippage
-                stop = fill - req.stop_distance
-            else:
-                fill = q.bid - self.fill_slippage
-                stop = fill + req.stop_distance
-            size = req.size * self.fill_size_factor
             self._ref_seq += 1
             reference = f"REF-{self._ref_seq}"
-            if target is None:
-                self._deal_seq += 1
-                deal_id = f"DEAL-{self._deal_seq}"
-                self.positions[deal_id] = OpenPosition(
-                    deal_id, req.epic, req.side, size, fill, stop, self._clock.now_utc()
-                )
+            if self._pending_rejections:
+                self._confirms[reference] = _Rejected(self._pending_rejections.popleft())
             else:
-                deal_id = target.deal_id
-                total = target.size + size
-                level = (target.size * target.open_level + size * fill) / total
-                self.positions[deal_id] = replace(target, size=total, open_level=level)
-            self._references[reference] = deal_id
+                self._confirms[reference] = self._fill(req, target)
         return EntryAck(reference)
 
     async def confirm(self, deal_reference: str) -> OpenPosition | None:
         with self._call("confirm"):
-            deal_id = self._references.get(deal_reference)
-            pos = self.positions.get(deal_id) if deal_id is not None else None
-        return pos
+            outcome = self._confirms.get(deal_reference)
+            if isinstance(outcome, _Rejected):
+                raise BrokerRejected(outcome.reason)
+        return outcome
 
     async def list_positions(self) -> list[OpenPosition]:
         with self._call("list_positions"):
@@ -267,7 +288,7 @@ class FakeBroker:
                 allowed = stop_level >= q.ask + min_distance
             if not allowed:
                 raise BrokerRejected("MIN_STOP_DISTANCE")
-            self.positions[deal_id] = replace(pos, stop_level=stop_level)
+            self.positions[deal_id] = replace(pos, stop_level=stop_level, stop_derived=False)
 
     async def closed_since(self, since: datetime) -> list[ClosedDeal]:
         with self._call("closed_since"):
@@ -300,8 +321,11 @@ class FakeBroker:
     @contextmanager
     def _call(self, method: str) -> Iterator[None]:
         self.calls.append(method)
-        for callback in list(self._callbacks.get(method, ())):
-            callback()
+        callbacks = self._callbacks.get(method, [])
+        for callback in list(callbacks):
+            if callback.once:
+                callbacks.remove(callback)
+            callback.fn()
         queue = self._failures.get(method)
         failure = queue.popleft() if queue else None
         if failure is not None and not failure.applied:
@@ -349,6 +373,28 @@ class FakeBroker:
             raise BrokerRejected("SIZE_STEP")
         if req.stop_distance <= 0 or req.stop_distance < r.min_stop_distance:
             raise BrokerRejected("MIN_STOP_DISTANCE")
+
+    def _fill(self, req: EntryRequest, target: OpenPosition | None) -> OpenPosition:
+        """Wykonuje wejście i zwraca migawkę wykonania tego zlecenia (wynik `confirm`)."""
+        q = self._current_quote()
+        if req.side is Side.BUY:
+            fill = q.ask + self.fill_slippage
+            stop = fill - req.stop_distance
+        else:
+            fill = q.bid - self.fill_slippage
+            stop = fill + req.stop_distance
+        size = req.size * self.fill_size_factor
+        now = self._clock.now_utc()
+        if target is None:
+            self._deal_seq += 1
+            snapshot = OpenPosition(f"DEAL-{self._deal_seq}", req.epic, req.side, size, fill, stop, now)
+            self.positions[snapshot.deal_id] = snapshot
+            return snapshot
+        total = target.size + size
+        level = (target.size * target.open_level + size * fill) / total
+        self.positions[target.deal_id] = replace(target, size=total, open_level=level)
+        # agregacja: stop pozycji się nie zmienia, więc migawka podaje stop, który faktycznie chroni pozycję
+        return OpenPosition(target.deal_id, req.epic, req.side, size, fill, target.stop_level, now)
 
     def _netting_target(self, req: EntryRequest) -> OpenPosition | None:
         if not self._netting:

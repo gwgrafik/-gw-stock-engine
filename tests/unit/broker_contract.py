@@ -6,9 +6,16 @@ Klasa nie zaczyna się od `Test`, więc pytest nie zbiera jej samej. Podklasa `T
 - fixture `close_market`: funkcja bez argumentów, która zamyka rynek instrumentu po stronie brokera
   (FakeBroker: `set_market_closed(True)`; adapter: stan lokalnego serwera testowego);
 - fixture `add_working_order`: funkcja `(epic, side, size, level) -> WorkingOrder`, która umieszcza zlecenie
-  oczekujące po stronie brokera i zwraca to, co broker ma potem raportować; podklasa, która nie umie
-  go utworzyć, wywołuje w tej fixture `pytest.skip(powód)` (pomija tylko ten jeden test).
+  oczekujące po stronie brokera i zwraca to, co broker ma potem raportować;
+- fixture `reject_next_entry`: funkcja `(reason) -> None`: broker przyjmie najbliższe wejście (zwróci referencję),
+  ale go nie wykona, a potwierdzenie pokaże odrzucenie z tym powodem;
+- fixture `expire_session`: funkcja bez argumentów, po której broker traktuje sesję jako wygasłą.
+Hooki `add_working_order`, `reject_next_entry` i `expire_session` są opcjonalne: podklasa, która nie umie danego
+stanu wytworzyć (np. adapter z przezroczystym ponownym logowaniem), wywołuje w tej fixture `pytest.skip(powód)`,
+co pomija tylko test, który jej używa.
 Każdy test sam wywołuje `login()`. Testy nie zależą od zegara silnika: czasy pochodzą od brokera.
+Porównania `list_positions() == [pos]` wymagają, żeby `confirm` i `list_positions` budowały `OpenPosition`
+identycznie (te same pola, także `stop_derived`) dla świeżo otwartej, niezmienionej pozycji.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from gwstock.types import (
     EntryRequest,
     MarketClosed,
     OpenPosition,
+    SessionExpired,
     Side,
     WorkingOrder,
 )
@@ -50,18 +58,32 @@ class BrokerContract:
             "(call pytest.skip(...) in it if the test broker cannot hold a working order)"
         )
 
+    @pytest.fixture
+    def reject_next_entry(self) -> Callable[[str], None]:
+        raise NotImplementedError(
+            "subclass must override the `reject_next_entry` fixture "
+            "(call pytest.skip(...) in it if the test broker cannot reject a deal after acknowledging it)"
+        )
+
+    @pytest.fixture
+    def expire_session(self) -> Callable[[], None]:
+        raise NotImplementedError(
+            "subclass must override the `expire_session` fixture "
+            "(call pytest.skip(...) in it if the adapter cannot surface an expired session)"
+        )
+
     async def _request(self, broker: Broker, side: Side) -> EntryRequest:
         rules = await broker.instrument_rules(self.epic)
         stop = max(self.stop_distance, rules.min_stop_distance)
         return EntryRequest(f"gws-contract-{side.value.lower()}", self.epic, side, rules.min_size, stop)
 
-    async def _open(self, broker: Broker, side: Side) -> tuple[EntryRequest, OpenPosition]:
+    async def _open(self, broker: Broker, side: Side) -> tuple[EntryRequest, str, OpenPosition]:
         req = await self._request(broker, side)
         ack = await broker.open_position(req)
         assert ack.deal_reference
         pos = await broker.confirm(ack.deal_reference)
         assert pos is not None, "confirm() of a fresh entry must return the open position"
-        return req, pos
+        return req, ack.deal_reference, pos
 
     async def test_login_and_keepalive(self, broker):
         await broker.login()
@@ -78,7 +100,7 @@ class BrokerContract:
     @pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
     async def test_open_attaches_stop_atomically_at_stop_distance_from_fill(self, broker, side):
         await broker.login()
-        req, pos = await self._open(broker, side)
+        req, _, pos = await self._open(broker, side)
         # pierwsza obserwacja pozycji ma już stop: brak okna bez ochrony
         assert (pos.epic, pos.side, pos.size) == (self.epic, side, req.size)
         if side is Side.BUY:
@@ -91,14 +113,30 @@ class BrokerContract:
         await broker.login()
         assert await broker.confirm("REF-does-not-exist") is None
 
+    async def test_confirm_after_close_still_returns_the_fill_snapshot(self, broker):
+        await broker.login()
+        _, ref, pos = await self._open(broker, Side.BUY)
+        await broker.close_position(pos.deal_id)
+        assert await broker.confirm(ref) == pos
+
+    async def test_rejected_deal_is_acknowledged_then_confirm_raises(self, broker, reject_next_entry):
+        await broker.login()
+        req = await self._request(broker, Side.BUY)
+        reject_next_entry("REJECTED_BY_CONTRACT_TEST")
+        ack = await broker.open_position(req)
+        with pytest.raises(BrokerRejected) as info:
+            await broker.confirm(ack.deal_reference)
+        assert info.value.reason == "REJECTED_BY_CONTRACT_TEST"
+        assert await broker.list_positions() == []
+
     async def test_list_positions_shows_confirmed_position(self, broker):
         await broker.login()
-        _, pos = await self._open(broker, Side.BUY)
+        _, _, pos = await self._open(broker, Side.BUY)
         assert await broker.list_positions() == [pos]
 
     async def test_close_position_empties_list_and_reports_closed_deal(self, broker):
         await broker.login()
-        _, pos = await self._open(broker, Side.BUY)
+        _, _, pos = await self._open(broker, Side.BUY)
         await broker.close_position(pos.deal_id)
         assert await broker.list_positions() == []
         closed = [d for d in await broker.closed_since(pos.opened_at) if d.deal_id == pos.deal_id]
@@ -112,7 +150,7 @@ class BrokerContract:
 
     async def test_market_closed_refuses_open_and_close_but_keeps_reads(self, broker, close_market):
         await broker.login()
-        _, pos = await self._open(broker, Side.BUY)
+        _, _, pos = await self._open(broker, Side.BUY)
         req = await self._request(broker, Side.SELL)
         close_market()
         with pytest.raises(MarketClosed):
@@ -152,3 +190,24 @@ class BrokerContract:
         q = await broker.quote(self.epic)
         order = add_working_order(self.epic, Side.BUY, rules.min_size, q.bid - Decimal("100"))
         assert await broker.list_working_orders() == [order]
+
+    async def test_set_stop_moves_stop_of_open_position(self, broker):
+        await broker.login()
+        _, _, pos = await self._open(broker, Side.BUY)
+        wider = pos.stop_level - Decimal("10")  # dalej od rynku: zawsze dozwolone
+        await broker.set_stop(pos.deal_id, wider)
+        [moved] = await broker.list_positions()
+        assert (moved.deal_id, moved.stop_level) == (pos.deal_id, wider)
+
+    async def test_set_stop_of_unknown_deal_is_rejected(self, broker):
+        await broker.login()
+        with pytest.raises(BrokerRejected):
+            await broker.set_stop("DEAL-does-not-exist", Decimal("1000"))
+
+    async def test_expired_session_raises_session_expired_until_login(self, broker, expire_session):
+        await broker.login()
+        expire_session()
+        with pytest.raises(SessionExpired):
+            await broker.list_positions()
+        await broker.login()
+        assert await broker.list_positions() == []
