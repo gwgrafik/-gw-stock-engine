@@ -337,6 +337,31 @@ async def test_closed_since_includes_its_boundary_and_excludes_earlier_deals(fak
     assert await fake.closed_since(t2 + timedelta(seconds=1)) == []
 
 
+async def test_history_limit_days_serves_ranges_up_to_the_limit_and_refuses_longer_ones(clock, rules, quote):
+    limited = FakeBroker(clock, rules, quote, history_limit_days=14)
+    await open_and_confirm(limited)
+    limited.trigger_stop("DEAL-1", Decimal("25750"))
+    clock.advance(3 * 24 * 3600)
+    now = clock.now_utc()
+    assert [d.deal_id for d in await limited.closed_since(now - timedelta(days=14))] == ["DEAL-1"]  # cała historia
+    with pytest.raises(BrokerError, match="history"):  # kompletna albo wyjątek, nigdy lista częściowa
+        await limited.closed_since(now - timedelta(days=14, seconds=1))
+    assert limited.calls.count("closed_since") == 2
+
+
+async def test_history_is_unlimited_by_default(fake, clock):
+    await open_and_confirm(fake)
+    fake.trigger_stop("DEAL-1", Decimal("25750"))
+    clock.advance(30 * 24 * 3600)
+    assert [d.deal_id for d in await fake.closed_since(T0 - timedelta(days=365))] == ["DEAL-1"]
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "14"])
+def test_history_limit_days_must_be_a_positive_integer(clock, rules, quote, bad):
+    with pytest.raises(ValueError, match="history_limit_days"):
+        FakeBroker(clock, rules, quote, history_limit_days=bad)
+
+
 async def test_trigger_stop_can_report_a_forced_close(fake):
     pos = await open_and_confirm(fake)
     fake.trigger_stop(pos.deal_id, Decimal("25700"), reason="FORCED")

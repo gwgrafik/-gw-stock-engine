@@ -20,6 +20,8 @@ Model:
   `margin_used` aktywnego = Σ size × open_level × value_per_point × margin_rate, `available` = equity − margin_used;
 - zlecenia oczekujące: tylko te dodane przez `add_working_order` (id "WO-{n}", dowolny epic); nie wykonują się
   i nie zajmują depozytu;
+- historia zamknięć: `closed_since` zwraca wszystkie zamknięcia od `since` albo rzuca; z `history_limit_days=N`
+  zakres dłuższy niż N dni (teraz − since) to `BrokerError` (jak adapter z limitem 14 dni), domyślnie bez limitu;
 - uproszczenia: pozycje są wspólne dla wszystkich rachunków, saldo nie zmienia się po zamknięciu, sesja wygasa
   tylko przez `expire_session()`; testy mogą zmieniać `positions` i `working_orders` bezpośrednio
   (np. obca pozycja, brak stopu).
@@ -100,7 +102,13 @@ class FakeBroker:
         account_id: str | None = None,
         *,
         netting: bool = False,
+        history_limit_days: int | None = None,
     ) -> None:
+        if history_limit_days is not None and (
+            isinstance(history_limit_days, bool) or not isinstance(history_limit_days, int) or history_limit_days <= 0
+        ):
+            raise ValueError(f"history_limit_days: expected a positive integer or None, got {history_limit_days!r}")
+        self._history_limit = None if history_limit_days is None else timedelta(days=history_limit_days)
         self._clock = clock
         self._rules = rules
         self._require_own_data(quote.epic)
@@ -292,6 +300,9 @@ class FakeBroker:
 
     async def closed_since(self, since: datetime) -> list[ClosedDeal]:
         with self._call("closed_since"):
+            span = self._clock.now_utc() - since
+            if self._history_limit is not None and span > self._history_limit:
+                raise BrokerError(f"closed_since: requested history of {span} exceeds the limit {self._history_limit}")
             closed = [d for d in self._closed if d.ts >= since]
         return closed
 

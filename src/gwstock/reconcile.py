@@ -6,6 +6,10 @@ Przebieg `run_once` (zawsze w tej kolejności):
 2. odczyty: migawka dziennika (zlecenia nierozstrzygnięte i pozycja instrumentu, znaczniki), potem broker:
    `list_positions`, `list_working_orders` i tylko w razie potrzeby `closed_since`; każda odpowiedź brokera trafia
    do `append_raw` (serializacja `dump`) przed interpretacją, a wyjątek odczytu do `broker.error` przed propagacją.
+   `closed_since` dostaje PRAWDZIWY początek (chwila odniesienia − `HISTORY_MARGIN`, bez przycinania do doby);
+   kontrakt brokera: cała historia od `since` albo `BrokerError` (adapter dzieli zakres na zapytania po dobie,
+   limit 14 dni), więc niepełne okno historii przerywa przebieg i nigdy nie staje się dowodem braku zamknięcia
+   (zlecenie UNKNOWN nie przejdzie wtedy w NOT_PLACED, zamknięcie nie zostanie pominięte);
    Wyjątek brokera (`BrokerError`, w tym `SessionExpired`) albo dziennika (`JournalWriteError`) przerywa przebieg,
    zanim zmieni się jakikolwiek stan: nieudany odczyt nigdy nie jest dowodem braku pozycji ani pustym odczytem;
 3. decyzja według macierzy niżej, w całości przed pierwszym zapisem stanu;
@@ -15,9 +19,11 @@ Przebieg `run_once` (zawsze w tej kolejności):
    brokera; plan opiera się na nieaktualnej migawce). Bramka nie pozwala więc przebiegowi wystartować w trakcie
    wejścia, a ponowne sprawdzenie nie pozwala mu zapisać ponad wejściem lub wyjściem, które zaszło w trakcie;
    silnik (Zadanie 14) dodatkowo szereguje oba kierunki jedną blokadą;
-5. kill switch miękki (przed zapisami: awaria dziennika nie połknie alarmu), księgowanie zamknięcia (jedyny zapis
-   z `await`; idempotentny po `deal_id`, po nim migawka jest sprawdzana jeszcze raz), zdarzenia `reconcile.event`,
-   zapisy: naprawa SUBMITTING -> UNKNOWN i potwierdzenie z dziennika, licznik pustych odczytów, pozycja,
+5. kill switch miękki (przed zapisami: awaria dziennika nie połknie alarmu), zdarzenia `reconcile.event` (ślad
+   decyzji zostaje także przy błędzie księgowania), księgowanie zamknięcia (jedyny zapis z `await`; idempotentny po
+   `deal_id`, po nim migawka jest sprawdzana jeszcze raz: zmiana → `SKIPPED_STATE_CHANGED_AFTER_BOOKING` z
+   zaksięgowanym zamknięciem w `closed`), zapisy: naprawa SUBMITTING -> UNKNOWN i potwierdzenie z dziennika,
+   licznik pustych odczytów, pozycja,
    zlecenia zamykane na podstawie pozycji (wiersz zlecenia na końcu, jak w menedżerze), znacznik historii,
    znacznik rozbieżności. Przerwanie między zapisami zostawia stan, który kolejny przebieg rozpoznaje i dokańcza.
 
@@ -35,8 +41,8 @@ Macierz (J = pozycja w dzienniku, B = pozycje brokera na naszym instrumencie, D 
   pozycji, ale bez D → BLOCKED do decyzji właściciela (nie da się sprawdzić ani zaksięgować);
 - D w B: zgodne kierunek i wielkość → odśwież pola (OPEN/EXITING bez zmiany stanu, BLOCKED → OPEN); różne →
   BLOCKED z polami dziennika + kill SIDE_MISMATCH / SIZE_MISMATCH; brak stopu → `unprotected` (stop ustawia wykonawca);
-- D poza B: historia od max(znacznik, otwarcie) − 1 min, nie dawniej niż doba; jedno zamknięcie D → zaksięguj, FLAT;
-  więcej → BLOCKED + kill AMBIGUOUS_CLOSURE; brak → BLOCKED (zamknięcia nie wymyślamy);
+- D poza B: historia od max(znacznik, otwarcie) − 1 min (bez obu: brak odczytu, BLOCKED); jedno zamknięcie D →
+  zaksięguj, FLAT; więcej → BLOCKED + kill AMBIGUOUS_CLOSURE; brak → BLOCKED (zamknięcia nie wymyślamy);
 - inna pozycja w B obok D → BLOCKED + kill FOREIGN_POSITION; zlecenie oczekujące na naszym instrumencie →
   `working_orders` + kill FOREIGN_WORKING_ORDER (nigdy nie anulujemy);
 - rozbieżność oczekująca (zlecenie nierozstrzygnięte albo J BLOCKED) dłużej niż `mismatch_tolerance_s` → kill
@@ -83,9 +89,9 @@ META_EMPTY_READS = "unknown_empty_reads:{}"  # liczba kolejnych udanych odczytó
 # Protokół UNKNOWN ze spec §6 ("po trzech zapytaniach w 30 s jej nie ma"): te same stałe co w menedżerze zleceń.
 EMPTY_READS_TO_NOT_PLACED = UNKNOWN_CHECKS
 MIN_UNKNOWN_AGE = timedelta(seconds=UNKNOWN_CHECKS * UNKNOWN_CHECK_INTERVAL_S)
-# Zapas zakresu historii na różnicę zegarów; historia brokera sięga najwyżej 1 dnia (spec §7).
+# Zapas początku zakresu historii na różnicę zegarów brokera i silnika; wspólny dla wszystkich odczytów historii.
+# Początku nigdy nie przycinamy: `Broker.closed_since` zwraca całą historię od `since` albo rzuca wyjątek.
 HISTORY_MARGIN = timedelta(minutes=1)
-HISTORY_FALLBACK = timedelta(days=1)
 
 RECOVERED_FROM_SUBMITTING = "RECOVERED_FROM_SUBMITTING"
 
@@ -115,7 +121,10 @@ class ReconcileResult:
     `blocked`: pozycja instrumentu jest po przebiegu BLOCKED. `notes`: kody decyzji ze szczegółami (pierwsze słowo
     to kod). `closed`: zamknięcia naszej pozycji przetworzone w tym przebiegu. `unprotected`: NASZE pozycje u brokera
     bez stopu (widok brokera: kierunek i poziomy brokera). `working_orders`: zlecenia oczekujące na naszym
-    instrumencie. `skipped`: przebieg pominięty przez bramkę wejścia (pozostałe pola nic wtedy nie mówią).
+    instrumencie. `skipped`: przebieg nie zapisał stanu, bo wejście było w toku (`SKIPPED_ENTRY_IN_FLIGHT`) albo
+    dziennik zmienił się w trakcie odczytu brokera (`SKIPPED_STATE_CHANGED`); pozostałe pola są wtedy puste.
+    Wyjątek: `SKIPPED_STATE_CHANGED_AFTER_BOOKING`: zamknięcie ZOSTAŁO zaksięgowane (jest w `closed`), a zmianę
+    wykryto dopiero po księgowaniu, więc reszta zapisów (FLAT, znaczniki) została pominięta.
     """
 
     blocked: bool
@@ -192,7 +201,7 @@ class Reconciler:
 
         `skipped=True`: wejście w toku (przed startem albo przed zapisami) albo dziennik zmienił się w trakcie
         odczytu brokera; nic nie zapisano poza surowymi odpowiedziami brokera (wyjątek: zmiana wykryta dopiero po
-        księgowaniu; zamknięcie jest wtedy zaksięgowane, a księga jest idempotentna po `deal_id`).
+        księgowaniu; zamknięcie jest wtedy zaksięgowane i zwrócone w `closed`, a księga jest idempotentna po `deal_id`).
         """
         if self._gate_closed():
             return _skipped("SKIPPED_ENTRY_IN_FLIGHT")
@@ -229,7 +238,7 @@ class Reconciler:
         if self._snapshot() != (orders, stored):
             return _skipped("SKIPPED_STATE_CHANGED")
         if not await self._apply(plan, current, (orders, stored)):
-            return _skipped("SKIPPED_STATE_CHANGED")
+            return ReconcileResult(False, ["SKIPPED_STATE_CHANGED_AFTER_BOOKING"], plan.closed, [], skipped=True)
         return ReconcileResult(
             final.state is _P.BLOCKED, plan.notes, plan.closed, plan.unprotected, working_orders=working_ours
         )
@@ -448,31 +457,30 @@ class Reconciler:
         self, plan: _Plan, ours: PositionRecord | None, mine: list[OpenPosition], final_check: OrderRecord | None
     ) -> list[ClosedDeal]:
         """`closed_since` tylko gdy potrzebne: nasza pozycja zniknęła z listy albo zlecenie UNKNOWN ma zostać
-        NOT_PLACED. Jeden odczyt od najwcześniejszej potrzebnej chwili, nie dawniej niż `HISTORY_FALLBACK` (historia
-        brokera sięga 1 dnia; zamknięcie sprzed tej granicy jest nieosiągalne, więc pozycja zostaje BLOCKED)."""
+        NOT_PLACED. Jeden odczyt od najwcześniejszego PRAWDZIWEGO początku (bez przycinania): niepełną historię
+        broker zgłasza wyjątkiem, który przerywa przebieg przed jakąkolwiek zmianą stanu."""
         starts = []
         if ours is not None and not any(p.deal_id == ours.deal_id for p in mine):
-            starts.append(self._history_start(ours))
+            start = self._history_start(ours)
+            if start is None:  # nie znamy początku: bez odczytu zamknięcia nie ma dowodu, pozycja zostanie BLOCKED
+                plan.record("HISTORY_START_UNKNOWN", deal_id=ours.deal_id)
+            else:
+                starts.append(start)
         if final_check is not None:
             starts.append(final_check.created_at - HISTORY_MARGIN)
         if not starts:
             return []
-        wanted = min(starts)
-        floor = self._clock.now_utc() - HISTORY_FALLBACK
-        since = max(wanted, floor)
-        if since > wanted:
-            plan.record("HISTORY_CLAMPED", wanted=wanted, since=since)
+        since = min(starts)
         closures = await self._read("closed_since", self._broker.closed_since(since))
         self._raw(SOURCE_CLOSED, {"since": since, "response": closures})
         return closures
 
-    def _history_start(self, ours: PositionRecord) -> datetime:
+    def _history_start(self, ours: PositionRecord) -> datetime | None:
         """Późniejsza z dwóch dolnych granic (znacznik ostatniego zamknięcia, otwarcie pozycji) minus zapas: zamknięcie
-        tej pozycji nie może być wcześniejsze, a krótszy zakres mieści się w 1 dniu historii brokera."""
+        tej pozycji nie może być wcześniejsze. None, gdy nie znamy żadnej z nich."""
         marker = self._journal.get_meta(META_CLOSED_MARKER)
         bounds = [t for t in (datetime.fromisoformat(marker) if marker else None, ours.opened_at) if t is not None]
-        base = max(bounds) if bounds else self._clock.now_utc() - HISTORY_FALLBACK
-        return base - HISTORY_MARGIN
+        return max(bounds) - HISTORY_MARGIN if bounds else None
 
     def _empty_reads(self, order: OrderRecord) -> int:
         text = self._journal.get_meta(META_EMPTY_READS.format(order.order_id))
@@ -483,16 +491,17 @@ class Reconciler:
     async def _apply(
         self, plan: _Plan, current: PositionRecord, snapshot: tuple[list[OrderRecord], PositionRecord | None]
     ) -> bool:
-        """Alarm i zapisy planu. Wywoływane tuż po sprawdzeniu migawki; jedyny `await` to księgowanie, po którym
-        migawka jest sprawdzana ponownie (False: zmieniła się, reszta zapisów pominięta; księga jest idempotentna)."""
+        """Alarm i zapisy planu. Wywoływane tuż po sprawdzeniu migawki (bez `await` od sprawdzenia do zdarzeń); jedyny
+        `await` to księgowanie, po którym migawka jest sprawdzana ponownie (False: zmieniła się, reszta zapisów
+        pominięta; zamknięcie jest zaksięgowane, a księga idempotentna)."""
         for reason in plan.kills:
             self._kill.soft(reason)
+        for event in plan.events:  # ślad decyzji przed księgowaniem: zostaje także przy jego błędzie
+            self._raw(SOURCE_EVENT, event)
         if plan.book is not None and self._booker is not None:
             await self._booker.book(*plan.book)  # błąd: pozycja zostaje, następny przebieg ponowi
             if self._gate_closed() or self._snapshot() != snapshot:
                 return False
-        for event in plan.events:
-            self._raw(SOURCE_EVENT, event)
         for write in plan.orders_before:
             self._write_order(write)
         if plan.empty_reads is not None:

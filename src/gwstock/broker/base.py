@@ -85,7 +85,13 @@ class Broker(Protocol):
     async def set_stop(self, deal_id: str, stop_level: Decimal) -> None: ...
 
     async def closed_since(self, since: datetime) -> list[ClosedDeal]:
-        """Zamknięcia z `ts >= since`."""
+        """WSZYSTKIE zamknięcia z `ts >= since` albo `BrokerError`; nigdy lista częściowa.
+
+        Historia Capital.com sięga jednego dnia na zapytanie, więc adapter dzieli zakres na zapytania obejmujące
+        najwyżej dobę i łączy wyniki; zakresu dłuższego niż 14 dni odmawia (`BrokerError`), tak samo jak każdej
+        niepełnej odpowiedzi. Wywołujący (uzgadnianie) podaje prawdziwy początek i nigdy go nie przycina: brak
+        zamknięcia na liście jest dowodem tylko wtedy, gdy lista obejmuje cały zakres.
+        """
         ...
 
     async def account(self) -> AccountInfo:
