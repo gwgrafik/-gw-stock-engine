@@ -1,3 +1,5 @@
+> **ARCHIWUM.** Alpaca została wykluczona. Aktualny szkic maila to `docs/ops/capital-com-support-email.md`.
+
 # Szkic maila do Alpaca support (wersja 2, po researchu z 2026-10-31)
 
 Wyślij z własnego adresu na `support@alpaca.markets`. Mail jest po angielsku. W miejscu oznaczonym `<...>` wpisz swoje imię i nazwisko. Nie podawaj w nim haseł, kluczy API ani numerów dokumentów.

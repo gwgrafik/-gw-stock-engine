@@ -1,3 +1,5 @@
+> **ARCHIWUM.** Ta wersja (v1: akcje USA, Alpaca) została zastąpiona przez `docs/superpowers/specs/2026-10-31-engine-design-v2.md` po wykluczeniu Alpaca i zmianie na CFD na indeksy (Capital.com demo). Zachowana dla historii decyzji.
+
 # Silnik tradingowy na akcje USA: projekt v1
 
 Data: 2026-10-31
