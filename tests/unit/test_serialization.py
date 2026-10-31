@@ -113,6 +113,12 @@ def test_non_finite_float_is_rejected(value):
         dump(value)
 
 
+@pytest.mark.parametrize("text", ["NaN", "sNaN", "Infinity", "-Infinity"])
+def test_non_finite_decimal_is_rejected(text):
+    with pytest.raises(ValueError, match="finite"):
+        dump({"level": Decimal(text)})
+
+
 def test_output_is_ascii_so_any_text_survives_storage():
     text = dump({"note": "zażółć \udc80"})  # także samotny surogat (np. zepsuta odpowiedź) nie psuje zapisu
     assert text.isascii()

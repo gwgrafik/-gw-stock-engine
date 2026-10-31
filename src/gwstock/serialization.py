@@ -5,7 +5,7 @@ Zasady:
 - enum po wartości, dataclass jako obiekt ze wszystkimi polami, krotka jak lista;
 - klucze słowników to napisy (albo enumy o wartości napisowej), sortowane: ten sam obiekt daje zawsze ten sam tekst;
 - wynik jest czystym ASCII (znaki spoza ASCII jako `\\uXXXX`), więc żaden tekst, nawet zepsuty, nie psuje zapisu;
-- nieznany typ to `TypeError`, a float nieskończony lub NaN to `ValueError` (nie zgadujemy reprezentacji).
+- nieznany typ to `TypeError`, a float lub Decimal nieskończony albo NaN to `ValueError` (nie zgadujemy reprezentacji).
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ def _plain(value: Any) -> Any:
     if isinstance(value, (str, int, float)):
         return value
     if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"cannot serialize non-finite Decimal {value!r}: expected a finite value")
         return str(value)
     if isinstance(value, datetime):
         if value.tzinfo is None or value.utcoffset() is None:

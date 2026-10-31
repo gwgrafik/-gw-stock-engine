@@ -15,21 +15,26 @@ Niezmienniki (prawdziwe pieniądze):
   więc uzgadnianie po restarcie zawsze je znajdzie;
 - `JournalWriteError` po wywołaniu brokera propaguje się bez ponowienia i bez kolejnego wywołania brokera
   (dziennik mówi wtedy SUBMITTING lub UNKNOWN, a uzgadnianie traktuje to jak UNKNOWN);
-- anulowanie zadania w trakcie wywołania brokera zostawia SUBMITTING (lub UNKNOWN) i jest przekazywane dalej.
+- anulowanie zadania w trakcie wywołania brokera zostawia SUBMITTING (lub UNKNOWN) i jest przekazywane dalej;
+- `in_flight` jest prawdziwe od przejścia ochrony do końca `submit_entry` / `resolve_unknown` (zawsze gaszone
+  w `finally`): uzgadnianie pomija wtedy swój przebieg, więc zlecenie w toku ma jednego piszącego.
 
-Rozstrzyganie UNKNOWN: do `UNKNOWN_CHECKS` rund co `UNKNOWN_CHECK_INTERVAL_S` (zegar silnika). W rundzie, gdy znamy
-referencję, najpierw `confirm`, potem zawsze `list_positions`. Pozycja pasuje do zlecenia, gdy zgadza się epic,
-kierunek i `opened_at >= created_at` (wielkość nie: broker może potwierdzić inną, zapisujemy faktyczną).
-Migawka `confirm` (odpowiedź na NASZĄ referencję) jest przyjmowana, gdy epic i kierunek są zgodne oraz
-`opened_at >= created_at` albo jej deal_id jest na liście pozycji; sprzeczna (inny epic lub kierunek) albo
-niesprawdzalna przy udanym odczycie listy to BLOCKED. NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy
-bez dopasowania; nieudany odczyt nigdy nie jest dowodem braku pozycji (wtedy zlecenie zostaje UNKNOWN).
+Rozstrzyganie UNKNOWN: tylko zlecenie UNKNOWN z pozycją ENTERING (BLOCKED to decyzja uzgadniania lub właściciela,
+OPEN to pozycja już przejęta). Do `UNKNOWN_CHECKS` rund co `UNKNOWN_CHECK_INTERVAL_S` (zegar silnika); w rundzie,
+gdy znamy referencję, najpierw `confirm`, potem zawsze `list_positions`. Dopasowanie: `match_entry_positions`
+(epic, kierunek, `opened_at >= created_at − _CLOCK_SKEW_TOLERANCE`; wielkość nie: zapisujemy faktyczną).
+Migawka `confirm` (odpowiedź na NASZĄ referencję) jest przyjmowana, gdy epic i kierunek są zgodne oraz pasuje czasem
+albo jej deal_id jest na liście pozycji; sprzeczna (inny epic lub kierunek) albo niesprawdzalna przy udanym odczycie
+listy to BLOCKED. NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy bez dopasowania; nieudany odczyt nigdy
+nie jest dowodem braku pozycji (wtedy zlecenie zostaje UNKNOWN). Notatka wyniku zaczyna się od kodu wyniku
+i zachowuje przyczynę UNKNOWN (`CAUSE=...`).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
+from datetime import timedelta
 from typing import Any, TypeVar
 
 from gwstock.broker.base import Broker
@@ -51,6 +56,11 @@ from gwstock.types import (
 UNKNOWN_CHECKS = 3
 UNKNOWN_CHECK_INTERVAL_S = 10
 
+# Zegar brokera różni się od naszego i może podawać pełne sekundy, więc nasze wykonanie może mieć `opened_at` tuż
+# sprzed INTENT. Tolerancja jest bezpieczna: ochrona dziennika i uzgadnianie przy starcie gwarantują, że w chwili
+# INTENT na instrumencie nie było innej pozycji.
+_CLOCK_SKEW_TOLERANCE = timedelta(seconds=5)
+
 SOURCE_OPEN = "broker.open_position"
 SOURCE_CONFIRM = "broker.confirm"
 SOURCE_POSITIONS = "broker.list_positions"
@@ -71,6 +81,16 @@ class EntryBlocked(Exception):
         self.detail = detail
 
 
+def match_entry_positions(order: OrderRecord, positions: Sequence[OpenPosition]) -> list[OpenPosition]:
+    """Pozycje brokera, które mogą być wykonaniem tego wejścia, w kolejności listy brokera.
+
+    Pasuje: ten sam epic i kierunek, `opened_at >= created_at − _CLOCK_SKEW_TOLERANCE`. Wielkość nie jest
+    porównywana (broker może potwierdzić inną). Funkcja czysta: wspólna dla menedżera i uzgadniania.
+    """
+    earliest = order.created_at - _CLOCK_SKEW_TOLERANCE
+    return [p for p in positions if p.epic == order.epic and p.side is order.side and p.opened_at >= earliest]
+
+
 class OrderManager:
     """Składa wejścia i rozstrzyga zlecenia UNKNOWN. Jeden wywołujący naraz (wątek decyzyjny silnika)."""
 
@@ -81,6 +101,15 @@ class OrderManager:
         self._broker = broker
         self._clock = clock
         self._cfg = cfg
+        self._in_flight = False
+
+    @property
+    def in_flight(self) -> bool:
+        """Wejście w toku: od przejścia ochrony w `submit_entry` (lub od wejścia do `resolve_unknown`) do ich końca.
+
+        Bramka dla uzgadniania: gdy True, uzgadnianie pomija przebieg (zlecenie w toku ma jednego piszącego).
+        """
+        return self._in_flight
 
     # --- wejście --------------------------------------------------------------------------------
 
@@ -94,6 +123,13 @@ class OrderManager:
         if not req.stop_distance > 0:
             raise ValueError(f"entry {req.client_id!r} without a stop is never sent: stop_distance {req.stop_distance}")
         self._guard(req)
+        self._in_flight = True
+        try:
+            return await self._submit(req)
+        finally:
+            self._in_flight = False
+
+    async def _submit(self, req: EntryRequest) -> OrderRecord:
         now = self._clock.now_utc()
         order = OrderRecord(
             req.client_id, req.epic, req.side, req.size, req.stop_distance, OrderState.INTENT, None, None, now, now
@@ -137,12 +173,32 @@ class OrderManager:
     async def resolve_unknown(self, order: OrderRecord) -> OrderRecord:
         """Rozstrzyga zlecenie UNKNOWN wyłącznie odczytami brokera (nigdy ponowną wysyłką).
 
+        Warunek wstępny (sprawdzany przed jakimkolwiek czekaniem i wywołaniem brokera): zlecenie UNKNOWN, a pozycja
+        jego instrumentu w dzienniku ENTERING; inaczej `ValueError`. W trakcie innego wejścia w toku: `RuntimeError`.
+
         Wynik: CONFIRMED (pozycja OPEN z faktycznymi danymi brokera), NOT_PLACED (pozycja FLAT) albo UNKNOWN z notatką
         AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED (pozycja BLOCKED: decyduje uzgadnianie lub właściciel)
         lub CHECKS_INCOMPLETE (pozycja ENTERING: brak udanych odczytów, rozstrzygnie uzgadnianie).
         """
+        if self._in_flight:
+            raise RuntimeError(f"resolve_unknown: an entry is already in flight, refusing {order.order_id!r}")
         if order.state is not OrderState.UNKNOWN:
             raise ValueError(f"resolve_unknown: order {order.order_id!r} is {order.state.value}, expected UNKNOWN")
+        pos = self._journal.current_position(order.epic)
+        if pos is None or pos.state is not PositionState.ENTERING:
+            found = "missing" if pos is None else pos.state.value
+            raise ValueError(
+                f"resolve_unknown: position {order.epic} is {found}, expected ENTERING "
+                "(BLOCKED and OPEN are decided by the reconciler or the owner, never re-resolved)"
+            )
+        self._in_flight = True
+        try:
+            return await self._resolve(order)
+        finally:
+            self._in_flight = False
+
+    async def _resolve(self, order: OrderRecord) -> OrderRecord:
+        cause = _cause(order)
         clean_checks = 0
         for attempt in range(1, UNKNOWN_CHECKS + 1):
             await self._clock.sleep(UNKNOWN_CHECK_INTERVAL_S)
@@ -152,7 +208,7 @@ class OrderManager:
                     snapshot = await self._call(self._broker.confirm(order.deal_reference))
                 except BrokerRejected as exc:
                     self._record_error(SOURCE_CONFIRM, order, exc, attempt=attempt)
-                    return self._not_placed(order, f"REJECTED_ON_CONFIRM={exc.reason}")
+                    return self._not_placed(order, _note(f"REJECTED_ON_CONFIRM={exc.reason}", cause))
                 except Exception as exc:
                     self._record_error(SOURCE_CONFIRM, order, exc, attempt=attempt)
                 else:
@@ -168,25 +224,25 @@ class OrderManager:
 
             if snapshot is not None:
                 if _contradicts(order, snapshot):
-                    return self._block(order, "CONFIRM_MISMATCH", deal_ids=[snapshot.deal_id])
+                    return self._block(order, "CONFIRM_MISMATCH", deal_ids=[snapshot.deal_id], cause=cause)
                 listed = positions is not None and any(p.deal_id == snapshot.deal_id for p in positions)
-                if snapshot.opened_at >= order.created_at or listed:
-                    return self._confirm(order, snapshot, "ADOPTED_AFTER_UNKNOWN VIA=confirm")
+                if match_entry_positions(order, [snapshot]) or listed:
+                    return self._confirm(order, snapshot, _note("ADOPTED_AFTER_UNKNOWN VIA=confirm", cause))
                 if positions is not None:
-                    return self._block(order, "CONFIRM_UNVERIFIED", deal_ids=[snapshot.deal_id])
+                    return self._block(order, "CONFIRM_UNVERIFIED", deal_ids=[snapshot.deal_id], cause=cause)
                 continue  # migawki nie da się sprawdzić w tej rundzie: to nie jest dowód braku pozycji
             if positions is None:
                 continue
-            matches = [p for p in positions if _matches(order, p)]
+            matches = match_entry_positions(order, positions)
             if len(matches) == 1:
-                return self._confirm(order, matches[0], "ADOPTED_AFTER_UNKNOWN VIA=positions")
+                return self._confirm(order, matches[0], _note("ADOPTED_AFTER_UNKNOWN VIA=positions", cause))
             if len(matches) > 1:
-                return self._block(order, "AMBIGUOUS_MATCH", deal_ids=[p.deal_id for p in matches])
+                return self._block(order, "AMBIGUOUS_MATCH", deal_ids=[p.deal_id for p in matches], cause=cause)
             clean_checks += 1
         if clean_checks == UNKNOWN_CHECKS:
-            return self._not_placed(order, f"NOT_FOUND_AFTER_CHECKS={UNKNOWN_CHECKS}")
+            return self._not_placed(order, _note(f"NOT_FOUND_AFTER_CHECKS={UNKNOWN_CHECKS}", cause))
         self._event(order, "CHECKS_INCOMPLETE", clean_checks=clean_checks)
-        return self._annotate(order, "CHECKS_INCOMPLETE")
+        return self._annotate(order, _note("CHECKS_INCOMPLETE", cause))
 
     # --- ochrona przed podwójnym wejściem --------------------------------------------------------
 
@@ -205,7 +261,7 @@ class OrderManager:
 
     async def _unknown(self, order: OrderRecord, cause: str, **fields: Any) -> OrderRecord:
         order = self._transition(order, OrderState.UNKNOWN, note=cause, **fields)
-        return await self.resolve_unknown(order)
+        return await self._resolve(order)  # pozycja jest ENTERING (zapisana przed SUBMITTING)
 
     def _reject(self, order: OrderRecord, reason: str, **fields: Any) -> OrderRecord:
         self._move_position(PositionRecord(order.epic, PositionState.FLAT))
@@ -224,13 +280,16 @@ class OrderManager:
             )
         )
         if pos.size != order.size:
-            note = f"{note} FILLED_SIZE={pos.size} REQUESTED={order.size}".strip()
+            note = _note(note, f"FILLED_SIZE={pos.size} REQUESTED={order.size}")
         return self._transition(order, OrderState.CONFIRMED, deal_id=pos.deal_id, note=note, **fields)
 
-    def _block(self, order: OrderRecord, note: str, *, deal_ids: list[str], **fields: Any) -> OrderRecord:
+    def _block(
+        self, order: OrderRecord, code: str, *, deal_ids: list[str], cause: str = "", **fields: Any
+    ) -> OrderRecord:
         """Sprzeczne dowody: pozycja BLOCKED, zlecenie zostaje UNKNOWN (decyduje uzgadnianie lub właściciel)."""
-        self._event(order, note, deal_ids=deal_ids)
+        self._event(order, code, deal_ids=deal_ids)
         self._move_position(PositionRecord(order.epic, PositionState.BLOCKED))
+        note = _note(code, cause)
         if order.state is OrderState.UNKNOWN:
             return self._annotate(order, note, **fields)
         return self._transition(order, OrderState.UNKNOWN, note=note, **fields)
@@ -267,10 +326,14 @@ class OrderManager:
         return await asyncio.wait_for(call, self._cfg.submit_timeout_s)
 
 
-def _matches(order: OrderRecord, pos: OpenPosition) -> bool:
-    return pos.epic == order.epic and pos.side is order.side and pos.opened_at >= order.created_at
-
-
 def _contradicts(order: OrderRecord, snapshot: OpenPosition) -> bool:
     return snapshot.epic != order.epic or snapshot.side is not order.side
 
+
+def _cause(order: OrderRecord) -> str:
+    """Przyczyna UNKNOWN z notatki (tokeny `CAUSE=...`), przenoszona do notatki wyniku."""
+    return " ".join(token for token in order.note.split() if token.startswith("CAUSE="))
+
+
+def _note(*parts: str) -> str:
+    return " ".join(part for part in parts if part)

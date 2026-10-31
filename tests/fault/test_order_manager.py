@@ -16,7 +16,7 @@ import pytest
 import gwstock.orders.manager as manager_module
 from gwstock.journal import JournalWriteError, OrderRecord, PositionRecord
 from gwstock.orders.fsm import check_order_transition, check_position_transition
-from gwstock.orders.manager import EntryBlocked, OrderManager
+from gwstock.orders.manager import EntryBlocked, OrderManager, match_entry_positions
 from gwstock.types import (
     BrokerError,
     BrokerRejected,
@@ -31,6 +31,7 @@ from gwstock.types import (
 T0 = datetime(2026, 11, 2, 7, 30, tzinfo=timezone.utc)  # = clock.now_utc() na starcie fixture `clock`
 FILL = Decimal("25782.3")  # BUY po ask z fixture `quote`
 STOP = FILL - Decimal("30")
+SKEW_BEYOND_TOLERANCE = timedelta(seconds=6)  # tolerancja zegara brokera to 5 s
 
 
 def order(journal, req):
@@ -93,7 +94,8 @@ async def test_timeout_then_position_found_is_adopted_not_duplicated(journal, fa
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.CONFIRMED and fake.calls.count("open_position") == 1
     assert rec.deal_id == "DEAL-1" and rec.deal_reference is None  # odpowiedź (referencja) nie dotarła
-    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=positions"
+    # kod wyniku na początku, przyczyna UNKNOWN zostaje w notatce
+    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=positions CAUSE=open_position:BrokerTimeout"
     assert position(journal).state == PositionState.OPEN and position(journal).deal_id == "DEAL-1"
     assert fake.calls.count("list_positions") == 1 and clock.elapsed_since_start() == 10
 
@@ -103,7 +105,7 @@ async def test_timeout_without_position_becomes_not_placed_after_three_checks(jo
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.NOT_PLACED and fake.calls.count("list_positions") == 3
     assert clock.elapsed_since_start() >= 30  # trzy zapytania w 30 s
-    assert rec.note == "NOT_FOUND_AFTER_CHECKS=3"
+    assert rec.note == "NOT_FOUND_AFTER_CHECKS=3 CAUSE=open_position:BrokerTimeout"
     assert position(journal).state == PositionState.FLAT
     assert fake.calls.count("open_position") == 1 and fake.positions == {}
 
@@ -135,7 +137,7 @@ async def test_confirm_returning_none_is_resolved_from_position_list(journal, fa
     monkeypatch.setattr(fake, "confirm", unknown_reference)
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.CONFIRMED and rec.deal_id == "DEAL-1" and rec.deal_reference == "REF-1"
-    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=positions"
+    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=positions CAUSE=confirm:NONE"
     assert fake.calls.count("open_position") == 1
 
 
@@ -143,7 +145,7 @@ async def test_confirm_timeout_is_resolved_by_asking_confirm_again(journal, fake
     fake.fail_next("confirm", BrokerTimeout())
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.CONFIRMED and (rec.deal_reference, rec.deal_id) == ("REF-1", "DEAL-1")
-    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm"
+    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm CAUSE=confirm:BrokerTimeout"
     assert fake.calls.count("open_position") == 1 and fake.calls.count("confirm") == 2
 
 
@@ -154,7 +156,7 @@ async def test_position_stopped_out_before_resolution_is_still_confirmed_from_sn
     fake.fail_next("confirm", BrokerTimeout())
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.CONFIRMED and rec.deal_id == "DEAL-1"
-    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm"
+    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm CAUSE=confirm:BrokerTimeout"
     assert position(journal).state == PositionState.OPEN  # rekoncyliator wykryje zniknięcie i zaksięguje stop
 
 
@@ -164,16 +166,17 @@ async def test_snapshot_opened_before_intent_is_accepted_when_the_deal_is_listed
 
     async def skewed_confirm(deal_reference):
         snap = await real_confirm(deal_reference)
-        return replace(snap, opened_at=T0 - timedelta(seconds=1))
+        return replace(snap, opened_at=T0 - SKEW_BEYOND_TOLERANCE)
 
     monkeypatch.setattr(fake, "confirm", skewed_confirm)
     fake.fail_next("confirm", BrokerTimeout())
     def skew_listed_position():  # sama lista nie wystarczy do przejęcia (opened_at < created_at): decyduje migawka
-        fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], opened_at=T0 - timedelta(seconds=1))
+        fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], opened_at=T0 - SKEW_BEYOND_TOLERANCE)
 
     fake.on_call("list_positions", skew_listed_position, once=True)
     rec = await mgr.submit_entry(req)
-    assert rec.state == OrderState.CONFIRMED and rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm"
+    assert rec.state == OrderState.CONFIRMED
+    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm CAUSE=confirm:BrokerTimeout"
 
 
 async def test_unverifiable_snapshot_blocks_instead_of_guessing(journal, fake, mgr, req, monkeypatch):
@@ -181,13 +184,13 @@ async def test_unverifiable_snapshot_blocks_instead_of_guessing(journal, fake, m
 
     async def skewed_confirm(deal_reference):
         snap = await real_confirm(deal_reference)
-        return replace(snap, opened_at=T0 - timedelta(seconds=1))
+        return replace(snap, opened_at=T0 - SKEW_BEYOND_TOLERANCE)
 
     monkeypatch.setattr(fake, "confirm", skewed_confirm)
     fake.fail_next("confirm", BrokerTimeout())
     fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True)
     rec = await mgr.submit_entry(req)
-    assert rec.state == OrderState.UNKNOWN and rec.note == "CONFIRM_UNVERIFIED"
+    assert rec.state == OrderState.UNKNOWN and rec.note == "CONFIRM_UNVERIFIED CAUSE=confirm:BrokerTimeout"
     assert position(journal).state == PositionState.BLOCKED
     assert fake.calls.count("open_position") == 1
 
@@ -198,12 +201,12 @@ async def test_direct_confirmation_is_not_compared_with_intent_time(journal, fak
 
     async def skewed_confirm(deal_reference):
         snap = await real_confirm(deal_reference)
-        return replace(snap, opened_at=T0 - timedelta(seconds=1))
+        return replace(snap, opened_at=T0 - SKEW_BEYOND_TOLERANCE)
 
     monkeypatch.setattr(fake, "confirm", skewed_confirm)
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.CONFIRMED and fake.calls == ["open_position", "confirm"]
-    assert position(journal).opened_at == T0 - timedelta(seconds=1)
+    assert position(journal).opened_at == T0 - SKEW_BEYOND_TOLERANCE
 
 
 async def test_confirmation_contradicting_the_order_blocks(journal, fake, mgr, req, monkeypatch):
@@ -225,7 +228,8 @@ async def test_rejection_found_while_resolving_is_not_placed(journal, fake, mgr,
     fake.reject_next_entry("INSUFFICIENT_FUNDS")
     fake.fail_next("confirm", BrokerTimeout())
     rec = await mgr.submit_entry(req)
-    assert rec.state == OrderState.NOT_PLACED and rec.note == "REJECTED_ON_CONFIRM=INSUFFICIENT_FUNDS"
+    assert rec.state == OrderState.NOT_PLACED
+    assert rec.note == "REJECTED_ON_CONFIRM=INSUFFICIENT_FUNDS CAUSE=confirm:BrokerTimeout"
     assert position(journal).state == PositionState.FLAT
     assert fake.calls.count("open_position") == 1
 
@@ -234,7 +238,8 @@ async def test_ambiguous_match_blocks_and_never_guesses(journal, fake, mgr, req)
     fake.fail_next("open_position", BrokerTimeout(), applied=True)
     fake.positions["MANUAL-1"] = foreign("MANUAL-1")  # druga pasująca pozycja (np. ręczna) w tym samym oknie
     rec = await mgr.submit_entry(req)
-    assert rec.state == OrderState.UNKNOWN and rec.note == "AMBIGUOUS_MATCH" and rec.deal_id is None
+    assert rec.state == OrderState.UNKNOWN and rec.deal_id is None
+    assert rec.note == "AMBIGUOUS_MATCH CAUSE=open_position:BrokerTimeout"
     assert position(journal) == PositionRecord("DE40", PositionState.BLOCKED)
     assert fake.calls.count("open_position") == 1
     [event] = payloads(journal, "order.event")
@@ -242,7 +247,7 @@ async def test_ambiguous_match_blocks_and_never_guesses(journal, fake, mgr, req)
 
 
 async def test_positions_opened_before_intent_or_not_matching_are_not_adopted(journal, fake, mgr, req):
-    fake.positions["OLD-1"] = foreign("OLD-1", opened_at=T0 - timedelta(seconds=1))
+    fake.positions["OLD-1"] = foreign("OLD-1", opened_at=T0 - SKEW_BEYOND_TOLERANCE)
     fake.positions["SELL-1"] = foreign("SELL-1", side=Side.SELL)
     fake.positions["US-1"] = foreign("US-1", epic="US500")
     fake.fail_next("open_position", BrokerTimeout(), applied=False)
@@ -255,7 +260,7 @@ async def test_failed_check_never_counts_as_proof_of_absence(journal, fake, mgr,
     fake.fail_next("open_position", BrokerTimeout(), applied=False)
     fake.fail_next("list_positions", BrokerTimeout())
     rec = await mgr.submit_entry(req)
-    assert rec.state == OrderState.UNKNOWN and rec.note == "CHECKS_INCOMPLETE"
+    assert rec.state == OrderState.UNKNOWN and rec.note == "CHECKS_INCOMPLETE CAUSE=open_position:BrokerTimeout"
     assert position(journal).state == PositionState.ENTERING  # rekoncyliator rozstrzygnie, gdy broker odpowie
     assert fake.calls.count("list_positions") == 3 and clock.elapsed_since_start() == 30
 
@@ -263,7 +268,7 @@ async def test_failed_check_never_counts_as_proof_of_absence(journal, fake, mgr,
 async def test_expired_session_leaves_order_unknown_not_not_placed(journal, fake, mgr, req):
     fake.expire_session()  # menedżer nie loguje się sam: brak odczytu to brak wiedzy, a nie brak pozycji
     rec = await mgr.submit_entry(req)
-    assert rec.state == OrderState.UNKNOWN and rec.note == "CHECKS_INCOMPLETE"
+    assert rec.state == OrderState.UNKNOWN and rec.note == "CHECKS_INCOMPLETE CAUSE=open_position:SessionExpired"
     assert fake.calls == ["open_position"] + ["list_positions"] * 3
 
 
@@ -301,31 +306,117 @@ async def test_asyncio_timeout_without_fill_is_not_placed(journal, fake, clock, 
     assert rec.state == OrderState.NOT_PLACED and fake.calls.count("open_position") == 1
 
 
-async def test_cancellation_during_broker_call_leaves_submitting(journal, fake, mgr, req, monkeypatch):
+@pytest.mark.parametrize(
+    ("method", "expected_calls"),
+    [("open_position", ["open_position"]), ("confirm", ["open_position", "confirm"])],
+)
+async def test_cancellation_during_broker_call_leaves_submitting(
+    journal, fake, mgr, req, monkeypatch, method, expected_calls
+):
     started = asyncio.Event()
 
-    async def slow(r):
-        fake.calls.append("open_position")
+    async def slow(*_args):
+        fake.calls.append(method)
         started.set()
         await hang_forever()
 
-    monkeypatch.setattr(fake, "open_position", slow)
+    monkeypatch.setattr(fake, method, slow)
     task = asyncio.create_task(mgr.submit_entry(req))
     waiter = asyncio.create_task(started.wait())
     await asyncio.wait([task, waiter], timeout=TEST_GUARD_S, return_when=asyncio.FIRST_COMPLETED)
     waiter.cancel()
     assert started.is_set(), "submit_entry never reached the broker call"
+    assert mgr.in_flight
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert not mgr.in_flight
     assert order(journal, req).state == OrderState.SUBMITTING  # rozstrzygnie uzgadnianie po restarcie
     assert position(journal).state == PositionState.ENTERING
-    assert fake.calls == ["open_position"]
+    assert fake.calls == expected_calls
+    if method == "confirm":  # referencja przetrwała w surowym zdarzeniu (wiersz 8 tabeli awarii)
+        assert payloads(journal, "broker.open_position")[0]["response"] == {"deal_reference": "REF-1"}
 
 
 async def test_resolve_unknown_accepts_only_unknown_orders(journal, mgr, req):
     with pytest.raises(ValueError, match="UNKNOWN"):
         await mgr.resolve_unknown(unresolved(OrderState.SUBMITTING))
+
+
+@pytest.mark.parametrize(
+    "pos",
+    [
+        None,
+        PositionRecord("DE40", PositionState.FLAT),
+        PositionRecord("DE40", PositionState.BLOCKED),
+        PositionRecord("DE40", PositionState.OPEN, "DEAL-7", Side.BUY, Decimal("0.007"), FILL, STOP, T0),
+        PositionRecord("DE40", PositionState.EXITING, "DEAL-7", Side.BUY, Decimal("0.007"), FILL, STOP, T0),
+    ],
+    ids=["missing", "FLAT", "BLOCKED", "OPEN", "EXITING"],
+)
+async def test_resolve_unknown_requires_an_entering_position(journal, fake, mgr, clock, pos):
+    # BLOCKED to decyzja uzgadniania lub właściciela; OPEN po awarii między zapisami to już przejęta pozycja
+    rec = unresolved(OrderState.UNKNOWN)
+    journal.insert_order(rec)
+    if pos is not None:
+        journal.upsert_position(pos)
+    with pytest.raises(ValueError, match="ENTERING"):
+        await mgr.resolve_unknown(rec)
+    assert clock.elapsed_since_start() == 0 and fake.calls == []  # ani czekania, ani brokera
+    assert journal.get_order(rec.order_id) == rec and journal.current_position("DE40") == pos
+    assert not mgr.in_flight
+
+
+async def test_second_resolve_after_ambiguous_match_is_refused(journal, fake, mgr, req, clock):
+    _ambiguous(fake)
+    rec = await mgr.submit_entry(req)
+    calls, elapsed = list(fake.calls), clock.elapsed_since_start()
+    with pytest.raises(ValueError, match="BLOCKED"):
+        await mgr.resolve_unknown(rec)  # nie wolno przejąć ręcznej pozycji wbrew decyzji BLOCKED
+    assert fake.calls == calls and clock.elapsed_since_start() == elapsed
+    assert order(journal, req) == rec and position(journal).state == PositionState.BLOCKED
+
+
+async def test_resolve_after_crash_between_writes_never_unbooks_a_filled_trade(journal, fake, mgr):
+    # awaria po zapisie pozycji OPEN, przed zapisem CONFIRMED; potem stop zamknął pozycję u brokera
+    rec = unresolved(OrderState.UNKNOWN)
+    journal.insert_order(rec)
+    opened = PositionRecord("DE40", PositionState.OPEN, "DEAL-7", Side.BUY, Decimal("0.007"), FILL, STOP, T0)
+    journal.upsert_position(opened)
+    with pytest.raises(ValueError, match="OPEN"):
+        await mgr.resolve_unknown(rec)
+    assert journal.current_position("DE40") == opened and journal.get_order(rec.order_id) == rec
+    assert fake.calls == []
+
+
+async def test_resolve_unknown_resolves_an_unknown_entering_order(journal, fake, mgr, clock):
+    rec = unresolved(OrderState.UNKNOWN)
+    journal.insert_order(rec)
+    journal.upsert_position(PositionRecord("DE40", PositionState.ENTERING))
+    fake.positions["DEAL-7"] = foreign("DEAL-7")
+    seen = []
+    fake.on_call("list_positions", lambda: seen.append(mgr.in_flight))
+    out = await mgr.resolve_unknown(rec)
+    assert out.state == OrderState.CONFIRMED and out.deal_id == "DEAL-7"
+    assert seen == [True] and not mgr.in_flight
+
+
+async def test_resolve_unknown_is_refused_while_an_entry_is_in_flight(journal, fake, mgr, req, monkeypatch):
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    real_list = fake.list_positions
+    refused = []
+
+    async def list_and_probe():  # drugi rozstrzygający w trakcie rozstrzygania tego samego wejścia
+        if not refused:
+            with pytest.raises(RuntimeError, match="in flight"):
+                await mgr.resolve_unknown(journal.get_order(req.client_id))
+            refused.append(mgr.in_flight)
+        return await real_list()
+
+    monkeypatch.setattr(fake, "list_positions", list_and_probe)
+    rec = await mgr.submit_entry(req)
+    assert refused == [True] and rec.state == OrderState.NOT_PLACED  # odmowa nie zgasiła flagi ani nie zmieniła wyniku
+    assert fake.calls.count("list_positions") == 3 and not mgr.in_flight
 
 
 # --- odrzucenia: stany końcowe z powodem ------------------------------------------------------------
@@ -646,12 +737,45 @@ async def test_write_failure_after_broker_call_propagates_without_retry(journal,
     assert position(journal).state == PositionState.OPEN  # pozycja zapisana przed zamknięciem zlecenia
 
 
+def fail_raw_once(journal, monkeypatch, source):
+    """`append_raw` zawodzi RAZ (dla danego źródła), potem działa: ponowienie lub połknięcie błędu byłoby widać."""
+    real = journal.append_raw
+    armed = [True]
+
+    def append_raw(src, payload, ts):
+        if armed[0] and src == source:
+            armed[0] = False
+            raise JournalWriteError("disk full (once)")
+        return real(src, payload, ts)
+
+    monkeypatch.setattr(journal, "append_raw", append_raw)
+
+
 async def test_raw_ack_write_failure_stops_before_confirm(journal, fake, mgr, req, monkeypatch):
-    monkeypatch.setattr(journal, "append_raw", write_failure)
+    fail_raw_once(journal, monkeypatch, "broker.open_position")
     with pytest.raises(JournalWriteError):
         await mgr.submit_entry(req)
     assert fake.calls == ["open_position"]  # odpowiedzi nie przetwarzamy, dopóki nie jest zapisana
+    assert order(journal, req).state == OrderState.SUBMITTING and not mgr.in_flight
+
+
+async def test_raw_error_write_failure_in_the_handler_stops_everything(journal, fake, mgr, req, monkeypatch):
+    # wiersz 6a: zapis surowego błędu (wewnątrz `except`) zawodzi → koniec, bez UNKNOWN i bez odczytów
+    fake.fail_next("open_position", BrokerTimeout(), applied=True)
+    fail_raw_once(journal, monkeypatch, "broker.open_position")
+    with pytest.raises(JournalWriteError):
+        await mgr.submit_entry(req)
+    assert fake.calls == ["open_position"]
     assert order(journal, req).state == OrderState.SUBMITTING
+
+
+async def test_raw_positions_write_failure_stops_resolution(journal, fake, mgr, req, monkeypatch):
+    fake.fail_next("open_position", BrokerTimeout(), applied=True)
+    fail_raw_once(journal, monkeypatch, "broker.list_positions")
+    with pytest.raises(JournalWriteError):
+        await mgr.submit_entry(req)
+    assert fake.calls == ["open_position", "list_positions"]  # błąd zapisu to nie nieudany odczyt: brak 2. rundy
+    assert order(journal, req).state == OrderState.UNKNOWN and position(journal).state == PositionState.ENTERING
 
 
 async def test_unknown_write_failure_after_timeout_stops_before_any_check(journal, fake, mgr, req, monkeypatch):
@@ -668,3 +792,118 @@ async def test_unknown_write_failure_after_timeout_stops_before_any_check(journa
         await mgr.submit_entry(req)
     assert fake.calls == ["open_position"]
     assert order(journal, req).state == OrderState.SUBMITTING
+
+
+# --- znaczniki czasu zleceń ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("applied", "final", "seconds"), [(True, OrderState.CONFIRMED, 10), (False, OrderState.NOT_PLACED, 30)]
+)
+async def test_updated_at_follows_the_engine_clock(journal, fake, mgr, req, monkeypatch, applied, final, seconds):
+    fake.fail_next("open_position", BrokerTimeout(), applied=applied)
+    written = []
+    update_order = journal.update_order
+
+    def on_update(order_id, **fields):
+        rec = update_order(order_id, **fields)
+        written.append((rec.state, rec.updated_at))
+        return rec
+
+    monkeypatch.setattr(journal, "update_order", on_update)
+    rec = await mgr.submit_entry(req)
+    assert written == [
+        (OrderState.SUBMITTING, T0),
+        (OrderState.UNKNOWN, T0),
+        (final, T0 + timedelta(seconds=seconds)),
+    ]
+    assert rec.created_at == T0
+
+
+# --- flaga in_flight (bramka dla uzgadniania) -----------------------------------------------------------
+
+
+async def test_in_flight_is_true_only_while_an_entry_is_being_submitted(journal, fake, mgr, req):
+    seen = []
+    fake.fail_next("confirm", BrokerTimeout())
+    for method in ("open_position", "confirm", "list_positions"):
+        fake.on_call(method, lambda: seen.append(mgr.in_flight))
+    assert not mgr.in_flight
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.CONFIRMED
+    assert seen == [True, True, True, True] and not mgr.in_flight  # open, confirm, confirm (runda 1), lista
+
+
+async def test_in_flight_is_never_set_when_the_guard_refuses(journal, fake, mgr, req):
+    journal.insert_order(unresolved(OrderState.UNKNOWN))
+    with pytest.raises(EntryBlocked):
+        await mgr.submit_entry(req)
+    assert not mgr.in_flight
+
+
+@pytest.mark.parametrize("stage", ["intent", "confirmed"])
+async def test_in_flight_is_cleared_after_a_journal_write_error(journal, fake, mgr, req, monkeypatch, stage):
+    if stage == "intent":
+        monkeypatch.setattr(journal, "insert_order", write_failure)
+    else:
+        update_order = journal.update_order
+
+        def fail_on_confirmed(order_id, **fields):
+            if fields.get("state") == OrderState.CONFIRMED:
+                raise JournalWriteError("disk full")
+            return update_order(order_id, **fields)
+
+        monkeypatch.setattr(journal, "update_order", fail_on_confirmed)
+    with pytest.raises(JournalWriteError):
+        await mgr.submit_entry(req)
+    assert not mgr.in_flight
+
+
+# --- dopasowanie pozycji do wejścia (wspólne z uzgadnianiem) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("offset_s", "matches"), [(-6, False), (-5, True), (0, True), (3600, True)], ids=["-6s", "-5s", "0s", "+1h"]
+)
+def test_match_entry_positions_tolerates_five_seconds_of_broker_clock_skew(offset_s, matches):
+    pos = foreign("DEAL-1", opened_at=T0 + timedelta(seconds=offset_s))
+    assert match_entry_positions(unresolved(OrderState.UNKNOWN), [pos]) == ([pos] if matches else [])
+
+
+def test_match_entry_positions_requires_same_epic_and_side():
+    rec = unresolved(OrderState.UNKNOWN)
+    assert match_entry_positions(rec, [foreign("S-1", side=Side.SELL), foreign("U-1", epic="US500")]) == []
+
+
+def test_match_entry_positions_returns_all_matches_in_broker_order():
+    rec = unresolved(OrderState.UNKNOWN)
+    listed = [foreign("B-2"), foreign("X-1", side=Side.SELL), foreign("A-1", opened_at=T0 + timedelta(seconds=1))]
+    assert match_entry_positions(rec, listed) == [listed[0], listed[2]]
+    assert match_entry_positions(rec, ()) == []
+
+
+async def test_position_reported_slightly_before_intent_is_adopted(journal, fake, mgr, req):
+    # zegar brokera 5 s za naszym (albo pełne sekundy): po utracie odpowiedzi to nadal nasze wykonanie
+    fake.on_call(
+        "list_positions",
+        lambda: fake.positions.update(
+            {"DEAL-1": replace(fake.positions["DEAL-1"], opened_at=T0 - timedelta(seconds=5))}
+        ),
+        once=True,
+    )
+    fake.fail_next("open_position", BrokerTimeout(), applied=True)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.CONFIRMED and rec.deal_id == "DEAL-1"
+
+
+async def test_snapshot_reported_slightly_before_intent_is_accepted(journal, fake, mgr, req, monkeypatch):
+    real_confirm = fake.confirm
+
+    async def skewed_confirm(deal_reference):
+        return replace(await real_confirm(deal_reference), opened_at=T0 - timedelta(seconds=5))
+
+    monkeypatch.setattr(fake, "confirm", skewed_confirm)
+    fake.fail_next("confirm", BrokerTimeout())
+    fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True)  # nie ma jej już na liście
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.CONFIRMED and rec.note.startswith("ADOPTED_AFTER_UNKNOWN VIA=confirm")
