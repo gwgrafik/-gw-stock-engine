@@ -3,6 +3,7 @@
 Kolejne zadania dopisują tu swoje fixtures (`journal`, `mgr`, `req`, `gate`, `kill`, `reconciler`).
 """
 
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from gwstock.broker.fake import FakeBroker
 from gwstock.clock import FakeClock
 from gwstock.config import CostConfig, RiskConfig, StrategyConfig, load_config
+from gwstock.journal import Journal
 from gwstock.types import InstrumentRules, Quote
 
 
@@ -62,3 +64,11 @@ def risk_cfg(_configs) -> RiskConfig:
 @pytest.fixture
 def cost_cfg(_configs) -> CostConfig:
     return _configs[2]
+
+
+@pytest.fixture
+def journal(tmp_path) -> Iterator[Journal]:
+    """Świeży dziennik SQLite w katalogu testu; zamykany po teście."""
+    j = Journal.open(str(tmp_path / "journal.sqlite"))
+    yield j
+    j.close()
