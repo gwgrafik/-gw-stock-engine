@@ -19,11 +19,15 @@ MAX_CLIENT_ID_LENGTH = 128
 _TOKEN = re.compile(r"[A-Za-z0-9]+")
 _DAY = re.compile(r"[0-9]{8}")
 _SEQ = re.compile(r"[1-9][0-9]*")
+# Cały identyfikator, sprawdzany jeszcze raz po sklejeniu: podklasa `str`, `int` lub `date` z własnym renderowaniem
+# (np. (str, Enum) daje w f-stringu "Side.BUY") nie może wyprodukować napisu, którego `parse_client_id` nie przyjmie.
+_CLIENT_ID = re.compile(rf"{PREFIX}-[0-9]{{8}}-[A-Za-z0-9]+-[1-9][0-9]*-[A-Za-z0-9]+")
 
 
 def _check_token(name: str, value: object) -> None:
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be str, got {type(value).__name__} {value!r}")
+    # dokładnie `str`: podklasa (np. (str, Enum)) renderuje się w f-stringu inaczej niż jej wartość
+    if type(value) is not str:
+        raise TypeError(f"{name} must be exactly str, got {type(value).__name__} {value!r}")
     if not _TOKEN.fullmatch(value):
         raise ValueError(f"{name} must be non-empty and match [A-Za-z0-9]+ (no '-'), got {value!r}")
 
@@ -42,6 +46,8 @@ def make_client_id(day: date, instrument: str, seq: int, role: str) -> str:
     client_id = f"{PREFIX}-{day.year:04d}{day.month:02d}{day.day:02d}-{instrument}-{seq:d}-{role}"
     if len(client_id) > MAX_CLIENT_ID_LENGTH:
         raise ValueError(f"client id longer than {MAX_CLIENT_ID_LENGTH} characters ({len(client_id)}): {client_id!r}")
+    if not _CLIENT_ID.fullmatch(client_id):
+        raise ValueError(f"client id {client_id!r} does not match {PREFIX}-YYYYMMDD-instrument-seq-role")
     return client_id
 
 

@@ -7,6 +7,7 @@ więc dodatkowa lub brakująca krawędź w `fsm.py` nie przejdzie niezauważona.
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from itertools import product
+from types import MappingProxyType
 
 import pytest
 
@@ -257,6 +258,21 @@ def test_invalid_transition_is_a_plain_exception():
     assert not issubclass(InvalidTransition, (TypeError, ValueError))
 
 
+# --- tabele są tylko do odczytu --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("table", "key"),
+    [(ALLOWED_ORDER_TRANSITIONS, O.CONFIRMED), (ALLOWED_POSITION_TRANSITIONS, P.BLOCKED)],
+    ids=["order", "position"],
+)
+def test_transition_tables_are_read_only(table, key):
+    assert isinstance(table, MappingProxyType)
+    with pytest.raises(TypeError):
+        table[key] = table[key]  # przypisanie tej samej wartości: gdyby przeszło, nie psuje innych testów
+    assert all(isinstance(v, frozenset) for v in table.values())  # wartości też niemutowalne
+
+
 # --- identyfikatory ------------------------------------------------------------------------------
 
 DAY = date(2026, 11, 2)
@@ -319,6 +335,22 @@ def test_client_id_length_limit_is_128_inclusive():
         make_client_id(DAY, "DE40", 1, "r" * 200)
 
 
+@pytest.mark.parametrize("long_field", ["instrument", "role"])
+def test_client_id_of_exactly_128_characters_round_trips_and_129_is_rejected(long_field):
+    fixed = len("gws-20261102-") + len("-1-") + 1  # prefiks z datą, "-1-" i jednoznakowy drugi człon
+    filler = "A" * (128 - fixed)
+    instrument, role = (filler, "r") if long_field == "instrument" else ("D", filler)
+    client_id = make_client_id(DAY, instrument, 1, role)
+    assert len(client_id) == 128
+    assert parse_client_id(client_id) == (DAY, instrument, 1, role)
+    assert make_client_id(*parse_client_id(client_id)) == client_id
+    longer = (filler + "A", "r") if long_field == "instrument" else ("D", filler + "A")
+    with pytest.raises(ValueError, match="128"):
+        make_client_id(DAY, longer[0], 1, longer[1])
+    with pytest.raises(ValueError, match="128"):
+        parse_client_id(f"gws-20261102-{longer[0]}-1-{longer[1]}")
+
+
 @pytest.mark.parametrize("bad_day", [datetime(2026, 11, 2, 7, 30, tzinfo=timezone.utc), datetime(2026, 11, 2), "2026-11-02", None, 20261102])
 def test_client_id_day_must_be_a_plain_date(bad_day):
     with pytest.raises(TypeError, match="date"):
@@ -341,6 +373,31 @@ def test_client_id_instrument_and_role_must_be_str(field, bad):
     kwargs[field] = bad
     with pytest.raises(TypeError, match=field):
         make_client_id(DAY, kwargs["instrument"], 1, kwargs["role"])
+
+
+@pytest.mark.parametrize("field", ["instrument", "role"])
+def test_client_id_rejects_str_subclasses(field):
+    # (str, Enum) w f-stringu 3.12 daje "Side.BUY", więc id byłoby nieparsowalne; wymagamy dokładnie `str`
+    kwargs = {"instrument": "DE40", "role": "entry"}
+    kwargs[field] = Side.BUY
+    with pytest.raises(TypeError, match=rf"{field}.*Side"):
+        make_client_id(DAY, kwargs["instrument"], 1, kwargs["role"])
+
+
+def test_client_id_rejects_value_whose_rendering_is_not_the_expected_token():
+    class OffsetDay(date):  # podklasa `date` z nadpisanym miesiącem: sklejony napis ma 9 cyfr zamiast 8
+        @property
+        def month(self):
+            return 123
+
+    class OddInt(int):  # podklasa `int` renderowana jako coś, co nie jest liczbą >= 1 bez zer wiodących
+        def __format__(self, spec):
+            return "007"
+
+    with pytest.raises(ValueError, match="client id"):
+        make_client_id(OffsetDay(2026, 11, 2), "DE40", 1, "entry")
+    with pytest.raises(ValueError, match="client id"):
+        make_client_id(DAY, "DE40", OddInt(7), "entry")
 
 
 @pytest.mark.parametrize("bad_seq", [0, -1, -100])

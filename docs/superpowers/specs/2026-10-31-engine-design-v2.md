@@ -168,7 +168,7 @@ Są to **założenia projektowe, nie wyniki badań**. Przed pierwszą sesją `dr
 
 | Stan | Znaczenie | Wyjścia |
 |---|---|---|
-| `INTENT` | Zapisane w dzienniku z `synchronous=FULL`, nic nie wysłano | → `SUBMITTING` |
+| `INTENT` | Zapisane w dzienniku z `synchronous=FULL`, nic nie wysłano | → `SUBMITTING`, `NOT_PLACED` (zlecenie porzucone przed wysyłką, np. po restarcie; bezpieczne, bo `SUBMITTING` zapisujemy przed wywołaniem brokera) |
 | `SUBMITTING` | Wysyłka w toku | → `CONFIRMED`, `REJECTED`, `UNKNOWN` (timeout 10 s) |
 | `UNKNOWN` | Nie wiadomo, czy broker przyjął | → przez listę pozycji do `CONFIRMED`, `NOT_PLACED` |
 | `CONFIRMED` | Broker potwierdził wykonanie (pozycja otwarta) | – |

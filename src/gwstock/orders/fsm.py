@@ -3,6 +3,7 @@
 Zasady:
 - przejście spoza tabeli (także X -> X) to `InvalidTransition`: nieobsłużona zmiana stanu jest błędem wywołującego,
   a nie cichym no-opem;
+- tabele są tylko do odczytu (`MappingProxyType` z wartościami `frozenset`): nikt nie dopisze krawędzi w locie;
 - kontrola przyjmuje wyłącznie enumy (`OrderState`, `PositionState`); gołe napisy są odrzucane z `TypeError`,
   mimo że enumy dziedziczą po `str` i "INTENT" == OrderState.INTENT;
 - stan pozycji zmienia się tylko na podstawie odpowiedzi i listy pozycji brokera, nigdy samego wysłania zlecenia
@@ -11,12 +12,14 @@ Zasady:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
+from types import MappingProxyType
 
 from gwstock.types import OrderState, PositionState
 
-O = OrderState
-P = PositionState
+_O = OrderState
+_P = PositionState
 
 
 class InvalidTransition(Exception):
@@ -31,38 +34,38 @@ class InvalidTransition(Exception):
 # Stany rozszerzone (WORKING, PARTIAL, CANCELING, CANCELED, EXPIRED) nie są używane w v1: żaden stan v1 do nich
 # nie prowadzi (nie ma krawędzi wejściowej, dołoży ją adapter, który ich potrzebuje), a one same dochodzą do
 # stanów v1 tylko przez CONFIRMED. CANCELED i EXPIRED są końcowe.
-ALLOWED_ORDER_TRANSITIONS: dict[OrderState, frozenset[OrderState]] = {
-    O.INTENT: frozenset({O.SUBMITTING, O.NOT_PLACED}),
-    O.SUBMITTING: frozenset({O.CONFIRMED, O.REJECTED, O.UNKNOWN}),
-    O.UNKNOWN: frozenset({O.CONFIRMED, O.NOT_PLACED}),
-    O.CONFIRMED: frozenset(),
-    O.REJECTED: frozenset(),
-    O.NOT_PLACED: frozenset(),
-    O.WORKING: frozenset({O.PARTIAL, O.CANCELING, O.CANCELED, O.EXPIRED, O.CONFIRMED}),
-    O.PARTIAL: frozenset({O.CONFIRMED, O.CANCELING, O.CANCELED}),
-    O.CANCELING: frozenset({O.CANCELED, O.CONFIRMED}),
-    O.CANCELED: frozenset(),
-    O.EXPIRED: frozenset(),
-}
+ALLOWED_ORDER_TRANSITIONS: Mapping[OrderState, frozenset[OrderState]] = MappingProxyType({
+    _O.INTENT: frozenset({_O.SUBMITTING, _O.NOT_PLACED}),
+    _O.SUBMITTING: frozenset({_O.CONFIRMED, _O.REJECTED, _O.UNKNOWN}),
+    _O.UNKNOWN: frozenset({_O.CONFIRMED, _O.NOT_PLACED}),
+    _O.CONFIRMED: frozenset(),
+    _O.REJECTED: frozenset(),
+    _O.NOT_PLACED: frozenset(),
+    _O.WORKING: frozenset({_O.PARTIAL, _O.CANCELING, _O.CANCELED, _O.EXPIRED, _O.CONFIRMED}),
+    _O.PARTIAL: frozenset({_O.CONFIRMED, _O.CANCELING, _O.CANCELED}),
+    _O.CANCELING: frozenset({_O.CANCELED, _O.CONFIRMED}),
+    _O.CANCELED: frozenset(),
+    _O.EXPIRED: frozenset(),
+})
 
 # Pozycja. Nie ma krawędzi FLAT -> OPEN/EXITING/BLOCKED ani ENTERING -> EXITING: pozycja powstaje tylko przez
 # ENTERING potwierdzone przez brokera, a BLOCKED oznacza rozbieżność z brokerem, której przed wejściem nie ma.
 # BLOCKED opuszcza wyłącznie decyzja rekoncyliacji lub właściciela.
-ALLOWED_POSITION_TRANSITIONS: dict[PositionState, frozenset[PositionState]] = {
-    P.FLAT: frozenset({P.ENTERING}),
+ALLOWED_POSITION_TRANSITIONS: Mapping[PositionState, frozenset[PositionState]] = MappingProxyType({
+    _P.FLAT: frozenset({_P.ENTERING}),
     # OPEN: broker potwierdził; FLAT: wejście odrzucone lub niezłożone
-    P.ENTERING: frozenset({P.OPEN, P.FLAT, P.BLOCKED}),
+    _P.ENTERING: frozenset({_P.OPEN, _P.FLAT, _P.BLOCKED}),
     # FLAT: pozycja zniknęła u brokera, bo zadziałał stop (księguje rekoncyliator)
-    P.OPEN: frozenset({P.EXITING, P.FLAT, P.BLOCKED}),
+    _P.OPEN: frozenset({_P.EXITING, _P.FLAT, _P.BLOCKED}),
     # OPEN: zamknięcie się nie powiodło, pozycja nadal otwarta
-    P.EXITING: frozenset({P.FLAT, P.BLOCKED, P.OPEN}),
-    P.BLOCKED: frozenset({P.FLAT, P.OPEN}),
-}
+    _P.EXITING: frozenset({_P.FLAT, _P.BLOCKED, _P.OPEN}),
+    _P.BLOCKED: frozenset({_P.FLAT, _P.OPEN}),
+})
 
 
 def _check(
     kind: str,
-    table: dict,
+    table: Mapping,
     state_type: type[Enum],
     old: object,
     new: object,
