@@ -13,9 +13,10 @@ import pytest
 from gwstock.broker.fake import FakeBroker
 from gwstock.clock import FakeClock
 from gwstock.config import CostConfig, RiskConfig, StrategyConfig, load_config
-from gwstock.journal import Journal
+from gwstock.journal import Journal, PositionRecord
 from gwstock.orders.manager import OrderManager
-from gwstock.types import EntryRequest, InstrumentRules, Quote, Side
+from gwstock.reconcile import Reconciler
+from gwstock.types import ClosedDeal, EntryRequest, InstrumentRules, Quote, Side
 
 
 @pytest.fixture
@@ -84,3 +85,49 @@ def req() -> EntryRequest:
 @pytest.fixture
 def mgr(journal: Journal, fake: FakeBroker, clock: FakeClock, risk_cfg: RiskConfig) -> OrderManager:
     return OrderManager(journal, fake, clock, risk_cfg)
+
+
+class RecordingKillSink:
+    """Atrapa kill switcha (`KillSink`): zapisuje przyczyny kolejnych wywołań `soft`."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def soft(self, reason: str) -> None:
+        self.calls.append(reason)
+
+
+class RecordingBooker:
+    """Atrapa księgującego (`TradeBooker`): zapisuje argumenty; z ustawionym `fail` rzuca go po zapisie."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[PositionRecord, ClosedDeal]] = []
+        self.fail: Exception | None = None
+
+    async def book(self, position: PositionRecord, closed: ClosedDeal) -> None:
+        self.calls.append((position, closed))
+        if self.fail is not None:
+            raise self.fail
+
+
+@pytest.fixture
+def kill_sink() -> RecordingKillSink:
+    return RecordingKillSink()
+
+
+@pytest.fixture
+def booker() -> RecordingBooker:
+    return RecordingBooker()
+
+
+@pytest.fixture
+def reconciler(
+    journal: Journal,
+    fake: FakeBroker,
+    clock: FakeClock,
+    kill_sink: RecordingKillSink,
+    risk_cfg: RiskConfig,
+    booker: RecordingBooker,
+) -> Reconciler:
+    """Uzgadnianie dla DE40 z atrapami kill switcha i księgującego, bez bramki wejścia."""
+    return Reconciler(journal, fake, clock, kill_sink, risk_cfg, "DE40", booker=booker)

@@ -187,7 +187,7 @@ Reguły:
 
 ### Pozycja
 
-`FLAT` → `ENTERING` → `OPEN` (pozycja potwierdzona przez brokera) → `EXITING` → `FLAT`, plus `BLOCKED` (rozbieżność z brokerem: tylko decyzja rekoncyliacji lub właściciela). Stan pozycji zmienia się wyłącznie na podstawie odpowiedzi i listy pozycji brokera, nigdy na podstawie samego wysłania zlecenia.
+`FLAT` → `ENTERING` → `OPEN` (pozycja potwierdzona przez brokera) → `EXITING` → `FLAT`, plus `BLOCKED` (rozbieżność z brokerem: tylko decyzja rekoncyliacji lub właściciela). Do `BLOCKED` prowadzą `ENTERING`, `OPEN` i `EXITING`, a także `FLAT`, gdy uzgadnianie wykryje u brokera obcą pozycję na naszym instrumencie; z `BLOCKED` wychodzi się do `FLAT` lub `OPEN`. Stan pozycji zmienia się wyłącznie na podstawie odpowiedzi i listy pozycji brokera, nigdy na podstawie samego wysłania zlecenia.
 
 ## 7. Uzgadnianie z brokerem
 

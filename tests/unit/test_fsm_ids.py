@@ -57,6 +57,7 @@ V1_ORDER_STATES = set(OrderState) - EXTENDED_ORDER_STATES
 
 POSITION_EDGES = [
     (P.FLAT, P.ENTERING),
+    (P.FLAT, P.BLOCKED),  # uzgadnianie wykryło obcą pozycję na naszym instrumencie, gdy byliśmy FLAT
     (P.ENTERING, P.OPEN),  # broker potwierdził
     (P.ENTERING, P.FLAT),  # wejście odrzucone / niezłożone
     (P.ENTERING, P.BLOCKED),
@@ -199,11 +200,15 @@ def test_position_transition_forbidden(old, new):
 
 
 def test_position_cannot_appear_from_flat_except_through_entering():
-    for new in (P.OPEN, P.EXITING, P.BLOCKED):
+    for new in (P.OPEN, P.EXITING):
         with pytest.raises(InvalidTransition):
             check_position_transition(P.FLAT, new)
     with pytest.raises(InvalidTransition):
         check_position_transition(P.ENTERING, P.EXITING)
+
+
+def test_flat_can_only_be_blocked_by_reconciliation_or_start_entering():
+    assert ALLOWED_POSITION_TRANSITIONS[P.FLAT] == {P.ENTERING, P.BLOCKED}  # BLOCKED: obca pozycja przy FLAT
 
 
 def test_position_self_transition_is_invalid():
