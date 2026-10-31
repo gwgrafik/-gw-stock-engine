@@ -18,7 +18,7 @@ Dokument nie zawiera kluczy, haseł ani danych rachunku.
 | [D8] | Docker Engine, rozwiązywanie problemów, "Kernel cgroup swap limit capabilities": <https://docs.docker.com/engine/daemon/troubleshoot/#kernel-cgroup-swap-limit-capabilities> |
 | [D9] | `docker compose config`: <https://docs.docker.com/reference/cli/docker/compose/config/> |
 | [D10] | Docker Engine, montowania tmpfs: <https://docs.docker.com/engine/storage/tmpfs/> |
-| [D11] | Źródło demona Docker (moby), plik `daemon/daemon_unix.go`, wersja v28.5.2, widziane przez wyszukiwarkę pod <https://github.com/Docker/Docker/blob/v28.5.2/daemon/daemon_unix.go>. Źródło wtórne: pokazuje, co demon robi z wartościami, ale to nie jest dokumentacja |
+| [D11] | Źródło demona Docker (moby), plik `daemon/daemon_unix.go` w wersji v28.5.2: <https://github.com/moby/moby/blob/v28.5.2/daemon/daemon_unix.go>. Tag `v28.5.2` istnieje (sprawdzone `git ls-remote --tags https://github.com/moby/moby`), a cytowane ostrzeżenia znalazłem w surowym pliku tego tagu. Źródło wtórne: pokazuje, co demon robi z wartościami, ale to nie jest dokumentacja |
 | [D12] | Zgłoszenie docker/compose #13898 (wymiana z lipca 2026 o `memswap_limit` na cgroup v2): <https://github.com/docker/compose/issues/13898>. Źródło wtórne, wypowiedź opiekuna Compose |
 | [D13] | Notatki wydania Compose v5.6.0 (2026-10-02): <https://github.com/docker/compose/releases/tag/v5.6.0> |
 | [D14] | `docker container run`, sekcja "Mount volume read-only": <https://docs.docker.com/reference/cli/docker/container/run/> |
@@ -34,19 +34,19 @@ Wymóg spec §13: kontener `python:3.12-slim`, użytkownik bez uprawnień, syste
 
 ### 1.1 Przegląd i statusy
 
-| Pole | Co dokumentacja mówi (semantyka) | Co z tego robi demon i jądro (efekt) | Wartość v1 |
-|---|---|---|---|
-| `mem_limit` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | `256m` |
-| `memswap_limit` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | `256m` |
-| `mem_reservation` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | `128m` (początkowa, do pomiaru) |
-| `oom_score_adj` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | `1000` |
-| `pids_limit` | udokumentowane | do potwierdzenia w dry_run lub w odczytach live | `64` (początkowa, do pomiaru) |
-| `read_only` | udokumentowane | udokumentowane | `true` |
-| `tmpfs` | udokumentowane | udokumentowane | `/tmp` z ograniczeniem rozmiaru |
-| `healthcheck` | udokumentowane | udokumentowane | polecenie sprawdzające świeżość pliku tętna |
-| `restart` | udokumentowane | udokumentowane | `unless-stopped` |
+| Pole | Semantyka | Efekt na hoście | Wartość v1 | Status pozycji |
+|---|---|---|---|---|
+| `mem_limit` | opisana w [D1] | do zmierzenia na VPS (pkt 4) | `256m` | do potwierdzenia w dry_run lub w odczytach live |
+| `memswap_limit` | opisana w [D1] | do zmierzenia na VPS (pkt 4) | `256m` | do potwierdzenia w dry_run lub w odczytach live |
+| `mem_reservation` | opisana w [D1] | do zmierzenia na VPS (pkt 4) | `128m` (początkowa, do pomiaru) | do potwierdzenia w dry_run lub w odczytach live |
+| `oom_score_adj` | opisana w [D1] | do zmierzenia na VPS (pkt 4) | `1000` | do potwierdzenia w dry_run lub w odczytach live |
+| `pids_limit` | opisana w [D1] | do zmierzenia na VPS (pkt 4) | `64` (początkowa, do pomiaru) | do potwierdzenia w dry_run lub w odczytach live |
+| `read_only` | opisana w [D1] | wynika wprost z opisu | `true` | udokumentowane |
+| `tmpfs` | opisana w [D1] i [D10]; rozmiar w formie skróconej (`size=`) nie jest wymieniony w [D1] | do sprawdzenia `df -h /tmp` (pkt 1.8) | `/tmp` z ograniczeniem rozmiaru | do potwierdzenia w dry_run lub w odczytach live |
+| `healthcheck` | opisana w [D1] i [D7] | wynika wprost z opisu | polecenie sprawdzające świeżość pliku tętna | udokumentowane |
+| `restart` | opisana w [D1] i [D6] | wynika wprost z opisu | `unless-stopped` | udokumentowane |
 
-Znaczenie kolumn: "semantyka" to pytanie, czy pole istnieje i co oznacza w Compose; "efekt" to pytanie, czy na konkretnym VPS (jądro, cgroup, wersja Docker Engine i runc) wartość faktycznie zadziała. Dla pól pamięci i procesów efekt zależy od hosta, więc jest do pomiaru.
+Znaczenie kolumn: "Semantyka" to pytanie, czy pole istnieje i co oznacza w Compose; "Efekt na hoście" to pytanie, czy na konkretnym VPS (jądro, cgroup, wersja Docker Engine i runc) wartość faktycznie zadziała. Dla pól pamięci i procesów efekt zależy od hosta, więc jest do pomiaru. Napis statusu występuje tylko w kolumnie "Status pozycji" i jest najsłabszym ogniwem z semantyki i efektu.
 
 ### 1.2 `mem_limit`
 
@@ -57,7 +57,9 @@ Cytat [D1]: "`mem_limit` configures a limit on the amount of memory a container 
 - Minimum demona: "If you set this option, the minimum allowed value is `6m` (6 megabytes)" [D4].
 - Pamięć tmpfs liczy się do limitu: "Because tmpfs stores data in memory, that usage counts against the container's memory cgroup limit (`--memory` / Compose `mem_limit`)" [D10]. Zapis na `/tmp` zjada z tych 256 MB.
 
-Status semantyki: `udokumentowane`. Efekt na VPS (czy limit jest egzekwowany w cgroup): do potwierdzenia w dry_run lub w odczytach live. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.Memory}}'` (oczekiwane `268435456`) oraz wewnątrz kontenera `cat /sys/fs/cgroup/memory.max` (cgroup v2, oczekiwane `268435456`).
+Semantyka jest opisana w [D1]. Efekt na VPS (czy limit jest egzekwowany w cgroup) rozstrzyga pomiar. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.Memory}}'` (oczekiwane `268435456`) oraz wewnątrz kontenera `cat /sys/fs/cgroup/memory.max` (cgroup v2, oczekiwane `268435456`).
+
+Status pozycji: `do potwierdzenia w dry_run lub w odczytach live`.
 
 ### 1.3 `memswap_limit`
 
@@ -69,13 +71,15 @@ Cytat [D1]: "`memswap_limit` defines the amount of memory the container is allow
 - "If `memswap_limit` is set to 0, the setting is ignored" oraz `-1` = swap bez limitu.
 - Uwaga [D4]: "Inside the container, tools like `free` report the host's available swap, not what's available inside the container. Don't rely on the output of `free` or similar tools to determine whether swap is present." Pomiar swapu robimy plikami cgroup, nie `free`.
 
-Wymóg spec §13: `memswap_limit` = `mem_limit` (`256m`), czyli brak swapu. Status semantyki: `udokumentowane`.
+Wymóg spec §13: `memswap_limit` = `mem_limit` (`256m`), czyli brak swapu. Semantyka jest opisana w [D1] i [D4].
 
 **Ryzyko egzekucji (to jest pytanie 9 ze spec):** demon odrzuca limit swapu, gdy jądro nie liczy swapu. W kodzie demona [D11]: gdy brak wsparcia, ostrzeżenie "Your kernel does not support swap limit capabilities or the cgroup is not mounted. Memory limited without swap." i ustawienie `MemorySwap = -1`; dokumentacja [D8] pokazuje to samo ostrzeżenie jako "WARNING: Your kernel does not support swap limit capabilities. Limitation discarded." i opisuje włączenie rachunkowości swapu parametrami jądra `cgroup_enable=memory swapaccount=1` (dotyczy cgroup v1; narzut według [D8]: "about 1% of the total available memory and a 10% overall performance degradation"). Wniosek z tego kodu: **na hoście bez rachunkowości swapu `memswap_limit` może zostać odrzucony (z ostrzeżeniem demona, które przy `docker compose up` łatwo przeoczyć), a kontener może używać swapu**.
 
 Dodatkowo [D12]: użytkownik zgłosił, że przy Engine 27.2.0 i runc 1.1.13 na cgroup v2 `docker inspect` pokazywał `MemorySwap` równe `Memory`, ale plik `memory.swap.max` miał wartość `max` (swap nie był ograniczony). Opiekun Compose odpowiedział, że Compose tylko przekazuje `mem_limit`/`memswap_limit` do `HostConfig.Memory`/`MemorySwap` (tak samo jak `docker run`), a poprawki obsługi swapu na cgroup v2 weszły w runc 1.2.0 (#4188) i 1.2.1 (#4501), więc na nowych wersjach (Engine 29.x, runc 1.3.x) `memory.swap.max` było `0`. Zasada: `docker inspect` pokazuje **zamówioną** konfigurację, nie stan cgroup; o egzekucji rozstrzyga plik cgroup.
 
-Status efektu: do potwierdzenia w dry_run lub w odczytach live. Polecenia na VPS: `docker info 2>&1 | grep -iE 'cgroup|swap|warning'` (wersja cgroup, ostrzeżenie "No swap limit support"), `docker inspect <kontener> --format '{{.HostConfig.MemorySwap}}'`, wewnątrz kontenera `cat /sys/fs/cgroup/memory.swap.max` (oczekiwane `0`) i `cat /sys/fs/cgroup/memory.swap.current`.
+Efekt na VPS rozstrzyga pomiar. Polecenia na VPS: `docker info 2>&1 | grep -iE 'cgroup|swap|warning'` (wersja cgroup, ostrzeżenie "No swap limit support"), `docker inspect <kontener> --format '{{.HostConfig.MemorySwap}}'`, wewnątrz kontenera `cat /sys/fs/cgroup/memory.swap.max` (oczekiwane `0`) i `cat /sys/fs/cgroup/memory.swap.current`.
+
+Status pozycji: `do potwierdzenia w dry_run lub w odczytach live`.
 
 ### 1.4 `mem_reservation`
 
@@ -83,7 +87,9 @@ Cytat [D1]: "`mem_reservation` configures a reservation on the amount of memory 
 
 - To limit miękki: "Allows you to specify a soft limit smaller than `--memory` which is activated when Docker detects contention or low memory on the host machine. If you use `--memory-reservation`, it must be set lower than `--memory` for it to take precedence. Because it is a soft limit, it doesn't guarantee that the container doesn't exceed the limit." [D4]. Spec §13 wymaga "niższe `mem_reservation`" niż `mem_limit`; test Zadania 16 oczekuje `128m`.
 - Demon odrzuca rezerwację większą od limitu: "Minimum memory limit can not be less than memory reservation limit, see usage" [D11]; minimum rezerwacji 6 MB [D11].
-- Efekt jest "miękki": nie gwarantuje pamięci. Status semantyki: `udokumentowane`. Efekt w cgroup (na cgroup v2 oczekiwane odwzorowanie na `memory.low`, **bez potwierdzenia w przeczytanych stronach**): do potwierdzenia w dry_run lub w odczytach live. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.MemoryReservation}}'` (oczekiwane `134217728`) i wewnątrz kontenera `cat /sys/fs/cgroup/memory.low`.
+- Efekt jest "miękki": nie gwarantuje pamięci. Semantyka jest opisana w [D1] i [D4]. Efekt w cgroup (na cgroup v2 oczekiwane odwzorowanie na `memory.low`, **bez potwierdzenia w przeczytanych stronach**) rozstrzyga pomiar. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.MemoryReservation}}'` (oczekiwane `134217728`) i wewnątrz kontenera `cat /sys/fs/cgroup/memory.low`.
+
+Status pozycji: `do potwierdzenia w dry_run lub w odczytach live`.
 
 ### 1.5 `oom_score_adj`
 
@@ -93,7 +99,9 @@ Cytat [D1]: "`oom_score_adj` tunes the preference for containers to be killed by
 - Dokumentacja nie opisuje, jak `oom_score_adj` zachowuje się przy OOM **w obrębie cgroup** (osiągnięcie `mem_limit`): wtedy jądro i tak zabija procesy w tej cgroup, a `oom_score_adj` rozstrzyga głównie o wyborze ofiary przy braku pamięci na hoście. Tego dokumentacja Docker nie rozstrzyga.
 - Na cgroup v2 flaga `--oom-kill-disable` jest ignorowana ("The `docker run` flag `--oom-kill-disable` is discarded on v2" [D5]); nie używamy jej.
 
-Status semantyki: `udokumentowane`. Efekt (czy wartość `1000` faktycznie trafia do procesu): do potwierdzenia w dry_run lub w odczytach live. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.OomScoreAdj}}'` (oczekiwane `1000`) i wewnątrz kontenera `cat /proc/1/oom_score_adj` (oczekiwane `1000`).
+Semantyka jest opisana w [D1]. Efekt (czy wartość `1000` faktycznie trafia do procesu) rozstrzyga pomiar. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.OomScoreAdj}}'` (oczekiwane `1000`) i wewnątrz kontenera `cat /proc/1/oom_score_adj` (oczekiwane `1000`).
+
+Status pozycji: `do potwierdzenia w dry_run lub w odczytach live`.
 
 ### 1.6 `pids_limit`
 
@@ -102,7 +110,9 @@ Cytat [D1]: "`pids_limit` tunes a container's PIDs limit. Set to -1 for unlimite
 - Przy braku wsparcia w jądrze demon odrzuca limit: "Your kernel does not support PIDs limit capabilities or the cgroup is not mounted. PIDs limit discarded." [D11].
 - Wartość `64` jest hojna dla jednoprocesowego silnika asyncio z jednym wątkiem zapisu SQLite i procesem sprawdzającym healthcheck; to wartość początkowa do zmierzenia w Zadaniu 18 (`cat /sys/fs/cgroup/pids.current` w kontenerze), nie ustalenie z dokumentacji.
 
-Status semantyki: `udokumentowane`. Efekt: do potwierdzenia w dry_run lub w odczytach live. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.PidsLimit}}'` (oczekiwane `64`) i wewnątrz kontenera `cat /sys/fs/cgroup/pids.max` (oczekiwane `64`).
+Semantyka jest opisana w [D1] i [D2]. Efekt (czy limit działa na tym jądrze) rozstrzyga pomiar. Polecenia: `docker inspect <kontener> --format '{{.HostConfig.PidsLimit}}'` (oczekiwane `64`) i wewnątrz kontenera `cat /sys/fs/cgroup/pids.max` (oczekiwane `64`).
+
+Status pozycji: `do potwierdzenia w dry_run lub w odczytach live`.
 
 ### 1.7 `read_only`
 
@@ -127,7 +137,9 @@ Opcje wymienione w [D1] dla formy skróconej: `mode`, `uid`, `gid`. Dłuższa li
 - Wariant długi (udokumentowany w [D1], sekcja `volumes`): `type: tmpfs`, `target: /tmp`, `tmpfs: { size: <bajty lub jednostka>, mode: <ósemkowo> }` (opcja `mode` od Compose 2.14.0). Wariant krótki z opcjami (`/tmp:size=16m,mode=1777`) jest zgodny z flagą `--tmpfs` z [D10], ale [D1] dla formy Compose wymienia tylko `mode`, `uid`, `gid`: czy Compose przekazuje `size` w formie krótkiej bez zmian, rozstrzyga `docker compose config` i `docker inspect` (`{{.HostConfig.Tmpfs}}`). Plan Zadania 16 sprawdza tekst `tmpfs: /tmp` w pliku; jeżeli test ma pozostać wąski, użyć formy krótkiej z `size`, a rozmiar zweryfikować poleceniem `docker exec <kontener> df -h /tmp`.
 - Zawartość tmpfs znika po restarcie kontenera ([D10]); w `/tmp` nie ma nic, czego silnik potrzebuje po restarcie (stan w `/data`).
 
-Status: `udokumentowane` dla semantyki; rozmiar w formie krótkiej: do potwierdzenia w dry_run lub w odczytach live (polecenie `docker exec <kontener> df -h /tmp`).
+Semantyka jest opisana w [D1] i [D10]. Rozmiar w formie krótkiej (`size=`) nie jest wymieniony w [D1] dla formy Compose, więc jego respektowanie sprawdza polecenie `docker exec <kontener> df -h /tmp`.
+
+Status pozycji: `do potwierdzenia w dry_run lub w odczytach live`.
 
 ### 1.9 `healthcheck`
 
@@ -216,7 +228,7 @@ Zasada ze spec §13: na współdzielonym VPS nic nie jest uruchamiane bez pomiar
 2. **Walidacja pliku Compose bez uruchamiania [D9]:**
    - `docker compose -f docker/compose.yml config -q`: "Only validate the configuration, don't print anything" (kod wyjścia różny od zera przy błędzie)
    - `docker compose -f docker/compose.yml config`: renderuje model w postaci kanonicznej ("Parse, resolve and render compose file in canonical format"); sprawdzić, że w usłudze są `mem_limit`, `memswap_limit`, `mem_reservation`, `oom_score_adj`, `pids_limit`, `read_only`, `tmpfs`, `healthcheck`, `restart`. Opcja `--format json` daje wynik do porównania skryptem. Wartości mogą być wypisane jako liczby bajtów, nie jako `256m`.
-   - Czy `config` zgłosi nieznany atrybut: nowsze wydania Compose ostrzegają o nieobsługiwanych atrybutach [D13]; stare mogą go po cichu zignorować, więc po `up` obowiązkowo sekcja 3 poniżej.
+   - Czy `config` zgłosi nieznany atrybut: nowsze wydania Compose ostrzegają o nieobsługiwanych atrybutach [D13]; stare mogą go po cichu zignorować, więc po `up` obowiązkowo wykonać odczyty z pkt 3 w sekcji 4.
 
 3. **Po uruchomieniu (po zgodzie właściciela), kontener `gw-stock-engine`:**
 
@@ -238,7 +250,7 @@ Zasada ze spec §13: na współdzielonym VPS nic nie jest uruchamiane bez pomiar
 
 ## 5. Szkic fragmentu `docker/compose.yml` (do Zadania 16, wartości początkowe)
 
-To szkic z samych pól opisanych powyżej; wartości `mem_reservation`, `pids_limit`, `stop_grace_period` i rozmiar tmpfs są wyjściowe i podlegają pomiarowi. Montowania `./config` i `./data` zgodnie z Rulings; ścieżka klucza zgodnie ze spec §13.
+To szkic z samych pól opisanych powyżej; wartości `mem_reservation`, `pids_limit`, `stop_grace_period` i rozmiar tmpfs są wyjściowe i podlegają pomiarowi. Montowanie `./data:/data` i tylko-do-odczytu klucza jest zgodne z planem (Zadanie 16) i spec §13; montowanie `./config:/app/config:ro` jest propozycją do zatwierdzenia w Zadaniu 16.
 
 ```yaml
 services:
@@ -247,7 +259,7 @@ services:
     user: "10001:10001"
     read_only: true
     tmpfs:
-      - /tmp:size=16m,mode=1777
+      - /tmp:size=16m,mode=1777   # rozmiar w formie skróconej: do sprawdzenia (pkt 1.8)
     volumes:
       - ./config:/app/config:ro
       - ./data:/data
