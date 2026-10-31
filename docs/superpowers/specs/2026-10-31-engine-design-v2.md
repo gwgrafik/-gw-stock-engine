@@ -170,7 +170,7 @@ Są to **założenia projektowe, nie wyniki badań**. Przed pierwszą sesją `dr
 |---|---|---|
 | `INTENT` | Zapisane w dzienniku z `synchronous=FULL`, nic nie wysłano | → `SUBMITTING`, `NOT_PLACED` (zlecenie porzucone przed wysyłką, np. po restarcie; bezpieczne, bo `SUBMITTING` zapisujemy przed wywołaniem brokera) |
 | `SUBMITTING` | Wysyłka w toku | → `CONFIRMED`, `REJECTED`, `UNKNOWN` (timeout 10 s) |
-| `UNKNOWN` | Nie wiadomo, czy broker przyjął | → przez listę pozycji do `CONFIRMED`, `NOT_PLACED` |
+| `UNKNOWN` | Nie wiadomo, czy broker przyjął | → przez listę pozycji do `CONFIRMED`, `NOT_PLACED` (`NOT_PLACED` dopiero po sprawdzeniu historii zamknięć) |
 | `CONFIRMED` | Broker potwierdził wykonanie (pozycja otwarta) | – |
 | `REJECTED`, `NOT_PLACED` | Stany końcowe | – |
 
@@ -179,7 +179,7 @@ Zlecenia oczekujące (`LIMIT` i `STOP` istnieją w API) nie są używane w v1. P
 Reguły:
 
 - Własny identyfikator `gws-{YYYYMMDD}-{instrument}-{seq}-{rola}` jest zapisany w INTENT. **Capital.com nie przyjmuje identyfikatora od klienta**, więc nasz identyfikator łączymy z odpowiedzią brokera (`dealReference`, a po potwierdzeniu identyfikator pozycji). Nazwy pól i endpointu potwierdzenia ustalamy odczytem dokumentacji, w `dry_run` i na próbie `smoke`.
-- **Timeout to `UNKNOWN`, nigdy „nieudane".** Wyjaśnienie: v1 ma co najwyżej jedną pozycję na instrument i jedno wejście dziennie, więc po timeoucie sprawdzamy listę pozycji. Jeśli jest pozycja na naszym instrumencie otwarta po chwili INTENT (zgodny kierunek i wielkość), przyjmujemy ją jako własną. Jeśli po trzech zapytaniach w 30 s jej nie ma, stan to `NOT_PLACED`. Identyfikator nie jest używany ponownie.
+- **Timeout to `UNKNOWN`, nigdy „nieudane".** Wyjaśnienie: v1 ma co najwyżej jedną pozycję na instrument i jedno wejście dziennie, więc po timeoucie sprawdzamy listę pozycji. Jeśli jest pozycja na naszym instrumencie otwarta po chwili INTENT (zgodny kierunek i wielkość), przyjmujemy ją jako własną. Jeśli po trzech zapytaniach w 30 s jej nie ma, stan to `NOT_PLACED` tylko gdy historia zamknięć od chwili INTENT nie zawiera zamknięcia na naszym instrumencie; w przeciwnym razie zlecenie zostaje `UNKNOWN`, pozycja `BLOCKED`, alarm (wejście mogło się wykonać i zostać wybite stopem, zanim zobaczyliśmy pozycję). Gdy historii nie udało się odczytać, zlecenie też zostaje `UNKNOWN` (nigdy `NOT_PLACED`), pozycja `ENTERING`, alarm, a rozstrzyga uzgadnianie (§7). Identyfikator nie jest używany ponownie.
 - **Ochrona przed podwójnym wejściem:** dopóki stan wejścia to `SUBMITTING` lub `UNKNOWN`, nie wysyłamy kolejnego wejścia. Przy kontach z agregacją pozycji drugie wejście na tym samym instrumencie zwiększyłoby pozycję, więc ta zasada jest krytyczna; tryb konta (agregacja czy hedging) sprawdzamy w próbie `smoke`.
 - Nieznany typ zdarzenia lub nieznana odpowiedź brokera trafia do dziennika, nie zmienia stanu i zwiększa licznik alarmowy.
 - Każda surowa odpowiedź brokera jest zapisywana **przed** przetworzeniem.

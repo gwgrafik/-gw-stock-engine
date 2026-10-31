@@ -25,9 +25,12 @@ gdy znamy referencję, najpierw `confirm`, potem zawsze `list_positions`. Dopaso
 (epic, kierunek, `opened_at >= created_at − _CLOCK_SKEW_TOLERANCE`; wielkość nie: zapisujemy faktyczną).
 Migawka `confirm` (odpowiedź na NASZĄ referencję) jest przyjmowana, gdy epic i kierunek są zgodne oraz pasuje czasem
 albo jej deal_id jest na liście pozycji; sprzeczna (inny epic lub kierunek) albo niesprawdzalna przy udanym odczycie
-listy to BLOCKED. NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy bez dopasowania; nieudany odczyt nigdy
-nie jest dowodem braku pozycji (wtedy zlecenie zostaje UNKNOWN). Notatka wyniku zaczyna się od kodu wyniku
-i zachowuje przyczynę UNKNOWN (`CAUSE=...`).
+listy to BLOCKED. NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy bez dopasowania ORAZ udanym odczycie
+historii zamknięć od `created_at − HISTORY_MARGIN` bez zamknięcia na naszym instrumencie: wejście mogło się wykonać
+i zostać wybite stopem, zanim zobaczyliśmy pozycję. Takie zamknięcie → UNKNOWN UNMATCHED_CLOSED_DEAL i pozycja BLOCKED
+(bez księgowania: cena wejścia i wielkość nieznane, odtwarza właściciel); nieudany odczyt historii → UNKNOWN
+CHECKS_INCOMPLETE, pozycja ENTERING. Nieudany odczyt nigdy nie jest dowodem braku pozycji ani zamknięcia. Notatka
+wyniku zaczyna się od kodu wyniku i zachowuje przyczynę UNKNOWN (`CAUSE=...`).
 """
 
 from __future__ import annotations
@@ -60,10 +63,14 @@ UNKNOWN_CHECK_INTERVAL_S = 10
 # sprzed INTENT. Tolerancja jest bezpieczna: ochrona dziennika i uzgadnianie przy starcie gwarantują, że w chwili
 # INTENT na instrumencie nie było innej pozycji.
 _CLOCK_SKEW_TOLERANCE = timedelta(seconds=5)
+# Zapas początku zakresu historii zamknięć na różnicę zegarów brokera i silnika: JEDNA stała dla menedżera
+# i uzgadniania (`gwstock.reconcile` importuje ją stąd). Początku nigdy nie przycinamy.
+HISTORY_MARGIN = timedelta(minutes=1)
 
 SOURCE_OPEN = "broker.open_position"
 SOURCE_CONFIRM = "broker.confirm"
 SOURCE_POSITIONS = "broker.list_positions"
+SOURCE_CLOSED = "broker.closed_since"
 SOURCE_EVENT = "order.event"
 
 T = TypeVar("T")
@@ -92,7 +99,12 @@ def match_entry_positions(order: OrderRecord, positions: Sequence[OpenPosition])
 
 
 class OrderManager:
-    """Składa wejścia i rozstrzyga zlecenia UNKNOWN. Jeden wywołujący naraz (wątek decyzyjny silnika)."""
+    """Składa wejścia i rozstrzyga zlecenia UNKNOWN. Jeden wywołujący naraz (wątek decyzyjny silnika).
+
+    Kontrakt z wykonawcą (Zadanie 12): gdy `submit_entry` zwraca zlecenie w stanie innym niż CONFIRMED, REJECTED
+    i NOT_PLACED (czyli UNKNOWN) albo zostawia pozycję BLOCKED, wykonawca włącza kill switch miękki: rozstrzyga
+    uzgadnianie lub właściciel, nigdy ponowne wejście.
+    """
 
     def __init__(self, journal: Journal, broker: Broker, clock: Clock, cfg: RiskConfig) -> None:
         if not cfg.submit_timeout_s > 0:
@@ -177,8 +189,9 @@ class OrderManager:
         jego instrumentu w dzienniku ENTERING; inaczej `ValueError`. W trakcie innego wejścia w toku: `RuntimeError`.
 
         Wynik: CONFIRMED (pozycja OPEN z faktycznymi danymi brokera), NOT_PLACED (pozycja FLAT) albo UNKNOWN z notatką
-        AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED (pozycja BLOCKED: decyduje uzgadnianie lub właściciel)
-        lub CHECKS_INCOMPLETE (pozycja ENTERING: brak udanych odczytów, rozstrzygnie uzgadnianie).
+        AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED / UNMATCHED_CLOSED_DEAL (pozycja BLOCKED: decyduje
+        uzgadnianie lub właściciel) lub CHECKS_INCOMPLETE (pozycja ENTERING: nieudany odczyt listy albo historii,
+        rozstrzygnie uzgadnianie). NOT_PLACED dopiero po czystej historii zamknięć.
         """
         if self._in_flight:
             raise RuntimeError(f"resolve_unknown: an entry is already in flight, refusing {order.order_id!r}")
@@ -239,9 +252,32 @@ class OrderManager:
             if len(matches) > 1:
                 return self._block(order, "AMBIGUOUS_MATCH", deal_ids=[p.deal_id for p in matches], cause=cause)
             clean_checks += 1
-        if clean_checks == UNKNOWN_CHECKS:
-            return self._not_placed(order, _note(f"NOT_FOUND_AFTER_CHECKS={UNKNOWN_CHECKS}", cause))
-        self._event(order, "CHECKS_INCOMPLETE", clean_checks=clean_checks)
+        if clean_checks < UNKNOWN_CHECKS:
+            return self._incomplete(order, cause, clean_checks=clean_checks, history_read=False)
+        return await self._check_history_before_not_placed(order, cause)
+
+    async def _check_history_before_not_placed(self, order: OrderRecord, cause: str) -> OrderRecord:
+        """Ostatni krok przed NOT_PLACED: historia zamknięć od INTENT − `HISTORY_MARGIN`.
+
+        Zamknięcie na naszym instrumencie w tym oknie (wejście wykonane i wybite, zanim zobaczyliśmy pozycję) →
+        UNKNOWN UNMATCHED_CLOSED_DEAL, pozycja BLOCKED, bez księgowania. Wyjątek odczytu → CHECKS_INCOMPLETE (pozycja
+        ENTERING). Zamknięcia spoza instrumentu i sprzed okna (adapter zwrócił więcej) nie są dowodem.
+        """
+        since = order.created_at - HISTORY_MARGIN
+        try:
+            closures = await self._call(self._broker.closed_since(since))
+        except Exception as exc:
+            self._record_error(SOURCE_CLOSED, order, exc, since=since)
+            return self._incomplete(order, cause, clean_checks=UNKNOWN_CHECKS, history_read=False)
+        self._record(SOURCE_CLOSED, order, since=since, response=closures)
+        ours = [c for c in closures if c.epic == order.epic and c.ts >= since]
+        if ours:
+            return self._block(order, "UNMATCHED_CLOSED_DEAL", deal_ids=[c.deal_id for c in ours], cause=cause)
+        return self._not_placed(order, _note(f"NOT_FOUND_AFTER_CHECKS={UNKNOWN_CHECKS}", cause))
+
+    def _incomplete(self, order: OrderRecord, cause: str, **details: Any) -> OrderRecord:
+        """Za mało udanych odczytów, żeby cokolwiek orzec: zlecenie zostaje UNKNOWN, pozycja ENTERING."""
+        self._event(order, "CHECKS_INCOMPLETE", **details)
         return self._annotate(order, _note("CHECKS_INCOMPLETE", cause))
 
     # --- ochrona przed podwójnym wejściem --------------------------------------------------------

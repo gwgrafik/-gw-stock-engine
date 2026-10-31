@@ -72,7 +72,7 @@ from gwstock.clock import Clock
 from gwstock.config import RiskConfig
 from gwstock.journal import Journal, OrderRecord, PositionRecord
 from gwstock.orders.fsm import check_order_transition, check_position_transition
-from gwstock.orders.manager import UNKNOWN_CHECK_INTERVAL_S, UNKNOWN_CHECKS, match_entry_positions
+from gwstock.orders.manager import HISTORY_MARGIN, UNKNOWN_CHECK_INTERVAL_S, UNKNOWN_CHECKS, match_entry_positions
 from gwstock.serialization import dump
 from gwstock.types import BrokerRejected, ClosedDeal, OpenPosition, OrderState, PositionState, WorkingOrder
 
@@ -89,9 +89,9 @@ META_EMPTY_READS = "unknown_empty_reads:{}"  # liczba kolejnych udanych odczytó
 # Protokół UNKNOWN ze spec §6 ("po trzech zapytaniach w 30 s jej nie ma"): te same stałe co w menedżerze zleceń.
 EMPTY_READS_TO_NOT_PLACED = UNKNOWN_CHECKS
 MIN_UNKNOWN_AGE = timedelta(seconds=UNKNOWN_CHECKS * UNKNOWN_CHECK_INTERVAL_S)
-# Zapas początku zakresu historii na różnicę zegarów brokera i silnika; wspólny dla wszystkich odczytów historii.
-# Początku nigdy nie przycinamy: `Broker.closed_since` zwraca całą historię od `since` albo rzuca wyjątek.
-HISTORY_MARGIN = timedelta(minutes=1)
+# `HISTORY_MARGIN` (zapas początku zakresu historii na różnicę zegarów) jest jedną stałą z `gwstock.orders.manager`,
+# wspólną dla menedżera i uzgadniania. Początku nigdy nie przycinamy: `Broker.closed_since` zwraca całą historię od
+# `since` albo rzuca wyjątek.
 
 RECOVERED_FROM_SUBMITTING = "RECOVERED_FROM_SUBMITTING"
 

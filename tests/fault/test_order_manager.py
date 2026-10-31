@@ -16,7 +16,7 @@ import pytest
 import gwstock.orders.manager as manager_module
 from gwstock.journal import JournalWriteError, OrderRecord, PositionRecord
 from gwstock.orders.fsm import check_order_transition, check_position_transition
-from gwstock.orders.manager import EntryBlocked, OrderManager, match_entry_positions
+from gwstock.orders.manager import HISTORY_MARGIN, EntryBlocked, OrderManager, match_entry_positions
 from gwstock.types import (
     BrokerError,
     BrokerRejected,
@@ -105,6 +105,7 @@ async def test_timeout_without_position_becomes_not_placed_after_three_checks(jo
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.NOT_PLACED and fake.calls.count("list_positions") == 3
     assert clock.elapsed_since_start() >= 30  # trzy zapytania w 30 s
+    assert fake.calls[-1] == "closed_since" and fake.calls.count("closed_since") == 1  # historia przed NOT_PLACED
     assert rec.note == "NOT_FOUND_AFTER_CHECKS=3 CAUSE=open_position:BrokerTimeout"
     assert position(journal).state == PositionState.FLAT
     assert fake.calls.count("open_position") == 1 and fake.positions == {}
@@ -516,7 +517,7 @@ async def test_positions_are_journaled_before_adoption(journal, fake, mgr, req, 
     assert check["attempt"] == 1 and [p["deal_id"] for p in check["response"]] == ["DEAL-1"]
 
 
-CHECKED = ["broker.open_position"] + ["broker.list_positions"] * 3
+CHECKED = ["broker.open_position"] + ["broker.list_positions"] * 3 + ["broker.closed_since"]
 
 
 @pytest.mark.parametrize(
@@ -559,6 +560,7 @@ async def test_every_raw_event_carries_engine_clock_time(journal, fake, mgr, req
         ("broker.list_positions", T0 + timedelta(seconds=10)),
         ("broker.list_positions", T0 + timedelta(seconds=20)),
         ("broker.list_positions", T0 + timedelta(seconds=30)),
+        ("broker.closed_since", T0 + timedelta(seconds=30)),
     ]
 
 
@@ -907,3 +909,88 @@ async def test_snapshot_reported_slightly_before_intent_is_accepted(journal, fak
     fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True)  # nie ma jej już na liście
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.CONFIRMED and rec.note.startswith("ADOPTED_AFTER_UNKNOWN VIA=confirm")
+
+
+# --- historia zamknięć przed NOT_PLACED (regresja utraconej transakcji: tests/fault/test_lost_trade_regression.py) --
+
+
+@pytest.mark.parametrize(
+    "exc", [BrokerError("HTTP 502"), BrokerTimeout(), SessionExpired("401"), RuntimeError("boom")],
+    ids=lambda e: type(e).__name__,
+)
+async def test_history_read_failure_keeps_the_order_unknown(journal, fake, mgr, req, exc):
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    fake.fail_next("closed_since", exc)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.UNKNOWN and rec.note == "CHECKS_INCOMPLETE CAUSE=open_position:BrokerTimeout"
+    assert position(journal).state == PositionState.ENTERING and not mgr.in_flight
+    [error] = payloads(journal, "broker.closed_since")
+    assert error["error"] == type(exc).__name__ and error["since"] == (T0 - HISTORY_MARGIN).isoformat()
+    [event] = payloads(journal, "order.event")
+    assert event["event"] == "CHECKS_INCOMPLETE" and event["history_read"] is False
+
+
+async def test_history_read_hanging_past_the_timeout_keeps_the_order_unknown(
+    journal, fake, clock, risk_cfg, req, monkeypatch
+):
+    async def silent(since):
+        fake.calls.append("closed_since")
+        await hang_forever()
+
+    monkeypatch.setattr(fake, "closed_since", silent)
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    mgr = OrderManager(journal, fake, clock, replace(risk_cfg, submit_timeout_s=0.05))
+    rec = await asyncio.wait_for(mgr.submit_entry(req), TEST_GUARD_S)
+    assert rec.state == OrderState.UNKNOWN and rec.note.split()[0] == "CHECKS_INCOMPLETE"
+    assert payloads(journal, "broker.closed_since")[0]["error"] == "TimeoutError"
+
+
+async def test_closure_on_our_epic_blocks_instead_of_not_placed(journal, fake, mgr, req):
+    fake.fail_next("open_position", BrokerTimeout(), applied=True)
+    fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.UNKNOWN and rec.note == "UNMATCHED_CLOSED_DEAL CAUSE=open_position:BrokerTimeout"
+    assert position(journal) == PositionRecord("DE40", PositionState.BLOCKED) and journal.trades() == []
+    [event] = payloads(journal, "order.event")
+    assert event["event"] == "UNMATCHED_CLOSED_DEAL" and event["deal_ids"] == ["DEAL-1"]
+
+
+async def test_history_is_journaled_before_the_block_it_justifies(journal, fake, mgr, req, monkeypatch):
+    fake.fail_next("open_position", BrokerTimeout(), applied=True)
+    fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True)
+    log = spy_writes(journal, monkeypatch)
+    await mgr.submit_entry(req)
+    sources = CHECKED + ["order.event"]
+    assert log[-2:] == [("position", PositionState.BLOCKED, sources), ("order", None, sources)]
+
+
+async def test_raw_history_write_failure_stops_before_any_decision(journal, fake, mgr, req, monkeypatch):
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    fail_raw_once(journal, monkeypatch, "broker.closed_since")
+    with pytest.raises(JournalWriteError):
+        await mgr.submit_entry(req)
+    assert fake.calls == ["open_position"] + ["list_positions"] * 3 + ["closed_since"]
+    assert order(journal, req).state == OrderState.UNKNOWN and position(journal).state == PositionState.ENTERING
+    assert not mgr.in_flight
+
+
+async def test_cancellation_during_history_read_leaves_unknown(journal, fake, mgr, req, monkeypatch):
+    started = asyncio.Event()
+
+    async def slow(since):
+        fake.calls.append("closed_since")
+        started.set()
+        await hang_forever()
+
+    monkeypatch.setattr(fake, "closed_since", slow)
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    task = asyncio.create_task(mgr.submit_entry(req))
+    waiter = asyncio.create_task(started.wait())
+    await asyncio.wait([task, waiter], timeout=TEST_GUARD_S, return_when=asyncio.FIRST_COMPLETED)
+    waiter.cancel()
+    assert started.is_set(), "submit_entry never reached the history read"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert order(journal, req).state == OrderState.UNKNOWN and position(journal).state == PositionState.ENTERING
+    assert not mgr.in_flight
