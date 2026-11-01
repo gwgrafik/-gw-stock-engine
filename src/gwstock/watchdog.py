@@ -11,7 +11,9 @@ Wyzwalacze (każdy idempotentny: kill switch nie powtarza zapisu ani alarmu tej 
   Blokada logowań (`may_login()` zwraca False na stałe) WYŁĄCZNIE po `LOGIN_FAILURE_LIMIT` odrzuceniach DANYCH
   LOGOWANIA (`note_login_failure(..., credential=True)`, adapter: `BrokerAuthError`): Capital.com może zablokować klucz
   po serii błędnych logowań, więc silnik przestaje próbować do restartu procesu (licznik jest w pamięci: restart daje
-  trzy nowe próby) albo do pliku `data/LOGIN_RESET` utworzonego przez właściciela (usuwany przy odczycie). Awaria
+  trzy nowe próby). Alarm LOGIN_LOCKOUT odsyła do procedury z runbooka (zatrzymać silnik, naprawić klucz, jedna próba
+  pojedynczego logowania, start). Plik `data/LOGIN_RESET` (usuwany przy odczycie) zdejmuje blokadę w działającym
+  silniku: to obejście dla wsparcia (równoważne restartowi), nie krok właściciela, więc alarm go nie podaje. Awaria
   transportu, timeout, 5xx i 429 NIE blokują: kolejna próba po 30 s, potem odstęp podwajany do 5 minut, bez końca
   (chwilowa awaria nie może odwołać spłaszczenia o 17:25). Po odrzuceniu danych logowania przerwa 30 s;
 - REJECTIONS: `REJECTION_LIMIT` odrzuceń zleceń (wejście, zamknięcie, stop) z rzędu;
@@ -67,7 +69,7 @@ RECONCILE_FAILURE_LIMIT = 3  # przebiegi uzgadniania z wyjątkiem z rzędu (3 ×
 RECONCILE_SKIP_LIMIT = 6  # pominięte przebiegi z rzędu (zagłodzenie uzgadniania): sam alarm
 UNKNOWN_RESPONSES_LIMIT = 3  # spec §9: nieznane odpowiedzi brokera ponad próg
 ALERT_WINDOW_S = 300  # ten sam alarm najwyżej raz na 5 minut
-LOGIN_RESET_FILE = "LOGIN_RESET"  # plik właściciela zdejmujący blokadę logowań (zużywany)
+LOGIN_RESET_FILE = "LOGIN_RESET"  # zdejmuje blokadę logowań (zużywany): obejście dla wsparcia, nie krok właściciela
 LOUD_HISTORY_CODES = ("HISTORY_AMBIGUOUS", "HISTORY_INCONSISTENT", "HISTORY_TRUNCATED", "HISTORY_RANGE_TOO_LARGE")
 
 SOURCE_WATCHDOG = "watchdog"
@@ -291,9 +293,9 @@ class Watchdog:
             self._alert_keyed(
                 "LOGIN_LOCKOUT",
                 "ERROR",
-                f"LOGIN_LOCKOUT: {n} credential rejections; no further login attempts (key lock-out protection) "
-                f"until the owner creates data/{LOGIN_RESET_FILE} or restarts the engine (3 fresh attempts); "
-                "positions keep their broker stops",
+                f"LOGIN_LOCKOUT: {n} credential rejections; no further login attempts (key lock-out protection); "
+                "positions keep their broker stops; follow the runbook (section 9, LOGIN_FAILED): stop the engine, "
+                "fix and check the key first, then one single-login probe, then restart",
             )
             self._event("LOGIN_LOCKOUT", failures=n, detail=detail)
 
@@ -416,6 +418,7 @@ class Watchdog:
     # --- wnętrze ---
 
     def _consume_reset(self) -> None:
+        """`data/LOGIN_RESET`: obejście dla wsparcia (jak restart: liczniki od zera), nie krok właściciela."""
         try:
             present = self._reset_path.exists()
         except OSError:

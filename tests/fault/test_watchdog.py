@@ -249,6 +249,18 @@ def test_three_consecutive_login_failures_soft_kill_and_stop_further_logins(wd, 
     assert alerts_with(notifier, "LOGIN_LOCKOUT")
 
 
+def test_login_lockout_alert_points_to_the_runbook_and_not_to_the_reset_file(wd, clock, notifier):
+    # AD-a: alarm mówi to, co runbook (napraw klucz, jedna próba logowania), a nie reklamuje obejścia data/LOGIN_RESET
+    for _ in range(3):
+        wd.note_login_failure("HTTP 401 error.invalid.details", credential=True)
+        clock.advance(watchdog_mod.LOGIN_RETRY_PAUSE_S)
+    [(level, message)] = alerts_with(notifier, "LOGIN_LOCKOUT")
+    assert level == "ERROR" and message.startswith("LOGIN_LOCKOUT: 3 credential rejections; no further login attempts")
+    assert "follow the runbook (section 9, LOGIN_FAILED)" in message and "one single-login probe" in message
+    assert "positions keep their broker stops" in message
+    assert "LOGIN_RESET" not in message and "restarts the engine" not in message
+
+
 def test_a_failed_login_waits_before_the_next_attempt(wd, clock):
     wd.note_login_failure("timeout")
     assert not wd.may_login()
