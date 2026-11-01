@@ -22,11 +22,13 @@ Definicje czterech liczb bramki (`gate_l1_status`, szczegóły i daty incydentó
   a wiersze `kill.audit` z `reason == MISMATCH_TIMEOUT` i `event` ENGAGE/ESCALATE/REASON po jednym. Wynik to większa
   z tych dwóch liczb. Wiersz nieczytelny (nie JSON), który zawiera nazwę przyczyny, liczy się jako osobny incydent.
 - `unhandled_rejections`: liczba RÓŻNYCH zleceń, które mają wiersz `event` ENTRY_UNRESOLVED ALBO są wciąż
-  nierozstrzygnięte w bazie (`unresolved_orders`: INTENT/SUBMITTING/UNKNOWN), plus liczba włączeń kill switcha
-  z przyczyną ENTRY_EXCEPTION (`kill.audit` ENGAGE/ESCALATE/REASON; ta przyczyna nie ma osobnego wiersza zdarzenia).
+  nierozstrzygnięte w bazie (`unresolved_orders`: każde zlecenie w stanie nieostatecznym), plus liczba włączeń
+  kill switcha z przyczyną ENTRY_EXCEPTION (`kill.audit` ENGAGE/ESCALATE/REASON; ta przyczyna nie ma osobnego
+  wiersza zdarzenia).
   Uwaga: wiersz ENTRY_UNRESOLVED liczy się NAWET wtedy, gdy zlecenie rozstrzygnięto później (ślad incydentu zostaje,
-  a kod nie ocenia wyjaśnień), a zlecenie INTENT/SUBMITTING liczy się, gdy raport powstaje w trakcie wejścia.
-  Zlecenie ZAKOŃCZONE (CONFIRMED, REJECTED, NOT_PLACED) bez wiersza ENTRY_UNRESOLVED nie jest nieobsłużone.
+  a kod nie ocenia wyjaśnień), a zlecenie w toku (w v1 INTENT, SUBMITTING albo UNKNOWN) liczy się, gdy raport powstaje
+  w trakcie wejścia. Zlecenie w stanie ostatecznym (CONFIRMED, REJECTED, NOT_PLACED, CANCELED, EXPIRED) bez wiersza
+  ENTRY_UNRESOLVED nie jest nieobsłużone.
 - `cost_deviation_ratio` (WERDYKT bramki, w PUNKTACH, bez zaokrągleń): Σ(niekorzystny poślizg wejścia) /
   (n × `entry_slippage_points` z `costs_v1.toml`), gdzie n to liczba PRÓBEK KOSZTU, a poślizg wejścia z wypełnienia
   to BUY: wypełnienie − ask, SELL: bid − wypełnienie, z poprawą ceny liczoną jako 0 (nie odejmuje się od innych

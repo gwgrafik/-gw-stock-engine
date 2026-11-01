@@ -45,7 +45,8 @@ Kontrole (próg, granica, powód):
   (`calendar.local_to_utc`), więc zmiana czasu nie przesuwa okna lokalnie. Okna, którego nie da się policzyć,
   blokuje.
 - DUPLICATE: dziennik ma pozycję instrumentu w stanie innym niż FLAT albo jakiekolwiek nierozstrzygnięte
-  zlecenie (INTENT, SUBMITTING, UNKNOWN) na tym instrumencie.
+  zlecenie (`journal.unresolved_orders()`: każdy stan nieostateczny, w v1 INTENT, SUBMITTING albo UNKNOWN) na tym
+  instrumencie; nieczytelny wiersz zlecenia też blokuje.
 - STALE_DATA: `quote_age_s > stale_quote_s` (60 przechodzi, 61 blokuje). Wiek ujemny, NaN, nieskończony, `bool`
   albo nieliczbowy to STALE_DATA (nie da się go ocenić), nie FORMAT.
 - KILL: `max(kill.level(), journal.kill_state().level) != NONE`. Poziom w pamięci się liczy, bo zapis kill
