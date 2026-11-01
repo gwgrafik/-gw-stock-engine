@@ -688,6 +688,37 @@ def test_record_trade_is_atomic_when_pnl_update_fails_for_existing_day(journal):
     assert journal.realized_pnl(DAY) == Decimal("-1")
 
 
+def test_record_trade_writes_its_flags_in_the_same_transaction(journal):
+    # BUG-E2E-2: znacznik wiersza księgi (np. szacunek właściciela) powstaje razem z transakcją albo wcale
+    journal._conn.execute("CREATE TRIGGER boom BEFORE INSERT ON meta BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    with pytest.raises(JournalWriteError):
+        journal.record_trade(make_trade(), "DEAL-1", DAY, flags="ESTIMATED RESOLVED_BY_OWNER")
+    assert journal.trades() == [] and journal.has_trade("DEAL-1") is False  # awaria przed COMMIT: ani wiersz...
+    assert journal.realized_pnl_total() == Decimal("0") and journal.trade_flags("DEAL-1") is None  # ...ani znacznik
+    journal._conn.execute("DROP TRIGGER boom")
+    assert journal.record_trade(make_trade(), "DEAL-1", DAY, flags="ESTIMATED RESOLVED_BY_OWNER") is True
+    assert journal.trade_flags("DEAL-1") == "ESTIMATED RESOLVED_BY_OWNER"
+    # już zaksięgowane: nic się nie zmienia, także znacznik
+    assert journal.record_trade(make_trade(), "DEAL-1", DAY, flags="RESOLVED_BY_OWNER") is False
+    assert journal.trade_flags("DEAL-1") == "ESTIMATED RESOLVED_BY_OWNER"
+
+
+def test_trade_flags_are_none_without_flags_and_listed_in_booking_order(journal):
+    assert journal.record_trade(make_trade(), "DEAL-1", DAY) is True  # zwykłe księgowanie: bez znacznika
+    assert journal.record_trade(make_trade(), "DEAL-2", DAY, flags="RESOLVED_BY_OWNER") is True
+    assert journal.record_trade(make_trade(), "DEAL-3", NEXT_DAY, flags="ESTIMATED RESOLVED_BY_OWNER") is True
+    assert journal.trade_flags("DEAL-1") is None and journal.trade_flags("DEAL-9") is None
+    assert journal.trade_flags() == [None, "RESOLVED_BY_OWNER", "ESTIMATED RESOLVED_BY_OWNER"]  # jak `trades()`
+    assert journal.get_meta("trade_flags:DEAL-1") is None
+
+
+@pytest.mark.parametrize("flags", ["estimated", "ESTIMATED  RESOLVED_BY_OWNER", " ESTIMATED", "ESTIMATED\n", 7])
+def test_record_trade_rejects_malformed_flags_before_writing(journal, flags):
+    with pytest.raises(TypeError if isinstance(flags, int) else ValueError):  # zły typ: TypeError jak reszta dziennika
+        journal.record_trade(make_trade(), "DEAL-1", DAY, flags=flags)
+    assert journal.trades() == [] and journal.trade_flags() == []
+
+
 def test_trades_roundtrip_preserves_exact_decimals_and_timestamps(journal):
     t = make_trade(entry_fill=Decimal("25782.30"), financing=Decimal("0E-8"), latency_ms=1234)
     journal.record_trade(t, "DEAL-1", DAY)

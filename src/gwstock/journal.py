@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta
 from decimal import Context, Decimal, Inexact, InvalidOperation, Overflow
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, overload
 
 from gwstock.types import (
     KillLevel,
@@ -339,6 +339,8 @@ _TERMINAL_ORDER_STATES = (
 _DAY_PREFIX = "gws-{:%Y%m%d}-"  # prefiks identyfikatora z `make_client_id` (dzień handlowy, bez znajomości stref)
 _ENTRY_SUFFIX = "-entry"  # rola wejścia strategii (ostatni segment identyfikatora)
 _SMOKE_SUFFIX = "-smoke"  # rola próby akceptacyjnej L0
+_TRADE_FLAGS = "trade_flags:{}"  # deal_id → znaczniki wiersza księgi (`record_trade(..., flags=)`)
+_FLAGS = re.compile(r"[A-Z_]+(?: [A-Z_]+)*")
 
 
 def _day_range(day: date) -> tuple[str, str]:
@@ -905,22 +907,53 @@ class Journal:
 
     # --- księga ---
 
-    def record_trade(self, t: TradeRecord, deal_id: str, exit_day: date) -> bool:
+    def record_trade(self, t: TradeRecord, deal_id: str, exit_day: date, *, flags: str = "") -> bool:
         """Księguje transakcję i dolicza `t.net_pnl` do wyniku `exit_day` w JEDNEJ transakcji (idempotentnie).
 
-        Zwraca True, gdy zaksięgowano; False (bez żadnej zmiany), gdy `deal_id` był już zaksięgowany.
+        `flags`: znaczniki wiersza księgi (wielkie litery i `_`, rozdzielone pojedynczą spacją, np.
+        `ESTIMATED RESOLVED_BY_OWNER`); niepuste trafiają do `trade_flags:<deal_id>` w tej samej transakcji, więc
+        nie ma wiersza bez znacznika ani znacznika bez wiersza. Zwraca True, gdy zaksięgowano; False (bez żadnej
+        zmiany, także znacznika), gdy `deal_id` był już zaksięgowany.
         """
         _check_str(deal_id, "record_trade.deal_id", non_empty=True)
         _check_day(exit_day)
+        _check_str(flags, "record_trade.flags")
+        if flags and not _FLAGS.fullmatch(flags):
+            raise ValueError(f"record_trade.flags: expected words of A-Z and _ separated by one space, got {flags!r}")
 
         def op(conn: sqlite3.Connection) -> bool:
             cur = conn.execute(_TRADE_INSERT, (deal_id, exit_day.isoformat(), *_trade_params(t)))
             if cur.rowcount == 0:
                 return False
             self._add_pnl(conn, exit_day, t.net_pnl)
+            if flags:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_TRADE_FLAGS.format(deal_id), flags),
+                )
             return True
 
         return self._write(op)
+
+    @overload
+    def trade_flags(self, deal_id: str) -> str | None: ...
+
+    @overload
+    def trade_flags(self) -> list[str | None]: ...
+
+    def trade_flags(self, deal_id: str | None = None) -> str | None | list[str | None]:
+        """Znaczniki księgi z `record_trade(..., flags=)`: z `deal_id` napis znaczników tej transakcji albo None
+        (bez znaczników albo bez transakcji); bez argumentu lista dla KAŻDEJ transakcji w kolejności `trades()`
+        (None przy transakcji bez znaczników), np. do oznaczenia szacunków w `status` i raporcie."""
+        if deal_id is not None:
+            _check_str(deal_id, "trade_flags.deal_id", non_empty=True)
+            return self.get_meta(_TRADE_FLAGS.format(deal_id))
+        rows = self._read(
+            lambda c: c.execute(
+                "SELECT m.value FROM trades t LEFT JOIN meta m ON m.key = 'trade_flags:' || t.deal_id ORDER BY t.id"
+            ).fetchall()
+        )
+        return [row[0] for row in rows]
 
     def has_trade(self, deal_id: str) -> bool:
         """Czy zamknięcie `deal_id` jest już zaksięgowane (tani odczyt przed ponownym księgowaniem)."""
