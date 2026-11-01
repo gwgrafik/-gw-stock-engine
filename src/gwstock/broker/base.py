@@ -70,6 +70,15 @@ class Broker(Protocol):
         Pola: deal_id pozycji, open_level = cena wykonania TEGO zlecenia, size = wielkość potwierdzona dla tego
         zlecenia, stop_level, opened_at = czas wypełnienia. Zwracana także wtedy, gdy pozycja została już
         zamknięta, wybita stopem albo zagregowana z inną. None tylko dla nieznanej referencji.
+
+        Stop przy agregacji (netting z inną pozycją tego samego kierunku): `deal_id` migawki to pozycja zagregowana, a
+        `stop_level` to stop, który faktycznie chroni tę pozycję zaraz po wypełnieniu (FakeBroker: stop pierwotnej
+        pozycji, bez zmian), więc NIE musi być równy `open_level ∓ stop_distance` żądania tego zlecenia. `size` i
+        `open_level` zostają wielkością i ceną wykonania tego zlecenia, nie sumą ani średnią pozycji. Wywołujący nie
+        zakłada więc, że stop migawki wynika z własnego żądania. Adapter, który nie potrafi jednoznacznie przypisać
+        wypełnienia przy agregacji (Capital.com: potwierdzenie bez jednego wpisu OPENED), rzuca `BrokerError` zamiast
+        zwracać niepewną migawkę.
+
         Zlecenie odrzucone przez brokera po przyjęciu (dealStatus REJECTED): `BrokerRejected(reason)`.
         """
         ...
@@ -89,8 +98,10 @@ class Broker(Protocol):
 
         Historia Capital.com sięga jednego dnia na zapytanie, więc adapter dzieli zakres na zapytania obejmujące
         najwyżej dobę i łączy wyniki; zakresu dłuższego niż 14 dni odmawia (`BrokerError`), tak samo jak każdej
-        niepełnej odpowiedzi. Wywołujący (uzgadnianie) podaje prawdziwy początek i nigdy go nie przycina: brak
-        zamknięcia na liście jest dowodem tylko wtedy, gdy lista obejmuje cały zakres.
+        niepełnej odpowiedzi. Wywołujący podają prawdziwy początek i nigdy go nie przycinają: brak zamknięcia na
+        liście jest dowodem tylko wtedy, gdy lista obejmuje cały zakres. Wywołujący to uzgadnianie (`Reconciler`),
+        menedżer zleceń (rozstrzyganie UNKNOWN przed NOT_PLACED), wykonawca (`Executor._settle` po zamknięciu) i
+        polecenie właściciela `reset-position`; każdy z nich traktuje wyjątek jak "nie wiadomo", nie jak "brak".
         """
         ...
 

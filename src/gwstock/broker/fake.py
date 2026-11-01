@@ -300,9 +300,12 @@ class FakeBroker:
 
     async def closed_since(self, since: datetime) -> list[ClosedDeal]:
         with self._call("closed_since"):
-            span = self._clock.now_utc() - since
-            if self._history_limit is not None and span > self._history_limit:
-                raise BrokerError(f"closed_since: requested history of {span} exceeds the limit {self._history_limit}")
+            if self._history_limit is not None:  # rozpiętość tylko przy limicie: bez limitu nie ma czego odejmować
+                span = self._clock.now_utc() - since
+                if span > self._history_limit:
+                    raise BrokerError(
+                        f"closed_since: requested history of {span} exceeds the limit {self._history_limit}"
+                    )
             closed = [d for d in self._closed if d.ts >= since]
         return closed
 

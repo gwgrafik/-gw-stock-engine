@@ -356,6 +356,20 @@ async def test_history_is_unlimited_by_default(fake, clock):
     assert [d.deal_id for d in await fake.closed_since(T0 - timedelta(days=365))] == ["DEAL-1"]
 
 
+async def test_closed_since_without_a_limit_does_not_compute_the_span_of_the_range(fake):
+    """Rozpiętość (teraz − since) jest liczona tylko przy limicie historii: bez limitu naiwne `since` nie jest odejmowane
+    od zegara, więc przy pustej historii nie ma czego porównywać i nie ma wyjątku."""
+    naive = datetime(2026, 11, 2, 7, 0)
+    assert await fake.closed_since(naive) == []
+    assert fake.calls == ["closed_since"]
+
+
+async def test_closed_since_with_a_limit_computes_the_span_and_so_rejects_a_naive_since(clock, rules, quote):
+    limited = FakeBroker(clock, rules, quote, history_limit_days=14)
+    with pytest.raises(TypeError):
+        await limited.closed_since(datetime(2026, 11, 2, 7, 0))
+
+
 @pytest.mark.parametrize("bad", [0, -1, True, 1.5, "14"])
 def test_history_limit_days_must_be_a_positive_integer(clock, rules, quote, bad):
     with pytest.raises(ValueError, match="history_limit_days"):
@@ -642,6 +656,21 @@ async def test_netting_second_entry_increases_existing_position(clock, rules, qu
         "DEAL-1", "DE40", Side.BUY, Decimal("0.003"), Decimal("25792.3"), Decimal("25752.3"), filled_at
     )
     assert (await fake.confirm("REF-1")).size == Decimal("0.007")
+
+
+async def test_netting_snapshot_stop_is_the_stop_of_the_aggregated_position_not_of_the_order(clock, rules, quote):
+    """Opisane w `Broker.confirm`: stop migawki agregacji nie jest równy poziomowi wypełnienia ∓ stop_distance zlecenia."""
+    fake = FakeBroker(clock, rules, quote, netting=True)
+    await open_and_confirm(fake, entry(size="0.007", stop="30"))  # ask 25782.3 → stop 25752.3
+    clock.advance(60)
+    fake.set_quote(Quote("DE40", Decimal("25790.3"), Decimal("25792.3"), clock.now_utc()))
+    ack = await fake.open_position(entry(size="0.003", stop="30"))
+    snapshot = await fake.confirm(ack.deal_reference)
+    own_stop = snapshot.open_level - Decimal("30")
+    assert snapshot.stop_level == Decimal("25752.3") and own_stop == Decimal("25762.3")
+    assert snapshot.stop_level != own_stop
+    [pos] = await fake.list_positions()
+    assert pos.stop_level == snapshot.stop_level  # to ten sam stop, który faktycznie chroni pozycję
 
 
 async def test_netting_opposite_entry_is_not_simulated(clock, rules, quote):
