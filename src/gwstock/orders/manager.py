@@ -34,12 +34,15 @@ Migawka `confirm` (odpowiedź na NASZĄ referencję) jest przyjmowana, gdy epic 
 albo jej deal_id jest na liście pozycji; sprzeczna (inny epic lub kierunek) albo niesprawdzalna przy udanym odczycie
 listy to BLOCKED. REJECTED w `confirm` w trakcie rozstrzygania nie jest dowodem braku pozycji: dopasowanie na liście →
 BLOCKED REJECTED_BUT_LISTED, inaczej (po udanym odczycie listy) historia jak niżej i NOT_PLACED REJECTED_ON_CONFIRM.
-NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy bez dopasowania ORAZ udanym odczycie
-historii zamknięć od `created_at − HISTORY_MARGIN` bez zamknięcia na naszym instrumencie: wejście mogło się wykonać
-i zostać wybite stopem, zanim zobaczyliśmy pozycję. Takie zamknięcie → UNKNOWN UNMATCHED_CLOSED_DEAL i pozycja BLOCKED
-(bez księgowania: cena wejścia i wielkość nieznane, odtwarza właściciel); nieudany odczyt historii → UNKNOWN
-CHECKS_INCOMPLETE, pozycja ENTERING. Nieudany odczyt nigdy nie jest dowodem braku pozycji ani zamknięcia. Notatka
-wyniku zaczyna się od kodu wyniku i zachowuje przyczynę UNKNOWN (`CAUSE=...`).
+NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy bez dopasowania i BEZ żadnej innej pozycji na naszym
+instrumencie (starsza pozycja tego samego kierunku mogła przyjąć wielkość zlecenia w trybie agregacji; takie
+odczyty nie są "czyste", a zlecenie zostaje UNKNOWN `CHECKS_INCOMPLETE ... UNMATCHED_POSITIONS=<deal id>`, więc
+rozstrzyga uzgadnianie: FOREIGN_POSITION) ORAZ udanym odczycie historii zamknięć od `created_at − HISTORY_MARGIN`
+bez zamknięcia na naszym instrumencie: wejście mogło się wykonać i zostać wybite stopem, zanim zobaczyliśmy
+pozycję. Takie zamknięcie → UNKNOWN UNMATCHED_CLOSED_DEAL i pozycja BLOCKED (bez księgowania: cena wejścia i
+wielkość nieznane, odtwarza właściciel); nieudany odczyt historii → UNKNOWN CHECKS_INCOMPLETE, pozycja ENTERING.
+Nieudany odczyt nigdy nie jest dowodem braku pozycji ani zamknięcia. Notatka wyniku zaczyna się od kodu wyniku i
+zachowuje przyczynę UNKNOWN (`CAUSE=...`).
 """
 
 from __future__ import annotations
@@ -257,8 +260,9 @@ class OrderManager:
         Wynik: CONFIRMED (pozycja OPEN z faktycznymi danymi brokera), NOT_PLACED (pozycja FLAT) albo UNKNOWN z notatką
         AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED / REJECTED_BUT_LISTED / UNMATCHED_CLOSED_DEAL (pozycja
         BLOCKED: decyduje uzgadnianie lub właściciel) lub CHECKS_INCOMPLETE (pozycja ENTERING: nieudany odczyt listy
-        albo historii, rozstrzygnie uzgadnianie). NOT_PLACED (także po REJECTED w `confirm`) dopiero po udanym odczycie
-        listy bez dopasowania i czystej historii zamknięć.
+        albo historii, albo pozycja na naszym instrumencie, która nie pasuje, ale mogła przyjąć wielkość zlecenia:
+        rozstrzygnie uzgadnianie). NOT_PLACED (także po REJECTED w `confirm`) dopiero po udanym odczycie listy bez
+        dopasowania i bez żadnej innej pozycji na naszym instrumencie oraz czystej historii zamknięć.
         """
         if self._in_flight:
             raise RuntimeError(f"resolve_unknown: an entry is already in flight, refusing {order.order_id!r}")
@@ -283,6 +287,7 @@ class OrderManager:
     async def _resolve(self, order: OrderRecord) -> OrderRecord:
         cause = _cause(order)
         clean_checks = 0
+        unmatched_seen: set[str] = set()  # pozycje na naszym instrumencie, które nie pasują, ale mogą zawierać zlecenie
         for attempt in range(1, UNKNOWN_CHECKS + 1):
             await self._clock.sleep(UNKNOWN_CHECK_INTERVAL_S)
             snapshot: OpenPosition | None = None
@@ -313,6 +318,8 @@ class OrderManager:
                 matches = match_entry_positions(order, positions)
                 if matches:
                     return self._rejected_but_listed(order, rejected, matches, cause=cause)
+                if self._unmatched_listed(order, positions, unmatched_seen, attempt):
+                    continue  # nie dowód braku pozycji: bez NOT_PLACED (patrz `_unmatched_listed`)
                 return await self._check_history_before_not_placed(
                     order, cause, not_placed=f"REJECTED_ON_CONFIRM={rejected}", rejected=rejected
                 )
@@ -332,12 +339,32 @@ class OrderManager:
                 return self._confirm(order, matches[0], _note("ADOPTED_AFTER_UNKNOWN VIA=positions", cause))
             if len(matches) > 1:
                 return self._block(order, "AMBIGUOUS_MATCH", deal_ids=[p.deal_id for p in matches], cause=cause)
+            if self._unmatched_listed(order, positions, unmatched_seen, attempt):
+                continue  # odczyt listy się udał, ale nie jest "czysty": nie liczy się do NOT_PLACED
             clean_checks += 1
         if clean_checks < UNKNOWN_CHECKS:
+            if unmatched_seen:  # uzgadnianie ocenia taką pozycję (FOREIGN_POSITION); notatka pokazuje ją właścicielowi
+                cause = _note(cause, f"UNMATCHED_POSITIONS={','.join(sorted(unmatched_seen))}")
             return self._incomplete(order, cause, clean_checks=clean_checks, history_read=False)
         return await self._check_history_before_not_placed(
             order, cause, not_placed=f"NOT_FOUND_AFTER_CHECKS={UNKNOWN_CHECKS}", clean_checks=UNKNOWN_CHECKS
         )
+
+    def _unmatched_listed(
+        self, order: OrderRecord, positions: Sequence[OpenPosition], seen: set[str], attempt: int
+    ) -> bool:
+        """Czy lista brokera zawiera pozycję na naszym instrumencie, która nie pasuje do zlecenia
+        (`match_entry_positions` już nic nie znalazło), ale mogłaby zawierać jego wielkość: w trybie agregacji zlecenie dołącza do starszej
+        pozycji tego samego kierunku (`opened_at` sprzed INTENT, większa wielkość), a zegar brokera może też
+        przesunąć `opened_at` poza tolerancję. Taka pozycja nie jest dowodem braku wykonania, więc odczyt nie jest
+        "czysty" i NOT_PLACED nie jest możliwe: po rundach zlecenie zostaje UNKNOWN z pozycją ENTERING, a uzgadnianie
+        (FOREIGN_POSITION: pozycja BLOCKED, kill switch) i właściciel decydują. Pozycji nigdy nie przejmujemy."""
+        unmatched = [p.deal_id for p in positions if p.epic == order.epic]
+        if not unmatched:
+            return False
+        seen.update(unmatched)
+        self._event(order, "UNMATCHED_POSITION_LISTED", deal_ids=unmatched, attempt=attempt)
+        return True
 
     async def _check_history_before_not_placed(
         self, order: OrderRecord, cause: str, *, not_placed: str, **details: Any

@@ -277,6 +277,14 @@ REJECTED_IN_RESOLUTION = {
         ),
         OrderState.UNKNOWN, f"CHECKS_INCOMPLETE {TIMEOUT_CAUSE}", PositionRecord("DE40", PositionState.ENTERING),
     ),
+    "older_position_listed": (  # nie dowodzi braku pozycji: zlecenie mogło dołączyć do starszej (agregacja)
+        lambda fake: (
+            _rejected_in_round_1(fake, filled=False),
+            fake.positions.update(OLD=foreign("OLD", opened_at=T0 - timedelta(hours=1))),
+        ),
+        OrderState.UNKNOWN, f"CHECKS_INCOMPLETE {TIMEOUT_CAUSE} UNMATCHED_POSITIONS=OLD",
+        PositionRecord("DE40", PositionState.ENTERING),
+    ),
     "clean": (
         lambda fake: _rejected_in_round_1(fake, filled=False),
         OrderState.NOT_PLACED, f"REJECTED_ON_CONFIRM=INSUFFICIENT_FUNDS {TIMEOUT_CAUSE}",
@@ -319,14 +327,77 @@ async def test_ambiguous_match_blocks_and_never_guesses(journal, fake, mgr, req)
     assert event["event"] == "AMBIGUOUS_MATCH" and sorted(event["deal_ids"]) == ["DEAL-1", "MANUAL-1"]
 
 
-async def test_positions_opened_before_intent_or_not_matching_are_not_adopted(journal, fake, mgr, req):
-    fake.positions["OLD-1"] = foreign("OLD-1", opened_at=T0 - SKEW_BEYOND_TOLERANCE)
-    fake.positions["SELL-1"] = foreign("SELL-1", side=Side.SELL)
+async def test_positions_of_other_instruments_do_not_stop_not_placed(journal, fake, mgr, req):
     fake.positions["US-1"] = foreign("US-1", epic="US500")
     fake.fail_next("open_position", BrokerTimeout(), applied=False)
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.NOT_PLACED and fake.calls.count("list_positions") == 3
     assert position(journal).state == PositionState.FLAT
+
+
+MERGED = OpenPosition("MERGED-1", "DE40", Side.BUY, Decimal("0.008"), FILL, STOP, T0 - timedelta(hours=1))
+POSITIONS_THE_ORDER_MAY_HAVE_JOINED = {
+    # tryb agregacji (spec: C15): zlecenie dołączyło do starszej pozycji tego samego kierunku, więc wynik ma
+    # `opened_at` sprzed INTENT i wielkość większą niż zlecenie; broker potwierdza nasz deal, ale lista go nie zna
+    "merged-older-same-side": [MERGED],
+    "older-than-the-clock-skew": [foreign("OLD-1", opened_at=T0 - SKEW_BEYOND_TOLERANCE)],
+    "opposite-side": [foreign("SELL-1", side=Side.SELL)],
+    "both": [MERGED, foreign("SELL-1", side=Side.SELL)],
+}
+
+
+@pytest.mark.parametrize(
+    "listed", list(POSITIONS_THE_ORDER_MAY_HAVE_JOINED.values()), ids=list(POSITIONS_THE_ORDER_MAY_HAVE_JOINED)
+)
+async def test_a_listed_position_that_may_include_the_order_keeps_it_unknown_never_not_placed(
+    journal, fake, mgr, req, listed
+):
+    # pozycja na naszym instrumencie, która nie pasuje (`opened_at` sprzed INTENT, inny kierunek), nie dowodzi, że
+    # zlecenia nie wykonano: NOT_PLACED + FLAT byłby fałszem w dzienniku; zlecenie zostaje UNKNOWN, pozycja ENTERING,
+    # a uzgadnianie (FOREIGN_POSITION) i właściciel rozstrzygają. Takiej pozycji nigdy nie przejmujemy.
+    for pos in listed:
+        fake.positions[pos.deal_id] = pos
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    rec = await mgr.submit_entry(req)
+    ids = ",".join(sorted(p.deal_id for p in listed))
+    assert rec.state == OrderState.UNKNOWN and rec.deal_id is None
+    assert rec.note == f"CHECKS_INCOMPLETE CAUSE=open_position:BrokerTimeout UNMATCHED_POSITIONS={ids}"
+    assert position(journal) == PositionRecord("DE40", PositionState.ENTERING)
+    assert fake.calls.count("list_positions") == 3 and "closed_since" not in fake.calls
+    assert fake.calls.count("open_position") == 1 and journal.trades() == []
+    events = [e for e in payloads(journal, "order.event") if e["event"] == "UNMATCHED_POSITION_LISTED"]
+    assert len(events) == 3 and all(sorted(e["deal_ids"]) == sorted(ids.split(",")) for e in events)
+
+
+async def test_an_unmatched_position_is_handed_over_to_reconciliation_as_foreign(
+    journal, fake, mgr, req, reconciler, kill_sink
+):
+    fake.positions["MERGED-1"] = MERGED
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.UNKNOWN and position(journal).state == PositionState.ENTERING
+    result = await reconciler.run_once()  # tylko czyta: nie przejmuje pozycji, której nie umie udowodnić jako naszej
+    assert result.blocked and result.notes[0].startswith("FOREIGN_POSITION deal_ids=MERGED-1")
+    assert kill_sink.calls == ["FOREIGN_POSITION"]
+    assert order(journal, req).state == OrderState.UNKNOWN and journal.trades() == []
+    assert position(journal) == PositionRecord("DE40", PositionState.BLOCKED)
+
+
+async def test_an_unmatched_position_seen_in_one_round_is_enough_to_refuse_not_placed(journal, fake, mgr, req):
+    fake.fail_next("open_position", BrokerTimeout(), applied=False)
+    fake.positions["OLD-1"] = foreign("OLD-1", opened_at=T0 - timedelta(hours=1))
+    reads = []
+
+    def gone_after_the_first_round() -> None:
+        reads.append(1)
+        if len(reads) == 2:  # callback działa tuż przed wynikiem odczytu: drugi odczyt już nie widzi pozycji
+            fake.positions.pop("OLD-1")
+
+    fake.on_call("list_positions", gone_after_the_first_round)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.UNKNOWN and rec.note.startswith("CHECKS_INCOMPLETE ")
+    assert "UNMATCHED_POSITIONS=OLD-1" in rec.note and position(journal).state == PositionState.ENTERING
+    assert fake.calls.count("list_positions") == 3 and "closed_since" not in fake.calls
 
 
 async def test_failed_check_never_counts_as_proof_of_absence(journal, fake, mgr, req, clock):
