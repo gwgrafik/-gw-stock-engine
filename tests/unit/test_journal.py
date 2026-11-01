@@ -92,14 +92,14 @@ def open_journal(path) -> Journal:
 
 
 class FailingConn:
-    """Proxy połączenia SQLite: instrukcja zawierająca `needle` kończy się błędem „database is locked”."""
+    """Proxy połączenia SQLite: instrukcja zawierająca któryś z `needles` kończy się błędem „database is locked”."""
 
-    def __init__(self, real: sqlite3.Connection, needle: str) -> None:
+    def __init__(self, real: sqlite3.Connection, *needles: str) -> None:
         self._real = real
-        self._needle = needle
+        self._needles = needles
 
     def execute(self, sql, params=()):
-        if self._needle in sql:
+        if any(needle in sql for needle in self._needles):
             raise sqlite3.OperationalError("database is locked")
         return self._real.execute(sql, params)
 
@@ -615,6 +615,58 @@ def test_mid_transaction_failure_rolls_back_and_wraps(journal, monkeypatch):
     monkeypatch.undo()
     assert journal.trades() == [] and journal.realized_pnl_total() == Decimal("0")
     assert journal.record_trade(make_trade(), "DEAL-1", DAY) is True
+
+
+def test_after_a_failed_rollback_reads_return_only_committed_data(tmp_path):
+    p = tmp_path / "j.sqlite"
+    j = open_journal(p)
+    booked = make_trade()
+    j.record_trade(booked, "DEAL-0", DAY)
+    # wiersz transakcji wstawiony, wynik dnia zawodzi, a potem zawodzi też ROLLBACK: transakcja zostaje otwarta
+    j._conn = FailingConn(j._conn, "INSERT INTO realized_pnl", "ROLLBACK")
+    with pytest.raises(JournalWriteError):
+        j.record_trade(make_trade(net_pnl=Decimal("-9")), "DEAL-1", NEXT_DAY)
+    # żaden odczyt nie widzi niezatwierdzonego wiersza (połączenie z otwartą transakcją jest porzucone)
+    assert j.trades() == [booked] and j.has_trade("DEAL-1") is False
+    assert j.realized_pnl(NEXT_DAY) == Decimal("0") and j.realized_pnl_total() == Decimal("-0.0240")
+    # nowe połączenie ma te same pragmy i działa dalej, także zapis tej samej transakcji
+    assert j.pragma("journal_mode") == "wal" and j.pragma("synchronous") == 2
+    assert j.record_trade(make_trade(net_pnl=Decimal("-9")), "DEAL-1", NEXT_DAY) is True
+    j.close()
+    other = open_journal(p)
+    assert [t.net_pnl for t in other.trades()] == [Decimal("-0.0240"), Decimal("-9")]
+    assert other.realized_pnl_total() == Decimal("-9.0240")
+    other.close()
+
+
+@pytest.mark.parametrize("replacement", ["missing", "empty"])
+def test_a_journal_that_cannot_reopen_after_a_failed_rollback_fails_every_call(tmp_path, replacement):
+    p = tmp_path / "j.sqlite"
+    j = open_journal(p)
+    j.append_raw("broker", "kept", T0)
+    j._conn = FailingConn(j._conn, "INSERT INTO orders", "ROLLBACK")
+    with pytest.raises(JournalWriteError):
+        j.insert_order(make_order())
+    aside = tmp_path / "aside.sqlite"
+    p.rename(aside)
+    if replacement == "empty":
+        p.write_bytes(b"")  # ponowne otwarcie nie tworzy schematu na cudzym (pustym) pliku
+    for _ in range(2):  # każde wywołanie, nie tylko pierwsze
+        with pytest.raises(JournalReadError):
+            j.events()
+        with pytest.raises(JournalWriteError):
+            j.append_raw("broker", "lost", T0)
+    assert p.exists() is (replacement == "empty")  # brak pliku: nie utworzono nowego
+    if replacement == "empty":
+        assert p.read_bytes() == b""
+        p.unlink()
+    aside.rename(p)
+    assert [e.payload for e in j.events()] == ["kept"]  # plik wrócił: następny dostęp otwiera go ponownie
+    assert j.get_order(make_order().order_id) is None
+    j.close()
+    j.close()
+    with pytest.raises(JournalReadError):
+        j.events()  # jawne zamknięcie nie otwiera ponownie
 
 
 def test_real_sqlite_readonly_failure_is_wrapped_and_nothing_is_written(journal):

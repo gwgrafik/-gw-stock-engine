@@ -4,7 +4,8 @@ Zasady (spec §3, §6, §9, §10):
 - jedno połączenie (`check_same_thread=False`) chronione `threading.Lock`; `journal_mode=WAL`, `synchronous=FULL`,
   więc po powrocie z zapisu wiersz jest na dysku (INTENT jest zapisany, zanim cokolwiek wyślemy do brokera);
 - każdy zapis przechodzi przez jedną funkcję `_write` (BEGIN IMMEDIATE ... COMMIT, przy błędzie ROLLBACK):
-  nieudany zapis wielu instrukcji nie zostawia po sobie nic;
+  nieudany zapis wielu instrukcji nie zostawia po sobie nic; gdy zawiedzie sam ROLLBACK, połączenie jest porzucane
+  (zamknięcie wycofuje transakcję), a następny dostęp otwiera nowe z tymi samymi pragmami, nigdy nie tworząc schematu;
 - żaden wyjątek `sqlite3` nie wycieka: błąd zapisu to `JournalWriteError`, błąd odczytu `JournalReadError`,
   uszkodzone dane to `JournalCorruptError`, nieobsługiwany schemat to `JournalSchemaError`;
 - `Decimal` zapisany jako TEXT (dokładnie, bez float), czas jako ISO-8601 UTC, enumy po wartości;
@@ -428,8 +429,10 @@ class Journal:
     Tworzyć wyłącznie przez `Journal.open(path)`.
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
+    def __init__(self, conn: sqlite3.Connection, reopen: Callable[[], sqlite3.Connection] | None = None) -> None:
+        self._conn: sqlite3.Connection | None = conn
+        self._reopen = reopen  # nowe połączenie po porzuconym (nieudany ROLLBACK); None: porzucone znaczy stracone
+        self._dropped = ""  # dlaczego połączenia nie ma (puste, gdy jest)
         self._lock = threading.Lock()
 
     @classmethod
@@ -445,10 +448,27 @@ class Journal:
             raise JournalError(f"cannot open journal {path!r}: {exc}") from exc
         try:
             cls._setup(conn, path)
+            target = Path(path).resolve()  # ponowne otwarcie trafia w ten sam plik, także po zmianie katalogu roboczego
         except BaseException:
             conn.close()
             raise
-        return cls(conn)
+        return cls(conn, reopen=lambda: cls._reconnect(target, path))
+
+    @classmethod
+    def _reconnect(cls, target: Path, path: str) -> sqlite3.Connection:
+        """Nowe połączenie z ISTNIEJĄCYM dziennikiem: `mode=rw` (nie tworzy pliku), te same pragmy, nigdy schemat."""
+        try:
+            conn = sqlite3.connect(
+                f"{target.as_uri()}?mode=rw", uri=True, check_same_thread=False, isolation_level=None
+            )
+        except sqlite3.Error as exc:
+            raise JournalError(f"cannot reopen journal {path!r}: {exc}") from exc
+        try:
+            cls._setup(conn, path, create=False)
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
     @classmethod
     def open_readonly(cls, path: str) -> Journal:
@@ -478,9 +498,14 @@ class Journal:
         return cls(conn)
 
     @staticmethod
-    def _setup(conn: sqlite3.Connection, path: str) -> None:
+    def _setup(conn: sqlite3.Connection, path: str, *, create: bool = True) -> None:
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if not create and version != SCHEMA_VERSION:
+                raise JournalSchemaError(
+                    f"{path!r} is no longer a gwstock journal of schema version {SCHEMA_VERSION} (found {version}); "
+                    "refusing to recreate it"
+                )
             if version > SCHEMA_VERSION:
                 raise JournalSchemaError(f"{path!r} has schema version {version}, this build supports {SCHEMA_VERSION}")
             if version == 0 and conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] > 0:
@@ -505,33 +530,70 @@ class Journal:
             raise JournalError(f"cannot initialise journal {path!r}: {exc}") from exc
 
     def close(self) -> None:
-        """Zamyka połączenie (idempotentne); WAL zostaje zapisany do pliku głównego."""
+        """Zamyka połączenie (idempotentne); WAL zostaje zapisany do pliku głównego. Później każde wywołanie to błąd."""
         with self._lock:
+            conn, self._conn = self._conn, None
+            self._reopen = None  # jawne zamknięcie jest ostateczne
+            self._dropped = "the journal is closed"
+            if conn is None:
+                return
             try:
-                self._conn.close()
+                conn.close()
             except sqlite3.Error as exc:
                 raise JournalError(f"cannot close journal: {exc}") from exc
 
     # --- jedyne ścieżki dostępu do bazy ---
 
     @staticmethod
-    def _rollback(conn: sqlite3.Connection) -> None:
+    def _rollback(conn: sqlite3.Connection) -> bool:
+        """Wycofuje otwartą transakcję; True, gdy połączenie nie ma już otwartej transakcji."""
         try:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
+            return not conn.in_transaction
         except sqlite3.Error:
-            pass  # oryginalny błąd jest ważniejszy; niedomknięta transakcja zablokuje kolejny zapis głośno
+            return False  # oryginalny błąd jest ważniejszy; wywołujący porzuca połączenie
+
+    def _connection(self, error: type[JournalError]) -> sqlite3.Connection:
+        """Połączenie do użycia (wołane pod `_lock`). Porzucone otwiera ponownie; gdy się nie da: `error` przy KAŻDYM
+        wywołaniu (aż plik znów da się otworzyć)."""
+        if self._conn is not None:
+            return self._conn
+        if self._reopen is None:
+            raise error(f"journal unavailable: {self._dropped}")
+        try:
+            self._conn = self._reopen()
+        except (JournalError, sqlite3.Error) as exc:
+            raise error(f"journal unavailable ({self._dropped}) and cannot be reopened: {exc}") from exc
+        self._dropped = ""
+        return self._conn
+
+    def _drop(self, conn: sqlite3.Connection, why: str) -> None:
+        """Porzuca połączenie z niedomkniętą transakcją. Zamknięcie ją wycofuje (SQLite), a bez tego kolejne odczyty
+        tym połączeniem widziałyby niezatwierdzone wiersze. Następny dostęp otwiera nowe połączenie."""
+        self._conn = None
+        self._dropped = why
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass  # odwołanie jest już porzucone; zwolnienie obiektu zamyka połączenie i wycofuje transakcję
 
     def _write(self, op: Callable[[sqlite3.Connection], T]) -> T:
-        """Jedyna ścieżka zapisu: `op` biegnie w jednej transakcji; błąd wycofuje całość."""
+        """Jedyna ścieżka zapisu: `op` biegnie w jednej transakcji; błąd wycofuje całość.
+
+        Gdy nie da się wycofać (ROLLBACK zawodzi), połączenie jest porzucane, żeby niezatwierdzone wiersze nie były
+        widoczne dla kolejnych odczytów.
+        """
         with self._lock:
+            conn = self._connection(JournalWriteError)
             try:
-                self._conn.execute("BEGIN IMMEDIATE")
+                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    result = op(self._conn)
-                    self._conn.execute("COMMIT")
+                    result = op(conn)
+                    conn.execute("COMMIT")
                 except BaseException:
-                    self._rollback(self._conn)
+                    if not self._rollback(conn):
+                        self._drop(conn, "dropped after a failed ROLLBACK")
                     raise
                 return result
             except sqlite3.Error as exc:
@@ -540,8 +602,9 @@ class Journal:
     def _read(self, op: Callable[[sqlite3.Connection], T]) -> T:
         """Jedyna ścieżka odczytu."""
         with self._lock:
+            conn = self._connection(JournalReadError)
             try:
-                return op(self._conn)
+                return op(conn)
             except sqlite3.Error as exc:
                 raise JournalReadError(f"journal read failed: {exc}") from exc
 
