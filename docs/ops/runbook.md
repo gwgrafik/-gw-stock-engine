@@ -4,7 +4,7 @@ Dokument dla właściciela, który nie musi umieć programować. Każdy blok `ba
 
 Silnik to **narzędzie pomiarowe**: sprawdza, czy strategia i infrastruktura działają zgodnie ze specyfikacją. Nie obiecuje zysku, a wynik pojedynczej sesji to grosze i szum.
 
-Oznaczenia: **[po zadaniu 14b]** i **[po zadaniu 15]** przy poleceniu znaczą, że polecenie powstaje w tych zadaniach planu i dopóki ich nie ma, nie wykonuj tego kroku (Claude powie, kiedy są gotowe).
+Wszystkie polecenia silnika z tego dokumentu istnieją w kodzie i zostały sprawdzone z jego pomocą (`--help`), także `clear-kill`, `reset-position`, `gwstock.prereg` i `gwstock.report`. Odbiór całości (kryteria akceptacji, bramki L0 i L1, miejsce na Twój podpis) jest w `docs/ops/acceptance-v1.md`.
 
 Spis: 0 Zasady, 1 Pierwsze uruchomienie, 2 Tryb `dry_run`, 3 Weryfikacja pierwszej świecy, 4 Ćwiczenia awaryjne, 5 Próba `smoke`, 6 Uzbrajanie, 7 Pierwsze 5 sesji i bramka L1, 8 Operacje, 9 Rozwiązywanie problemów, 10 Lista kontrolna, Dodatek A (plik z kluczem).
 
@@ -353,15 +353,51 @@ Oczekiwane, bo silnik jeszcze nie pracował: linia `mode (files): dry_run (...)`
 
 ## 2. Uruchomienie w trybie `dry_run`
 
-### 2.0 Zamrożenie pre-rejestracji [po zadaniu 15]
+### 2.0 Zamrożenie pre-rejestracji
 
-Specyfikacja (sekcja 11) wymaga zamrożenia odcisków konfiguracji **przed pierwszą sesją `dry_run`**. Po zadaniu 15 wykonaj raz:
+Specyfikacja (sekcja 11) wymaga zamrożenia odcisków konfiguracji **przed pierwszą sesją `dry_run`**. Odcisk to skrót SHA-256 plików `config/strategy_v1.toml`, `risk_v1.toml` i `costs_v1.toml` (bajt po bajcie) razem z nazwą adaptera i klasą instrumentu; pliku `runtime.toml` w nim nie ma. Silnik porównuje go przy każdym starcie z zamrożonym i przy różnicy zostaje w `dry_run`.
+
+**Zasady, od których zależy, czy to zadziała:**
+
+- Zamrażasz **na serwerze, w katalogu projektu, poleceniami z Compose** (poniżej). Plik `data/preregistration.json` powstaje wtedy z numerem właściciela `GW_UID` i uprawnieniami 600, więc silnik w kontenerze może go przeczytać. Plik utworzony z innego konta (np. po uruchomieniu programu bezpośrednio jako `root`, poza Composem) ma uprawnienia 600 i innego właściciela: kontener go nie przeczyta, a silnik zostanie w `dry_run` z powodem `no frozen pre-registration fingerprint`.
+- **Nigdy nie otwieraj i nie zapisuj ponownie** plików `strategy_v1.toml`, `risk_v1.toml` i `costs_v1.toml` (edytor, Notatnik, kopiowanie przez Windows zmieniają końce linii albo dodają znacznik BOM, a zmiana jednego bajtu zmienia odcisk). Silnik nadal by taki plik wczytał, ale odcisk byłby inny. Na serwerze pliki pochodzą z repozytorium (końce linii LF pilnuje plik `.gitattributes`) i tak mają zostać.
+- **Po każdym pobraniu kodu i po każdym wdrożeniu** wykonaj kontrolę `--check` z tego punktu (w punkcie 8.2 jest to osobny krok). Pobranie samych dokumentów nie zmienia odcisku.
+
+Pokaż, co zostałoby zamrożone (niczego nie zapisuje):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --print
+```
+
+Zamroź (zapisuje `data/preregistration.json` i wypisuje gotowy blok z odciskami; jeśli ta sama konfiguracja jest już zamrożona, niczego nie zmienia):
 
 ```bash
 docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --write
 ```
 
-Od tego momentu **nie zmieniaj** `config/strategy_v1.toml`, `risk_v1.toml` ani `costs_v1.toml`. Zmiana unieważnia pre-rejestrację i tworzy nowy wariant (zwiększa liczbę prób K). Kontener nie ma zapisu nigdzie poza `/data` i `/tmp`; gdyby polecenie zgłosiło brak możliwości zapisu dokumentu pre-rejestracji w repozytorium, nie obchodź tego, tylko zgłoś (dokładny przebieg opisze zadanie 15).
+Polecenie **tylko wypisuje** blok z odciskami. Kontener nie ma dostępu do dokumentów (jedyne miejsca zapisu to `/data` i `/tmp`), więc nie zapisuje `docs/preregistration/v1.md` i nie robi żadnego commita. Wklej cały wydruk w czacie (zawiera same skróty, jest bezpieczny) razem z datą pierwszego dnia `dry_run`. Claude wpisze blok i datę do `docs/preregistration/v1.md` i zatwierdzi dokument w repozytorium; potem pobierzesz go przy najbliższej aktualizacji (punkt 8.2). Dopóki odciski nie są wpisane w dokumencie, pre-rejestracja nie jest kompletna.
+
+Kontrola, czy bieżąca konfiguracja zgadza się z zamrożoną (zaraz po zamrożeniu, po każdej aktualizacji i przed uzbrojeniem):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --check
+```
+
+Wynik: linia `OK: the configuration matches the frozen pre-registration` i kod wyjścia 0 to zgodność. Kod 1 (`MISMATCH: ...`, z nazwami plików, które się różnią) znaczy, że konfiguracja jest inna niż zamrożona. Kod 2 (`NOT FROZEN: ...`) znaczy, że nic nie zamrożono albo plik jest nieczytelny. W obu przypadkach silnik zostaje w `dry_run`.
+
+**Przy niezgodności (kod 1) nie używaj `--force`.** Wklej wynik Claude i nic nie zmieniaj, dopóki nie odpowie. Jeśli niczego świadomie nie zmieniałeś, a różnią się same końce linii (typowo po przeniesieniu pliku przez Windows), właściwe jest przywrócenie plików z repozytorium, a nie nowy wariant. Wykonaj to polecenie **dopiero po potwierdzeniu przez Claude**, a potem powtórz `--check`:
+
+```bash
+git checkout -- config/strategy_v1.toml config/risk_v1.toml config/costs_v1.toml
+```
+
+Opcja `--force` służy wyłącznie do **świadomego rozpoczęcia nowego wariantu strategii** (K+1), opisanego w `docs/preregistration/v1.md`, sekcja 7: Claude najpierw dopisuje wiersz do tabeli wariantów, dopiero potem zamrażasz od nowa. Program przy niezgodnej konfiguracji prosi o wpisanie słowa `FORCE` i czyta je ze standardowego wejścia, dlatego polecenie podaje je z rurki. Użyj go wyłącznie na wyraźne polecenie Claude i nie uzbrajaj po takiej zmianie bez ustalenia z nim dalszych kroków:
+
+```bash
+echo FORCE | docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --write --force
+```
+
+Od zamrożenia **nie zmieniaj** `config/strategy_v1.toml`, `risk_v1.toml` ani `costs_v1.toml`. Zmiana unieważnia pre-rejestrację i tworzy nowy wariant (zwiększa liczbę prób K).
 
 ### 2.1 Brama zgody nr 2: pierwszy start silnika
 
@@ -376,7 +412,7 @@ Warunki startu (wszystkie naraz):
 - kolumna `available` co najmniej **500 MB** (w najgorszym razie silnik zajmie 256 MB, więc reszta serwera zachowa co najmniej 244 MB); 400 do 499 MB to żółte światło: zapytaj; poniżej 400 MB: STOP,
 - w punkcie 1.10 jest `WYNIK: WSZYSTKO OK` z `memory.swap.max` równym `0`,
 - testy z punktu 1.7 przeszły bez `failed`,
-- pre-rejestracja jest zamrożona (punkt 2.0) **[po zadaniu 15]**: specyfikacja wymaga tego przed pierwszą sesją `dry_run`,
+- pre-rejestracja jest zamrożona (punkt 2.0: `--check` kończy się `OK`, a Claude wpisał odciski do dokumentu): specyfikacja wymaga tego przed pierwszą sesją `dry_run`,
 - po stronie Capital.com nic nie jest w trakcie (silnik w `dry_run` i tak nie wysyła zleceń).
 
 **Zgoda: uruchamiasz silnik tylko jako świadomą decyzję po spełnieniu tych warunków.** Nie masz pewności: wklej wynik Claude i poczekaj na „ok". Jeśli po starcie pamięć zacznie rosnąć ponad progi z punktu 2.4, zatrzymaj usługę poleceniem z tego punktu.
@@ -515,7 +551,7 @@ Zrób to po pierwszej sesji `dry_run`, najlepiej na dwóch różnych dniach.
 
 ## 4. Ćwiczenia awaryjne (w `dry_run`, po co najmniej jednej pełnej sesji)
 
-Cel: zobaczyć na własne oczy, że mechanizmy bezpieczeństwa działają, zanim cokolwiek zależy od nich naprawdę. Wszystkie ćwiczenia robisz w `dry_run`, czyli bez żadnej pozycji. Do zdjęcia kill switcha używasz polecenia `clear-kill` **[po zadaniu 14b]**; dopóki go nie ma, **nie rób ćwiczeń 4.1, 4.2 i 4.4** (po nich kill switch nie dałby się zdjąć). Ćwiczenia 4.3 i 4.3b możesz zrobić wcześniej.
+Cel: zobaczyć na własne oczy, że mechanizmy bezpieczeństwa działają, zanim cokolwiek zależy od nich naprawdę. Wszystkie ćwiczenia robisz w `dry_run`, czyli bez żadnej pozycji. Do zdjęcia kill switcha służy polecenie `clear-kill` (punkt 8.4): ćwiczenia 4.1, 4.2 i 4.4 kończą się nim, a program prosi wtedy o wpisanie słowa `CLEAR`.
 
 Zasada ogólna: kill switch zapisuje swój stan w dzienniku i **przeżywa restart**. Usunięcie pliku `STOP` albo `HARD_STOP` **nie zdejmuje** poziomu: robi to wyłącznie `clear-kill`.
 
@@ -557,7 +593,7 @@ Zatrzymaj silnik (`clear-kill` działa tylko przy zatrzymanym silniku, bo bierze
 docker compose -f docker/compose.yml stop
 ```
 
-Zdejmij kill switch **[po zadaniu 14b]**. Program pokaże poprzedni poziom i powód, poprosi o wpisanie potwierdzenia (wpisz dokładnie to, o co prosi) i zapisze, kto zdjął blokadę. Po `--by` jest tylko nazwa do zapisu w dzienniku, możesz wpisać swoje imię bez spacji:
+Zdejmij kill switch. Program pokaże poprzedni poziom, powód i ostatnie alarmy, poprosi o wpisanie słowa `CLEAR` (`Type CLEAR to clear the kill switch:`) i zapisze, kto zdjął blokadę; na końcu wypisze `kill switch cleared by wlasciciel (was SOFT: STOP_FILE); start the engine`. Po `--by` jest tylko nazwa do zapisu w dzienniku, możesz wpisać swoje imię bez spacji:
 
 ```bash
 docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
@@ -605,7 +641,7 @@ rm -f data/STOP data/HARD_STOP
 docker compose -f docker/compose.yml stop
 ```
 
-Zdejmij kill switch **[po zadaniu 14b]**:
+Zdejmij kill switch (wpisz `CLEAR`, jak w 4.1):
 
 ```bash
 docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
@@ -701,7 +737,7 @@ Oczekiwane: alarm o ciszy notowań (`QUOTE_SILENCE`, po 60 s ciszy) i kill switc
 docker network connect gw-stock-engine_default gw-stock-engine
 ```
 
-Silnik zaczyna znów dostawać notowania, ale `SOFT` **zostaje**, dopóki go nie zdejmiesz: zatrzymaj, `clear-kill` **[po zadaniu 14b]**, uruchom, dokładnie jak w 4.1.
+Silnik zaczyna znów dostawać notowania, ale `SOFT` **zostaje**, dopóki go nie zdejmiesz: zatrzymaj, `clear-kill`, uruchom, dokładnie jak w 4.1.
 
 Jeśli w którymkolwiek ćwiczeniu zobaczysz coś, czego ta instrukcja nie opisuje: zatrzymaj silnik (hamulec 3 z początku dokumentu) i zgłoś.
 
@@ -715,7 +751,7 @@ Jeśli w którymkolwiek ćwiczeniu zobaczysz coś, czego ta instrukcja nie opisu
 
 - Bramka L0 zaliczona do tego miejsca: pełna sesja `dry_run` bez rozbieżności i błędów, świeca zweryfikowana (punkt 3), ćwiczenia (punkt 4), pamięć zmierzona (punkty 2.4 i 2.6), testy w obrazie i odczyty live przeszły.
 - `bind-account` wykonane (jest `data/account.json`).
-- Pre-rejestracja zamrożona [po zadaniu 15], bo `smoke` działa tylko w trybie `live`, a ten wymaga zgodnego odcisku konfiguracji.
+- Pre-rejestracja zamrożona (punkt 2.0; `--check` kończy się `OK`), bo `smoke` działa tylko w trybie `live`, a ten wymaga zgodnego odcisku konfiguracji.
 - Na rachunku jest saldo (40 €), a w aplikacji Capital.com nie ma żadnej otwartej pozycji DE40.
 - Dzień roboczy, 10:00 do 16:00 czasu Berlina (płynny rynek, wąski spread), **nie** w okolicy 09:00 do 09:10 ani 17:25, i **nie** w przerwie 21:00 do 21:05 UTC.
 - Aplikacja Capital.com otwarta na ekranie pozycji DE40 i odświeżana.
@@ -754,7 +790,7 @@ docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock 
 
 ### Co zobaczysz
 
-Linie `PASS [n]`, `FAIL [n]` i `INFO [n]`, a na końcu wynik `PASS` albo `FAIL` (kod wyjścia 0 tylko, gdy każdy krok jest `PASS`). Znaczenie kroków: [1] rachunek poprawny, [2] wejście przyjęte (z poziomem otwarcia i stopu), [3] pozycja widoczna ze stopem, [4] spłaszczenie przez wykonawcę (po upływie `--hold`), [5] pozycja zniknęła i transakcja zaksięgowana (z kosztami), [6] drugie zamknięcie odrzucone jako „nie znaleziono" (to jest wymagane), [7] trzy ostatnie świece 5-minutowe do porównania z wykresem, [8] opóźnienie historii. Dokładne brzmienie linii może się nieco różnić od opisu.
+Linie `PASS [n]`, `FAIL [n]` i `INFO [n]`, a na końcu wynik `PASS smoke: 7/7 checks passed` albo `FAIL smoke: ...` (kod wyjścia 0 tylko, gdy każdy z siedmiu kroków jest `PASS`). Znaczenie kroków: [1] rachunek poprawny, [2] wejście przyjęte (z poziomem otwarcia i stopu), [3] pozycja widoczna ze stopem, [4] spłaszczenie przez wykonawcę (po upływie `--hold`), [5] pozycja zniknęła i transakcja zaksięgowana (z kosztami), [6] drugie zamknięcie odrzucone jako „nie znaleziono" (to jest wymagane), [7] trzy ostatnie świece 5-minutowe do porównania z wykresem, [8] opóźnienie historii. Dokładne brzmienie linii może się nieco różnić od opisu.
 
 Jeśli w kroku [2] jest `INFO ... the API did not show the stop ...`, broker nie pokazał stopu w liście pozycji i silnik zapisał stop **wyliczony z naszego żądania**. Wtedy stop musisz zobaczyć w aplikacji sam (poniżej): bez tego nie uzbrajaj.
 
@@ -791,7 +827,7 @@ Ma być `live_allowed = false`. Zapisz wynik próby (cały wydruk) i przekaż Cl
 docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock status
 ```
 
-Ma być `mode (files): dry_run (...)`. **Jeśli widzisz `kill switch: SOFT`**, a zwłaszcza po nieudanym kroku [6] (wtedy silnik sam włącza miękki kill switch z powodem `SMOKE_SECOND_CLOSE_UNEXPECTED`), silnik nie wejdzie już w żadną pozycję, dopóki go nie zdejmiesz: wykonaj `clear-kill` **[po zadaniu 14b]** (silnik jest zatrzymany, jak trzeba), ale **dopiero po wyjaśnieniu przyczyny z Claude**:
+Ma być `mode (files): dry_run (...)`. **Jeśli widzisz `kill switch: SOFT`**, a zwłaszcza po nieudanym kroku [6] (wtedy silnik sam włącza miękki kill switch z powodem `SMOKE_SECOND_CLOSE_UNEXPECTED`), silnik nie wejdzie już w żadną pozycję, dopóki go nie zdejmiesz: wykonaj `clear-kill` (silnik jest zatrzymany, jak trzeba; wpisz `CLEAR`), ale **dopiero po wyjaśnieniu przyczyny z Claude**:
 
 ```bash
 docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
@@ -805,6 +841,8 @@ docker compose -f docker/compose.yml up -d gw-stock-engine
 
 **Reguła przerwania:** przy jakiejkolwiek wątpliwości (FAIL, pozycja nadal otwarta w aplikacji, dziwny wydruk, przerwane polecenie) natychmiast usuń `data/ARM_LIVE` (hamulec 2 z początku dokumentu), sprawdź aplikację, a gdy pozycja jest otwarta, **zamknij ją ręcznie w aplikacji**. Potem opisz sytuację Claude i nie ponawiaj próby.
 
+**Co się dzieje po przerwaniu `--hold` i co wtedy zostaje w dzienniku.** Jeśli polecenie zostanie przerwane w trakcie wstrzymania (Ctrl+C, sygnał, zerwane połączenie SSH, błąd), program sam próbuje zamknąć pozycję próby: najpierw procedurą awaryjną wykonawcy, a gdy broker nadal ją pokazuje, jednym bezpośrednim zamknięciem po numerze transakcji (to zamknięcie **nie idzie przez wykonawcę silnika**). Gdy się uda, wypisze `INFO [4] deal ... closed after the interrupt; the engine's reconciliation books it if needed`. Dziennik silnika **zostaje wtedy z pozycją `OPEN`** (`status` pokazuje `position DE40: OPEN ...`), dopóki uzgadnianie silnika nie zaksięguje zamknięcia z historii brokera, czyli dopóki nie uruchomisz silnika. Gdy się nie uda, wypisze głośną linię `FAIL [4] LOUD: deal ... left open with its stop; ...`: pozycja ma wtedy stop u brokera, ale zamknij ją ręcznie w aplikacji (albo uruchom silnik, który ją uzgodni i spłaszczy o 17:25). W obu przypadkach najpierw zdejmij uzbrojenie (reguła przerwania powyżej), potem uruchom silnik w `dry_run` (punkt 2.2), odczekaj kilka minut na uzgodnienie i sprawdź `status` (ma być `position DE40: FLAT`). Wynik opisz Claude. Jeśli pozycja pozostaje `OPEN` albo `BLOCKED`, nie obchodź tego: punkt 8.5.
+
 ---
 
 ## 6. Uzbrajanie (live)
@@ -816,7 +854,7 @@ docker compose -f docker/compose.yml up -d gw-stock-engine
 1. `live_allowed = true` w `config/runtime.toml`.
 2. Plik `data/ARM_LIVE` utworzony przez Ciebie.
 3. Powiązany rachunek: `bind-account` wykonane (jest `data/account.json`).
-4. Zamrożona pre-rejestracja [po zadaniu 15], zgodna z bieżącą konfiguracją (polecenie z punktu 2.0), od tego czasu bez zmian w `strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`.
+4. Zamrożona pre-rejestracja zgodna z bieżącą konfiguracją (kontrola `--check` z punktu 2.0 kończy się `OK`), od tego czasu bez zmian w `strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`. Gdy odcisk jest inny, `status` pokazuje `dry_run` z powodem `the configuration fingerprint differs from the frozen pre-registration`.
 
 Dodatkowo silnik przy **każdym** starcie sprawdza u brokera, że powiązany rachunek istnieje, jest `ENABLED`, ma saldo większe od zera, walutę EUR i jest aktywny w sesji. Jeśli nie, zostaje w `dry_run` do końca procesu i zgłasza alarm.
 
@@ -895,13 +933,25 @@ Pozycja otwarta w chwili rozbrojenia nadal jest zarządzana (stop u brokera, sp�
 
 ## 7. Pierwsze 5 sesji i bramka L1
 
-Pierwsze 5 sesji live silnik handluje wielkością minimalną 0,001. Po każdej sesji, po 17:35:
+Pierwsze 5 sesji live silnik handluje wielkością minimalną 0,001. Po każdej sesji, po 17:35, uruchom raport. Raport tylko czyta (dziennik otwiera wyłącznie do odczytu), więc można go puścić przy pracującym silniku:
 
 ```bash
 docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock.report
 ```
 
-**[po zadaniu 15]**: raport dzienny (wynik, koszty, status bramki L1 i instrukcja). Dodatkowo wykonaj codzienną kontrolę z punktu 2.6 (stan, alarmy, tętno, pamięć).
+Domyślnie raport pokazuje ostatni dzień z zapisem; opcja `--day` z datą w postaci RRRR-MM-DD pokazuje wskazany dzień, `--all` wszystkie dni, a `--journal` wskazuje inny plik dziennika (zwykle niepotrzebne). Gdy silnik jest zatrzymany, użyj tego samego polecenia z `run --rm -T` zamiast `exec -T`. Dodatkowo wykonaj codzienną kontrolę z punktu 2.6 (stan, alarmy, tętno, pamięć). Linia `live sessions (trades without smoke): N; L1_PASSED: yes` albo `no` w `status` mówi, ile sesji liczy bramka i czy plik bramki istnieje.
+
+Eksport księgi transakcji do CSV (plik pojawia się na serwerze jako `data/ledger.csv`, uprawnienia 600). Ścieżka wyjściowa musi leżeć pod `/data` albo `/tmp`, bo reszta systemu plików kontenera jest tylko do odczytu (a `/tmp` znika po zakończeniu polecenia):
+
+```bash
+docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock.report --csv /data/ledger.csv
+```
+
+**Jak czytać raport.** Blok „Dzień” to wynik, koszty i liczniki błędów (poślizg w tabeli dnia pochodzi z modelu w konfiguracji, nie jest pomiarem). Pod nimi jest blok „Bramka L1” i to w nim są punkty, które decydują o bramce:
+
+- Status `PASS` albo `NOT YET` z listą powodów. `NOT YET` znaczy „jeszcze nie”, nie awarię. Powód `brak pomiaru kosztów: użytecznych próbek N z 5` także znaczy **jeszcze nie** (za mało próbek kosztu), a nie „koszty są w normie”.
+- Werdykt kosztów to stosunek niekorzystnego poślizgu wejścia do modelu, liczony w punktach (najwyżej 2, czyli przy modelu 0,5 pkt średnio do 1,0 pkt). Pod nim raport podaje średni i największy poślizg wejścia, spread w chwili decyzji (informacyjnie: nie wchodzi do werdyktu), liczbę zamknięć stopem (spread i poślizg przy wyjściu stopem nie są mierzone) oraz koszt w EUR (informacyjnie i zgrubnie, bo księga zaokrągla do 0,01 €).
+- Ostrzeżenie o skąpych dowodach: pięć próbek to wciąż mało, by oceniać koszty.
 
 Co przeglądasz po każdej sesji i na koniec piątej (warunki bramki L1 ze specyfikacji, sekcja 11):
 
@@ -911,7 +961,7 @@ Co przeglądasz po każdej sesji i na koniec piątej (warunki bramki L1 ze specy
 - transakcje w raporcie zgadzają się z historią w aplikacji Capital.com (cena wejścia, wyjścia, wynik),
 - pamięć nadal w zielonych progach (punkt 2.4).
 
-**Bramka L1.** Dopiero po przeglądzie, który wypadł dobrze, i po 5 sesjach, utwórz plik:
+**Bramka L1.** Dopiero po przeglądzie (lista wyżej), który wypadł dobrze, i po 5 sesjach, utwórz plik. Gdy bramka w raporcie ma status `PASS`, na końcu bloku bramki pojawia się zdanie „Aby dopuścić wielkość według reguł utwórz plik data/L1_PASSED (kod go nigdy nie tworzy).” To tylko informacja o skutku pliku, **a nie zgoda ani polecenie**: `PASS` liczy wyłącznie liczby z całego dziennika i nie ocenia, czy rozbieżności zostały wyjaśnione. To Twoja ocena po przeglądzie (a przy jakiejkolwiek wątpliwości, także rozmowa z Claude) rozstrzyga o pliku:
 
 ```bash
 touch data/L1_PASSED
@@ -987,7 +1037,7 @@ git pull --ff-only
 git log --oneline -3
 ```
 
-Sprawdź skrót z Claude, a potem zbuduj obraz testowy i powtórz testy logiki (punkty 1.7 i 1.9):
+Sprawdź skrót z Claude (pobranie samych dokumentów, np. wpisu pre-rejestracji, nie zmienia odcisku konfiguracji), a potem zbuduj obraz testowy i powtórz testy logiki (punkty 1.7 i 1.9):
 
 ```bash
 docker compose -f docker/compose.yml --profile test build gw-stock-test
@@ -1001,6 +1051,12 @@ Zbuduj obraz silnika:
 
 ```bash
 docker compose -f docker/compose.yml build gw-stock-engine
+```
+
+Sprawdź, że konfiguracja nadal zgadza się z zamrożoną pre-rejestracją (punkt 2.0). Ten krok wykonujesz **po każdej aktualizacji**, zanim uruchomisz silnik; `OK` i kod wyjścia 0 to zgodność:
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --check
 ```
 
 **Brama pamięci przed startem.** Zmierz jeszcze raz (kontenery testowe już nie istnieją):
@@ -1027,7 +1083,7 @@ free -m
 
 Progi są te same co w punkcie 2.4: `MEM USAGE` silnika do 100 MiB (zielone), 101 do 150 MiB żółte, powyżej 150 MiB czerwone; `available` serwera co najmniej 400 MB. Przy żółtym lub czerwonym wyniku zatrzymaj silnik (hamulec 3) i zapytaj Claude.
 
-Jeśli aktualizacja zmienia `strategy_v1.toml`, `risk_v1.toml` albo `costs_v1.toml`, to nowy wariant strategii: odcisk przestanie pasować do pre-rejestracji i silnik zostanie w `dry_run`. **Nie uzbrajaj ponownie bez ustalenia z Claude.**
+Jeśli aktualizacja zmienia `strategy_v1.toml`, `risk_v1.toml` albo `costs_v1.toml`, to nowy wariant strategii: odcisk przestanie pasować do pre-rejestracji (`--check` pokaże `MISMATCH` i nazwy plików, które się różnią), a silnik zostanie w `dry_run`. **Nie używaj `--force` i nie uzbrajaj ponownie bez ustalenia z Claude** (punkt 2.0).
 
 ### 8.3 Czytanie alarmów
 
@@ -1048,7 +1104,7 @@ Format linii: `czas-UTC POZIOM treść`. Alarmy są też w logu kontenera (polec
 | **Miękki (SOFT)** | Brak nowych wejść; istniejąca pozycja jest zarządzana normalnie | plik `data/STOP`; dzienny limit strat; rozbieżność z brokerem dłuższa niż 60 s; cisza notowań dłuższa niż 60 s; nieudane logowanie; trzy odrzucenia z rzędu |
 | **Twardy (HARD)** | Zamyka pozycje procedurą awaryjną, potem działa jak miękki | plik `data/HARD_STOP`; strata dzienna co najmniej 2 razy limit; strata łączna od startu 12 €; pozycja bez stopu dłużej niż 10 s |
 
-Oba poziomy są zapisane w dzienniku, przeżywają restart i **zdejmuje je wyłącznie Twoje polecenie `clear-kill`**; twardy zostaje do tego czasu także po restarcie. Dotyczy to również miękkiego poziomu włączonego przez nieudane logowanie (punkt 9): sam restart go nie zdejmuje. **`clear-kill` działa tylko przy zatrzymanym silniku** (bierze blokadę instancji i inaczej odmawia). Procedura zdjęcia, po kolei. Najpierw ustal przyczynę (polecenie z punktu 8.3). Potem usuń pliki, zatrzymaj silnik i uruchom `clear-kill` **[po zadaniu 14b]**:
+Oba poziomy są zapisane w dzienniku, przeżywają restart i **zdejmuje je wyłącznie Twoje polecenie `clear-kill`**; twardy zostaje do tego czasu także po restarcie. Dotyczy to również miękkiego poziomu włączonego przez nieudane logowanie (punkt 9): sam restart go nie zdejmuje. **`clear-kill` działa tylko przy zatrzymanym silniku** (bierze blokadę instancji i inaczej odmawia). Procedura zdjęcia, po kolei. Najpierw ustal przyczynę (polecenie z punktu 8.3). Potem usuń pliki, zatrzymaj silnik i uruchom `clear-kill` (program pokaże poziom, powód i ostatnie alarmy, a zdejmie blokadę dopiero po wpisaniu słowa `CLEAR`):
 
 ```bash
 rm -f data/STOP data/HARD_STOP
@@ -1062,7 +1118,7 @@ docker compose -f docker/compose.yml stop
 docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
 ```
 
-Polecenie odmówi, jeśli pliki `STOP` albo `HARD_STOP` nadal istnieją albo jeśli silnik działa. Na końcu uruchom silnik (`up -d`, jak w punkcie 8.1).
+Polecenie odmówi, jeśli pliki `STOP` albo `HARD_STOP` nadal istnieją (`refused: data/STOP exists; remove it first ...`), jeśli silnik działa albo jeśli kill switch jest już zdjęty (`kill switch: NONE; nothing to clear`). Inne słowo niż `CLEAR` kończy polecenie bez zmian (`aborted: the kill switch stays as it is`). Na końcu uruchom silnik (`up -d`, jak w punkcie 8.1).
 
 ### 8.5 Stan `BLOCKED` pozycji
 
@@ -1071,13 +1127,21 @@ Polecenie odmówi, jeśli pliki `STOP` albo `HARD_STOP` nadal istnieją albo je�
 1. Otwórz aplikację Capital.com i sprawdź, **czy istnieje otwarta pozycja DE40**.
 2. Jeśli **jest** (prawdziwa ekspozycja): zdecyduj, czy ją zamknąć. Zamknij ją ręcznie w aplikacji, jeśli nie ma być trzymana.
 3. Zatrzymaj silnik (hamulec 3 z początku dokumentu). `reset-position` działa tylko przy zatrzymanym silniku.
-4. Gdy w aplikacji **nie ma** pozycji DE40, wyczyść stan lokalny poleceniem **[po zadaniu 14b]**. Polecenie samo sprawdza u brokera, że pozycji nie ma; **odmówi także, gdy w dzienniku jest jeszcze niewyjaśnione zlecenie**. Prosi o potwierdzenie i zapisuje zdarzenie audytowe:
+4. Gdy w aplikacji **nie ma** pozycji DE40, wyczyść stan lokalny poleceniem poniżej. Działa tylko na pozycję `BLOCKED` (albo `ENTERING`); logowanie do brokera robi jedno. Polecenie samo sprawdza u brokera, że nie ma pozycji ani zlecenia oczekującego na DE40, i **odmawia** w kilku przypadkach (punkt 5). Prosi o potwierdzenie i zapisuje zdarzenie audytowe:
 
 ```bash
 docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock reset-position --by wlasciciel
 ```
 
-5. Jeśli polecenie odmówi, bo broker nadal widzi pozycję albo zlecenie jest niewyjaśnione, wróć do punktu 1 i nie obchodź odmowy; zapytaj Claude. Po sukcesie uruchom silnik (punkt 8.1).
+   Program najpierw pokazuje stan z dziennika (linia `journal position DE40: ...`, z numerem transakcji) i pyta o jedno słowo, zależnie od przypadku: gdy zamknięcia tej transakcji nie da się zaksięgować z historii brokera, prosi o **wpisanie jej numeru** (`Type the deal id ... to accept that it stays unbooked and set FLAT:`), a przed pytaniem wypisuje ostrzeżenie `WARNING: deal ... is not booked in the ledger ...`, które znaczy, że jej wynik **nie trafi do limitów strat** (sprawdź tę transakcję w aktywności w aplikacji i opisz ją Claude); dla pozycji z polami, ale bez numeru transakcji, prosi o `NO-DEAL-ID`; w pozostałych przypadkach o `RESET`. Inne słowo kończy polecenie bez zmian (`aborted: nothing changed`).
+
+5. Odmowa nie jest awarią; przeczytaj jej treść i nie obchodź jej:
+   - `refused: unresolved orders in the journal ...` albo `refused: position DE40 is OPEN ...` (`EXITING`) z dopiskiem, że `reset-position is for BLOCKED`: silnik sam uzgodni i zaksięguje taki stan. Uruchom silnik (punkt 8.1), odczekaj na uzgodnienie i sprawdź `status`. **Jeśli po tym `status` nadal pokazuje `BLOCKED` i niewyjaśnione zlecenie (`unresolved orders: 1`), a ponowny `reset-position` odmawia z tego samego powodu, nie obchodź tego:** to znany otwarty punkt (silnik czeka na właściciela, a polecenie czeka na silnik). Zostaw miękki kill switch (wejścia są zablokowane), upewnij się w aplikacji, że nie ma pozycji DE40, i zgłoś Claude.
+   - `refused: the closure of deal ... is in the broker history ...`: zamknięcie tej transakcji jest w historii brokera i **silnik je zaksięguje sam**. Uruchom silnik, odczekaj na uzgodnienie i wracaj do `reset-position` tylko wtedy, gdy `status` nadal pokazuje `BLOCKED`.
+   - `refused: the broker still shows a position on DE40 ...` albo `refused: a working order on DE40 exists at the broker ...`: wróć do punktu 1 (decyzja o pozycji albo anulowanie zlecenia w aplikacji).
+   - `refused: the broker cannot be read ...`, `refused: login failed`, `refused: the session is not on the bound account ...` albo `refused: the broker history cannot be read ...`: nic nie zmieniono. Zapytaj Claude; nie ponawiaj w pętli (każde uruchomienie loguje się do brokera).
+
+   Po sukcesie (`position DE40 set FLAT by wlasciciel ...; start the engine`) uruchom silnik (punkt 8.1).
 
 ### 8.6 Uwagi operatorskie
 
@@ -1093,6 +1157,7 @@ docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock 
 
 Po kopii uruchom silnik zwykłym startem (punkt 8.1).
 - **Restart serwera.** Po restarcie VPS kontener startuje sam (polityka `unless-stopped`), chyba że był zatrzymany ręcznie. Po każdym restarcie serwera sprawdź `ps` i `status`.
+- **Strażnik i CI (tylko dla porządku).** Repozytorium ma zabezpieczenia pracy z Claude Code (blokada zapisów, które tworzyłyby `data/ARM_LIVE` albo `data/L1_PASSED`, zaszywałyby klucze albo ustawiały `live_allowed = true`) oraz CI w GitHub Actions bez żadnych sekretów. Opis jest w pliku `CLAUDE.md`, sekcja „Strażnik live”. To bariera przed wypadkiem, nie granica bezpieczeństwa: ostateczną bramką jesteś Ty, a wdrożenie na serwer jest zawsze ręczne i nie zależy od CI.
 
 ---
 
@@ -1106,8 +1171,9 @@ Tabela mówi, co oznacza objaw i które polecenia z listy pod tabelą wykonać (
 | `OOMKilled=true` (brak pamięci) | Jądro zabiło proces po przekroczeniu 256 MB (polecenia 2 i 4, plik `~/gw-pomiar-po.txt`) | Zatrzymaj (1), zgłoś Claude z wynikiem pomiaru. **Nie podnoś limitu** `mem_limit` na własną rękę: serwer dzieli pamięć z botem z prawdziwymi pieniędzmi |
 | Status `unhealthy` | Tętno starsze niż 120 s: silnik wisi albo nie zapisuje do `data/` (miejsce na dysku, uprawnienia). Polecenia 5, 6 i 3 | Zatrzymaj (1), odczytaj logi (3), uruchom (polecenie z punktu 8.1); jeśli się powtarza, zgłoś |
 | `refused: another engine instance holds ...` (kod 3, `AlreadyRunning`) | Inny silnik, `bind-account`, `smoke`, `clear-kill` albo `reset-position` trzyma blokadę (polecenie 7) | Zatrzymaj drugą instancję. Plik `engine.lock` zwalnia się sam po zakończeniu procesu: **nie usuwaj go ręcznie**. Polecenia `bind-account`, `smoke`, `clear-kill` i `reset-position` działają tylko przy zatrzymanym silniku |
-| **Błąd logowania, alarm `LOGIN_FAILED`** (kill switch miękki) | Capital.com odrzuca klucz lub hasło. Silnik liczy tylko odrzucenia danych logowania; błędy sieci nie wliczają się do licznika (silnik czeka wtedy 30 s, potem do 5 minut). Po 3 odrzuceniach z rzędu przestaje się logować (`LOGIN_LOCKOUT`) i włącza `SOFT`. Licznik jest tylko w pamięci, więc **każdy restart kontenera daje 3 nowe próby**. Alarmy: polecenie 8 | **Zasada: nie więcej niż jedna próba logowania po alarmie albo problemie z kluczem.** Procedura: (a) zatrzymaj silnik (1), (b) odczekaj co najmniej 10 minut, (c) sprawdź w Capital.com, czy klucz API nie został wymieniony lub wyłączony i czy hasło się zgadza; zweryfikuj plik klucza (punkt 1.3), (d) wykonaj **jedną** próbę: pojedyncze logowanie (polecenie 9), **nie** pełny zestaw 8 logowań i **nie** wielokrotne uruchamianie silnika, (e) gdy próba przeszła: zdejmij kill switch (polecenie 10, silnik jest zatrzymany), potem uruchom silnik. Miękki kill switch od nieudanego logowania **nie znika sam po restarcie**: bez `clear-kill` silnik nie wejdzie w pozycję. (f) gdy próba nie przeszła: STOP, nie ponawiaj, zapytaj |
-| Silnik w `dry_run`, mimo że uzbrojony | Silnik sam podaje powód w logu przy starcie i w `status` (polecenia 11 i 6) | Możliwe powody: `live_allowed is not true` (sprawdź polecenie 12); `data/ARM_LIVE does not exist` (pamiętaj: usunięcie pliku wyłącza wejścia do restartu); `no bound account` (zrób `bind-account`); `no frozen pre-registration fingerprint` albo `fingerprint differs` (nie zrobiono pre-rejestracji albo zmieniono pliki strategii, ryzyka lub kosztów); po starcie także kontrola rachunku u brokera (rachunek nieaktywny, saldo 0, waluta inna niż EUR, rachunek sesji inny niż powiązany). Po każdej zmianie plików: zatrzymaj, potem uruchom (tryb wybiera się przy starcie) |
+| **Błąd logowania, alarm `LOGIN_FAILED`** (kill switch miękki) | Capital.com odrzuca klucz lub hasło albo logowanie nie przechodzi. Trzy nieudane logowania z rzędu, także z powodu sieci albo awarii brokera, włączają miękki kill switch `LOGIN_FAILED`. Blokada dalszych prób (`LOGIN_LOCKOUT`) zapada tylko po 3 odrzuceniach samych danych logowania; błędy sieci nie wliczają się do niej (silnik czeka wtedy 30 s, potem do 5 minut). Licznik jest tylko w pamięci, więc **każdy restart kontenera daje 3 nowe próby**. Alarm `LOGIN_LOCKOUT` wspomina w treści plik `data/LOGIN_RESET`: **nie twórz go** (omija ochronę klucza przed zablokowaniem po serii błędnych logowań); jedyną dozwoloną drogą jest procedura obok. Alarmy: polecenie 8 | **Zasada: nie więcej niż jedna próba logowania po alarmie albo problemie z kluczem.** Procedura: (a) zatrzymaj silnik (1), (b) odczekaj co najmniej 10 minut, (c) sprawdź w Capital.com, czy klucz API nie został wymieniony lub wyłączony i czy hasło się zgadza; zweryfikuj plik klucza (punkt 1.3), (d) wykonaj **jedną** próbę: pojedyncze logowanie (polecenie 9), **nie** pełny zestaw 8 logowań i **nie** wielokrotne uruchamianie silnika, (e) gdy próba przeszła: zdejmij kill switch (polecenie 10, silnik jest zatrzymany), potem uruchom silnik. Miękki kill switch od nieudanego logowania **nie znika sam po restarcie**: bez `clear-kill` silnik nie wejdzie w pozycję. (f) gdy próba nie przeszła: STOP, nie ponawiaj, zapytaj |
+| Silnik w `dry_run`, mimo że uzbrojony | Silnik sam podaje powód w logu przy starcie i w `status` (polecenia 11 i 6) | Możliwe powody: `live_allowed is not true` (sprawdź polecenie 12); `data/ARM_LIVE does not exist` (pamiętaj: usunięcie pliku wyłącza wejścia do restartu); `no bound account` (zrób `bind-account`); `no frozen pre-registration fingerprint` (nie zamrożono pre-rejestracji albo plik `data/preregistration.json` ma innego właściciela niż użytkownik kontenera i jest dla niego nieczytelny: polecenie 15 i punkt 2.0) albo `fingerprint differs` (zmieniono pliki strategii, ryzyka lub kosztów, także samymi końcami linii: polecenie 24, czyli `prereg --check`, wypisze nazwy plików, które się różnią; zob. następny wiersz); po starcie także kontrola rachunku u brokera (rachunek nieaktywny, saldo 0, waluta inna niż EUR, rachunek sesji inny niż powiązany). Po każdej zmianie plików: zatrzymaj, potem uruchom (tryb wybiera się przy starcie) |
+| Kontrola `prereg --check` kończy się kodem 1 (`MISMATCH`) albo 2 (`NOT FROZEN`) | Kod 1: konfiguracja jest inna niż zamrożona, a polecenie 24 wypisuje nazwy plików, które się różnią. Kod 2: nic nie zamrożono albo plik jest nieczytelny | Silnik zostaje w `dry_run`. **Nie używaj `--force`.** Wklej wynik Claude i nic nie zmieniaj, dopóki nie odpowie. Jeśli niczego świadomie nie zmieniałeś, a różnią się końce linii, przywrócenie plików z repozytorium (punkt 2.0, po potwierdzeniu Claude) jest właściwe. `--force` to wyłącznie świadome rozpoczęcie nowego wariantu (K+1), ustalone z Claude |
 | Zegar serwera się rozjechał | Decyzje i kontrola ciszy notowań liczą czas z zegara serwera (polecenia 13 i 14) | Różnica powyżej 2 s jest podejrzana, powyżej 10 s wymaga naprawy synchronizacji czasu (NTP) przez administratora serwera. Do czasu naprawy hamulec 1 (plik `data/STOP`) |
 | `Permission denied` w `data/` albo przy kluczu | Numer właściciela plików nie zgadza się z użytkownikiem kontenera (polecenia 15 i 16, wynik próby izolacji z punktu 1.10) | Numery w wyniku polecenia 15 muszą równać się `GW_UID` i `GW_GID`. Jeśli katalog `data` powstał jako `root`, napraw go jako `root` (polecenia 17 i 18). Jeśli polecenie 19 pokazuje `Enforcing`, a uprawnienia są poprawne, zgłoś to: **nie dodawaj sam** oznaczeń `:z` do montowań (zmieniają etykiety plików w katalogu domowym) |
 | **Katalog zamiast pliku klucza**: próba izolacji pokazuje, że klucz nie jest plikiem, albo Docker zgłasza błąd montowania | Gdy plik klucza nie istniał w chwili uruchomienia polecenia docker compose, **Docker (jako root) założył w jego miejscu pusty KATALOG** o tej nazwie, a klucz nie jest czytelny (polecenie 20 pokaże `d` na początku uprawnień) | Zatrzymaj wszystko (1). Wróć na konto `root` (polecenie 17) i usuń **pusty** katalog poleceniem `rmdir` (polecenie 21; `rmdir` odmówi usunięcia czegokolwiek niepustego). Wróć na `claude` (polecenie 22) i załóż plik od nowa według Dodatku A. Zanim ponownie uruchomisz cokolwiek, powtórz punkt 1.3 |
@@ -1175,7 +1241,7 @@ tail -n 30 data/alerts.log
 docker compose -f docker/compose.yml --profile test run --rm gw-stock-live-readonly python -m pytest -m integration_live_readonly -k test_accounts_listed -v -p no:cacheprovider
 ```
 
-10\. Zdjęcie kill switcha po nieudanym logowaniu **[po zadaniu 14b]** (silnik zatrzymany):
+10\. Zdjęcie kill switcha po nieudanym logowaniu (silnik zatrzymany; wpisz `CLEAR`):
 
 ```bash
 docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
@@ -1259,6 +1325,12 @@ su - claude
 export GW_UID=$(id -u claude) GW_GID=$(id -g claude)
 ```
 
+24\. Kontrola zgodności konfiguracji z zamrożoną pre-rejestracją (kod 0 i `OK`: zgodna; kod 1: inna, z nazwami plików; kod 2: nic nie zamrożono):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --check
+```
+
 ---
 
 ## 10. Lista kontrolna przed uzbrojeniem
@@ -1275,12 +1347,13 @@ Uzbrajasz (punkt 6) dopiero, gdy **każda** pozycja jest zaznaczona. Nie ma „p
 - [ ] Ćwiczenia wykonane i kill switch zdjęty po każdym: `STOP`, `HARD_STOP`, docker kill (ćwiczenie 4.3), odcięcie sieci.
 - [ ] Awaria procesu wewnątrz kontenera (ćwiczenie 4.3b): kontener wstał sam, bez błędów w logach i bez nowych alarmów `ERROR`.
 - [ ] `bind-account` wykonane, `data/account.json` istnieje, rachunek to ten z 40 € w EUR.
-- [ ] Pre-rejestracja zamrożona [po zadaniu 15], od tego czasu żadnych zmian w `strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`.
+- [ ] Pre-rejestracja zamrożona (punkt 2.0), odciski wpisane do dokumentu przez Claude, `--check` kończy się `OK`, a od zamrożenia żadnych zmian w `strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`.
 - [ ] `smoke` zakończony `PASS smoke: N/N`, krok [6] (drugie zamknięcie) na `PASS`, stop obejrzany w aplikacji albo zgłoszony Claude.
 - [ ] Po `smoke` usunięto `data/ARM_LIVE` i `live_allowed` wróciło do `false`; uzbrojenie na stałe jest osobną, świadomą decyzją.
 - [ ] W aplikacji Capital.com nie ma żadnej otwartej pozycji DE40, a saldo zgadza się z oczekiwanym.
 - [ ] Wiesz, jak rozbroić (punkt 6) i jak zatrzymać natychmiast (szybkie hamulce 1 do 3 z początku dokumentu).
 - [ ] Sprawdzono kalendarz: gdy zbliża się 30.12.2026, aktualizacja `early_closes` jest zrobiona (punkt 8.6).
+- [ ] Dokument odbioru `docs/ops/acceptance-v1.md`: kroki bramki L0 mają wpisane daty i wyniki zgodne z oczekiwanymi, a zastrzeżenia (rentowność nie jest wykazana) są przeczytane.
 
 ---
 
