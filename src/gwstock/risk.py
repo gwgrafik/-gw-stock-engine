@@ -5,7 +5,9 @@ przechodzi, nawet przy kill switchu HARD i zepsutym dzienniku). Jest tylko do od
 `Verdict.reasons` zawiera WSZYSTKIE niespełnione kontrole, w kolejności tabeli ze spec §9 (bez duplikatów).
 
 Zasada nadrzędna: kontrola, której nie da się ocenić (błąd odczytu dziennika, zepsuty zegar lub kalendarz,
-brak konta), BLOKUJE swoim powodem. Bramka nigdy nie rzuca wyjątku z powodu złych danych.
+brak konta), BLOKUJE swoim powodem. Bramka nigdy nie rzuca wyjątku z powodu złych danych. Gdy zawiedzie sama
+bramka (nieoczekiwany wyjątek poza pojedynczą kontrolą, np. błąd w kodzie), wejście blokuje jedyny powód
+GATE_ERROR (spoza tabeli; nie FORMAT, bo kandydat może być poprawny), a wyjątek trafia do logu.
 
 Kontrole (próg, granica, powód):
 
@@ -117,6 +119,8 @@ OUTSIDE_WINDOW = "OUTSIDE_WINDOW"
 DUPLICATE = "DUPLICATE"
 STALE_DATA = "STALE_DATA"
 KILL = "KILL"
+# Spoza tabeli: sama bramka zawiodła (nieoczekiwany wyjątek), więc blokuje bez oceny kandydata.
+GATE_ERROR = "GATE_ERROR"
 # Kontrole, których nie stosuje `check_smoke` (próba L0 biegnie poza oknem strategii i nie zużywa wejścia dnia).
 _SMOKE_EXEMPT = frozenset({NOT_SESSION, OUTSIDE_WINDOW, ENTRIES_PER_DAY})
 
@@ -236,7 +240,7 @@ class RiskGate:
             return self._check_entry(c, account, exempt)
         except Exception:  # siatka bezpieczeństwa: bramka nie rzuca, a niepewny kandydat nie przechodzi
             _LOG.exception("risk gate failed unexpectedly, blocking the entry")
-            return Verdict(False, [FORMAT])
+            return Verdict(False, [GATE_ERROR])  # nie FORMAT: zawiodła bramka, nie pola kandydata
 
     # --- ocena ---
 

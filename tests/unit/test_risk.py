@@ -6,6 +6,7 @@ Domyślny zegar w tym pliku to 09:06 w Berlinie (w oknie wejścia); testy okna b
 from __future__ import annotations
 
 import dataclasses
+import logging
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType
@@ -20,6 +21,7 @@ from gwstock.risk import (
     DUPLICATE,
     ENTRIES_PER_DAY,
     FORMAT,
+    GATE_ERROR,
     KILL,
     LEVERAGE,
     LOSS_PER_TRADE,
@@ -761,12 +763,16 @@ def test_the_gate_does_not_write_to_the_journal(gate, journal):
     assert before == after
 
 
-def test_unexpected_internal_error_blocks_instead_of_raising(gate, monkeypatch):
+def test_an_unexpected_gate_error_blocks_with_gate_error_not_format(gate, monkeypatch, caplog):
     def boom(*a, **k):
         raise RuntimeError("bug")
 
     monkeypatch.setattr(gate, "_window", boom)
-    assert gate.check_entry(cand(), ACCT) == Verdict(False, [FORMAT])
+    with caplog.at_level(logging.ERROR, logger="gwstock.risk"):
+        verdict = gate.check_entry(cand(), ACCT)  # nie rzuca
+    # kandydat jest poprawny: FORMAT wskazywałby na złe pola, a zawiodła sama bramka
+    assert verdict == Verdict(False, [GATE_ERROR]) and GATE_ERROR == "GATE_ERROR"
+    assert "risk gate failed unexpectedly" in caplog.text and "bug" in caplog.text
 
 
 def test_kill_view_is_optional(journal, risk_cfg, strat_cfg):
@@ -834,4 +840,4 @@ def test_smoke_never_raises_on_an_internal_error(gate, monkeypatch):
         raise RuntimeError("bug")
 
     monkeypatch.setattr(gate, "_today", boom)
-    assert gate.check_smoke(cand(), ACCT) == Verdict(False, [FORMAT])
+    assert gate.check_smoke(cand(), ACCT) == Verdict(False, [GATE_ERROR])
