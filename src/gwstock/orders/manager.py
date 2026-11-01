@@ -20,9 +20,9 @@ Niezmienniki (prawdziwe pieniądze):
   w `finally`): uzgadnianie pomija wtedy swój przebieg, więc zlecenie w toku ma jednego piszącego; drugie
   `submit_entry` lub `resolve_unknown` w tym czasie to `RuntimeError` przed jakimkolwiek zapisem.
 
-Odrzucenie: odrzucony POST (`open_position`) to REJECTED od razu (nic nie powstało). Odrzucenie odroczone (POST przyjęty,
-REJECTED dopiero w `confirm`) to REJECTED tylko po udanym odczycie listy pozycji bez dopasowania; nasza pozycja na
-liście → UNKNOWN REJECTED_BUT_LISTED i pozycja BLOCKED, nieczytelna lista → UNKNOWN
+Odrzucenie: odrzucony POST (`open_position`) to REJECTED od razu (nic nie powstało). Odrzucenie odroczone (POST
+przyjęty, REJECTED dopiero w `confirm`) to REJECTED tylko po udanym odczycie listy pozycji bez dopasowania; nasza
+pozycja na liście → UNKNOWN REJECTED_BUT_LISTED i pozycja BLOCKED, nieczytelna lista → UNKNOWN
 `CAUSE=confirm:BrokerRejected_UNVERIFIED` z pozycją ENTERING (rozstrzyga uzgadnianie).
 
 Rozstrzyganie UNKNOWN: tylko zlecenie UNKNOWN z pozycją ENTERING (BLOCKED to decyzja uzgadniania lub właściciela,
@@ -231,9 +231,9 @@ class OrderManager:
 
         Wynik: CONFIRMED (pozycja OPEN z faktycznymi danymi brokera), NOT_PLACED (pozycja FLAT) albo UNKNOWN z notatką
         AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED / REJECTED_BUT_LISTED / UNMATCHED_CLOSED_DEAL (pozycja
-        BLOCKED: decyduje uzgadnianie lub właściciel) lub CHECKS_INCOMPLETE (pozycja ENTERING: nieudany odczyt listy albo
-        historii, rozstrzygnie uzgadnianie). NOT_PLACED (także po REJECTED w `confirm`) dopiero po udanym odczycie listy
-        bez dopasowania i czystej historii zamknięć.
+        BLOCKED: decyduje uzgadnianie lub właściciel) lub CHECKS_INCOMPLETE (pozycja ENTERING: nieudany odczyt listy
+        albo historii, rozstrzygnie uzgadnianie). NOT_PLACED (także po REJECTED w `confirm`) dopiero po udanym odczycie
+        listy bez dopasowania i czystej historii zamknięć.
         """
         if self._in_flight:
             raise RuntimeError(f"resolve_unknown: an entry is already in flight, refusing {order.order_id!r}")

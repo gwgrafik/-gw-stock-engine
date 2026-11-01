@@ -454,7 +454,8 @@ async def test_resolve_unknown_works_on_the_journal_record_not_on_the_passed_cop
     fake.calls.clear()
     old_copy = replace(first, deal_reference=None, note="CAUSE=open_position:BrokerTimeout")  # kopia sprzed odpowiedzi
     rec = await mgr.resolve_unknown(old_copy)
-    assert rec.state == OrderState.CONFIRMED and rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm CAUSE=confirm:BrokerTimeout"
+    assert rec.state == OrderState.CONFIRMED
+    assert rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm CAUSE=confirm:BrokerTimeout"
     assert fake.calls[0] == "confirm"  # referencja z dziennika, nie z przekazanej kopii
 
 

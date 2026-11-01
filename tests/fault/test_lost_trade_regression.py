@@ -268,7 +268,8 @@ async def test_a_crash_after_the_history_read_before_the_block_still_ends_blocke
     # restart 2: transakcja nadal zablokowana do decyzji właściciela, nigdy NOT_PLACED ani FLAT
     j2 = reopen(path)
     rec = j2.get_order(req.client_id)
-    assert rec.state is OrderState.UNKNOWN and j2.current_position("DE40") == PositionRecord("DE40", PositionState.BLOCKED)
+    assert rec.state is OrderState.UNKNOWN
+    assert j2.current_position("DE40") == PositionRecord("DE40", PositionState.BLOCKED)
     assert j2.trades() == [] and j2.realized_pnl_total() == 0
     assert OrderState.NOT_PLACED not in written["order"] and PositionState.FLAT not in written["position"]
     if crash == "after_the_block_write":  # BLOCKED już zapisane: uzgadnianie czeka na właściciela, nie dopisuje kodu

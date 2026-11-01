@@ -498,7 +498,8 @@ class Reconciler:
             return
         waited = int((self._clock.now_utc() - closed_at).total_seconds())
         plan.record(
-            CLOSURE_NOT_IN_HISTORY, deal_id=missing.deal_id, closed_at=closed_at, waited_s=waited, mismatch_since=started
+            CLOSURE_NOT_IN_HISTORY,
+            deal_id=missing.deal_id, closed_at=closed_at, waited_s=waited, mismatch_since=started,
         )
         plan.alerts.append((
             key,
