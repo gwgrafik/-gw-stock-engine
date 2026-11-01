@@ -723,10 +723,18 @@ def _status_decision(journal: Any, epic: str, data_dir: Path, now: datetime, out
         f"first candle {candle.get('start')} {ohlc}")  # fmt: skip
 
 
+def _estimated(flags: str | None) -> bool:
+    """Wiersz księgi zaksięgowany przez właściciela jako szacunek (`resolve-lost-trade`), nie pomiar."""
+    return "ESTIMATED" in (flags or "").split()
+
+
 def _status_sessions(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
-    sessions = len(journal.trades()) - journal.count_smoke_trades()
+    booked = journal.trade_flags()  # księga ze znacznikami jednym odczytem
+    sessions = len(booked) - journal.count_smoke_trades()
+    estimates = sum(1 for _, flags in booked if _estimated(flags))
+    note = f" (including {estimates} owner estimate{'' if estimates == 1 else 's'})" if estimates else ""
     l1 = (data_dir / L1_PASSED_FILE).exists()
-    out(f"live sessions (trades without smoke): {sessions}; {L1_PASSED_FILE}: {'yes' if l1 else 'no'}")
+    out(f"live sessions (trades without smoke): {sessions}{note}; {L1_PASSED_FILE}: {'yes' if l1 else 'no'}")
 
 
 def _status_trades(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
@@ -734,13 +742,23 @@ def _status_trades(journal: Any, epic: str, data_dir: Path, now: datetime, out: 
 
     calendar = ExchangeCalendar(XETRA)
     today = calendar.to_local(now).date()
-    booked = list(zip(journal.trades(), journal.trade_flags(), strict=True))
+    booked = journal.trade_flags()  # księga ze znacznikami jednym odczytem (piszący silnik niczego nie rozjedzie)
+
+    def line(t: Any, flags: str | None) -> str:
+        mark = " [ESTIMATED]" if _estimated(flags) else ""  # szacunek właściciela, nie pomiar
+        return (f"{t.side.value} {t.size} entry {t.entry_fill} exit {t.exit_fill} net {t.net_pnl} "
+                f"({t.exit_reason}){mark}")  # fmt: skip
+
     todays = [(t, flags) for t, flags in booked if calendar.to_local(t.exit_ts).date() == today]
     out(f"trades today ({today}): {len(todays)}")
     for t, flags in todays:
-        mark = " [ESTIMATED]" if "ESTIMATED" in (flags or "").split() else ""  # szacunek właściciela, nie pomiar
-        out(f"  {t.side.value} {t.size} entry {t.entry_fill} exit {t.exit_fill} net {t.net_pnl} ({t.exit_reason})"
-            + mark)  # fmt: skip
+        out(f"  {line(t, flags)}")
+    estimates = [(t, flags) for t, flags in booked if _estimated(flags)]  # zwykle z innego dnia niż dziś
+    if estimates:
+        out(f"owner estimates in the ledger: {len(estimates)} (excluded from cost measurement; check them at "
+            "Capital.com)")  # fmt: skip
+        for t, flags in estimates:
+            out(f"  {calendar.to_local(t.exit_ts).date()} {line(t, flags)}")
 
 
 def health(data_dir: Path, now: datetime | None = None, max_age_s: float = HEALTH_MAX_AGE_S) -> int:

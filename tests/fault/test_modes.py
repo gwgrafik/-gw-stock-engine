@@ -1620,6 +1620,31 @@ async def test_status_marks_a_trade_booked_from_an_estimate(make_engine, broker,
     assert trade_line.endswith("(STOP) [ESTIMATED]")
 
 
+async def test_status_lists_every_owner_estimate_also_on_a_later_day_from_one_ledger_read(
+    make_engine, broker, clock, data_dir, monkeypatch
+):
+    # m6/m7: resolve-lost-trade bywa uruchamiane dzień później; szacunek musi być widoczny, a księga i znaczniki
+    # czytane jednym odczytem (bez osobnego `trades()`, które przy piszącym silniku mogłoby się rozjechać)
+    monkeypatch.setitem(sys.modules, "gwstock.prereg", None)
+    make_engine.journal_path = data_dir / "journal.sqlite"
+    engine = make_engine(Mode.LIVE)
+    await lost_trade(engine, broker, clock)
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1", "SZACUNEK"), out=lambda _: None) == 0
+    clock.advance(86400)
+
+    def no_separate_ledger_read(self):
+        raise AssertionError("status reads the ledger only through trade_flags()")
+
+    monkeypatch.setattr(Journal, "trades", no_separate_ledger_read)
+    lines: list[str] = []
+    assert cli.status(Path("config"), data_dir, out=lines.append, now=clock.now_utc()) == 0
+    assert "trades today (2026-11-03): 0" in lines
+    assert "owner estimates in the ledger: 1 (excluded from cost measurement; check them at Capital.com)" in lines
+    [line] = [x for x in lines if x.startswith("  2026-11-02 BUY 0.001")]
+    assert line.endswith("(STOP) [ESTIMATED]")
+    assert any(x.startswith("live sessions (trades without smoke): 1 (including 1 owner estimate)") for x in lines)
+
+
 async def test_smoke_hold_keeps_managing_and_counts_down_before_the_flatten(engine, broker, smoke_clock):
     lines: list[str] = []
     closes = calls_at(broker, smoke_clock, "close_position")

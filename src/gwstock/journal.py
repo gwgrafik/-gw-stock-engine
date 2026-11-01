@@ -951,21 +951,24 @@ class Journal:
     def trade_flags(self, deal_id: str) -> str | None: ...
 
     @overload
-    def trade_flags(self) -> list[str | None]: ...
+    def trade_flags(self) -> list[tuple[TradeRecord, str | None]]: ...
 
-    def trade_flags(self, deal_id: str | None = None) -> str | None | list[str | None]:
+    def trade_flags(self, deal_id: str | None = None) -> str | None | list[tuple[TradeRecord, str | None]]:
         """Znaczniki księgi z `record_trade(..., flags=)`: z `deal_id` napis znaczników tej transakcji albo None
-        (bez znaczników albo bez transakcji); bez argumentu lista dla KAŻDEJ transakcji w kolejności `trades()`
-        (None przy transakcji bez znaczników), np. do oznaczenia szacunków w `status` i raporcie."""
+        (bez znaczników albo bez transakcji); bez argumentu cała księga w kolejności `trades()`, KAŻDA transakcja razem
+        ze swoimi znacznikami (None: bez znaczników), czytana JEDNĄ instrukcją, więc zgodna także przy piszącym
+        silniku (`status` i raport oznaczają szacunki właściciela)."""
         if deal_id is not None:
             _check_str(deal_id, "trade_flags.deal_id", non_empty=True)
             return self.get_meta(_TRADE_FLAGS.format(deal_id))
+        cols = ", ".join(f"t.{c.strip()}" for c in _TRADE_COLS.split(","))
         rows = self._read(
             lambda c: c.execute(
-                "SELECT m.value FROM trades t LEFT JOIN meta m ON m.key = 'trade_flags:' || t.deal_id ORDER BY t.id"
+                f"SELECT {cols}, m.value FROM trades t LEFT JOIN meta m ON m.key = 'trade_flags:' || t.deal_id "
+                "ORDER BY t.id"
             ).fetchall()
         )
-        return [row[0] for row in rows]
+        return [(_decode("trade", _trade_from_row, r[:-1]), r[-1]) for r in rows]
 
     def has_trade(self, deal_id: str) -> bool:
         """Czy zamknięcie `deal_id` jest już zaksięgowane (tani odczyt przed ponownym księgowaniem)."""

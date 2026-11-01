@@ -1026,7 +1026,7 @@ def test_report_lists_other_events_and_warns_about_unreadable_rows(journal, caps
 
 ESTIMATE_WARNING = (
     "UWAGA: transakcja z 2026-11-03 (wyjście 17:25 czasu Europe/Berlin, STOP, netto -0.22) zaksięgowana przez "
-    "właściciela jako SZACUNEK (najgorsza strata ze stopu); sprawdź wynik w Capital.com"
+    "właściciela jako SZACUNEK (ostrożny szacunek straty, nie górna granica); sprawdź wynik w Capital.com"
 )
 
 
@@ -1041,6 +1041,46 @@ def test_report_warns_about_estimated_trades(journal, capsys, config_env, jpath)
     lines = out.splitlines()
     assert lines.count(ESTIMATE_WARNING) == 1 and "DEAL-" not in out  # bez identyfikatorów deali
     assert lines.index(ESTIMATE_WARNING) < lines.index("Podsumowanie od początku dziennika:")
+
+
+def book_estimate_with_a_matching_context(journal, day, seq=1):
+    """Szacunek właściciela, którego czasy pasują do kontekstu wejścia, a notowanie jest użyteczne (ask > bid): bez
+    jawnego wykluczenia byłby sesją i próbką kosztu."""
+    trade = make_trade(day, exit_reason="STOP")
+    client_id = make_client_id(day, "DE40", seq, "entry")
+    journal.insert_order(OrderRecord(
+        client_id, "DE40", trade.side, trade.size, Decimal("30"), OrderState.CONFIRMED, None, f"DEAL-E-{seq}",
+        trade.signal_ts, trade.confirm_ts,
+    ))  # fmt: skip
+    journal.set_meta(f"entry_ctx:{client_id}", dump({
+        "client_id": client_id, "signal_ts": trade.signal_ts, "submit_ts": trade.submit_ts, "value_per_point": "1",
+    }))  # fmt: skip
+    assert journal.record_trade(trade, f"DEAL-E-{seq}", day, flags="ESTIMATED RESOLVED_BY_OWNER")
+
+
+def test_l1_gate_excludes_an_owner_estimate_by_its_flag(journal, capsys, config_env, jpath):
+    # m7: szacunek nie jest pomiarem: ani sesją, ani próbką kosztu, niezależnie od roli z kontekstu wejścia
+    for day in (D1, D2, D3, D4):
+        book_session(journal, day)
+    book_estimate_with_a_matching_context(journal, D5)
+    _, out, _ = run(["--journal", jpath, "--all"], capsys)
+    lines = out.splitlines()
+    assert f"Bramka L1 (spec §11): NOT YET {VERDICT_TAIL}" in lines
+    assert "  sesje na wielkości minimalnej: 4 z 5 (brakuje 1)" in lines
+    assert "  wykluczone z bramki szacunki właściciela (ESTIMATED): 1" in lines
+    assert any(line.startswith("UWAGA: transakcja z 2026-11-06") for line in lines)
+
+
+def test_report_reads_the_ledger_and_its_flags_in_one_read(journal, capsys, config_env, jpath, monkeypatch):
+    # m6: osobne `trades()` i znaczniki przy piszącym silniku mogłyby się rozjechać (raport by padł)
+    five_clean_sessions(journal)
+
+    def no_separate_ledger_read(self):
+        raise AssertionError("the report reads the ledger only through trade_flags()")
+
+    monkeypatch.setattr(Journal, "trades", no_separate_ledger_read)
+    code, out, _ = run(["--journal", jpath], capsys)
+    assert code == 0 and "Bramka L1 (spec §11): PASS" in out
 
 
 def test_report_counts_closure_booked_as_benign_not_as_another_event(journal, capsys, config_env, jpath):

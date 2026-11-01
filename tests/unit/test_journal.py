@@ -760,13 +760,37 @@ def test_record_trade_writes_its_flags_in_the_same_transaction(journal):
     assert journal.trade_flags("DEAL-1") == "ESTIMATED RESOLVED_BY_OWNER"
 
 
-def test_trade_flags_are_none_without_flags_and_listed_in_booking_order(journal):
-    assert journal.record_trade(make_trade(), "DEAL-1", DAY) is True  # zwykłe księgowanie: bez znacznika
-    assert journal.record_trade(make_trade(), "DEAL-2", DAY, flags="RESOLVED_BY_OWNER") is True
-    assert journal.record_trade(make_trade(), "DEAL-3", NEXT_DAY, flags="ESTIMATED RESOLVED_BY_OWNER") is True
+def test_trade_flags_are_none_without_flags_and_listed_with_each_trade_in_booking_order(journal):
+    a, b, c = make_trade(), make_trade(net_pnl=Decimal("-1")), make_trade(exit_reason="MANUAL")
+    assert journal.record_trade(a, "DEAL-1", DAY) is True  # zwykłe księgowanie: bez znacznika
+    assert journal.record_trade(b, "DEAL-2", DAY, flags="RESOLVED_BY_OWNER") is True
+    assert journal.record_trade(c, "DEAL-3", NEXT_DAY, flags="ESTIMATED RESOLVED_BY_OWNER") is True
     assert journal.trade_flags("DEAL-1") is None and journal.trade_flags("DEAL-9") is None
-    assert journal.trade_flags() == [None, "RESOLVED_BY_OWNER", "ESTIMATED RESOLVED_BY_OWNER"]  # jak `trades()`
+    # bez argumentu: każda transakcja razem ze swoimi znacznikami, w kolejności `trades()`
+    assert journal.trade_flags() == [(a, None), (b, "RESOLVED_BY_OWNER"), (c, "ESTIMATED RESOLVED_BY_OWNER")]
     assert journal.get_meta("trade_flags:DEAL-1") is None
+
+
+def test_trade_flags_reads_the_ledger_and_its_flags_in_one_statement(journal):
+    # m6: dwa osobne odczyty (`trades()`, potem znaczniki) przy piszącym silniku mogłyby się rozjechać
+    assert journal.record_trade(make_trade(), "DEAL-1", DAY, flags="ESTIMATED RESOLVED_BY_OWNER") is True
+    statements: list[str] = []
+    real = journal._conn
+
+    class Counting:
+        def execute(self, sql, params=()):
+            statements.append(sql)
+            return real.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    journal._conn = Counting()
+    try:
+        assert journal.trade_flags() == [(make_trade(), "ESTIMATED RESOLVED_BY_OWNER")]
+    finally:
+        journal._conn = real
+    assert len(statements) == 1
 
 
 @pytest.mark.parametrize("flags", ["estimated", "ESTIMATED  RESOLVED_BY_OWNER", " ESTIMATED", "ESTIMATED\n", 7])

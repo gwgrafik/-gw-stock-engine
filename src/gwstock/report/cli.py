@@ -68,9 +68,11 @@ NO_DECISION = "brak zapisu decyzji"
 # (uzgadnianie zaksięgowało zamknięcie) powtarza się przy idempotentnym ponownym księgowaniu: transakcje liczy księga.
 BENIGN_EVENTS = frozenset({"TRADE_BOOKED", "CLOSURE_BOOKED"})
 ESTIMATED_FLAG = "ESTIMATED"  # znacznik księgi szacunku właściciela (`Journal.trade_flags`)
+ROLE_ESTIMATED = "estimated"  # rola szacunku w raporcie: poza bramką L1 (ani sesja, ani próbka kosztu)
+L1_ESTIMATED_LABEL = "  wykluczone z bramki szacunki właściciela (ESTIMATED): "
 ESTIMATED_WARNING = (
     "UWAGA: transakcja z {day} (wyjście {time} czasu Europe/Berlin, {reason}, netto {net}) zaksięgowana przez "
-    "właściciela jako SZACUNEK (najgorsza strata ze stopu); sprawdź wynik w Capital.com"
+    "właściciela jako SZACUNEK (ostrożny szacunek straty, nie górna granica); sprawdź wynik w Capital.com"
 )
 LOGIN_LOCKOUT = "LOGIN_LOCKOUT"
 EVENT_SOURCES = (gates.SOURCE_EVENT, gates.SOURCE_RECONCILE, gates.SOURCE_WATCHDOG, gates.SOURCE_ENGINE)
@@ -259,11 +261,11 @@ def _summary_lines(trades: list[TradeRecord]) -> list[str]:
     return lines
 
 
-def _estimated_lines(trades: list[TradeRecord], flags: list[str | None]) -> list[str]:
+def _estimated_lines(booked: list[tuple[TradeRecord, str | None]]) -> list[str]:
     """Uwaga dla każdej transakcji zaksięgowanej przez właściciela jako SZACUNEK (`resolve-lost-trade`): jej wynik to
-    najgorsza strata ze stopu, nie pomiar. Bez identyfikatora deala (raport ich nie drukuje): dzień, godzina, wynik."""
+    ostrożny szacunek straty, nie pomiar. Bez identyfikatora deala (raport ich nie drukuje): dzień, godzina, wynik."""
     lines = []
-    for trade, marks in zip(trades, flags, strict=True):
+    for trade, marks in booked:
         if ESTIMATED_FLAG not in (marks or "").split():
             continue
         local = _CALENDAR.to_local(trade.exit_ts)
@@ -277,7 +279,7 @@ def _days(days: tuple[date, ...]) -> str:
     return "; dni: " + ", ".join(day.isoformat() for day in sorted(set(days))) if days else ""
 
 
-def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[str]:
+def _gate_lines(details: L1Details, required: int, costs: CostConfig, *, estimates: int = 0) -> list[str]:
     gate, points = details.gate, details.points
     reasons = gate.reasons(required)
     missing = max(0, required - gate.sessions_at_min_size)
@@ -314,6 +316,8 @@ def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[st
     lines.append(L1_EUR_CAVEAT)
     if details.excluded_trades:
         lines.append(f"{L1_EXCLUDED_LABEL}{details.excluded_trades}")
+    if estimates:
+        lines.append(f"{L1_ESTIMATED_LABEL}{estimates}")
     smoke = details.roles.count(gates.ROLE_SMOKE)
     if smoke:
         lines.append(f"  próby smoke (poza liczbą sesji): {smoke}")
@@ -377,9 +381,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _report(args: argparse.Namespace, journal_path: Path, journal: Journal, strat_sessions: int, costs: CostConfig):
     """Treść raportu (lista linii) i komunikat błędu eksportu CSV (None: brak błędu albo CSV niezamówione)."""
-    trades = journal.trades()
-    details = gates.l1_details(journal, costs=costs, trades=trades)
-    data = _collect(journal, trades, list(details.roles))
+    booked = journal.trade_flags()  # księga ze znacznikami jednym odczytem (zgodna także przy piszącym silniku)
+    trades = [trade for trade, _ in booked]
+    estimated = [ESTIMATED_FLAG in (flags or "").split() for _, flags in booked]
+    # szacunek właściciela to nie pomiar: bramka L1 (sesje, próbki kosztu) liczy wyłącznie pozostałe transakcje
+    details = gates.l1_details(journal, costs=costs, trades=[t for t, e in zip(trades, estimated) if not e])
+    measured_roles = iter(details.roles)
+    roles = [ROLE_ESTIMATED if e else next(measured_roles) for e in estimated]
+    data = _collect(journal, trades, roles)
     lines = ["Raport gw-stock-engine (pomiar)", f"Dziennik: {journal_path}"]
     csv_error = None
     if args.csv is not None:
@@ -404,11 +413,11 @@ def _report(args: argparse.Namespace, journal_path: Path, journal: Journal, stra
         lines += _day_lines(journal, day, data.days.get(day, _Day()), trades)
     if data.unreadable:
         lines += [f"UWAGA: {data.unreadable} nieczytelnych zapisów zdarzeń pominięto w liczniku.", ""]
-    estimated = _estimated_lines(trades, journal.trade_flags())
-    if estimated:
-        lines += [*estimated, ""]
+    warnings = _estimated_lines(booked)
+    if warnings:
+        lines += [*warnings, ""]
     lines += _summary_lines(trades)
-    lines += _gate_lines(details, strat_sessions, costs)
+    lines += _gate_lines(details, strat_sessions, costs, estimates=sum(estimated))
     lines.append(STATEMENT)
     return lines, csv_error
 
