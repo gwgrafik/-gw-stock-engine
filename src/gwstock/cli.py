@@ -744,11 +744,13 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     brak powiązanego rachunku, sesja na innym rachunku, broker nieczytelny; broker pokazuje pozycję albo zlecenie
     oczekujące na instrumencie; historia zamknięć nieczytelna (każdy błąd); zamknięcie deal_id JEST w historii (jedno):
     wtedy księguje je uzgadnianie silnika, a reset by je zgubił na zawsze (bez deal_id w dzienniku nikt go już nie
-    znajdzie). Potwierdzenie (inaczej 2, nic nie zmienione): przy deal_id bez zamknięcia w historii (albo historii
-    niejednoznacznej) właściciel wpisuje DEAL ID jako jawne przyjęcie, że transakcja nie zostanie zaksięgowana; przy
-    BLOCKED z polami pozycji, ale bez deal_id, wpisuje `NO-DEAL-ID`; w pozostałych stanach `RESET`. Zdarzenie audytowe
-    `owner.reset` (kto, poprzedni stan, niezaksięgowany deal, wynik historii, potwierdzenie) przed zapisem FLAT przez
-    automat stanów. Wyjście nie zawiera identyfikatorów rachunków. 0: wyczyszczone.
+    znajdzie). Początek historii jak w uzgadnianiu (`reconcile.history_start`); starszy niż okno historii brokera: bez
+    odczytu (HISTORY_OUT_OF_RANGE). Potwierdzenie (inaczej 2, nic nie zmienione): przy deal_id bez zamknięcia w historii
+    (albo historii niejednoznacznej, z każdym zamknięciem wypisanym) właściciel wpisuje DEAL ID jako jawne przyjęcie, że
+    transakcja nie zostanie zaksięgowana; przy BLOCKED z polami pozycji, ale bez deal_id, wpisuje `NO-DEAL-ID`; w
+    pozostałych stanach `RESET`. Zdarzenie audytowe `owner.reset` (kto, poprzedni stan, niezaksięgowany deal, wynik
+    historii, zamknięcia tego deala, potwierdzenie) przed zapisem FLAT przez automat stanów. Wyjście nie zawiera
+    identyfikatorów rachunków. 0: wyczyszczone.
     """
     journal, epic = engine.journal, engine.strat.instrument
     position = journal.current_position(epic)
@@ -792,11 +794,12 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
         out(f"refused: a working order on {epic} exists at the broker ({', '.join(orders)}); cancel it in the app")
         return 1
     deal_id = position.deal_id
-    history = "NOT_APPLICABLE"
+    history, closures = "NOT_APPLICABLE", []
     if deal_id is not None:
-        history = await _reset_history_check(engine, position, out)
-        if history is None:
+        checked = await _reset_history_check(engine, position, out)
+        if checked is None:
             return 1
+        history, closures = checked
     out(f"journal position {epic}: {position.state.value} deal {deal_id} side "
         f"{position.side.value if position.side else '?'} size {position.size} open level {position.open_level} "
         f"stop {position.stop_level} opened at {position.opened_at.isoformat() if position.opened_at else '?'}")
@@ -821,7 +824,8 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     journal.append_raw(
         SOURCE_OWNER_RESET,
         dump({"event": "OWNER_RESET", "by": by.strip(), "previous": position, "unbooked_deal": deal_id,
-              "history": history, "acknowledged": typed, "broker_positions": [], "working_orders": []}),  # fmt: skip
+              "history": history, "closures": closures, "acknowledged": typed, "broker_positions": [],
+              "working_orders": []}),  # fmt: skip
         now,
     )
     check_position_transition(position.state, PositionState.FLAT)
@@ -830,15 +834,19 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     return 0
 
 
-async def _reset_history_check(engine: Engine, position: PositionRecord, out: Callable[[str], None]) -> str | None:
+async def _reset_history_check(
+    engine: Engine, position: PositionRecord, out: Callable[[str], None]
+) -> tuple[str, list] | None:
     """Historia zamknięć deal_id pozycji BLOCKED (pełna albo wyjątek) od tego samego początku, co uzgadnianie:
     `reconcile.history_start` (późniejszy z: znacznik ostatniego zaksięgowanego zamknięcia, otwarcie; minus
     HISTORY_MARGIN).
 
-    None: odmowa (już wypisana): zamknięcie do zaksięgowania przez silnik albo historia nieczytelna. Inaczej wynik
-    do audytu: `NO_CLOSURE`, `AMBIGUOUS_<n>_CLOSURES`, `START_UNKNOWN` (bez czasu otwarcia i bez znacznika nie da się
-    jej sprawdzić).
+    None: odmowa (już wypisana): zamknięcie do zaksięgowania przez silnik albo historia nieczytelna. Inaczej (wynik do
+    audytu, zamknięcia tego deala): `NO_CLOSURE`, `AMBIGUOUS_<n>_CLOSURES` (każde wypisane), `START_UNKNOWN` (bez czasu
+    otwarcia i bez znacznika nie da się jej sprawdzić), `HISTORY_OUT_OF_RANGE` (początek dawniej niż okno historii
+    brokera, 14 dni: odczyt i tak by odmówił, a ponowienie niczego nie zmieni).
     """
+    from gwstock.broker.capitalcom_history import HISTORY_MAX_RANGE
     from gwstock.reconcile import history_start
 
     deal_id, epic = position.deal_id, position.epic
@@ -846,7 +854,11 @@ async def _reset_history_check(engine: Engine, position: PositionRecord, out: Ca
     if start is None:
         out(f"note: neither the open time of deal {deal_id} nor a booked closure is known, so its closure cannot be "
             "looked up in the history")  # fmt: skip
-        return "START_UNKNOWN"
+        return "START_UNKNOWN", []
+    if engine.clock.now_utc() - start > HISTORY_MAX_RANGE:
+        out(f"note: deal {deal_id} opened more than {HISTORY_MAX_RANGE.days} days ago: the broker history no longer "
+            "covers it, so its closure cannot be looked up")  # fmt: skip
+        return "HISTORY_OUT_OF_RANGE", []
     try:
         closures = await engine.probe(engine.raw_broker.closed_since, start)
     except Exception as exc:
@@ -860,7 +872,9 @@ async def _reset_history_check(engine: Engine, position: PositionRecord, out: Ca
             f"{c.ts.isoformat()}): the engine books it; start the engine and let its reconciliation book it, then "
             "run reset-position again only if the position is still BLOCKED")  # fmt: skip
         return None
-    return f"AMBIGUOUS_{len(found)}_CLOSURES" if found else "NO_CLOSURE"
+    for c in found:  # niejednoznaczna historia: każde zamknięcie na ekranie i w audycie
+        out(f"closure of {deal_id}: {c.reason} at {c.exit_level}, {c.ts.isoformat()}")
+    return (f"AMBIGUOUS_{len(found)}_CLOSURES" if found else "NO_CLOSURE"), found
 
 
 # --- resolve-lost-trade (BUG-E2E-2) ---------------------------------------------------------------------------
@@ -878,9 +892,10 @@ async def resolve_lost_trade(
 
     (i) zamknięcie w pełnej historii brokera od INTENT − HISTORY_MARGIN → księgowanie jedyną ścieżką
         (`Executor.book` → `Journal.record_trade`): DOKŁADNIE z `confirm(ref)` (znacznik RESOLVED_BY_OWNER), a gdy
-        broker nie zna wejścia (brak referencji albo `confirm` zwraca None) SZACUNEK najgorszej straty ze stopu
-        (wejście = wyjście ± odległość stopu, znacznik ESTIMATED, dodatkowe potwierdzenie `SZACUNEK`; zysku z szacunku
-        nigdy nie księgujemy), i to tylko przy jednym możliwym zamknięciu;
+        broker nie zna wejścia (brak referencji, `confirm` zwraca None albo odrzucenie) SZACUNEK najgorszej straty ze
+        stopu (wejście = wyjście ± odległość stopu, znacznik ESTIMATED, dodatkowe potwierdzenie `SZACUNEK`; zysku
+        z szacunku nigdy nie księgujemy), i to tylko przy jednym możliwym zamknięciu; chwilowy błąd `confirm` to odmowa
+        (dokładne dane mogą istnieć);
     (ii) broker bez pozycji i zlecenia, historia pełna i bez zamknięcia, a dziennik nie zapisał dla zlecenia żadnej
         pozycji ani zamknięcia u brokera → zlecenie NOT_PLACED, pozycja FLAT po wpisaniu `NIEWYKONANE`;
     (iii) wszystko inne → odmowa z dokładnym powodem.
@@ -1028,15 +1043,17 @@ class _LostTrade:
 
         # 5. dane wejścia: potwierdzenie brokera (dokładnie) albo szacunek najgorszej straty ze stopu
         snapshot = None
+        confirm = "NO_REFERENCE"
         if order.deal_reference is not None:
             try:
                 snapshot = await engine.probe(engine.raw_broker.confirm, order.deal_reference)
+                confirm = "SNAPSHOT" if snapshot is not None else "NONE"
             except BrokerRejected as exc:
-                return self.refuse(
-                    "CONFIRM_CONTRADICTS",
-                    f"potwierdzenie brokera mówi, że zlecenie odrzucono ({exc.reason}), a historia pokazuje zamknięcie "
-                    f"{closed.deal_id}: dowody są sprzeczne; zapytaj Claude",
-                )
+                # trwała odpowiedź brokera (odrzucenie albo przyjęcie bez danych na tę referencję): dokładnych danych
+                # wejścia nie będzie nigdy, więc szacunek; ponowienie niczego by nie zmieniło
+                confirm = f"REJECTED: {exc.reason}"
+                self.out(f"potwierdzenie brokera na referencję {order.deal_reference} to odrzucenie ({exc.reason}): "
+                         "broker nie poda danych wejścia")  # fmt: skip
             except Exception as exc:
                 return self.refuse(
                     "CONFIRM_UNREADABLE",
@@ -1078,8 +1095,8 @@ class _LostTrade:
         # 6. księgowanie jedyną ścieżką, potem zlecenie, pozycja i znacznik historii
         self.audit(
             "BOOKING", order=order, position=position, closures=listed, chosen=closed.deal_id,
-            source="CONFIRM" if snapshot is not None else "ESTIMATE", snapshot=snapshot, estimate=estimate,
-            acknowledged=acknowledged,
+            source="CONFIRM" if snapshot is not None else "ESTIMATE", confirm=confirm, snapshot=snapshot,
+            estimate=estimate, acknowledged=acknowledged,
         )  # fmt: skip
         if snapshot is not None:  # księga bierze prawdziwy kontekst wejścia (notowanie decyzji, czasy) tego zlecenia
             journal.set_meta(META_ENTRY_BY_DEAL.format(closed.deal_id), order.order_id)

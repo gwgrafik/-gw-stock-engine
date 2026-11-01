@@ -24,7 +24,7 @@ import pytest
 
 import gwstock.cli as cli
 from gwstock.app import EngineMisconfigured, Mode
-from gwstock.broker.fake import FakeBroker
+from gwstock.broker.fake import FakeBroker, _Rejected
 from gwstock.config import RuntimeConfig, load_runtime
 from gwstock.journal import Journal, JournalError, JournalReadError, JournalWriteError, OrderRecord, PositionRecord
 from gwstock.types import (
@@ -966,6 +966,37 @@ async def test_reset_position_start_unknown_only_without_open_time_and_marker_ne
     assert any("cannot be looked up" in line for line in lines)
 
 
+async def test_reset_position_older_than_the_history_window_says_so_and_needs_the_deal_id(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    clock.advance(15 * 86400)  # właściciel wraca po dwóch tygodniach: historia brokera (14 dni) tego już nie obejmuje
+    before = broker.calls.count("closed_since")
+    lines: list[str] = []
+    owner = Typed("DEAL-1")
+    assert await cli.reset_position(engine, "wlasciciel", owner, out=lines.append) == 0
+    assert broker.calls.count("closed_since") == before  # bez odczytu, który i tak by odmówił
+    assert any("more than 14 days ago: the broker history no longer covers it" in line for line in lines)
+    assert not any("try again later" in line for line in lines) and "DEAL-1" in owner.prompts[0]
+    [audit] = payloads(engine.journal, "owner.reset")
+    assert audit["history"] == "HISTORY_OUT_OF_RANGE" and audit["acknowledged"] == "DEAL-1"
+
+
+async def test_reset_position_with_an_ambiguous_history_lists_and_audits_every_closure(engine, broker, clock):
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    broker.trigger_stop("DEAL-1", MID + 1 - 30)
+    broker._closed.append(replace(broker._closed[-1], exit_level=MID, reason="MANUAL"))  # dwa zamknięcia DEAL-1
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=P.BLOCKED))
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed("DEAL-1"), out=lines.append) == 0
+    first, second = broker._closed[-2:]
+    for c in (first, second):
+        assert any(f"closure of DEAL-1: {c.reason} at {c.exit_level}, {c.ts.isoformat()}" in line for line in lines)
+    [audit] = payloads(engine.journal, "owner.reset")
+    assert audit["history"] == "AMBIGUOUS_2_CLOSURES"
+    expected = [("STOP", str(MID + 1 - 30)), ("MANUAL", str(MID))]
+    assert [(c["reason"], c["exit_level"]) for c in audit["closures"]] == expected
+
+
 async def test_reset_position_without_a_deal_id_needs_the_no_deal_id_acknowledgement(engine, broker, clock):
     await blocked_position(engine, broker, clock)
     engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), deal_id=None))
@@ -1175,6 +1206,23 @@ async def test_resolve_lost_trade_books_exactly_from_the_confirm_when_the_refere
     assert any("(DOKŁADNIE z potwierdzenia)" in line for line in lines)
 
 
+async def test_resolve_lost_trade_estimates_when_the_broker_answers_the_reference_with_a_rejection(
+    engine, broker, clock
+):
+    # potwierdzenie stale odpowiada REJECTED (np. odrzucenie, a potem pusta lista i zamknięcie w historii): dokładnych
+    # danych wejścia nie będzie nigdy, więc szacunek najgorszej straty (z drugim potwierdzeniem), a nie wieczna odmowa
+    await lost_trade(engine, broker, clock, reference_known=True)
+    broker._confirms["REF-1"] = _Rejected("REJECTED_SAFETY")
+    lines: list[str] = []
+    owner = Typed("DEAL-1", "SZACUNEK")
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append) == 0, lines
+    assert owner.prompts == [cli.DEAL_PROMPT, cli.ESTIMATE_PROMPT]
+    assert engine.journal.trade_flags("DEAL-1") == "ESTIMATED RESOLVED_BY_OWNER"
+    assert any("odrzucenie (REJECTED_SAFETY)" in line for line in lines)
+    booking = resolve_audit(engine.journal)[0]
+    assert booking["source"] == "ESTIMATE" and booking["confirm"] == "REJECTED: REJECTED_SAFETY"
+
+
 async def test_resolve_lost_trade_never_books_a_profit_from_an_estimate(engine, broker, clock):
     def close_by_hand_with_a_profit(deal_id):  # właściciel zamknął w aplikacji 50 pkt nad wejściem
         broker.positions.pop(deal_id)
@@ -1276,10 +1324,6 @@ REFUSALS = {
     "confirm_unreadable": (
         lambda e, b, c: b.fail_next("confirm", BrokerTimeout()), True, ("DEAL-1",),
         "potwierdzenia brokera nie da się teraz odczytać (BrokerTimeout)",
-    ),
-    "confirm_rejected": (
-        lambda e, b, c: b.fail_next("confirm", BrokerRejected("REJECTED_SAFETY")), True, ("DEAL-1",),
-        "zlecenie odrzucono (REJECTED_SAFETY)",
     ),
     "confirm_contradicts": (
         lambda e, b, c: contradicting_confirm(b, side=Side.SELL), True, ("DEAL-1",),
