@@ -15,8 +15,10 @@ from decimal import Decimal
 
 import pytest
 
+import gwstock.reconcile as reconcile_module
 from gwstock.broker.fake import FakeBroker
 from gwstock.journal import JournalWriteError, OrderRecord, PositionRecord
+from gwstock.orders.manager import HISTORY_MARGIN
 from gwstock.reconcile import ReconcileResult, Reconciler
 from gwstock.types import (
     BrokerError,
@@ -681,6 +683,40 @@ async def test_unknown_order_older_than_a_day_with_old_closure_is_blocked_not_pl
     assert order(journal).state is O.UNKNOWN and order(journal).note.split()[0] == "UNMATCHED_CLOSED_DEAL"
     assert position(journal) == PositionRecord(EPIC, P.BLOCKED)
     assert result.blocked and kill_sink.calls == ["UNMATCHED_CLOSED_DEAL"]
+
+
+@pytest.mark.parametrize(
+    ("marker", "opened_at", "expected"),
+    [
+        (T0 + 600 * SECONDS, T0, T0 + 600 * SECONDS - HISTORY_MARGIN),  # znacznik późniejszy niż otwarcie
+        (T0 - 600 * SECONDS, T0, T0 - HISTORY_MARGIN),  # otwarcie późniejsze niż znacznik
+        (T0 + 600 * SECONDS, None, T0 + 600 * SECONDS - HISTORY_MARGIN),  # nieznane otwarcie: sam znacznik (h1)
+        (None, T0, T0 - HISTORY_MARGIN),
+        (None, None, None),  # żadnej dolnej granicy: początku nie zgadujemy
+    ],
+    ids=["marker_later", "open_later", "marker_only", "open_only", "neither"],
+)
+def test_history_start_uses_the_later_of_marker_and_open_time(journal, marker, opened_at, expected):
+    # publiczna funkcja dla narzędzi właściciela (reset-position): ta sama reguła co w przebiegu uzgadniania
+    if marker is not None:
+        journal.set_meta("closed_marker", marker.isoformat())
+    assert reconcile_module.history_start(journal, held(P.BLOCKED, opened_at=opened_at)) == expected
+
+
+async def test_run_once_reads_the_history_from_the_public_history_start(journal, fake, reconciler, monkeypatch):
+    seen = []
+
+    def spy(journal_arg, position_arg):
+        seen.append(position_arg)
+        return T0 - 2 * HISTORY_MARGIN
+
+    monkeypatch.setattr(reconcile_module, "history_start", spy)
+    journal.upsert_position(held())
+
+    await reconciler.run_once()
+
+    assert seen == [held()]  # jedna reguła: przebieg pyta funkcję publiczną, nie własną kopię
+    assert payloads(journal, "broker.closed_since")[-1]["since"] == (T0 - 2 * HISTORY_MARGIN).isoformat()
 
 
 async def test_missing_position_without_any_history_start_is_blocked_without_reading(journal, fake, reconciler):

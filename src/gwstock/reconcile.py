@@ -466,7 +466,7 @@ class Reconciler:
         broker zgłasza wyjątkiem, który przerywa przebieg przed jakąkolwiek zmianą stanu."""
         starts = []
         if ours is not None and not any(p.deal_id == ours.deal_id for p in mine):
-            start = self._history_start(ours)
+            start = history_start(self._journal, ours)
             if start is None:  # nie znamy początku: bez odczytu zamknięcia nie ma dowodu, pozycja zostanie BLOCKED
                 plan.record("HISTORY_START_UNKNOWN", deal_id=ours.deal_id)
             else:
@@ -479,13 +479,6 @@ class Reconciler:
         closures = await self._read("closed_since", self._broker.closed_since(since))
         self._raw(SOURCE_CLOSED, {"since": since, "response": closures})
         return closures
-
-    def _history_start(self, ours: PositionRecord) -> datetime | None:
-        """Późniejsza z dwóch dolnych granic (znacznik ostatniego zamknięcia, otwarcie pozycji) minus zapas: zamknięcie
-        tej pozycji nie może być wcześniejsze. None, gdy nie znamy żadnej z nich."""
-        marker = self._journal.get_meta(META_CLOSED_MARKER)
-        bounds = [t for t in (datetime.fromisoformat(marker) if marker else None, ours.opened_at) if t is not None]
-        return max(bounds) - HISTORY_MARGIN if bounds else None
 
     def _empty_reads(self, order: OrderRecord) -> int:
         text = self._journal.get_meta(META_EMPTY_READS.format(order.order_id))
@@ -544,6 +537,17 @@ class Reconciler:
 
     def _raw(self, source: str, payload: dict[str, Any]) -> None:
         self._journal.append_raw(source, dump(payload), self._clock.now_utc())
+
+
+def history_start(journal: Journal, position: PositionRecord) -> datetime | None:
+    """Początek odczytu historii zamknięć dla NASZEJ pozycji: późniejsza z dwóch dolnych granic (znacznik ostatniego
+    zaksięgowanego zamknięcia `closed_marker`, otwarcie pozycji) minus `HISTORY_MARGIN`; zamknięcie tej pozycji nie może
+    być wcześniejsze. None, gdy nie znamy żadnej z nich (początku nie zgadujemy).
+
+    Jedna reguła dla uzgadniania i narzędzi właściciela (np. `reset-position` przy nieznanym czasie otwarcia)."""
+    marker = journal.get_meta(META_CLOSED_MARKER)
+    bounds = [t for t in (datetime.fromisoformat(marker) if marker else None, position.opened_at) if t is not None]
+    return max(bounds) - HISTORY_MARGIN if bounds else None
 
 
 def _skipped(code: str) -> ReconcileResult:
