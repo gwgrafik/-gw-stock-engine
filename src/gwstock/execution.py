@@ -425,8 +425,9 @@ class Executor:
         """Straże po wypełnieniu (poślizg, ryzyko faktycznej wielkości) dla pozycji, której wejścia nie sprawdził
         `enter` (przyjętej przez uzgadnianie); silnik woła ją po każdym udanym przebiegu uzgadniania, po zabezpieczeniu.
 
-        Nic nie robi (żadnego wywołania brokera), gdy pozycja w dzienniku nie jest OPEN z deal_id, ma już znacznik
-        `fill_guarded`, albo na instrumencie jest zlecenie nierozstrzygnięte (najpierw uzgadnianie). Z kontekstem
+        Nic nie robi (żadnego wywołania brokera), gdy pozycja w dzienniku nie jest OPEN z deal_id, kill switch jest
+        HARD (zamyka awaryjne spłaszczenie tego samego taktu; bez znacznika), pozycja ma już znacznik `fill_guarded`,
+        albo na instrumencie jest zlecenie nierozstrzygnięte (najpierw uzgadnianie). Z kontekstem
         wejścia: notowanie decyzji, żądana wielkość, odległość stopu i wartość punktu z kontekstu. Bez niego (albo
         z nieczytelnym): tylko ryzyko wielkości z odległości stopu pozycji i wartości punktu brokera; pozycja bez stopu
         czeka na zabezpieczenie, nieczytelne reguły brokera → alarm FILL_GUARD_UNAVAILABLE i ponowienie w następnym
@@ -437,6 +438,8 @@ class Executor:
         self._remember_deal(position)  # każdy przebieg: ostatni nasz deal dla awaryjnego spłaszczenia bez dziennika
         if position is None or position.state is not _P.OPEN or position.deal_id is None:
             return False
+        if self._kill.level() is KillLevel.HARD:
+            return False  # wyjście należy do awaryjnego spłaszczenia, które silnik woła zaraz po uzgadnianiu (ten takt)
         deal_id = position.deal_id
         if self._journal.get_meta(META_FILL_GUARDED.format(deal_id)) is not None:
             return False

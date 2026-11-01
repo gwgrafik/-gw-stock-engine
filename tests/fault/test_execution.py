@@ -766,6 +766,19 @@ async def test_guard_adopted_fill_without_entry_context_checks_the_size_risk_fro
     assert marker == "SIZE_MISMATCH_RISK" and journal.get_meta("entry_by_deal:DEAL-9") is None
 
 
+async def test_guard_adopted_fill_leaves_the_exit_to_the_emergency_flatten_while_hard(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, kill
+):
+    fake.fill_size_factor = D("5")
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    kill.hard("HARD_STOP_FILE")  # silnik po uzgadnianiu i tak woła awaryjne spłaszczenie w tym samym takcie
+    seen = len(journal.events())
+    assert await executor.guard_adopted_fill() is False
+    assert fake.calls == [] and len(journal.events()) == seen and journal.get_meta("fill_guarded:DEAL-1") is None
+    await executor.emergency_flatten()
+    assert fake.calls.count("close_position") == 1 and position(journal) == PositionRecord("DE40", P.FLAT)
+
+
 @pytest.mark.parametrize("corrupt", ["bad_json", "wrong_client", "missing_field", "float_value", "zero_vpp"])
 async def test_guard_adopted_fill_treats_a_malformed_entry_context_as_missing(
     executor, adopting, signal, rules, journal, fake, clock, risk_cfg, corrupt
