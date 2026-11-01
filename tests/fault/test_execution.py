@@ -739,26 +739,35 @@ async def test_guard_adopted_fill_without_entry_context_checks_the_size_risk_fro
                                             T_ENTRY)  # fmt: skip
     if case == "rules_unreadable":
         fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
+        fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
     fired = await executor.guard_adopted_fill()
     marker = journal.get_meta("fill_guarded:DEAL-9")
     if case == "no_stop":  # stop ustawia procedura zabezpieczenia; straż czeka na następny przebieg
         assert fired is False and fake.calls == [] and marker is None and journal.events() == []
+        assert notifier.alerts == []
         return
     if case == "rules_unreadable":
         assert fired is False and fake.calls == ["instrument_rules"] and marker is None
-        assert [lvl for lvl, _ in alerts(notifier, "FILL_GUARD_UNAVAILABLE DEAL-9")] == ["WARN"]
         assert "close_position" not in fake.calls and position(journal) == stored
-        assert await executor.guard_adopted_fill() is False  # następny przebieg ponawia
-        assert fake.calls == ["instrument_rules"] * 2 and journal.get_meta("fill_guarded:DEAL-9") == "NO_CONTEXT_PASS"
+        assert await executor.guard_adopted_fill() is False  # następny przebieg ponawia, reguły nadal nieczytelne
+        assert [lvl for lvl, _ in alerts(notifier, "FILL_GUARD_UNAVAILABLE DEAL-9")] == ["WARN"]  # raz na pozycję
+        assert await executor.guard_adopted_fill() is False  # reguły wróciły
+        assert fake.calls == ["instrument_rules"] * 3 and journal.get_meta("fill_guarded:DEAL-9") == "NO_CONTEXT_PASS"
+        assert len(alerts(notifier, "FILL_GUARD_UNAVAILABLE")) == 1
+        assert [lvl for lvl, _ in alerts(notifier, "FILL_GUARD_NO_CONTEXT DEAL-9")] == ["WARN"]
         return
     [guard] = events(journal, "FILL_GUARD_ADOPTED")
     assert guard["source"] == "broker_rules" and guard["order_id"] is None
     assert events(journal, "SLIPPAGE_GUARD") == []  # bez notowania decyzji poślizgu nie da się sprawdzić
+    # brak kontekstu (zapisywanego przed wysyłką) to uszkodzony dziennik: jeden alarm na pozycję, nie na przebieg
+    [(level, message)] = alerts(notifier, "FILL_GUARD_NO_CONTEXT DEAL-9")
+    assert level == "WARN" and "slippage" in message
     if case == "normal":
         assert fired is False and fake.calls == ["instrument_rules"] and marker == "NO_CONTEXT_PASS"
         assert guard["causes"] == [] and position(journal) == stored
         fake.calls.clear()
         assert await executor.guard_adopted_fill() is False and fake.calls == []  # NO_CONTEXT_PASS: sprawdzone
+        assert len(alerts(notifier, "FILL_GUARD_NO_CONTEXT")) == 1
         return
     assert fired is True and guard["causes"] == ["SIZE_MISMATCH_RISK"]
     [risk] = events(journal, "SIZE_MISMATCH_RISK")
@@ -766,6 +775,21 @@ async def test_guard_adopted_fill_without_entry_context_checks_the_size_risk_fro
     assert fake.calls[:2] == ["instrument_rules", "close_position"] and fake.calls.count("close_position") == 1
     assert position(journal) == PositionRecord("DE40", P.FLAT) and journal.trades()[0].exit_reason == "FORCED"
     assert marker == "SIZE_MISMATCH_RISK" and journal.get_meta("entry_by_deal:DEAL-9") is None
+
+
+async def test_fill_guard_alerts_are_once_per_position_not_once_per_process(executor, journal, fake, notifier):
+    for deal in ("DEAL-9", "DEAL-8"):  # dwie kolejne pozycje bez kontekstu w tym samym procesie
+        stored = replace(NO_CTX_POSITION, deal_id=deal)
+        journal.upsert_position(stored)
+        fake.positions[deal] = OpenPosition(deal, "DE40", Side.BUY, stored.size, D("25700"), stored.stop_level, T_ENTRY)
+        fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
+        for _ in range(2):
+            assert await executor.guard_adopted_fill() is False
+        del fake.positions[deal]
+    assert [m.split(":")[0] for _, m in alerts(notifier, "FILL_GUARD_")] == [
+        "FILL_GUARD_UNAVAILABLE DEAL-9", "FILL_GUARD_NO_CONTEXT DEAL-9",
+        "FILL_GUARD_UNAVAILABLE DEAL-8", "FILL_GUARD_NO_CONTEXT DEAL-8",
+    ]  # fmt: skip
 
 
 async def test_a_guarded_deal_that_is_open_again_is_closed_again_without_new_guard_events(

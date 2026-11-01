@@ -274,6 +274,7 @@ class Executor:
         self._timeout = risk.submit_timeout_s
         self._memory = memory if memory is not None else ExitMemory()
         self._closes_started = 0  # wywołania `close_position` w tym wykonawcy (czy procedura cokolwiek wysłała)
+        self._alerted_once: set[tuple[str, str]] = set()  # (kod, deal_id): alarmy straży raz na pozycję w procesie
 
     @property
     def live(self) -> bool:
@@ -429,7 +430,8 @@ class Executor:
         """Spłaszczenie po zadziałaniu straży: zwykłe (EXITING przed zamknięciem, spec §8). Gdy zapis obowiązkowy
         zawiedzie, zanim zamknięcie poszło (np. EXITING na pełnym dysku), pozycja ponad limit nie czeka na dziennik:
         kill switch HARD GUARD_EXIT_UNPERSISTED, alarm i awaryjne spłaszczenie (zamknięcie niezależne od dziennika),
-        jak przy pozycji bez stopu. Błąd zapisu PO wysłanym zamknięciu propaguje się (kolejna próba zaczyna od listy)."""
+        jak przy pozycji bez stopu. Błąd zapisu PO wysłanym zamknięciu propaguje się (kolejna próba zaczyna od
+        listy)."""
         closes_before = self._closes_started
         try:
             await self.flatten(position, "FORCED")
@@ -507,6 +509,13 @@ class Executor:
                     return False
                 causes = self._guard_values(position, None, None, None, vpp, None, failures, adopted=True)
                 source, passed = "broker_rules", FILL_GUARD_NO_CONTEXT_PASS
+                # kontekst wejścia zapisuje się przed wysyłką: jego brak to uszkodzony dziennik (poślizg niesprawdzony)
+                self._alert_once(
+                    "FILL_GUARD_NO_CONTEXT", deal_id, "WARN",
+                    f"FILL_GUARD_NO_CONTEXT {deal_id}: no readable entry context for this fill; only the size risk was "
+                    f"checked (broker rules: {'over the limit' if causes else 'within the limit'}), the slippage guard "
+                    "could not run; check the journal",
+                )  # fmt: skip
             self._event(
                 "FILL_GUARD_ADOPTED", best_effort=failures, deal_id=deal_id, order_id=order_id, causes=causes,
                 source=source,
@@ -547,17 +556,28 @@ class Executor:
             )
         except Exception as exc:
             self._raw_error(SOURCE_RULES, exc, best_effort=failures, deal_id=deal_id, context="fill_guard")
-            self._alert(
-                "WARN",
+            self._alert_once(
+                "FILL_GUARD_UNAVAILABLE", deal_id, "WARN",
                 f"FILL_GUARD_UNAVAILABLE {deal_id}: instrument rules unreadable ({type(exc).__name__}: {exc}); the "
-                "size risk of the adopted fill is checked on the next reconciliation pass",
-            )
+                "size risk of the adopted fill is checked on every reconciliation pass until they are readable",
+            )  # fmt: skip
             return None
         self._raw(SOURCE_RULES, best_effort=failures, deal_id=deal_id, context="fill_guard", response=rules)
         if not rules.value_per_point > 0:
-            self._alert("WARN", f"FILL_GUARD_UNAVAILABLE {deal_id}: value per point {rules.value_per_point}; retrying")
+            self._alert_once(
+                "FILL_GUARD_UNAVAILABLE", deal_id, "WARN",
+                f"FILL_GUARD_UNAVAILABLE {deal_id}: value per point {rules.value_per_point}; retrying",
+            )  # fmt: skip
             return None
         return rules.value_per_point
+
+    def _alert_once(self, code: str, deal_id: str, level: str, message: str) -> None:
+        """Alarm straży raz na (kod, pozycja) w tym procesie: ponowienia w każdym przebiegu uzgadniania nie zalewają
+        kanału alarmów (zdarzenia i surowe odpowiedzi w dzienniku zostają za każdym razem)."""
+        if (code, deal_id) in self._alerted_once:
+            return
+        self._alerted_once.add((code, deal_id))
+        self._alert(level, message)
 
     def _mark_fill_guarded(
         self, position: PositionRecord, causes: list[str], passed: str, failures: list[str]
