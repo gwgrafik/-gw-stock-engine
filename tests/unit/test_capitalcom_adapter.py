@@ -1450,6 +1450,39 @@ async def test_spacer_honours_a_pause_raised_while_a_request_is_already_waiting(
     assert clock.now == T0 + timedelta(seconds=1) and clock.sleeps == [0.2, 0.8]
 
 
+class FrozenClock:
+    """Zegar, którego `sleep` oddaje sterowanie pętli, ale czasu nie przesuwa (np. źle napisany zegar testowy)."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+        self.sleeps: list[float] = []
+
+    def now_utc(self) -> datetime:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        await asyncio.sleep(0)
+
+
+async def test_spacer_does_not_spin_with_a_clock_that_never_advances():
+    clock = FrozenClock(T0)
+    spacer = capitalcom._Spacer(clock, 0.2, max_wait_s=1.0)
+    await spacer.acquire()
+    await asyncio.wait_for(spacer.acquire(), timeout=1.0)  # sen, który nie przesunął zegara, kończy czekanie
+    assert clock.sleeps == [0.2]
+    clock.now -= timedelta(seconds=0.1)  # sen, po którym zegar się cofnął, też niczego nie przesunął do przodu
+    real_sleep = clock.sleep
+
+    async def sleep_stepping_back(seconds: float) -> None:
+        await real_sleep(seconds)
+        clock.now -= timedelta(seconds=0.01)
+
+    clock.sleep = sleep_stepping_back
+    await asyncio.wait_for(spacer.acquire(), timeout=1.0)
+    assert clock.sleeps == [0.2, pytest.approx(0.3)]
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

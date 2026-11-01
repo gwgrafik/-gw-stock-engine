@@ -313,7 +313,8 @@ class _Spacer:
 
     Oczekiwanie nigdy nie przekracza `max_wait_s` (najdłuższej uprawnionej przerwy: odstępu albo pauzy po 429):
     zegar silnika to czas ścienny, a jego cofnięcie (krok NTP, wznowienie maszyny) wstrzymałoby inaczej wszystkie
-    żądania, także ochronne, na cały czas cofnięcia.
+    żądania, także ochronne, na cały czas cofnięcia. Sen, po którym zegar nie przesunął się do przodu (zegar
+    zamrożony albo cofnięty w trakcie), kończy czekanie: inaczej pętla kręciłaby się bez końca.
     """
 
     def __init__(self, clock: Clock, interval_s: float, *, max_wait_s: float | None = None) -> None:
@@ -327,16 +328,19 @@ class _Spacer:
         async with self._lock:
             # pętla: pauza (`pause_until`) podniesiona w trakcie czekania też musi zostać odczekana
             while self._next is not None:
-                wait = (self._next - self._clock.now_utc()).total_seconds()
+                before = self._clock.now_utc()
+                wait = (self._next - before).total_seconds()
                 if wait <= 0:
                     break
                 if wait <= self._max_wait_s:
                     await self._clock.sleep(wait)
-                    continue
-                # zegar cofnął się: odczekaj najdłuższą uprawnioną przerwę; jeśli termin nadal jest nierealnie
-                # daleko (nie pauza podniesiona w międzyczasie), licz od nowa od bieżącej chwili
-                await self._clock.sleep(self._max_wait_s)
-                if (self._next - self._clock.now_utc()).total_seconds() > self._max_wait_s:
+                else:
+                    # zegar cofnął się: odczekaj najdłuższą uprawnioną przerwę; jeśli termin nadal jest nierealnie
+                    # daleko (nie pauza podniesiona w międzyczasie), licz od nowa od bieżącej chwili
+                    await self._clock.sleep(self._max_wait_s)
+                    if (self._next - self._clock.now_utc()).total_seconds() > self._max_wait_s:
+                        break
+                if self._clock.now_utc() <= before:  # sen nie przesunął zegara: bez tego pętla bez końca
                     break
             self._next = self._clock.now_utc() + self._interval
 
