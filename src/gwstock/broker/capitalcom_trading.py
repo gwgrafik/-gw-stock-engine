@@ -37,7 +37,8 @@ Zasady:
   `BrokerRejected` i `MarketClosed`);
 - `closed_since`: kompletność albo wyjątek (szczegóły w `capitalcom_history`); zakres > 14 dni →
   `HISTORY_RANGE_TOO_LARGE` przed zapytaniem; okna ≤ 1 doba; obcięte okno dzielone; nieudane okno → wyjątek; deal,
-  którego otwarcia nie ma w zakresie, jest szukany wstecz z filtrem `dealId` (do 14 dni, wspólny limit zapytań);
+  którego otwarcia nie ma w zakresie, jest szukany wstecz z filtrem `dealId` (do 14 dni, wspólny limit zapytań;
+  wyniki okien w całości przed `since` są zapamiętywane, najwyżej `LOOKBACK_CACHE_LIMIT` okien);
 - pamięć adaptera (wysłane odległości stopu, stopy deali, strony deali, migawki potwierdzeń) jest ograniczona do
   `RECORD_LIMIT` wpisów na tablicę (najstarsze wypadają).
 """
@@ -83,6 +84,8 @@ from gwstock.types import (
 
 RECORD_LIMIT = 256
 """Najwięcej wpisów w każdej tablicy pamięci adaptera (referencje, deale, migawki)."""
+LOOKBACK_CACHE_LIMIT = 64
+"""Najwięcej zapamiętanych okien wyszukiwania wstecz (deal, okno w całości przed `since`); najstarsze wypadają."""
 NOT_FOUND_DEAL = "error.not-found.dealId"
 NOT_FOUND_REFERENCE = "error.not-found.dealReference"
 POSITION_NOT_FOUND = "POSITION_NOT_FOUND"
@@ -104,10 +107,10 @@ class _Budget:
         self.left = limit
 
 
-def _remember(table: OrderedDict, key: Any, value: Any) -> None:
+def _remember(table: OrderedDict, key: Any, value: Any, limit: int | None = None) -> None:
     table[key] = value
     table.move_to_end(key)
-    while len(table) > RECORD_LIMIT:
+    while len(table) > (RECORD_LIMIT if limit is None else limit):
         table.popitem(last=False)
 
 
@@ -133,7 +136,8 @@ def _attempt(parser: Callable[..., Any], *args: Any) -> tuple[Any, str | None]:
 
 
 class TradingMixin:
-    """Część handlowa adaptera. Wymaga od klasy docelowej: `_clock`, `_request`, `_error`, `_scrub`, `_parse`."""
+    """Część handlowa adaptera. Wymaga od klasy docelowej: `_clock`, `_request`, `_error`, `_scrub`, `_parse`,
+    `_session_account_id`."""
 
     def _init_trading(self) -> None:
         self.unknown_close_sources = 0
@@ -142,6 +146,8 @@ class TradingMixin:
         self._deal_sides: OrderedDict[str, Side] = OrderedDict()  # dealId → strona (potwierdzenie, lista pozycji)
         self._snapshots: OrderedDict[str, OpenPosition] = OrderedDict()  # dealReference → migawka potwierdzenia
         self._unknown_seen: OrderedDict[tuple, None] = OrderedDict()  # zamknięcia o nieznanym źródle już policzone
+        # (rachunek, dealId, początek, koniec) → wiersze okna wyszukiwania wstecz w całości przed `since`
+        self._lookback_cache: OrderedDict[tuple, tuple[DealRow, ...]] = OrderedDict()
         # czy jakakolwiek odpowiedź z pozycją pokazała klucze stopu: od tej chwili brak klucza = brak stopu, a zapis
         # adaptera nie może już udawać ochrony (stop_derived=True tylko, dopóki klucze nigdy nie wystąpiły)
         self._stop_keys_seen = False
@@ -458,18 +464,37 @@ class TradingMixin:
     ) -> list[DealRow]:
         """Dla każdego nierozstrzygniętego deala: historia z filtrem `dealId` WSTECZ od `since`, okna ≤ 1 doba, do
         granicy 14 dni od teraz, aż jego wiersze dadzą się rozstrzygnąć (zwykle: wcześniejsze otwarcie o kierunku
-        przeciwnym). Limit zapytań wspólny z oknami głównymi; jego wyczerpanie → `HISTORY_TRUNCATED`."""
+        przeciwnym). Limit zapytań wspólny z oknami głównymi; jego wyczerpanie → `HISTORY_TRUNCATED`. Okna z pamięci
+        (`_lookback_rows`) nie zużywają limitu."""
         merged = {row.key: row for row in rows}
         windows = history.lookback_windows(since, now - history.HISTORY_MAX_RANGE)
         for deal_id in sorted(undecided):
             for window in windows:
-                for row in await self._activity_rows([window], budget, deal_id=deal_id):
+                for row in await self._lookback_rows(deal_id, window, since, budget):
                     merged.setdefault(row.key, row)
                 deal_rows = [r for r in merged.values() if r.deal_id == deal_id]
                 verdict = history.classify(deal_rows, self._deal_sides)
                 if deal_id not in verdict.undecided:
                     break
         return list(merged.values())
+
+    async def _lookback_rows(
+        self, deal_id: str, window: tuple[datetime, datetime], since: datetime, budget: _Budget
+    ) -> tuple[DealRow, ...]:
+        """Wiersze deala w jednym oknie wyszukiwania wstecz (filtr `dealId`), kompletne albo wyjątek.
+
+        Okno w całości przed `since` (koniec < `since`, więc co najmniej ok. doby przed teraz: późne wiersze już nie
+        dochodzą) jest zapamiętywane w ograniczonej pamięci (`LOOKBACK_CACHE_LIMIT`, klucz z rachunkiem sesji), więc
+        kolejne odczyty z tym samym `since` nie powtarzają zapytań. Okno sięgające `since` jest zawsze czytane od nowa.
+        """
+        key = (self._session_account_id, deal_id, *window)
+        cached = self._lookback_cache.get(key)
+        if cached is not None:
+            return cached
+        rows = tuple(await self._activity_rows([window], budget, deal_id=deal_id))
+        if window[1] < since:
+            _remember(self._lookback_cache, key, rows, LOOKBACK_CACHE_LIMIT)
+        return rows
 
     @staticmethod
     def _history_problem(code: str, deals: set[str], what: str) -> str:

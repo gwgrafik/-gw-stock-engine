@@ -17,7 +17,7 @@ from decimal import Decimal
 
 import pytest
 
-from gwstock.broker import capitalcom, capitalcom_history, capitalcom_parse
+from gwstock.broker import capitalcom, capitalcom_history, capitalcom_parse, capitalcom_trading
 from gwstock.broker.capitalcom import CapitalComBroker
 from gwstock.broker.capitalcom_history import history_windows, split_window
 from gwstock.broker.capitalcom_parse import is_market_closed_code
@@ -1858,6 +1858,42 @@ async def test_deal_lookback_goes_back_day_by_day_within_the_cap(server, broker)
     assert lookbacks[0] == ("2026-11-01T06:30:00", "2026-11-02T06:30:00")  # najpierw doba tuż przed `since`
     assert len(lookbacks) == 5  # dzień po dniu wstecz, aż do otwarcia sprzed 5 dni
     assert all(parse_api(t) - parse_api(f) <= DAY for f, t in lookbacks)
+
+
+def lookback_requests(server, deal_id: str = "F-1") -> list[tuple[str, str]]:
+    return [(r.query["from"], r.query["to"]) for r in server.requests("GET", "/history/activity")
+            if r.query.get("dealId") == deal_id]  # fmt: skip
+
+
+async def test_lookback_results_before_since_are_cached_and_bounded(server, broker, clock, monkeypatch):
+    server.add_activity(activity("F-1", T0 - timedelta(days=5), source="USER", direction="BUY"))
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL", level="25001.0"))
+    await broker.login()
+    since = T0 - timedelta(hours=1)
+    expected = [ClosedDeal("F-1", "DE40", Decimal("25001.0"), "MANUAL", T0 - timedelta(minutes=20))]
+    assert await broker.closed_since(since) == expected
+    first = lookback_requests(server)
+    assert len(first) == 5  # dzień po dniu wstecz, aż do otwarcia sprzed 5 dni
+    clock.advance(60)
+    assert await broker.closed_since(since) == expected
+    # okna w całości przed `since` (ich historia się już nie zmienia) z pamięci; doba tuż przed `since` (koniec okna
+    # = `since`) zawsze od nowa, bo opóźniony wiersz mógłby się w niej jeszcze pojawić
+    assert lookback_requests(server)[5:] == [first[0]]
+    assert all(window_end < since for *_, window_end in broker._lookback_cache)
+    await broker.select_account("ACC-EMPTY")  # historia należy do rachunku: pamięć innego rachunku nie obowiązuje
+    assert await broker.closed_since(since) == expected  # (historia serwera testowego jest wspólna dla rachunków)
+    assert len(lookback_requests(server)) == 5 + 1 + 5
+    # ograniczenie: najwyżej LOOKBACK_CACHE_LIMIT okien (najstarsze wypadają i są czytane ponownie)
+    assert capitalcom_trading.LOOKBACK_CACHE_LIMIT == 64
+    monkeypatch.setattr(capitalcom_trading, "LOOKBACK_CACHE_LIMIT", 2)
+    restarted = CapitalComBroker(broker._creds, broker._session, clock, base_url=server.base_url)
+    clock.advance(1)
+    await restarted.login()
+    assert await restarted.closed_since(since) == expected
+    assert len(restarted._lookback_cache) == 2
+    mark = len(lookback_requests(server))
+    assert await restarted.closed_since(since) == expected
+    assert len(lookback_requests(server)) - mark == 5 and len(restarted._lookback_cache) == 2
 
 
 async def test_deal_lookback_that_exhausts_the_request_budget_raises(server, broker, monkeypatch):
