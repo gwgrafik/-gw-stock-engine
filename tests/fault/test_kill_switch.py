@@ -10,6 +10,7 @@ Niezmienniki pod lupą (prawdziwe pieniądze):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -618,6 +619,32 @@ def test_hard_is_in_memory_before_a_slow_read_of_an_unknown_stored_state(
         ks.scan_files()
     assert ks.level() is KillLevel.HARD
     assert seen and all(level is KillLevel.HARD for level in seen), seen
+
+
+@pytest.mark.parametrize(
+    ("name", "level", "reason"),
+    [("HARD_STOP", KillLevel.HARD, "HARD_STOP_FILE"), ("STOP", KillLevel.SOFT, "STOP_FILE")],
+    ids=["hard-stop", "stop"],
+)
+def test_scan_files_checks_the_stop_files_even_if_recovery_raises(
+    journal, clock, data_dir, notifier, monkeypatch, caplog, name, level, reason
+):
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)  # nieznany stan startowy: odzyskiwanie biegnie przy każdym kroku
+    state["down"] = False  # odczyt już działa (do asercji), ale samo odzyskiwanie ma błąd
+
+    def broken_recovery():
+        raise RuntimeError("bug in recovery")
+
+    monkeypatch.setattr(ks, "_resolve_unknown", broken_recovery)
+    (data_dir / name).write_text("")
+    with caplog.at_level(logging.ERROR, logger="gwstock.risk"):
+        ks.scan_files()  # nie rzuca
+    assert ks.level() is level
+    assert notifier.alerts[-1][0] == level.name and reason in notifier.alerts[-1][1]  # włączenie z pliku ogłoszone
+    if level is KillLevel.HARD:  # HARD zapisuje się mimo nieznanego stanu (niczego nie obniży)
+        assert (journal.kill_state().level, journal.kill_state().reason) == (KillLevel.HARD, reason)
+    assert "recovery of the stored kill state failed" in caplog.text and "bug in recovery" in caplog.text
 
 
 def test_scan_files_retries_the_stored_state_read_and_persists_after_recovery(

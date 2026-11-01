@@ -473,7 +473,7 @@ class KillSwitch:
             if present:
                 engage(reason)
         with self._lock:
-            self._resolve_unknown()
+            self._recover()
             self._retry_unsynced()
 
     def clear(self, requested_by: str) -> None:
@@ -498,7 +498,7 @@ class KillSwitch:
                     f"{path} exists: remove it first, otherwise scan_files() would engage the kill switch again at once"
                 )
         with self._lock:
-            self._resolve_unknown()
+            self._recover()
             if self._state_unknown:
                 raise ValueError("the stored kill state cannot be read; refusing to clear (it may be HARD)")
             previous_level, previous_reason = self._level, self._reason  # już scalone z zapisanym stanem
@@ -556,6 +556,17 @@ class KillSwitch:
             if level > self._level:
                 self._level = level
 
+    def _recover(self) -> None:
+        """`_resolve_unknown`, który nigdy nie rzuca (woła się pod blokadą).
+
+        Błąd samego odzyskiwania zostaje w logu, a reszta kroku (sprawdzenie plików STOP, zapis i alarm włączenia,
+        ponowienie zapisu) i tak się wykonuje; stan zostaje nieznany, więc kolejna próba przy następnym wywołaniu.
+        """
+        try:
+            self._resolve_unknown()
+        except Exception:
+            _LOG.exception("recovery of the stored kill state failed; it is retried on the next call")
+
     def _resolve_unknown(self) -> None:
         """Ponawia odczyt zapisanego stanu, którego nie udało się odczytać przy starcie (woła się pod blokadą).
 
@@ -588,7 +599,7 @@ class KillSwitch:
         self._retry_unsynced()  # zapis poziomu z pamięci do dziennika (po sukcesie alarm INFO)
 
     def _apply(self, level: KillLevel, reason: str) -> None:
-        self._resolve_unknown()
+        self._recover()
         previous_level, previous_reason = self._level, self._reason
         if level < previous_level:  # poziom nie spada: tylko ślad audytowy, raz na przyczynę
             if reason not in self._suppressed:
