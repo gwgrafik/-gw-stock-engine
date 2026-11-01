@@ -690,7 +690,7 @@ async def enter_with_write_failure(root, cfgs, n: int, label: str, mode: str, po
         try:  # kolejna próba tego dnia (w oknie wejścia) nigdy nie daje drugiego zlecenia
             await enter(rig)
         except EntryBlocked:
-            pass  # kontekst wejścia bez wiersza zlecenia: luka numeracji, kill switch ENTRY_EXCEPTION
+            pass  # wiersz zlecenia pod tym numerem już jest: DUPLICATE_CLIENT_ID, kill switch ENTRY_EXCEPTION
         disk = read_disk(rig.path)
         check(world.broker.calls.count("open_position") <= 1, "a second order reached the broker")
         for p in world.broker.positions.values():
@@ -1060,22 +1060,23 @@ async def test_bug_e2e_1_engine_restart_mid_entry_still_closes_a_slipped_fill(en
     assert_books_balance(disk)
 
 
-async def test_e_a_crash_between_the_entry_context_and_the_intent_row_sends_nothing_and_blocks_the_retry(rig, world):
-    """Obserwacja (zachowanie bezpieczne, opisane w raporcie): kontekst wejścia zapisany, wiersz INTENT nie; po
-    restarcie ponowna próba tego dnia trafia na ten sam numer kolejny i kończy się kill switchem ENTRY_EXCEPTION."""
-    from gwstock.orders.manager import EntryBlocked
-
+async def test_e_a_crash_between_the_entry_context_and_the_intent_row_sends_nothing_and_the_retry_proceeds(rig, world):
+    """O-4: kontekst wejścia zapisany, wiersz INTENT nie (nic nie wysłano: INTENT poprzedza wysyłkę); po restarcie
+    ponowna próba tego dnia dostaje ten sam numer kolejny, osierocony kontekst jest nasz, więc zostaje zastąpiony,
+    a wejście idzie dalej (jedno zlecenie, bez ENTRY_EXCEPTION). Wiersz zlecenia pod tym numerem nadal blokuje."""
     crash_before(rig.s.journal, "insert_order", lambda o: True)
     with pytest.raises(ProcessDied):
         await enter(rig)
     disk = read_disk(rig.path)
     assert f"entry_ctx:{CID}" in disk.meta and disk.orders == [] and world.broker.calls == ["account"]
     rig.restart()
-    with pytest.raises(EntryBlocked):
-        await enter(rig)
+    rec = await enter(rig)
+    assert rec is not None and rec.state is O.CONFIRMED and rec.order_id == CID
     disk = read_disk(rig.path)
-    assert (disk.kill.level, disk.kill.reason) == (KillLevel.SOFT, "ENTRY_EXCEPTION")
-    assert "open_position" not in world.broker.calls and disk.orders == []
+    assert disk.kill.level is KillLevel.NONE and "ENTRY_EXCEPTION" not in kill_reasons(disk)
+    assert world.broker.calls.count("open_position") == 1 and [o.order_id for o in disk.orders] == [CID]
+    assert disk.position.state is P.OPEN and disk.position.deal_id == DEAL
+    assert "ORPHAN_ENTRY_CONTEXT_REPLACED" in disk.codes()
 
 
 async def test_engine_journal_failure_between_the_trade_and_pnl_statements_books_once_on_the_next_pass(

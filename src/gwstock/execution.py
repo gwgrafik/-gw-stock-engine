@@ -7,6 +7,8 @@ Niezmienniki (prawdziwe pieniądze):
 - przed wysyłką dziennik trwale ma kontekst wejścia (`entry_ctx:<client_id>`: notowanie decyzji, żądana wielkość, stop,
   wartość punktu, czasy) i wskaźnik ostatniego wejścia (`entry_last:<epic>`); `JournalWriteError` przed wysyłką albo
   z menedżera = kill switch miękki JOURNAL_WRITE_FAILED i brak zlecenia (lub zlecenie zostawione uzgadnianiu);
+  kontekst bez wiersza zlecenia (przerwanie przed INTENT, nic nie wysłano) jest zastępowany, a istniejący wiersz
+  zlecenia pod tym identyfikatorem blokuje wejście (DUPLICATE_CLIENT_ID);
 - wynik `submit_entry` inny niż CONFIRMED/REJECTED/NOT_PLACED albo pozycja BLOCKED = kill switch miękki
   ENTRY_UNRESOLVED (rozstrzyga uzgadnianie lub właściciel, nigdy ponowne wejście); każdy inny wyjątek = kill miękki
   ENTRY_EXCEPTION, alarm i wyjątek dalej; anulowanie (`CancelledError`) przechodzi nietknięte;
@@ -44,7 +46,9 @@ Niezmienniki (prawdziwe pieniądze):
   awaryjne spłaszczenie WYSYŁA zamknięcie nawet wtedy, gdy zapis EXITING zawiedzie (dziennik wg możliwości, alarm,
   kill switch miękki JOURNAL_WRITE_FAILED; uzgadnianie dogoni stan), a zdarzenie PROTECTION_FAILED pisze się dopiero po
   awaryjnym spłaszczeniu;
-- pozycja bez stopu: stop (3 próby co 3 s) albo kill switch twardy UNPROTECTED_POSITION i awaryjne spłaszczenie;
+- pozycja bez stopu: stop (3 próby co 3 s; gdy żadna nie odpowiedziała, a z budżetu 10 s została co najmniej 1 s,
+  jeden odczyt listy: nasz deal z tym stopem podanym przez brokera = stop jest) albo kill switch twardy
+  UNPROTECTED_POSITION i awaryjne spłaszczenie;
   HARD włącza się także wtedy, gdy zabezpieczenie przerwie wyjątek lub anulowanie (wtedy spłaszczenie wykona silnik);
 - awaryjne spłaszczenie: no-op przy FLAT; inaczej do `EMERGENCY_ATTEMPTS` prób ze skróconym limitem czasu; pozycja
   BLOCKED tylko przy kill switchu HARD w tej chwili i tylko wtedy, gdy jest dowodnie nasza (zapis ma deal_id, a lista
@@ -57,7 +61,9 @@ Niezmienniki (prawdziwe pieniądze):
 
 Zdarzenia strukturalne: `append_raw("event", {"event": KOD, ...})`; blokada bramki: `gate_block`; decyzja `dry_run`:
 `decision`. Czasy w księdze: sygnał = wywołanie `enter`, wysyłka = tuż przed `submit_entry`, potwierdzenie = zapis
-CONFIRMED zlecenia (zegar silnika; bez niego czas otwarcia u brokera), opóźnienie = potwierdzenie − sygnał.
+CONFIRMED zlecenia (zegar silnika; przy zleceniu przyjętym przez uzgadnianie i bez zapisu: czas otwarcia u brokera),
+opóźnienie = potwierdzenie − sygnał. Spread wyjścia: bieżące notowanie, a przy księgowaniu późniejszym niż
+`mismatch_tolerance_s` po zamknięciu (np. po restarcie) spread wejścia (notatka EXIT_SPREAD_FROM_ENTRY).
 """
 
 from __future__ import annotations
@@ -144,6 +150,8 @@ KILL_CHECK_FAILED = "KILL_CHECK_FAILED"
 
 COST_FALLBACK = "COST_FALLBACK"
 NO_ENTRY_CONTEXT = "NO_ENTRY_CONTEXT"
+EXIT_SPREAD_FROM_ENTRY = "EXIT_SPREAD_FROM_ENTRY"  # księgowanie późne: spread wyjścia = spread wejścia
+ADOPTED_BY_RECONCILER = "ADOPTED_BY_RECONCILER"  # pierwszy token notatki zlecenia przyjętego przez `gwstock.reconcile`
 
 # Wynik jednej próby spłaszczenia (`_flatten`).
 OUTCOME_FLAT = "FLAT"  # zamknięte i zaksięgowane (FLAT, albo dziennik dogoni to w uzgadnianiu)
@@ -165,6 +173,8 @@ PROTECT_ATTEMPTS = 3
 PROTECT_PAUSE_S = 3
 # Od pierwszej nieudanej próby do decyzji HARD: 3 + 2 + 3 + 2 = 10 s (spec §9: bez stopu najdłużej 10 s).
 PROTECT_CALL_TIMEOUT_S = 2
+PROTECT_BUDGET_S = 10  # budżet od pierwszej porażki; reszta po trzech próbach idzie na odczyt listy (stop mógł dojść)
+PROTECT_VERIFY_MIN_S = 1  # najkrótszy sensowny odczyt listy; mniej zostało: HARD bez odczytu
 EMERGENCY_ATTEMPTS = 5
 EMERGENCY_PAUSE_S = 1
 EMERGENCY_MIN_TIMEOUT_S = 1  # skrócony limit = max(1 s, submit_timeout_s / 2)
@@ -197,10 +207,13 @@ class ExitMemory:
     zamkniętym rynku się nie liczy): kolejna próba zawsze zaczyna od listy pozycji, nawet gdy dziennik nadal mówi OPEN.
     `last_own_deal`: ostatni NASZ deal widziany w dzienniku (OPEN/EXITING/BLOCKED) albo przekazany zabezpieczeniu;
     awaryjne spłaszczenie przy nieczytelnym dzienniku zamyka tylko jego (i tylko gdy broker go pokazuje).
+    `exit_intents`: deal → przyczyna wyjścia silnika, zapisywana tam, gdzie `exit_intent:<deal>` w dzienniku: wyjście
+    silnika jest FORCED także wtedy, gdy zapis zamiaru zawiódł (po restarcie bez zapisu: MANUAL).
     """
 
     closes_sent: set[str] = field(default_factory=set)
     last_own_deal: str | None = None
+    exit_intents: dict[str, str] = field(default_factory=dict)
 
 
 async def _with_timeout(call: Awaitable[T], timeout: float) -> T:
@@ -346,9 +359,14 @@ class Executor:
             return None
 
         ctx_key = META_ENTRY_CTX.format(client_id)
-        if self._journal.get_order(client_id) is not None or self._journal.get_meta(ctx_key) is not None:
-            # luka w numeracji dnia: cudzego kontekstu nie nadpisujemy (księga tamtego zlecenia by na tym ucierpiała)
+        if self._journal.get_order(client_id) is not None:
+            # luka w numeracji dnia: kontekstu innego zlecenia nie nadpisujemy (księga tamtego zlecenia by ucierpiała)
             raise EntryBlocked("DUPLICATE_CLIENT_ID", client_id)
+        orphan = self._journal.get_meta(ctx_key)
+        if orphan is not None:
+            # kontekst bez wiersza zlecenia: przerwanie między kontekstem a INTENT (INTENT poprzedza wysyłkę), więc
+            # nic nie wysłano, a kontekst jest nasz; zastępujemy go, ślad poprzedniego zostaje w zdarzeniu
+            self._event("ORPHAN_ENTRY_CONTEXT_REPLACED", client_id=client_id, previous=orphan)
         context = {
             "client_id": client_id,
             "epic": self._epic,
@@ -708,6 +726,7 @@ class Executor:
         sent_before = deal_id in self._memory.closes_sent
         self._memory.closes_sent.add(deal_id)
         self._closes_started += 1
+        self._memory.exit_intents[deal_id] = reason
         self._set_meta(META_EXIT_INTENT.format(deal_id), reason, best_effort=failures)
         return sent_before
 
@@ -724,15 +743,15 @@ class Executor:
         return target
 
     async def _find_at_broker(
-        self, deal_id: str, timeout: float, must: Failures
+        self, deal_id: str, timeout: float, must: Failures, *, context: str = "flatten"
     ) -> tuple[bool, OpenPosition | None, str | None]:
         """Lista pozycji zamiast wysyłki na ślepo: (odczyt udany, pozycja brokera z tym deal_id lub None, błąd)."""
         try:
             positions = await _with_timeout(self._broker.list_positions(), timeout)
         except Exception as exc:
-            self._raw_error(SOURCE_POSITIONS, exc, best_effort=must, deal_id=deal_id, context="flatten")
+            self._raw_error(SOURCE_POSITIONS, exc, best_effort=must, deal_id=deal_id, context=context)
             return False, None, type(exc).__name__
-        self._raw(SOURCE_POSITIONS, best_effort=must, deal_id=deal_id, context="flatten", response=positions)
+        self._raw(SOURCE_POSITIONS, best_effort=must, deal_id=deal_id, context=context, response=positions)
         return True, next((p for p in positions if p.deal_id == deal_id), None), None
 
     async def _settle(
@@ -967,29 +986,52 @@ class Executor:
 
     async def _attach_stop(self, position: OpenPosition, level: Decimal, failures: list[str]) -> bool:
         """Do `PROTECT_ATTEMPTS` prób `set_stop` (ponowienie tego samego poziomu jest bezpieczne); zapisy wg możliwości,
-        więc awaria dziennika nie skraca procedury."""
+        więc awaria dziennika nie skraca procedury. Gdy wszystkie zawiodą, a z budżetu `PROTECT_BUDGET_S` (od pierwszej
+        porażki) zostało co najmniej `PROTECT_VERIFY_MIN_S`: jeden odczyt listy (limit = reszta budżetu), bo stop mógł
+        zostać ustawiony mimo braku odpowiedzi; nasz deal z tym poziomem stopu podanym przez brokera (nie wyliczonym
+        przez adapter) = stop jest."""
+        deal_id = position.deal_id
         timeout = min(self._timeout, PROTECT_CALL_TIMEOUT_S)
+        first_failure: datetime | None = None
         for attempt in range(1, PROTECT_ATTEMPTS + 1):
             if attempt > 1:
                 await self._clock.sleep(PROTECT_PAUSE_S)
             try:
-                await _with_timeout(self._broker.set_stop(position.deal_id, level), timeout)
+                await _with_timeout(self._broker.set_stop(deal_id, level), timeout)
             except Exception as exc:
+                if first_failure is None:
+                    first_failure = self._now()
                 self._raw_error(
-                    SOURCE_SET_STOP, exc, best_effort=failures, deal_id=position.deal_id, stop_level=level,
-                    attempt=attempt,
-                )  # fmt: skip
+                    SOURCE_SET_STOP, exc, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt
+                )
                 continue
             self._raw(
-                SOURCE_SET_STOP, best_effort=failures, deal_id=position.deal_id, stop_level=level, attempt=attempt,
+                SOURCE_SET_STOP, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt,
                 response=None,
             )  # fmt: skip
-            self._alert("INFO", f"STOP_ATTACHED {position.deal_id}: stop {level} set after the broker had none")
+            self._alert("INFO", f"STOP_ATTACHED {deal_id}: stop {level} set after the broker had none")
             self._event(
-                "STOP_ATTACHED", best_effort=failures, deal_id=position.deal_id, stop_level=level, attempt=attempt
-            )
+                "STOP_ATTACHED", best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt,
+                verified_by="set_stop",
+            )  # fmt: skip
             return True
-        return False
+        spent = 0.0 if first_failure is None else (self._now() - first_failure).total_seconds()
+        remaining = PROTECT_BUDGET_S - spent
+        if remaining < PROTECT_VERIFY_MIN_S:
+            return False
+        read_ok, at_broker, _ = await self._find_at_broker(deal_id, remaining, failures, context="protection")
+        if not read_ok or at_broker is None or at_broker.stop_level != level or at_broker.stop_derived is not False:
+            return False
+        self._alert(
+            "INFO",
+            f"STOP_ATTACHED {deal_id}: stop {level} confirmed by the position list after {PROTECT_ATTEMPTS} unanswered "
+            "attempts",
+        )
+        self._event(
+            "STOP_ATTACHED", best_effort=failures, deal_id=deal_id, stop_level=level, attempt=PROTECT_ATTEMPTS,
+            verified_by="list",
+        )  # fmt: skip
+        return True
 
     async def _protection_distance(self, position: OpenPosition, failures: list[str]) -> Decimal | None:
         try:
@@ -1056,10 +1098,12 @@ class Executor:
             self._event(code, **detail)
 
     def _exit_reason(self, closed: ClosedDeal) -> str:
-        """STOP: stop brokera; FORCED: wyjście silnika (zapisany zamiar) albo wymuszenie brokera; MANUAL: zamknięcie
-        wywołaniem bez zamiaru silnika (właściciel)."""
+        """STOP: stop brokera; FORCED: wyjście silnika (zamiar w dzienniku albo w pamięci tego procesu, gdy zapis
+        zawiódł) albo wymuszenie brokera; MANUAL: zamknięcie wywołaniem bez zamiaru silnika (właściciel)."""
         if closed.reason == "STOP":
             return "STOP"
+        if closed.deal_id in self._memory.exit_intents:
+            return "FORCED"
         if self._journal.get_meta(META_EXIT_INTENT.format(closed.deal_id)) is not None:
             return "FORCED"
         return closed.reason
@@ -1074,7 +1118,12 @@ class Executor:
         vpp = _ctx_decimal(ctx, "value_per_point")
         signal_ts, submit_ts = _ctx_time(ctx, "signal_ts"), _ctx_time(ctx, "submit_ts")
         spread_entry = ask - bid
-        spread_exit = await self._exit_spread(position.epic, closed.deal_id, spread_entry, timeout)
+        extra_notes: tuple[str, ...] = ()
+        if (self._now() - closed.ts).total_seconds() > self._risk.mismatch_tolerance_s:
+            # księgowanie późne (np. po restarcie): bieżące notowanie nie mówi nic o spreadzie przy wyjściu
+            spread_exit, extra_notes = spread_entry, (EXIT_SPREAD_FROM_ENTRY,)
+        else:
+            spread_exit = await self._exit_spread(position.epic, closed.deal_id, spread_entry, timeout)
         # mid wyjścia nie jest obserwowany: BUY wychodzi po bid (mid = wyjście + spread/2), SELL po ask (− spread/2)
         half = spread_exit / 2
         mid_exit = closed.exit_level + half if position.side is Side.BUY else closed.exit_level - half
@@ -1087,7 +1136,7 @@ class Executor:
         costs = self._cost_model.compute(facts)
         confirm_ts = self._confirm_ts(ctx, closed.deal_id, position, submit_ts)
         trade = _record(position, bid, ask, closed, costs, signal_ts, submit_ts, confirm_ts, exit_reason)
-        return trade, costs.notes
+        return trade, costs.notes + extra_notes
 
     async def _fallback_trade(
         self, position: PositionRecord, closed: ClosedDeal, exit_reason: str, timeout: float
@@ -1135,10 +1184,13 @@ class Executor:
         return rules.value_per_point
 
     def _confirm_ts(self, ctx: dict[str, Any], deal_id: str, position: PositionRecord, submit_ts: datetime) -> datetime:
-        """Chwila zapisu CONFIRMED zlecenia (zegar silnika); bez niej czas otwarcia u brokera albo wysyłki."""
+        """Chwila zapisu CONFIRMED zlecenia (zegar silnika); zlecenie przyjęte przez uzgadnianie (zapis CONFIRMED
+        obejmuje przestój i rozstrzyganie) albo bez zapisu: czas otwarcia u brokera, a bez niego czas wysyłki."""
         order = self._journal.get_order(ctx["client_id"])
         if order is not None and order.state is _O.CONFIRMED and order.deal_id == deal_id:
-            return order.updated_at
+            adopted = order.note.split()[:1] == [ADOPTED_BY_RECONCILER]
+            if not (adopted and position.opened_at is not None):
+                return order.updated_at
         return position.opened_at if position.opened_at is not None else submit_ts
 
     def _nights(self, opened_at: datetime, closed: ClosedDeal) -> int:
