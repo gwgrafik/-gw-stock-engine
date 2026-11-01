@@ -661,7 +661,7 @@ def test_scan_files_checks_the_stop_files_even_if_recovery_raises(
     journal, clock, data_dir, notifier, monkeypatch, caplog, name, level, reason
 ):
     state = flaky_kill_state(monkeypatch, journal)
-    ks = KillSwitch(journal, clock, data_dir, notifier)  # nieznany stan startowy: odzyskiwanie biegnie przy każdym kroku
+    ks = KillSwitch(journal, clock, data_dir, notifier)  # nieznany stan startowy: odzyskiwanie przy każdym kroku
     state["down"] = False  # odczyt już działa (do asercji), ale samo odzyskiwanie ma błąd
 
     def broken_recovery():
