@@ -204,6 +204,35 @@ async def test_a_lost_ack_and_stop_out_before_the_first_check_blocks_soft_kills_
     assert world.broker.calls.count("open_position") == 1
 
 
+async def test_unreadable_history_across_restarts_never_clears_the_lost_trade_and_ends_blocked_when_readable(rig, world):
+    """Zgubione potwierdzenie + stop przed pierwszym odczytem, a historia zamknięć NIEDOSTĘPNA (kilka awarii z rzędu,
+    z restartami między przebiegami): zlecenie zostaje UNKNOWN, pozycja nigdy FLAT, nic nie zaksięgowane po cichu, kill
+    SOFT, drugiego zlecenia brak. Gdy historia znów jest czytelna: BLOCKED UNMATCHED_CLOSED_DEAL (decyduje właściciel)."""
+    fake = world.broker
+    accept_then_stop_before_first_check(fake)
+    for _ in range(5):
+        fake.fail_next("closed_since", BrokerError("HTTP 502"))  # historia nieczytelna przy kolejnych odczytach
+    rec = await enter(rig)
+    assert rec.state is O.UNKNOWN  # brak dowodu braku zlecenia, więc nie NOT_PLACED
+    for _ in range(8):
+        disk = read_disk(rig.path)
+        assert disk.order(CID).state is O.UNKNOWN
+        assert disk.position.state is not P.FLAT  # ENTERING albo (po odczycie historii) BLOCKED, nigdy FLAT
+        assert disk.trades == [] and disk.pnl == {} and disk.pnl_total == 0
+        assert disk.kill.level is KillLevel.SOFT
+        if disk.position == PositionRecord(EPIC, P.BLOCKED):
+            break
+        rig.restart()  # zamknięty dziennik, nowe obiekty, ten sam broker
+        try:
+            await reconcile(rig)
+        except BrokerError:
+            pass  # nieczytelna historia: uzgadnianie rzuca, a pętla silnika liczy to jako błąd (RECONCILE_FAILING)
+    disk = read_disk(rig.path)
+    assert_lost_trade_is_blocked(disk)  # po odzyskaniu historii: BLOCKED, UNMATCHED_CLOSED_DEAL, nic nie zaksięgowane
+    assert disk.kill.level is KillLevel.SOFT
+    assert world.broker.calls.count("open_position") == 1  # żadnego drugiego zlecenia
+
+
 @pytest.mark.parametrize(
     "crash",
     ["after_send", "at_check_1", "at_check_3", "before_history", "before_executor_kill"],

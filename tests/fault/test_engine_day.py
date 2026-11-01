@@ -205,6 +205,27 @@ async def test_restart_mid_entry_adopts_position_without_duplicate(make_engine, 
     assert second.journal.get_order("gws-20261102-DE40-1-entry").state is OrderState.CONFIRMED
 
 
+async def test_dry_run_day_with_a_restart_in_the_middle_sends_no_order_and_decides_once(make_engine, broker, clock):
+    """Cały dzień w dry_run (bez uzbrojenia) z restartem w środku sesji: ani jednego wywołania handlowego brokera,
+    jedna prawdziwa decyzja (po restarcie za terminem wejścia tylko rekord pominięcia), dziennik bez transakcji i bez
+    kill switcha, pozycja FLAT, brak nierozstrzygniętych zleceń."""
+    first = make_engine(Mode.DRY_RUN)
+    stop_engine_at(first, clock, berlin(DAY, 11, 0))
+    await first.run_day(DAY)  # zatrzymany o 11:00: po otwarciu zakresu, decyzji i terminie wejścia
+    assert len(engine_decisions(first.journal)) == 1
+    second = make_engine.restart(first, Mode.DRY_RUN)  # nowy dziennik z dysku, nowe obiekty, ten sam broker
+    assert second is not first and second.journal is not first.journal
+    rep = await second.run_day(DAY)
+    trading_calls = {"open_position", "close_position", "set_stop"}
+    assert not trading_calls & set(broker.calls), sorted(trading_calls & set(broker.calls))
+    decisions = engine_decisions(second.journal)
+    # jedna prawdziwa decyzja (z pierwszego procesu); restart po terminie wejścia dopisuje tylko rekord pominięcia
+    assert [d['skip_reason'] for d in decisions] == [None, 'NO_SIGNAL_DATA']
+    assert second.journal.trades() == [] and rep.final_position_state is P.FLAT
+    assert second.journal.kill_state().level.name == "NONE"
+    assert not second.journal.unresolved_orders()
+
+
 async def test_start_after_flatten_time_with_open_position_flattens_and_does_not_enter(make_engine, broker, clock):
     first = make_engine(Mode.LIVE)
     at_time(broker, clock, datetime(2026, 11, 2, 11, 0, tzinfo=timezone.utc), lambda: die())
