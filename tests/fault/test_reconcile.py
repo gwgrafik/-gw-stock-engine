@@ -886,6 +886,35 @@ async def test_second_run_after_booking_books_nothing(journal, fake, reconciler,
     assert result.closed == [] and len(booker.calls) == 1 and snapshot(journal) == before
 
 
+@pytest.mark.parametrize("with_booker", [True, False], ids=["booker", "no_booker"])
+async def test_closure_found_states_intent_and_closure_booked_follows_the_booking(
+    journal, fake, clock, kill_sink, risk_cfg, booker, with_booker
+):
+    rec = Reconciler(journal, fake, clock, kill_sink, risk_cfg, EPIC, booker=booker if with_booker else None)
+    journal.upsert_position(held())
+    put(fake, at_broker())
+    fake.trigger_stop("DEAL-1", STOP)
+    booker.fail = RuntimeError("ledger down")  # pierwsze księgowanie się nie udaje
+
+    if with_booker:
+        with pytest.raises(RuntimeError, match="ledger down"):
+            await rec.run_once()
+        [found] = payloads(journal, "reconcile.event")
+        assert found["event"] == "CLOSURE_FOUND" and found["will_book"] is True and "booked" not in found
+        booker.fail = None
+    result = await rec.run_once()
+
+    events = payloads(journal, "reconcile.event")
+    if with_booker:  # zamiar przed księgowaniem, fakt dopiero po udanym księgowaniu
+        assert [e["event"] for e in events] == ["CLOSURE_FOUND", "CLOSURE_FOUND", "CLOSURE_BOOKED"]
+        assert events[-1] == {"event": "CLOSURE_BOOKED", "deal_id": "DEAL-1", "reason": "STOP"}
+        assert has_note(result, "CLOSURE_BOOKED") and len(booker.calls) == 2
+    else:
+        assert [e["event"] for e in events] == ["CLOSURE_FOUND"] and events[0]["will_book"] is False
+        assert not has_note(result, "CLOSURE_BOOKED") and booker.calls == []
+    assert position(journal) == PositionRecord(EPIC, P.FLAT)
+
+
 async def test_booker_failure_propagates_and_position_stays_open(journal, fake, reconciler, booker):
     journal.upsert_position(held())
     put(fake, at_broker())
@@ -1078,7 +1107,8 @@ async def test_position_change_during_booking_stops_the_remaining_writes(journal
     assert ConcurrentBooker.calls == 1 and result.skipped and result.closed == [closed]  # zaksięgowane naprawdę
     assert result.notes == ["SKIPPED_STATE_CHANGED_AFTER_BOOKING"]
     assert position(journal) == held(P.EXITING) and journal.get_meta("closed_marker") is None
-    assert [e["event"] for e in payloads(journal, "reconcile.event")] == ["CLOSURE_FOUND"]
+    # księgowanie się udało, więc jego ślad zostaje, choć reszta zapisów została pominięta
+    assert [e["event"] for e in payloads(journal, "reconcile.event")] == ["CLOSURE_FOUND", "CLOSURE_BOOKED"]
 
 
 async def test_unrelated_journal_change_during_the_read_does_not_skip(journal, fake, reconciler, kill_sink):

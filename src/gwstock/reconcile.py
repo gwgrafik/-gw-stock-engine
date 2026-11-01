@@ -20,8 +20,9 @@ Przebieg `run_once` (zawsze w tej kolejności):
    wejścia, a ponowne sprawdzenie nie pozwala mu zapisać ponad wejściem lub wyjściem, które zaszło w trakcie;
    silnik (Zadanie 14) dodatkowo szereguje oba kierunki jedną blokadą;
 5. kill switch miękki (przed zapisami: awaria dziennika nie połknie alarmu), zdarzenia `reconcile.event` (ślad
-   decyzji zostaje także przy błędzie księgowania), księgowanie zamknięcia (jedyny zapis z `await`; idempotentny po
-   `deal_id`, po nim migawka jest sprawdzana jeszcze raz: zmiana → `SKIPPED_STATE_CHANGED_AFTER_BOOKING` z
+   decyzji zostaje także przy błędzie księgowania; CLOSURE_FOUND niesie zamiar `will_book`), księgowanie zamknięcia
+   (jedyny zapis z `await`; idempotentny po `deal_id`; zaraz po udanym zdarzenie CLOSURE_BOOKED, potem migawka jest
+   sprawdzana jeszcze raz: zmiana → `SKIPPED_STATE_CHANGED_AFTER_BOOKING` z
    zaksięgowanym zamknięciem w `closed`), zapisy: naprawa SUBMITTING -> UNKNOWN i potwierdzenie z dziennika,
    licznik pustych odczytów, pozycja,
    zlecenia zamykane na podstawie pozycji (wiersz zlecenia na końcu, jak w menedżerze), znacznik historii,
@@ -423,9 +424,9 @@ class Reconciler:
                 plan.book = (ours, closed)
                 plan.closed.append(closed)
                 target = PositionRecord(self._epic, _P.FLAT)
-                plan.record(
+                plan.record(  # zamiar (`will_book`); fakt księgowania to osobne zdarzenie CLOSURE_BOOKED po nim
                     "CLOSURE_FOUND", deal_id=closed.deal_id, reason=closed.reason, exit_level=closed.exit_level,
-                    ts=closed.ts, booked=self._booker is not None,
+                    ts=closed.ts, will_book=self._booker is not None,
                 )
             elif found:
                 target = replace(ours, state=_P.BLOCKED)
@@ -498,6 +499,10 @@ class Reconciler:
             self._raw(SOURCE_EVENT, event)
         if plan.book is not None and self._booker is not None:
             await self._booker.book(*plan.book)  # błąd: pozycja zostaje, następny przebieg ponowi
+            closed = plan.book[1]
+            booked = {"event": "CLOSURE_BOOKED", "deal_id": closed.deal_id, "reason": closed.reason}
+            self._raw(SOURCE_EVENT, booked)  # fakt (także gdy niżej migawka okaże się zmieniona)
+            plan.notes.append(f"CLOSURE_BOOKED deal_id={closed.deal_id} reason={closed.reason}")
             if self._gate_closed() or self._snapshot() != snapshot:
                 return False
         for write in plan.orders_before:
