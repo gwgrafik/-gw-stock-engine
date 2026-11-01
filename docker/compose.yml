@@ -62,8 +62,9 @@ services:
       GW_DATA_DIR: /data
       GW_CAPITALCOM_KEY_FILE: /secrets/capitalcom.json
 
-  # Testy w obrazie (profil `test`, nie startuje z `docker compose up`). Te same zasady izolacji; dane tylko do odczytu.
-  # Użycie: runbook, sekcja 1 (testy logiki i odczyty live tylko do odczytu).
+  # Testy logiki w obrazie (profil `test`, nie startuje z `docker compose up`). Najmniejsze uprawnienia: BEZ klucza,
+  # BEZ danych silnika i BEZ sieci (serwery atrap słuchają na loopbacku). Te same zasady izolacji co silnik.
+  # Użycie: runbook, punkt 1.7.
   gw-stock-test:
     profiles: ["test"]
     image: gw-stock-engine:test
@@ -71,6 +72,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       target: test
+    network_mode: none
     user: "${GW_UID:?GW_UID nie ustawione - patrz runbook sekcja 1}:${GW_GID:?GW_GID nie ustawione - patrz runbook sekcja 1}"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -91,8 +93,41 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Odczyty live TYLKO do odczytu (testy `integration_live_readonly`): klucz tylko do odczytu i sieć, dane tylko do
+  # odczytu, żadnych zleceń (strażnik w teście przerywa każde żądanie inne niż GET i logowanie). Każdy test loguje się
+  # osobno (8 testów = 8 logowań), dlatego uruchamiaj to rzadko, a przy problemach z kluczem tylko pojedynczy test
+  # (runbook, punkty 1.8 i 9). Użycie: runbook, punkt 1.8.
+  gw-stock-live-readonly:
+    profiles: ["test"]
+    image: gw-stock-engine:test
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: test
+    command: ["python", "-m", "pytest", "-m", "integration_live_readonly", "-v", "-p", "no:cacheprovider"]
+    user: "${GW_UID:?GW_UID nie ustawione - patrz runbook sekcja 1}:${GW_GID:?GW_GID nie ustawione - patrz runbook sekcja 1}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp:size=128m"]
+    init: true
+    mem_limit: 384m
+    memswap_limit: 384m
+    mem_reservation: 128m
+    oom_score_adj: 1000
+    pids_limit: 128
+    cpus: 1.0
+    restart: "no"
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
-      - ../data:/data:ro               # testy live odczytują tylko data/account.json; nigdy nie piszą do danych silnika
+      - ../data:/data:ro               # testy odczytują tylko data/account.json; nigdy nie piszą do danych silnika
       - ${GW_SECRET_FILE:-/home/claude/.config/gw/capitalcom.json}:/secrets/capitalcom.json:ro
     environment:
       GW_DATA_DIR: /data

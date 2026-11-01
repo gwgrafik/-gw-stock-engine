@@ -30,6 +30,9 @@ RUNBOOK = ROOT / "docs" / "ops" / "runbook.md"
 
 SERVICE = "gw-stock-engine"
 TEST_SERVICE = "gw-stock-test"
+LIVE_SERVICE = "gw-stock-live-readonly"
+GITIGNORE = ROOT / ".gitignore"
+SOURCES = ROOT / "src" / "gwstock"
 SECRET_MOUNT_TARGET = "/secrets/capitalcom.json"
 DEFAULT_SECRET_SOURCE = "${GW_SECRET_FILE:-/home/claude/.config/gw/capitalcom.json}"
 
@@ -170,19 +173,48 @@ def test_image_and_build_target() -> None:
     assert "profiles" not in svc  # `docker compose up -d` uruchamia silnik, nie usługę testową
 
 
-def test_test_service_is_a_profile_with_the_same_hardening() -> None:
-    svc = _svc(TEST_SERVICE)
+def _assert_same_hardening(svc: dict) -> None:
     assert svc["profiles"] == ["test"]
     assert svc["build"]["target"] == "test" and svc["image"] == "gw-stock-engine:test"
-    assert svc["read_only"] is True and svc["cap_drop"] == ["ALL"]
+    assert svc["read_only"] is True and svc["cap_drop"] == ["ALL"] and "cap_add" not in svc
     assert "no-new-privileges:true" in svc["security_opt"]
     assert svc["memswap_limit"] == svc["mem_limit"] and svc["oom_score_adj"] == 1000
     assert "pids_limit" in svc and "ports" not in svc and svc["restart"] == "no"
     assert re.fullmatch(r"\$\{GW_UID:\?[^}]+\}:\$\{GW_GID:\?[^}]+\}", svc["user"])
-    assert "../data:/data:ro" in svc["volumes"]  # testy nigdy nie piszą do danych silnika
-    assert any(v.endswith(f":{SECRET_MOUNT_TARGET}:ro") for v in svc["volumes"])
     assert svc["healthcheck"] == {"disable": True}
     assert svc["tmpfs"] == ["/tmp:size=128m"]
+    assert not svc.get("privileged", False)
+
+
+def test_unit_test_service_has_no_key_and_no_network() -> None:
+    """Testy logiki: bez klucza (najmniejsze uprawnienia) i bez sieci (loopback wystarcza serwerom atrap)."""
+    svc = _svc(TEST_SERVICE)
+    _assert_same_hardening(svc)
+    assert svc["network_mode"] == "none"
+    assert "volumes" not in svc  # ani klucza, ani danych silnika
+    assert "environment" not in svc or not any("KEY" in k or "SECRET" in k for k in svc["environment"])
+    assert "command" not in svc  # domyślne CMD obrazu: pytest bez testów live
+
+
+def test_live_readonly_service_has_the_key_read_only_and_runs_only_live_tests() -> None:
+    svc = _svc(LIVE_SERVICE)
+    _assert_same_hardening(svc)
+    assert "network_mode" not in svc  # łączy się z Capital.com
+    assert sorted(svc["volumes"]) == sorted(
+        ["../data:/data:ro", f"{DEFAULT_SECRET_SOURCE}:{SECRET_MOUNT_TARGET}:ro"]
+    )  # dane tylko do odczytu; testy nigdy nie piszą do danych silnika
+    assert svc["environment"] == {"GW_DATA_DIR": "/data", "GW_CAPITALCOM_KEY_FILE": SECRET_MOUNT_TARGET}
+    cmd = svc["command"]
+    assert cmd[:3] == ["python", "-m", "pytest"] and cmd[cmd.index("-m", 3) + 1] == "integration_live_readonly"
+    assert "not integration_live_readonly" not in " ".join(cmd)
+
+
+def test_only_the_live_readonly_and_engine_services_mount_the_key() -> None:
+    mounting = [
+        name for name, svc in _compose()["services"].items()
+        if any(SECRET_MOUNT_TARGET in v for v in svc.get("volumes", []))
+    ]  # fmt: skip
+    assert sorted(mounting) == sorted([SERVICE, LIVE_SERVICE])
 
 
 # --- Dockerfile ---------------------------------------------------------------------------------------------------------
@@ -316,7 +348,7 @@ def _ignore_patterns() -> list[str]:
 
 def test_dockerignore_excludes_history_data_secrets_and_working_notes() -> None:
     patterns = _ignore_patterns()
-    for needed in (".git", "data", ".superpowers", ".env", "**/__pycache__", "*.sqlite*", "docs"):
+    for needed in (".git", "data", "data*/", ".superpowers", ".env", "**/.env", "**/__pycache__", "*.sqlite*", "docs"):
         assert needed in patterns, needed
     assert any("capitalcom" in p or p.endswith(".json") for p in patterns)
 
@@ -325,6 +357,19 @@ def test_dockerignore_does_not_hide_what_the_build_needs() -> None:
     patterns = _ignore_patterns()
     for needed in ("src", "tests", "config", "docker", "requirements.lock", "requirements-dev.lock", "pyproject.toml"):
         assert needed not in patterns and f"{needed}/" not in patterns, needed
+
+
+def test_gitignore_keeps_data_backups_and_the_uid_env_file_out_of_the_repo() -> None:
+    """Kopie `data*` (np. data.kopia-...) i `docker/.env` nie mogą trafić do publicznego repozytorium."""
+    if not GITIGNORE.exists():
+        pytest.skip(".gitignore nie jest w obrazie testowym")
+    patterns = [ln.strip() for ln in GITIGNORE.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert "data/" in patterns and "data*/" in patterns
+    assert ".env" in patterns  # wzorzec bez ukośnika dopasowuje `.env` na każdej głębokości, także docker/.env
+    if shutil.which("git") and Path(".git").exists():
+        for path in ("docker/.env", "data.kopia-2026-11-02/journal.sqlite", "data/journal.sqlite"):
+            res = subprocess.run(["git", "check-ignore", "-q", path], capture_output=True, check=False)
+            assert res.returncode == 0, f"git nie ignoruje {path}"
 
 
 # --- docker compose config (tylko CLI, bez demona) --------------------------------------------------------------------
@@ -480,3 +525,130 @@ def test_runbook_never_prints_the_secret_file() -> None:
         for line in body.splitlines():
             if "capitalcom.json" in line:
                 assert not re.match(r"^\s*(cat|less|more|head|tail|nano|vi|vim|echo)\b", line), line
+
+
+# --- runbook: zasady dla właściciela, który nie jest programistą (fix round 1) --------------------------------------
+
+_RUNNABLE_WORDS = (
+    "docker", "touch", "rm", "sed", "git", "tail", "grep", "cat", "mkdir", "cp", "chown", "chmod", "export", "free",
+    "df", "stat", "curl", "su", "install", "ls", "cd", "python", "printf", "echo", "umask", "timedatectl", "getenforce",
+)  # fmt: skip
+
+
+def _runbook_prose() -> str:
+    """Tekst runbooka bez zakwalifikowanych bloków kodu."""
+    return re.sub(r"^```[a-z]*\n.*?^```$", "", RUNBOOK.read_text(encoding="utf-8"), flags=re.S | re.M)
+
+
+@needs_runbook
+def test_runbook_prose_has_no_runnable_commands_in_inline_code() -> None:
+    """Każde polecenie jest w osobnym bloku do skopiowania; w tekście i tabelach tylko nazwy plików i słowa kluczowe."""
+    spans = re.findall(r"`([^`\n]+)`", _runbook_prose())
+    # dwa i więcej wyrazów zaczynających się od nazwy polecenia wygląda na polecenie do skopiowania; pojedyncze nazwy
+    # (np. `clear-kill`, `status`) są dozwolone jako odwołania
+    offenders = [s for s in spans if len(s.split()) >= 2 and s.split()[0] in _RUNNABLE_WORDS]
+    assert offenders == []
+    assert [s for s in spans if "\\|" in s or "|" in s] == []  # rurka w kodzie w tabeli psuje kopiowanie
+
+
+@needs_runbook
+def test_runbook_does_not_ask_for_a_terminal_flag_and_runs_compose_one_off_commands_plainly() -> None:
+    for _, body in _runbook_blocks():
+        for line in body.splitlines():
+            if re.match(r"^\s*docker compose\b.*\brun\b", line):
+                assert " -it " not in line and " -t " not in line, line  # Compose sam przydziela terminal
+
+
+@needs_runbook
+def test_runbook_backup_goes_outside_the_repository() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "~/gw-kopie" in text and "umask 077" in text
+    assert "data.kopia" not in text  # kopia w repozytorium trafiłaby do publicznego repo i kontekstu budowy
+    assert "cp -a data data" not in text
+
+
+@needs_runbook
+def test_runbook_login_recovery_uses_a_single_login_probe_and_counts_the_full_suite_correctly() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "-k test_accounts_listed" in text  # jedno logowanie
+    assert "kilkanaście logowań" not in text and "8 logowań" in text
+    assert "gw-stock-live-readonly" in text and "gw-stock-test" in text
+    assert "nie więcej niż jedna próba logowania" in text.replace("\n", " ")
+
+
+@needs_runbook
+def test_runbook_update_procedure_has_memory_gates_before_and_after() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    section = text[text.index("### 8.2"):text.index("### 8.3")]
+    assert "free -m" in section and "docker stats --no-stream" in section
+    assert section.index("free -m") < section.index("build gw-stock-engine") < section.rindex("docker stats --no-stream")
+    assert "600 MB" in section and "500 MB" in section
+
+
+@needs_runbook
+def test_runbook_grep_of_live_allowed_does_not_print_the_comment_line() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "grep live_allowed" not in text
+    assert text.count("grep '^live_allowed' config/runtime.toml") >= 2
+
+
+@needs_runbook
+def test_runbook_documents_the_decided_operator_semantics() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    for needle in (
+        "smoke --hold",  # (d) pozycja próbna trzymana N sekund
+        "4.3b",  # awaria wewnątrz kontenera: restart polityką
+        "ARM_LIVE",
+        "3 nowe próby",  # (b) licznik logowań jest w pamięci
+        "nieudane logowanie",
+        "gw-stock-live-readonly",
+        "rmdir",  # katalog zamiast pliku klucza utworzony przez Dockera
+        "early_closes",
+    ):
+        assert needle in text, needle
+    assert "(kalendarz je zna)" not in text
+
+
+# Zdania i nazwy z kodu, które runbook cytuje. Test wiąże je z tekstem źródeł: gdy kod je zmieni, runbook trzeba
+# poprawić. Celowo NIE ma tu napisów, które ma jeszcze zmienić poprawka zadania 14 (treść alarmów kill switcha,
+# wiersze kroków `smoke`, `PASS smoke`); sprawdzamy tylko te stabilne.
+_QUOTED_FROM_SOURCES = {
+    "cli.py": (
+        "Number of the account to bind",
+        "Type the last 4 characters of the chosen account id to confirm",
+        "bind-account aborted",
+        "nothing written",
+        "mode (files):",
+        "all arming conditions met",
+        "last decision",
+        "heartbeat: none",
+        "journal: none yet",
+        "unresolved orders:",
+        "kill switch:",
+        "mode: live (all four arming conditions met",
+        "mode: dry_run, no orders will be sent",
+        "OVERWRITE",
+        "the API did not show the stop",
+        "SMOKE_SECOND_CLOSE_UNEXPECTED",
+    ),
+    "watchdog.py": ("another engine instance holds", "LOGIN_FAILED", "LOGIN_LOCKOUT", "QUOTE_SILENCE"),
+    "risk.py": ("KILL_STATE_UNREADABLE", "HARD_STOP_FILE", "STOP_FILE", "kill switch escalated"),
+    "app.py": ("engine started: mode", "NOT_SESSION", "DayReport", "NO_SIGNAL_DATA"),
+}
+
+
+@needs_runbook
+@pytest.mark.skipif(not SOURCES.exists(), reason="brak src/gwstock")
+def test_strings_quoted_in_the_runbook_still_exist_in_the_sources() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    missing_in_runbook = []
+    missing_in_source = []
+    for filename, phrases in _QUOTED_FROM_SOURCES.items():
+        source = (SOURCES / filename).read_text(encoding="utf-8")
+        for phrase in phrases:
+            if phrase not in runbook:
+                missing_in_runbook.append(phrase)
+            if phrase not in source:
+                missing_in_source.append((filename, phrase))
+    assert missing_in_source == [], "runbook cytuje napisy, których nie ma już w kodzie"
+    assert missing_in_runbook == [], "lista cytatów w teście nie odpowiada runbookowi"

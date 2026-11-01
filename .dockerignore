@@ -8,8 +8,10 @@
 .superpowers
 .claude
 
-# dane silnika (dziennik, ARM_LIVE, account.json, alerts.log, heartbeat.json): montowane w czasie pracy, nigdy w obrazie
+# dane silnika (dziennik, ARM_LIVE, account.json, alerts.log, heartbeat.json): montowane w czasie pracy, nigdy w obrazie;
+# `data*/` łapie też kopie w katalogu projektu (np. data.kopia-...), choć runbook każe je robić poza repozytorium
 data
+data*/
 
 # sekrety i środowisko
 .env

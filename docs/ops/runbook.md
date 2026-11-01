@@ -13,13 +13,33 @@ Spis: 0 Zasady, 1 Pierwsze uruchomienie, 2 Tryb `dry_run`, 3 Weryfikacja pierwsz
 ## 0. Zasady
 
 1. **Nic nie wchodzi na VPS bez pomiaru pamięci i Twojej zgody.** Na serwerze działa bot z prawdziwymi pieniędzmi (Solana), n8n i boty OKX, a wolnej pamięci jest około 700 MB. W tym dokumencie są dwie „bramy zgody" (punkty 1.2 i 2.1): przed każdą z nich wykonujesz pomiar, porównujesz go z progami i dopiero wtedy decydujesz. Wątpliwość oznacza: nie idź dalej i zapytaj.
-2. **Klucz nigdy w czacie, w repozytorium, w poleceniach ani w logach.** Repozytorium jest publiczne. Klucz leży wyłącznie w pliku `/home/claude/.config/gw/capitalcom.json` (tryb 600) i trafia do kontenera tylko do odczytu. Żadnego `cat` tego pliku. Wyniki poleceń z tego dokumentu są bezpieczne do wklejenia w czacie, z jednym wyjątkiem: `bind-account` wypisuje numery rachunków i salda, ich nie wklejaj.
+2. **Klucz nigdy w czacie, w repozytorium, w poleceniach ani w logach.** Repozytorium jest publiczne. Klucz leży wyłącznie w pliku `/home/claude/.config/gw/capitalcom.json` (tryb 600) i trafia do kontenera tylko do odczytu. Zawartości tego pliku nigdy nie wypisujesz w terminalu. Wyniki poleceń z tego dokumentu są bezpieczne do wklejenia w czacie, z jednym wyjątkiem: `bind-account` wypisuje numery rachunków i salda, ich nie wklejaj.
 3. **Kod nigdy sam nie uzbraja handlu.** Uzbrajasz wyłącznie Ty (punkt 6): plikiem `data/ARM_LIVE` i wpisem `live_allowed = true`. Bez tego silnik pracuje w trybie `dry_run`: robi wszystko (logowanie, notowania, decyzje), ale **nie wysyła zleceń**.
 4. **Restart zawsze oznacza „zatrzymaj, potem uruchom"**: dwa osobne polecenia, jedno po drugim. Nigdy nakładanie dwóch instancji. Nie używaj polecenia `restart` Composa ani `down`; `down` usuwa kontener razem z jego logami.
 5. **SSH jako `root`, ale wszystkie polecenia projektu jako użytkownik `claude`** (to on jest właścicielem pozostałych botów i kluczy). Każde polecenie z tego dokumentu wykonujesz w katalogu `/home/claude/gw-stock-engine`, chyba że napisano inaczej.
-6. **Wątpliwość oznacza STOP.** Jeśli coś wygląda dziwnie: `touch data/STOP` (brak nowych wejść), a przy prawdziwej pozycji także sprawdź aplikację Capital.com. Usunięcie `data/ARM_LIVE` i zatrzymanie kontenera to zawsze bezpieczny ruch.
+6. **Wątpliwość oznacza STOP.** Jeśli coś wygląda dziwnie, użyj jednego z „szybkich hamulców" poniżej, a przy prawdziwej pozycji sprawdź aplikację Capital.com. Każdy z nich jest bezpieczny.
 7. **Nie edytuj kodu ani plików `config/strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`.** Ich zmiana tworzy nowy wariant strategii i unieważnia pre-rejestrację. Jedyny plik konfiguracji, który zmieniasz Ty, to `config/runtime.toml` (i tylko podanymi poleceniami).
 8. **Czas.** Godziny w tym dokumencie to czas Europe/Berlin (taki sam jak w Holandii). Logi Dockera i pliki w `data/` są w UTC: zimą Berlin = UTC + 1 godzina (do 28.03.2027), latem UTC + 2.
+
+### Szybkie hamulce (gdy coś wygląda dziwnie)
+
+Hamulec 1: brak nowych wejść. Silnik działa dalej i zarządza istniejącą pozycją (miękki kill switch, zdejmuje go tylko `clear-kill`, punkt 8.4):
+
+```bash
+touch data/STOP
+```
+
+Hamulec 2: zdjęcie uzbrojenia. Działający silnik przestaje wchodzić w nowe pozycje natychmiast i **do restartu** (ponowne uzbrojenie wymaga restartu: zatrzymaj, utwórz `data/ARM_LIVE`, uruchom):
+
+```bash
+rm -f data/ARM_LIVE
+```
+
+Hamulec 3: zatrzymanie silnika. Otwarta pozycja zostaje u brokera ze stopem:
+
+```bash
+docker compose -f docker/compose.yml stop
+```
 
 ### Ograniczenia / do potwierdzenia
 
@@ -76,10 +96,10 @@ Jak czytać wynik i **brama zgody nr 1** (przed jakąkolwiek budową obrazu):
 
 | Co | Zielone: idź dalej | Żółte: zatrzymaj się i zapytaj Claude | Czerwone: STOP |
 |---|---|---|---|
-| `free -m`, kolumna `available` | co najmniej 600 MB | 450 do 599 MB | poniżej 450 MB |
-| Wolne miejsce na dysku (`df`, kolumna `Avail` dla `/var/lib`) | co najmniej 3 GB | 2 do 3 GB | poniżej 2 GB |
-| Wersja cgroup (`stat`) | `cgroup2fs` | – | `tmpfs` (cgroup v1): nie idź dalej, procedura pomiaru jest wtedy inna |
-| Ostrzeżenia w `docker info` | brak linii z „No swap limit support" | – | jest taka linia: nie idź dalej |
+| Pamięć serwera: sekcja „pamięć (MB)", kolumna `available` | co najmniej 600 MB | 450 do 599 MB | poniżej 450 MB |
+| Wolne miejsce na dysku: sekcja „dysk", kolumna `Avail` dla `/var/lib` | co najmniej 3 GB | 2 do 3 GB | poniżej 2 GB |
+| Wersja cgroup: sekcja „cgroup" | `cgroup2fs` | – | `tmpfs` (cgroup v1): nie idź dalej, procedura pomiaru jest wtedy inna |
+| Ostrzeżenia w sekcji „docker info" | brak linii z „No swap limit support" | – | jest taka linia: nie idź dalej |
 
 Dlaczego te progi: budowa obrazu i uruchomienie testów zużywają chwilowo do ok. 400 MB (kontener testowy ma twardy limit 384 MB i jest pierwszą ofiarą jądra przy braku pamięci), a po nich silnik ma stale mieścić się w 256 MB. Wynik wklej Claude (jest bezpieczny) i przejdź dalej dopiero po jego „ok" albo po spełnieniu zielonych progów. **Zgodę na budowę i testy wyrażasz właśnie tym krokiem.**
 
@@ -102,10 +122,10 @@ Jeśli właścicielem nie jest `claude`, nie poprawiaj tego sam: zapytaj.
 Sprawdź nazwy pól. To polecenie wypisuje **same nazwy**, nigdy wartości:
 
 ```bash
-grep -o '"[a-z_]*" *:' /home/claude/.config/gw/capitalcom.json
+grep -o '"[A-Za-z0-9_]*" *:' /home/claude/.config/gw/capitalcom.json
 ```
 
-Ma wypisać dokładnie trzy nazwy: `"api_key":`, `"identifier":` i `"api_password":` (w dowolnej kolejności), nic więcej i nic mniej. Numeru rachunku w tym pliku **nie ma**: rachunek wskaże polecenie `bind-account` (punkt 1.11). Dodatkowe pole spowoduje odmowę startu.
+Ma wypisać dokładnie trzy nazwy: `"api_key":`, `"identifier":` i `"api_password":` (w dowolnej kolejności), nic więcej i nic mniej; dodatkowe pole z wielką literą lub cyfrą też byłoby tu widoczne. Numeru rachunku w tym pliku **nie ma**: rachunek wskaże polecenie `bind-account` (punkt 1.11). Dodatkowe pole spowoduje odmowę startu.
 
 Sprawdź, czy plik jest poprawnym JSON-em (bez wypisywania zawartości):
 
@@ -179,13 +199,13 @@ Oczekiwane wartości: `cpus: 0.5`, `mem_limit: "268435456"`, `mem_reservation: "
 
 ### 1.7 Obraz testowy i testy w obrazie
 
-Budowa obrazu testowego (kilka minut, potrzebuje internetu do pobrania obrazu bazowego i pakietów):
+Budowa obrazu testowego (kilka minut, potrzebuje internetu do pobrania obrazu bazowego i pakietów). Ten sam obraz służy dwóm usługom: testom logiki (punkt 1.7) i odczytom live (punkt 1.8):
 
 ```bash
 docker compose -f docker/compose.yml --profile test build gw-stock-test
 ```
 
-Uruchomienie testów w obrazie (kontener testowy ma limit pamięci 384 MB i działa tak samo odizolowany jak silnik):
+Uruchomienie testów logiki w obrazie. Kontener testowy **nie ma klucza ani sieci** (najmniejsze uprawnienia: testy używają tylko lokalnych atrap), działa z systemem plików tylko do odczytu i ma limit pamięci 384 MB:
 
 ```bash
 docker compose -f docker/compose.yml --profile test run --rm gw-stock-test
@@ -195,13 +215,21 @@ Ostatnia linia ma mieć postać `... passed, ... skipped, ... deselected in ...`
 
 ### 1.8 Odczyty live tylko do odczytu (test klucza)
 
-Ten test loguje się do Capital.com (kilkanaście logowań w odstępach ponad sekundy) i **tylko czyta**: konto, reguły DE40, notowania, świece, historię. Żadnych zleceń. Wykonuj go wyłącznie wtedy, gdy silnik nie działa:
+Osobna usługa `gw-stock-live-readonly` dostaje klucz tylko do odczytu i sieć, a dane silnika tylko do odczytu. Uruchamia wyłącznie testy `integration_live_readonly`: **tylko czytają** konto, reguły DE40, notowania, świece i historię; żadnych zleceń (strażnik w teście przerywa każde żądanie inne niż odczyt i logowanie). **Każdy z 8 testów loguje się osobno, więc pełny zestaw to 8 logowań** w odstępach ponad 1,2 sekundy. Uruchamiaj go rzadko (raz teraz) i wyłącznie wtedy, gdy silnik nie działa:
 
 ```bash
-docker compose -f docker/compose.yml --profile test run --rm gw-stock-test python -m pytest -m integration_live_readonly -v -p no:cacheprovider
+docker compose -f docker/compose.yml --profile test run --rm gw-stock-live-readonly
 ```
 
-Wszystkie testy mają mieć wynik `PASSED`. Jeśli widzisz `SKIPPED`, kontener nie widzi pliku z kluczem (wróć do punktów 1.3 i 1.5). Jeśli widzisz `FAILED`, **nie ponawiaj w pętli** (limity logowania, patrz punkt 9): zapisz wynik i zapytaj. Po `bind-account` (punkt 1.11) powtórz ten krok jeszcze raz: wtedy testy sprawdzą także powiązany rachunek.
+Wszystkie 8 testów ma mieć wynik `PASSED`. Jeśli widzisz `SKIPPED`, kontener nie widzi pliku z kluczem (wróć do punktów 1.3 i 1.5). Jeśli widzisz `FAILED`, **nie ponawiaj pełnego zestawu** (każdy przebieg to 8 kolejnych logowań, patrz punkt 9): zapisz wynik i zapytaj.
+
+**Pojedyncze logowanie.** Gdy trzeba tylko sprawdzić, czy klucz działa (po `bind-account`, po wymianie klucza, po błędzie logowania), użyj jednego testu: loguje się dokładnie **raz** i sprawdza konto (a po `bind-account` także powiązany rachunek):
+
+```bash
+docker compose -f docker/compose.yml --profile test run --rm gw-stock-live-readonly python -m pytest -m integration_live_readonly -k test_accounts_listed -v -p no:cacheprovider
+```
+
+Wynik: `1 passed`.
 
 ### 1.9 Obraz silnika
 
@@ -257,6 +285,7 @@ print("== użytkownik, klucz, zapis")
 print("uid:gid w kontenerze:", f"{os.getuid()}:{os.getgid()}")
 check("kontener nie działa jako root", os.getuid() != 0, True)
 key = "/secrets/capitalcom.json"
+check("klucz jest plikiem (nie katalogiem)", os.path.isfile(key), True)
 check("klucz czytelny w kontenerze", os.access(key, os.R_OK), True)
 check("uprawnienia klucza", stat.filemode(os.stat(key).st_mode), "-rw-------")
 for path, expected in (("/data", True), ("/tmp", True), ("/app", False), ("/app/config", False)):
@@ -296,7 +325,7 @@ Compose wypisze przy okazji kilka linii o tworzeniu sieci i kontenera: to normal
 Silnik handluje tylko na rachunku, który sam wskażesz. Polecenie jest interaktywne i **wymaga, żeby silnik nie działał** (dziś jeszcze nie działa). Loguje się raz do Capital.com i **niczego nie kupuje**:
 
 ```bash
-docker compose -f docker/compose.yml run --rm -it gw-stock-engine python -m gwstock bind-account
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock bind-account
 ```
 
 Co zobaczysz i co wpisujesz (komunikaty programu są po angielsku):
@@ -306,9 +335,9 @@ Co zobaczysz i co wpisujesz (komunikaty programu są po angielsku):
 3. Pytanie `Type the last 4 characters of the chosen account id to confirm:`. Wpisz ostatnie 4 znaki numeru wybranego rachunku z listy z kroku 1. To jawne potwierdzenie.
 4. Wynik: `Bound account ... written to ... (mode 600).` Plik `data/account.json` powstał. Przy pomyłce program pisze `bind-account aborted: ... nothing written` i nic nie zapisuje: uruchom polecenie jeszcze raz. Jeśli silnik działa, program odmówi (`refused: another engine instance holds ...`) i do niczego się nie zaloguje: najpierw `stop`.
 
-Przy okazji mogą pojawić się linie logu z godziną i słowem `INFO`: to normalne, zignoruj je.
+Compose sam przydziela terminal, więc nie trzeba żadnych dodatkowych opcji. Przy okazji mogą pojawić się linie logu z godziną i słowem `INFO`: to normalne, zignoruj je.
 
-Jeśli wybierasz inny rachunek niż poprzednio powiązany, program każe wpisać słowo `OVERWRITE`. Sprawdź w aplikacji Capital.com, że wybrałeś rachunek z saldem 40 €, a potem wróć do punktu 1.8 i powtórz test odczytów (tym razem sprawdzi powiązany rachunek).
+Jeśli wybierasz inny rachunek niż poprzednio powiązany, program każe wpisać słowo `OVERWRITE`. Sprawdź w aplikacji Capital.com, że wybrałeś rachunek z saldem 40 €. Potem wykonaj **pojedyncze logowanie** z punktu 1.8 (polecenie z `-k test_accounts_listed`): tym razem sprawdzi ono także powiązany rachunek. Pełnego zestawu 8 logowań nie powtarzaj.
 
 ### 1.12 Stan silnika (`status`)
 
@@ -347,6 +376,7 @@ Warunki startu (wszystkie naraz):
 - kolumna `available` co najmniej **500 MB** (w najgorszym razie silnik zajmie 256 MB, więc reszta serwera zachowa co najmniej 244 MB); 400 do 499 MB to żółte światło: zapytaj; poniżej 400 MB: STOP,
 - w punkcie 1.10 jest `WYNIK: WSZYSTKO OK` z `memory.swap.max` równym `0`,
 - testy z punktu 1.7 przeszły bez `failed`,
+- pre-rejestracja jest zamrożona (punkt 2.0) **[po zadaniu 15]**: specyfikacja wymaga tego przed pierwszą sesją `dry_run`,
 - po stronie Capital.com nic nie jest w trakcie (silnik w `dry_run` i tak nie wysyła zleceń).
 
 **Zgoda: uruchamiasz silnik tylko jako świadomą decyzję po spełnieniu tych warunków.** Nie masz pewności: wklej wynik Claude i poczekaj na „ok". Jeśli po starcie pamięć zacznie rosnąć ponad progi z punktu 2.4, zatrzymaj usługę poleceniem z tego punktu.
@@ -357,7 +387,7 @@ Warunki startu (wszystkie naraz):
 docker compose -f docker/compose.yml up -d gw-stock-engine
 ```
 
-Tryb jest `dry_run`, dopóki nie spełnisz wszystkich czterech warunków uzbrojenia z punktu 6. Kontener startuje z polityką `unless-stopped`: po restarcie serwera lub Dockera uruchomi się sam (w trybie wynikającym z plików). Aby tego uniknąć, zatrzymaj go poleceniem `docker compose -f docker/compose.yml stop`; zatrzymany ręcznie sam nie wstanie.
+Tryb jest `dry_run`, dopóki nie spełnisz wszystkich czterech warunków uzbrojenia z punktu 6. Kontener startuje z polityką `unless-stopped`: po restarcie serwera lub Dockera uruchomi się sam (w trybie wynikającym z plików). Aby tego uniknąć, zatrzymaj go (hamulec 3 z początku dokumentu); zatrzymany ręcznie sam nie wstanie.
 
 ### 2.3 Pierwsze minuty
 
@@ -394,7 +424,7 @@ echo "--- wszystkie kontenery na serwerze (pamięć)"; docker stats --no-stream 
 
 Progi decyzyjne (**silnik musi mieścić się w 256 MB z zapasem, a reszta serwera ma pozostać nietknięta**):
 
-| Pomiar | Zielone: dalej | Żółte: zapytaj Claude, nie idź dalej | Czerwone: `docker compose -f docker/compose.yml stop` |
+| Pomiar | Zielone: dalej | Żółte: zapytaj Claude, nie idź dalej | Czerwone: zatrzymaj silnik (hamulec 3) |
 |---|---|---|---|
 | `MEM USAGE` silnika po 10 minutach | do 100 MiB | 101 do 150 MiB | powyżej 150 MiB |
 | `available` serwera po starcie | co najmniej 400 MB | 300 do 399 MB | poniżej 300 MB |
@@ -408,7 +438,7 @@ Przy czerwonym wyniku zatrzymaj silnik od razu i wklej pomiar Claude:
 docker compose -f docker/compose.yml stop
 ```
 
-Dla orientacji: sam interpreter z biblioteką `aiohttp` zajmuje ok. 45 MB, a nieruchomy silnik ok. 30 MB w `docker stats`. Kontrola zdrowia co minutę uruchamia na chwilę drugi proces Pythona (kolejne ok. 45 MB, w tym samym limicie 256 MB).
+Dla orientacji: sam interpreter z biblioteką `aiohttp` zajmuje ok. 45 MB, a nieruchomy silnik ok. 30 MB w odczycie zużycia pamięci kontenera. Kontrola zdrowia co minutę uruchamia na chwilę drugi proces Pythona (kolejne ok. 45 MB, w tym samym limicie 256 MB).
 
 ### 2.5 Jak wygląda zwykły dzień sesji
 
@@ -424,7 +454,7 @@ Wszystkie godziny w czasie Berlin. W kolumnach UTC są godziny, które zobaczysz
 | po 17:30 | po 16:30 | po 15:30 | Uzgodnienie końcowe i raport dnia w logu |
 | noc, weekend, święto | | | Spoczynek: silnik tylko zapisuje tętno i pilnuje plików `STOP` |
 
-W skrócone sesje (kalendarz je zna) spłaszczenie jest 5 minut przed skróconym zamknięciem.
+Kalendarz silnika zna na razie wyłącznie pełne sesje (09:00 do 17:30) i święta; lista skróconych sesji (`early_closes`) jest **pusta**, więc spłaszczenie jest zawsze o 17:25. Skrócona sesja 30.12.2026 jest do sprawdzenia w grudniu (punkt 8.6).
 
 **Gdzie czytać decyzję dnia.** Stan i ostatnia decyzja (z początkiem świecy w UTC i jej ceną otwarcia, maksimum, minimum, zamknięcia):
 
@@ -462,7 +492,7 @@ Tętno (silnik zapisuje je co kilka sekund; kontrola zdrowia sprawdza, że plik 
 cat data/heartbeat.json
 ```
 
-Pamięć ma zostać w zielonych progach z punktu 2.4. **Po pierwszej pełnej sesji powtórz cały pomiar z punktu 2.4:** pole `memory.peak` (jeśli jądro je ma) pokazuje szczyt od startu kontenera; bez niego patrz na najwyższy odczyt `docker stats` z całego dnia. Szczyt do 170 MiB jest zielony, 171 do 220 MiB żółty (zapytaj), powyżej 220 MiB albo `OOMKilled=true` czerwony.
+Pamięć ma zostać w zielonych progach z punktu 2.4. **Po pierwszej pełnej sesji powtórz cały pomiar z punktu 2.4:** pole `memory.peak` (jeśli jądro je ma) pokazuje szczyt od startu kontenera; bez niego patrz na najwyższy odczyt zużycia pamięci kontenera z całego dnia. Szczyt do 170 MiB jest zielony, 171 do 220 MiB żółty (zapytaj), powyżej 220 MiB albo `OOMKilled=true` czerwony.
 
 ---
 
@@ -485,7 +515,7 @@ Zrób to po pierwszej sesji `dry_run`, najlepiej na dwóch różnych dniach.
 
 ## 4. Ćwiczenia awaryjne (w `dry_run`, po co najmniej jednej pełnej sesji)
 
-Cel: zobaczyć na własne oczy, że mechanizmy bezpieczeństwa działają, zanim cokolwiek zależy od nich naprawdę. Wszystkie ćwiczenia robisz w `dry_run`, czyli bez żadnej pozycji. Do zdjęcia kill switcha używasz polecenia `clear-kill` **[po zadaniu 14b]**; dopóki go nie ma, **nie rób ćwiczeń 4.1, 4.2 i 4.4** (po nich kill switch nie dałby się zdjąć). Ćwiczenie 4.3 możesz zrobić wcześniej.
+Cel: zobaczyć na własne oczy, że mechanizmy bezpieczeństwa działają, zanim cokolwiek zależy od nich naprawdę. Wszystkie ćwiczenia robisz w `dry_run`, czyli bez żadnej pozycji. Do zdjęcia kill switcha używasz polecenia `clear-kill` **[po zadaniu 14b]**; dopóki go nie ma, **nie rób ćwiczeń 4.1, 4.2 i 4.4** (po nich kill switch nie dałby się zdjąć). Ćwiczenia 4.3 i 4.3b możesz zrobić wcześniej.
 
 Zasada ogólna: kill switch zapisuje swój stan w dzienniku i **przeżywa restart**. Usunięcie pliku `STOP` albo `HARD_STOP` **nie zdejmuje** poziomu: robi to wyłącznie `clear-kill`.
 
@@ -501,7 +531,7 @@ Odczekaj ok. 15 sekund i sprawdź alarm:
 tail -n 5 data/alerts.log
 ```
 
-Oczekiwane: linia w rodzaju `... SOFT kill switch SOFT: STOP_FILE`.
+Oczekiwane: linia w rodzaju `... SOFT kill switch SOFT: STOP_FILE` (z poziomu `NONE` alarm brzmi `kill switch <POZIOM>: <powód>`).
 
 ```bash
 docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock status
@@ -515,7 +545,13 @@ Powrót do normy (kolejność ma znaczenie). Najpierw usuń plik:
 rm -f data/STOP
 ```
 
-Sprawdź, że `status` **nadal** pokazuje `SOFT` (tak ma być). Zatrzymaj silnik:
+Odczekaj ok. 15 sekund i sprawdź stan jeszcze raz. `status` **nadal** ma pokazywać `kill switch: SOFT` (tak ma być: usunięcie pliku nie zdejmuje poziomu):
+
+```bash
+docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock status
+```
+
+Zatrzymaj silnik (`clear-kill` działa tylko przy zatrzymanym silniku, bo bierze blokadę instancji i inaczej odmawia):
 
 ```bash
 docker compose -f docker/compose.yml stop
@@ -524,7 +560,7 @@ docker compose -f docker/compose.yml stop
 Zdejmij kill switch **[po zadaniu 14b]**. Program pokaże poprzedni poziom i powód, poprosi o wpisanie potwierdzenia (wpisz dokładnie to, o co prosi) i zapisze, kto zdjął blokadę. Po `--by` jest tylko nazwa do zapisu w dzienniku, możesz wpisać swoje imię bez spacji:
 
 ```bash
-docker compose -f docker/compose.yml run --rm -it gw-stock-engine python -m gwstock clear-kill --by wlasciciel
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
 ```
 
 Uruchom silnik:
@@ -551,7 +587,7 @@ Odczekaj ok. 15 sekund i sprawdź alarm:
 tail -n 5 data/alerts.log
 ```
 
-Oczekiwane: alarm o eskalacji do `HARD` z powodem `HARD_STOP_FILE`.
+Oczekiwane: alarm o twardym poziomie z powodem `HARD_STOP_FILE`. Z poziomu `NONE` brzmi `kill switch HARD: HARD_STOP_FILE`, a jeśli wcześniej był miękki (np. po 4.1 bez zdjęcia), brzmi `kill switch escalated SOFT -> HARD: HARD_STOP_FILE (was: ...)`.
 
 ```bash
 docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock status
@@ -572,16 +608,16 @@ docker compose -f docker/compose.yml stop
 Zdejmij kill switch **[po zadaniu 14b]**:
 
 ```bash
-docker compose -f docker/compose.yml run --rm -it gw-stock-engine python -m gwstock clear-kill --by wlasciciel
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
 ```
 
 ```bash
 docker compose -f docker/compose.yml up -d gw-stock-engine
 ```
 
-### 4.3 Nagłe zabicie procesu (`kill -9`), najlepiej w trakcie sesji
+### 4.3 Nagłe zabicie kontenera (docker kill), najlepiej w trakcie sesji
 
-Symuluje awarię bez żadnego czystego zamknięcia:
+Symuluje nagłe zatrzymanie bez czystego zamknięcia. **Zabicie poleceniem docker kill jest dla Dockera „ręcznym zatrzymaniem", więc polityka restartu go nie podnosi**; to ćwiczenie sprawdza, że po ręcznym starcie silnik wraca do właściwego stanu. Samoczynny restart po prawdziwej awarii sprawdza ćwiczenie 4.3b.
 
 ```bash
 docker kill -s KILL gw-stock-engine
@@ -593,7 +629,7 @@ Sprawdź:
 docker compose -f docker/compose.yml ps -a
 ```
 
-Oczekiwane: `Exited (137)`. Kontener zabity ręcznie **nie wstaje sam** (polityka restartu nie dotyczy ręcznego zabicia; tak działa Docker 29 na maszynie testowej, na VPS to potwierdza to ćwiczenie). Uruchom go ponownie zwykłym startem:
+Oczekiwane: `Exited (137)`. Kontener zabity ręcznie **nie wstaje sam** (tak działa Docker 29 na maszynie testowej, na VPS to potwierdza to ćwiczenie). Uruchom go ponownie zwykłym startem:
 
 ```bash
 docker compose -f docker/compose.yml up -d gw-stock-engine
@@ -610,6 +646,40 @@ docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock s
 ```
 
 Oczekiwane: w logach nowy start (`engine started`), w `status` świeże tętno, ten sam poziom kill switcha co przed zabiciem i `unresolved orders: 0`, bez zdublowanych zleceń. Blokada instancji (`data/engine.lock`) zwalnia się sama, nie usuwaj jej ręcznie.
+
+### 4.3b Awaria procesu wewnątrz kontenera: samoczynny restart
+
+To jest prawdziwa awaria: ginie sam proces Pythona, a kontener i Docker „nie wiedzą", że to Ty. Polityka `unless-stopped` ma go podnieść **sama**. Najlepiej w trakcie sesji (po 09:15), żeby zobaczyć także uzgadnianie startowe. Polecenie szuka procesu silnika (uruchomionego jako python -m gwstock) i zabija go sygnałem KILL (w obrazie nie ma `pkill`, dlatego przeszukuje `/proc`):
+
+```bash
+docker exec gw-stock-engine sh -c 'for p in /proc/[0-9]*; do if [ "$(tr "\0" " " < $p/cmdline)" = "python -m gwstock " ]; then kill -9 "${p#/proc/}"; echo "zabito proces ${p#/proc/}"; fi; done'
+```
+
+Oczekiwane: jedna linia `zabito proces N` (zwykle `7`). Po sekundzie, bez żadnego Twojego polecenia, Docker uruchamia kontener ponownie. Sprawdź licznik restartów i stan:
+
+```bash
+docker inspect gw-stock-engine --format 'status={{.State.Status}} restarty={{.RestartCount}} OOMKilled={{.State.OOMKilled}} zdrowie={{.State.Health.Status}}'
+```
+
+Oczekiwane: `status=running`, `restarty` o jeden większe niż przed ćwiczeniem, `OOMKilled=false`, a `zdrowie` przechodzi z `starting` do `healthy` w ciągu kilkunastu sekund. Logi nie są tracone przy restarcie:
+
+```bash
+docker logs --tail 30 gw-stock-engine
+```
+
+Oczekiwane: druga linia `engine started: mode ...` (a w sesji uzgadnianie startowe z brokerem) i **żadnych** linii `ERROR` ani `Traceback`.
+
+```bash
+docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock status
+```
+
+Oczekiwane: świeże tętno, ten sam poziom kill switcha co przed ćwiczeniem, `unresolved orders: 0`, pozycja bez zmian.
+
+```bash
+tail -n 5 data/alerts.log
+```
+
+Oczekiwane: brak nowych alarmów `ERROR`. Jeśli kontener nie wstał sam albo w logach są błędy, zatrzymaj go (`stop`) i zgłoś.
 
 ### 4.4 Odcięcie sieci (tylko w godzinach sesji, 09:00 do 17:25)
 
@@ -631,15 +701,15 @@ Oczekiwane: alarm o ciszy notowań (`QUOTE_SILENCE`, po 60 s ciszy) i kill switc
 docker network connect gw-stock-engine_default gw-stock-engine
 ```
 
-Silnik zaczyna znów dostawać notowania, ale `SOFT` **zostaje**, dopóki go nie zdejmiesz: `stop`, `clear-kill` **[po zadaniu 14b]**, `up -d`, jak w 4.1.
+Silnik zaczyna znów dostawać notowania, ale `SOFT` **zostaje**, dopóki go nie zdejmiesz: zatrzymaj, `clear-kill` **[po zadaniu 14b]**, uruchom, dokładnie jak w 4.1.
 
-Jeśli w którymkolwiek ćwiczeniu zobaczysz coś, czego ta instrukcja nie opisuje: `docker compose -f docker/compose.yml stop` i zgłoś.
+Jeśli w którymkolwiek ćwiczeniu zobaczysz coś, czego ta instrukcja nie opisuje: zatrzymaj silnik (hamulec 3 z początku dokumentu) i zgłoś.
 
 ---
 
 ## 5. Próba `smoke`
 
-**Uwaga: to jest pierwsza prawdziwa transakcja.** `smoke` wysyła na Twoje konto jedno zlecenie rynkowe DE40 o wielkości **0,001** (najmniejsza możliwa) ze stopem i **zamyka je od razu**. Sprawdza całą ścieżkę zleceń: otwarcie, widoczność pozycji i stopu, zamknięcie, księgowanie, drugie zamknięcie (musi zostać odrzucone), ostatnie świece i opóźnienie historii. Koszt to spread i poślizg przy wielkości 0,001, czyli rząd ułamka grosza do około 1 centa (jeden punkt przy 0,001 to ok. 0,001 €; dokładną wartość punktu potwierdza ta próba).
+**Uwaga: to jest pierwsza prawdziwa transakcja.** `smoke` wysyła na Twoje konto jedno zlecenie rynkowe DE40 o wielkości **0,001** (najmniejsza możliwa) ze stopem, **trzyma je otwarte tyle sekund, ile zażądasz opcją `--hold`** (żebyś zdążył obejrzeć pozycję i jej stop w aplikacji), a potem **zamyka**. Sprawdza całą ścieżkę zleceń: otwarcie, widoczność pozycji i stopu, zamknięcie, księgowanie, drugie zamknięcie (musi zostać odrzucone), ostatnie świece i opóźnienie historii. Koszt to spread i poślizg przy wielkości 0,001, czyli rząd ułamka grosza do około 1 centa (jeden punkt przy 0,001 to ok. 0,001 €; dokładną wartość punktu potwierdza ta próba). W czasie `--hold` cena może się ruszyć o kilka punktów, co przy 0,001 to ułamki centa; stop ogranicza stratę.
 
 ### Warunki wstępne (wszystkie)
 
@@ -648,7 +718,7 @@ Jeśli w którymkolwiek ćwiczeniu zobaczysz coś, czego ta instrukcja nie opisu
 - Pre-rejestracja zamrożona [po zadaniu 15], bo `smoke` działa tylko w trybie `live`, a ten wymaga zgodnego odcisku konfiguracji.
 - Na rachunku jest saldo (40 €), a w aplikacji Capital.com nie ma żadnej otwartej pozycji DE40.
 - Dzień roboczy, 10:00 do 16:00 czasu Berlina (płynny rynek, wąski spread), **nie** w okolicy 09:00 do 09:10 ani 17:25, i **nie** w przerwie 21:00 do 21:05 UTC.
-- Aplikacja Capital.com otwarta na ekranie pozycji DE40.
+- Aplikacja Capital.com otwarta na ekranie pozycji DE40 i odświeżana.
 
 ### Procedura
 
@@ -674,28 +744,30 @@ Sprawdź, że wszystkie warunki są spełnione (ma być `mode (files): live (all
 docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock status
 ```
 
-Uruchom próbę:
+Uruchom próbę z trzymaniem pozycji przez 90 sekund (dopuszczalne wartości `--hold` to 0 do 600 sekund; 0 zamyka od razu):
 
 ```bash
-docker compose -f docker/compose.yml run --rm -it gw-stock-engine python -m gwstock smoke
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock smoke --hold 90
 ```
+
+**Nie przerywaj polecenia w trakcie** (bez Ctrl+C): przerwanie mogłoby zostawić pozycję otwartą. Gdyby tak się stało, patrz „Reguła przerwania" niżej.
 
 ### Co zobaczysz
 
-Linie `PASS [n]`, `FAIL [n]` i `INFO [n]`, a na końcu `PASS smoke: N/N checks passed` (kod wyjścia 0) albo `FAIL`. Znaczenie kroków: [1] rachunek poprawny, [2] wejście przyjęte (z poziomem otwarcia i stopu), [3] pozycja widoczna ze stopem, [4] spłaszczenie przez wykonawcę, [5] pozycja zniknęła i transakcja zaksięgowana (z kosztami), [6] drugie zamknięcie odrzucone jako „nie znaleziono" (to jest wymagane), [7] trzy ostatnie świece 5-minutowe do porównania z wykresem, [8] opóźnienie historii.
+Linie `PASS [n]`, `FAIL [n]` i `INFO [n]`, a na końcu wynik `PASS` albo `FAIL` (kod wyjścia 0 tylko, gdy każdy krok jest `PASS`). Znaczenie kroków: [1] rachunek poprawny, [2] wejście przyjęte (z poziomem otwarcia i stopu), [3] pozycja widoczna ze stopem, [4] spłaszczenie przez wykonawcę (po upływie `--hold`), [5] pozycja zniknęła i transakcja zaksięgowana (z kosztami), [6] drugie zamknięcie odrzucone jako „nie znaleziono" (to jest wymagane), [7] trzy ostatnie świece 5-minutowe do porównania z wykresem, [8] opóźnienie historii. Dokładne brzmienie linii może się nieco różnić od opisu.
 
-Jeśli w kroku [2] jest `INFO ... the API did not show the stop: verify the stop in the Capital.com app before arming`, broker nie pokazał stopu w liście pozycji i silnik zapisał stop **wyliczony z naszego żądania**. Wtedy musisz sam zobaczyć stop w aplikacji (poniżej).
+Jeśli w kroku [2] jest `INFO ... the API did not show the stop ...`, broker nie pokazał stopu w liście pozycji i silnik zapisał stop **wyliczony z naszego żądania**. Wtedy stop musisz zobaczyć w aplikacji sam (poniżej): bez tego nie uzbrajaj.
 
 ### Co sprawdzasz w aplikacji Capital.com
 
-Pozycja żyje tylko kilka sekund, więc:
+Dzięki `--hold` pozycja jest otwarta około 90 sekund:
 
-1. W momencie startu polecenia odświeżaj ekran pozycji: pozycja DE40 o wielkości 0,001 powinna się pojawić **z ustawionym stop lossem** (zapisz poziom).
-2. Po próbie otwórz historię (aktywność lub zamknięte pozycje): ma być **dokładnie jedna** transakcja DE40 0,001, otwarta i zamknięta, i **żadnej** pozostałej otwartej pozycji.
-3. W szczegółach transakcji poszukaj poziomu stopu; porównaj z `stop level` z kroku [2].
+1. Zaraz po starcie polecenia odśwież ekran pozycji: pozycja DE40 o wielkości 0,001 powinna się pojawić **z ustawionym stop lossem**. Zapisz poziom stopu.
+2. Porównaj ten poziom z `stop level` z kroku [2] wydruku.
+3. Po próbie otwórz historię (aktywność lub zamknięte pozycje): ma być **dokładnie jedna** transakcja DE40 0,001, otwarta i zamknięta, i **żadnej** pozostałej otwartej pozycji.
 4. Porównaj świece z kroku [7] z wykresem 5-minutowym (zasada ta sama co w punkcie 3: początek świecy w UTC i ceny środkowe).
 
-Jeśli nie zdążysz zobaczyć stopu na żywo ani znaleźć go w historii, **zapisz to i zgłoś Claude**: poziom stopu to pozycja C24, a próba nie ma dziś opcji dłuższego trzymania pozycji.
+Jeśli nie widzisz stopu przy pozycji, **zapisz to i zgłoś Claude** (to pozycja C24 z listy ograniczeń) i nie uzbrajaj.
 
 ### Po próbie (zawsze, także gdy wszystko jest PASS)
 
@@ -710,16 +782,28 @@ sed -i 's/^live_allowed = true/live_allowed = false/' config/runtime.toml
 ```
 
 ```bash
-grep live_allowed config/runtime.toml
+grep '^live_allowed' config/runtime.toml
 ```
 
-Ma być `live_allowed = false`. Zapisz wynik próby (cały wydruk) i przekaż Claude. Silnik po próbie zostaje zatrzymany; jeśli chcesz wrócić do pracy w `dry_run`, uruchom go (restart zawsze jako osobny krok po `stop`, więc to już jest ten drugi krok):
+Ma być `live_allowed = false`. Zapisz wynik próby (cały wydruk) i przekaż Claude. Sprawdź stan przed powrotem do `dry_run`:
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock status
+```
+
+Ma być `mode (files): dry_run (...)`. **Jeśli widzisz `kill switch: SOFT`**, a zwłaszcza po nieudanym kroku [6] (wtedy silnik sam włącza miękki kill switch z powodem `SMOKE_SECOND_CLOSE_UNEXPECTED`), silnik nie wejdzie już w żadną pozycję, dopóki go nie zdejmiesz: wykonaj `clear-kill` **[po zadaniu 14b]** (silnik jest zatrzymany, jak trzeba), ale **dopiero po wyjaśnieniu przyczyny z Claude**:
+
+```bash
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
+```
+
+Silnik po próbie zostaje zatrzymany; jeśli chcesz wrócić do pracy w `dry_run`, uruchom go (restart zawsze jako osobny krok po zatrzymaniu, więc to już jest ten drugi krok):
 
 ```bash
 docker compose -f docker/compose.yml up -d gw-stock-engine
 ```
 
-**Reguła przerwania:** przy jakiejkolwiek wątpliwości (FAIL, pozycja nadal otwarta w aplikacji, dziwny wydruk) natychmiast usuń `data/ARM_LIVE` (polecenie wyżej), sprawdź aplikację, a gdy pozycja jest otwarta, **zamknij ją ręcznie w aplikacji**. Potem opisz sytuację Claude i nie ponawiaj próby.
+**Reguła przerwania:** przy jakiejkolwiek wątpliwości (FAIL, pozycja nadal otwarta w aplikacji, dziwny wydruk, przerwane polecenie) natychmiast usuń `data/ARM_LIVE` (hamulec 2 z początku dokumentu), sprawdź aplikację, a gdy pozycja jest otwarta, **zamknij ją ręcznie w aplikacji**. Potem opisz sytuację Claude i nie ponawiaj próby.
 
 ---
 
@@ -732,7 +816,7 @@ docker compose -f docker/compose.yml up -d gw-stock-engine
 1. `live_allowed = true` w `config/runtime.toml`.
 2. Plik `data/ARM_LIVE` utworzony przez Ciebie.
 3. Powiązany rachunek: `bind-account` wykonane (jest `data/account.json`).
-4. Zamrożona pre-rejestracja [po zadaniu 15], zgodna z bieżącą konfiguracją: `python -m gwstock.prereg --write` (punkt 2.0), od tego czasu bez zmian w `strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`.
+4. Zamrożona pre-rejestracja [po zadaniu 15], zgodna z bieżącą konfiguracją (polecenie z punktu 2.0), od tego czasu bez zmian w `strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`.
 
 Dodatkowo silnik przy **każdym** starcie sprawdza u brokera, że powiązany rachunek istnieje, jest `ENABLED`, ma saldo większe od zera, walutę EUR i jest aktywny w sesji. Jeśli nie, zostaje w `dry_run` do końca procesu i zgłasza alarm.
 
@@ -775,7 +859,7 @@ docker logs --tail 20 gw-stock-engine
 
 ### Rozbrajanie
 
-Najlepiej poza sesją albo po spłaszczeniu. W razie nagłej potrzeby podczas sesji najpierw `touch data/STOP`. Rozbrojenie to: usunięcie pliku, zatrzymanie, uruchomienie (restart zawsze w dwóch krokach):
+Najlepiej poza sesją albo po spłaszczeniu. **Samo usunięcie pliku `data/ARM_LIVE` działa od razu także na działający silnik: przestaje on wchodzić w nowe pozycje i tak zostaje do restartu** (istniejąca pozycja jest nadal zarządzana). To dlatego jest to hamulec 2 z początku dokumentu. Ponowne uzbrojenie zawsze wymaga restartu: zatrzymaj, utwórz `data/ARM_LIVE`, uruchom. Pełne rozbrojenie to: usunięcie pliku, zatrzymanie, zmiana `live_allowed`, kontrola i uruchomienie (restart zawsze w dwóch krokach):
 
 ```bash
 rm -f data/ARM_LIVE
@@ -789,11 +873,23 @@ docker compose -f docker/compose.yml stop
 sed -i 's/^live_allowed = true/live_allowed = false/' config/runtime.toml
 ```
 
+Sprawdź stan przed uruchomieniem (ma być `mode (files): dry_run (...)`):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock status
+```
+
 ```bash
 docker compose -f docker/compose.yml up -d gw-stock-engine
 ```
 
-W logu ma być `mode: dry_run, no orders will be sent: ...`. Pozycja otwarta w chwili rozbrojenia nadal jest zarządzana (stop u brokera, spłaszczenie o 17:25), bo wyjść nie blokujemy nigdy.
+W logu ma być `mode: dry_run, no orders will be sent: ...`:
+
+```bash
+docker logs --tail 20 gw-stock-engine
+```
+
+Pozycja otwarta w chwili rozbrojenia nadal jest zarządzana (stop u brokera, spłaszczenie o 17:25), bo wyjść nie blokujemy nigdy.
 
 ---
 
@@ -805,7 +901,7 @@ Pierwsze 5 sesji live silnik handluje wielkością minimalną 0,001. Po każdej 
 docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock.report
 ```
 
-**[po zadaniu 15]**: raport dzienny (wynik, koszty, status bramki L1 i instrukcja). Dodatkowo `status` i `tail -n 30 data/alerts.log` (punkt 2.6).
+**[po zadaniu 15]**: raport dzienny (wynik, koszty, status bramki L1 i instrukcja). Dodatkowo wykonaj codzienną kontrolę z punktu 2.6 (stan, alarmy, tętno, pamięć).
 
 Co przeglądasz po każdej sesji i na koniec piątej (warunki bramki L1 ze specyfikacji, sekcja 11):
 
@@ -821,7 +917,11 @@ Co przeglądasz po każdej sesji i na koniec piątej (warunki bramki L1 ze specy
 touch data/L1_PASSED
 ```
 
-Plik tworzy wyłącznie właściciel, kod nigdy. Silnik sprawdza go przy każdej decyzji, więc restart nie jest potrzebny. **Bez tego pliku wielkość pozostaje 0,001**, nawet po 5 sesjach. Z plikiem, od 6. sesji, wielkość liczona jest regułami strategii (zawsze w granicach limitów ryzyka). Wycofanie: `rm -f data/L1_PASSED`.
+Plik tworzy wyłącznie właściciel, kod nigdy. Silnik sprawdza go przy każdej decyzji, więc restart nie jest potrzebny. **Bez tego pliku wielkość pozostaje 0,001**, nawet po 5 sesjach. Z plikiem, od 6. sesji, wielkość liczona jest regułami strategii (zawsze w granicach limitów ryzyka). Wycofanie bramki:
+
+```bash
+rm -f data/L1_PASSED
+```
 
 ---
 
@@ -849,7 +949,13 @@ Po zatrzymaniu otwarta pozycja zostaje u brokera ze swoim stopem; nowy start uzg
 
 ### 8.2 Aktualizacja kodu (nigdy przy otwartej pozycji)
 
-Wykonuj poza sesją, np. po 17:35 albo w weekend, gdy `status` pokazuje `position DE40: FLAT`. Jeśli jesteś uzbrojony, najpierw rozbrój (punkt 6), żeby `git` nie widział lokalnej zmiany `runtime.toml`.
+Wykonuj poza sesją, np. po 17:35 albo w weekend. Przebudowa obrazów i kontener testowy zużywają chwilowo do ok. 400 MB, więc obowiązuje ta sama zasada co na początku: **bez pomiaru pamięci nic nie budujesz** (zasada 0.1). Jeśli jesteś uzbrojony, najpierw rozbrój (punkt 6), żeby system kontroli wersji nie widział lokalnej zmiany pliku `runtime.toml`.
+
+Sprawdź, że nie ma otwartej pozycji (ma być `position DE40: FLAT`):
+
+```bash
+docker compose -f docker/compose.yml exec -T gw-stock-engine python -m gwstock status
+```
 
 Zapisz logi kontenera (znikają razem z kontenerem przy jego odtworzeniu):
 
@@ -857,9 +963,21 @@ Zapisz logi kontenera (znikają razem z kontenerem przy jego odtworzeniu):
 docker logs gw-stock-engine > data/logi-przed-aktualizacja.txt 2>&1
 ```
 
+Zatrzymaj silnik (to zwalnia jego pamięć):
+
 ```bash
 docker compose -f docker/compose.yml stop
 ```
+
+**Brama pamięci przed budową.** Zmierz wolną pamięć serwera:
+
+```bash
+free -m
+```
+
+Kolumna `available`: co najmniej **600 MB** to zielone światło; 450 do 599 MB to żółte (zapytaj Claude, nie buduj); poniżej 450 MB to czerwone. Przy żółtym albo czerwonym **nie buduj niczego**: nic jeszcze nie zmieniłeś (kod i obraz są stare), więc po prostu uruchom z powrotem dotychczasowy silnik poleceniem z punktu 8.1 i zapytaj Claude, co dalej.
+
+Przy zielonym świetle pobierz nowy kod:
 
 ```bash
 git pull --ff-only
@@ -869,7 +987,7 @@ git pull --ff-only
 git log --oneline -3
 ```
 
-Sprawdź skrót z Claude, a potem zbuduj oba obrazy i powtórz testy (punkty 1.7 i 1.9):
+Sprawdź skrót z Claude, a potem zbuduj obraz testowy i powtórz testy logiki (punkty 1.7 i 1.9):
 
 ```bash
 docker compose -f docker/compose.yml --profile test build gw-stock-test
@@ -879,13 +997,35 @@ docker compose -f docker/compose.yml --profile test build gw-stock-test
 docker compose -f docker/compose.yml --profile test run --rm gw-stock-test
 ```
 
+Zbuduj obraz silnika:
+
 ```bash
 docker compose -f docker/compose.yml build gw-stock-engine
 ```
 
+**Brama pamięci przed startem.** Zmierz jeszcze raz (kontenery testowe już nie istnieją):
+
+```bash
+free -m
+```
+
+Wymagane **500 MB** w kolumnie `available` (400 do 499 MB to żółte: zapytaj; poniżej 400 MB: nie uruchamiaj). Dopiero wtedy start:
+
 ```bash
 docker compose -f docker/compose.yml up -d gw-stock-engine
 ```
+
+**Pomiar po aktualizacji.** Po 10 minutach pracy wykonaj pomiar z punktu 2.4 (blok zapisujący `~/gw-pomiar-po.txt`) albo przynajmniej te dwa polecenia:
+
+```bash
+docker stats --no-stream gw-stock-engine
+```
+
+```bash
+free -m
+```
+
+Progi są te same co w punkcie 2.4: `MEM USAGE` silnika do 100 MiB (zielone), 101 do 150 MiB żółte, powyżej 150 MiB czerwone; `available` serwera co najmniej 400 MB. Przy żółtym lub czerwonym wyniku zatrzymaj silnik (hamulec 3) i zapytaj Claude.
 
 Jeśli aktualizacja zmienia `strategy_v1.toml`, `risk_v1.toml` albo `costs_v1.toml`, to nowy wariant strategii: odcisk przestanie pasować do pre-rejestracji i silnik zostanie w `dry_run`. **Nie uzbrajaj ponownie bez ustalenia z Claude.**
 
@@ -899,7 +1039,7 @@ tail -n 50 data/alerts.log
 grep -E "ERROR|HARD" data/alerts.log | tail -n 20
 ```
 
-Format linii: `czas-UTC POZIOM treść`. Alarmy są też w logu kontenera (`docker logs`), ale `data/alerts.log` przeżywa odtworzenie kontenera.
+Format linii: `czas-UTC POZIOM treść`. Alarmy są też w logu kontenera (polecenie docker logs), ale `data/alerts.log` przeżywa odtworzenie kontenera.
 
 ### 8.4 Poziomy kill switcha
 
@@ -908,7 +1048,7 @@ Format linii: `czas-UTC POZIOM treść`. Alarmy są też w logu kontenera (`dock
 | **Miękki (SOFT)** | Brak nowych wejść; istniejąca pozycja jest zarządzana normalnie | plik `data/STOP`; dzienny limit strat; rozbieżność z brokerem dłuższa niż 60 s; cisza notowań dłuższa niż 60 s; nieudane logowanie; trzy odrzucenia z rzędu |
 | **Twardy (HARD)** | Zamyka pozycje procedurą awaryjną, potem działa jak miękki | plik `data/HARD_STOP`; strata dzienna co najmniej 2 razy limit; strata łączna od startu 12 €; pozycja bez stopu dłużej niż 10 s |
 
-Oba poziomy są zapisane w dzienniku, przeżywają restart i **zdejmuje je wyłącznie Twoje polecenie `clear-kill`**; twardy zostaje do tego czasu także po restarcie. Procedura zdjęcia, po kolei. Najpierw ustal przyczynę (polecenie z punktu 8.3). Potem usuń pliki, zatrzymaj silnik i uruchom `clear-kill` **[po zadaniu 14b]**:
+Oba poziomy są zapisane w dzienniku, przeżywają restart i **zdejmuje je wyłącznie Twoje polecenie `clear-kill`**; twardy zostaje do tego czasu także po restarcie. Dotyczy to również miękkiego poziomu włączonego przez nieudane logowanie (punkt 9): sam restart go nie zdejmuje. **`clear-kill` działa tylko przy zatrzymanym silniku** (bierze blokadę instancji i inaczej odmawia). Procedura zdjęcia, po kolei. Najpierw ustal przyczynę (polecenie z punktu 8.3). Potem usuń pliki, zatrzymaj silnik i uruchom `clear-kill` **[po zadaniu 14b]**:
 
 ```bash
 rm -f data/STOP data/HARD_STOP
@@ -919,10 +1059,10 @@ docker compose -f docker/compose.yml stop
 ```
 
 ```bash
-docker compose -f docker/compose.yml run --rm -it gw-stock-engine python -m gwstock clear-kill --by wlasciciel
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
 ```
 
-Polecenie odmówi, jeśli pliki `STOP` albo `HARD_STOP` nadal istnieją. Na końcu uruchom silnik (`up -d`, jak w punkcie 8.1).
+Polecenie odmówi, jeśli pliki `STOP` albo `HARD_STOP` nadal istnieją albo jeśli silnik działa. Na końcu uruchom silnik (`up -d`, jak w punkcie 8.1).
 
 ### 8.5 Stan `BLOCKED` pozycji
 
@@ -930,46 +1070,193 @@ Polecenie odmówi, jeśli pliki `STOP` albo `HARD_STOP` nadal istnieją. Na koń
 
 1. Otwórz aplikację Capital.com i sprawdź, **czy istnieje otwarta pozycja DE40**.
 2. Jeśli **jest** (prawdziwa ekspozycja): zdecyduj, czy ją zamknąć. Zamknij ją ręcznie w aplikacji, jeśli nie ma być trzymana.
-3. Zatrzymaj silnik (`docker compose -f docker/compose.yml stop`).
-4. Gdy w aplikacji **nie ma** pozycji DE40: wyczyść stan lokalny poleceniem **[po zadaniu 14b]**. Polecenie samo sprawdza u brokera, że nie ma pozycji ani niewyjaśnionego zlecenia, prosi o potwierdzenie i zapisuje zdarzenie audytowe:
+3. Zatrzymaj silnik (hamulec 3 z początku dokumentu). `reset-position` działa tylko przy zatrzymanym silniku.
+4. Gdy w aplikacji **nie ma** pozycji DE40, wyczyść stan lokalny poleceniem **[po zadaniu 14b]**. Polecenie samo sprawdza u brokera, że pozycji nie ma; **odmówi także, gdy w dzienniku jest jeszcze niewyjaśnione zlecenie**. Prosi o potwierdzenie i zapisuje zdarzenie audytowe:
 
 ```bash
-docker compose -f docker/compose.yml run --rm -it gw-stock-engine python -m gwstock reset-position --by wlasciciel
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock reset-position --by wlasciciel
 ```
 
-5. Uruchom silnik (`up -d`). Jeśli polecenie odmówi, bo broker nadal widzi pozycję, wróć do punktu 1.
+5. Jeśli polecenie odmówi, bo broker nadal widzi pozycję albo zlecenie jest niewyjaśnione, wróć do punktu 1 i nie obchodź odmowy; zapytaj Claude. Po sukcesie uruchom silnik (punkt 8.1).
 
 ### 8.6 Uwagi operatorskie
 
 - **Nieczytelny stan kill switcha przy starcie.** Jeśli przy starcie dziennik był chwilowo nieczytelny, kill switch ustawia się na `SOFT` z powodem `KILL_STATE_UNREADABLE` i **zostaje miękki przez kolejne restarty**, aż go zdejmiesz `clear-kill`. To zamierzona ochrona: nie jest awarią sam w sobie, ale sprawdź przyczynę (miejsce na dysku, uprawnienia do `data/`).
 - **Pozycja trzymana dłużej niż 14 dni.** Silnik pobiera historię w oknach nie dłuższych niż 14 dni. Jeśli Ty (właściciel) trzymasz własną pozycję DE40 dłużej niż 14 dni i zamkniesz ją, gdy silnik jest wyłączony, historia może stać się niejednoznaczna i silnik zgłosi głośny błąd historii (`HISTORY_AMBIGUOUS`). Wtedy potrzebna jest Twoja interwencja z Claude; nie próbuj tego obchodzić. Zasada praktyczna: nie handluj ręcznie DE40 na rachunku silnika.
-- **Grudzień 2026.** Deutsche Börse zapowiedziała możliwe odstępstwo od godzin handlu w dniu **30.12.2026** (możliwe wcześniejsze zamknięcie). Kalendarz silnika tego jeszcze nie zawiera. Przed końcem grudnia poproś Claude o sprawdzenie komunikatu Deutsche Börse i dopisanie `2026-12-30` do `early_closes` w kalendarzu XETRA; jeśli aktualizacji jeszcze nie ma, rano 30.12.2026 wykonaj `touch data/STOP`.
+- **Grudzień 2026.** Lista skróconych sesji (`early_closes`) w kalendarzu XETRA jest dziś **pusta**: silnik zna tylko pełne sesje. Deutsche Börse zapowiedziała jednak możliwe odstępstwo od godzin handlu w dniu **30.12.2026** (możliwe wcześniejsze zamknięcie). Przed końcem grudnia poproś Claude o sprawdzenie komunikatu Deutsche Börse i dopisanie `2026-12-30` z godziną z komunikatu do `early_closes`. Jeśli aktualizacji jeszcze nie ma, rano 30.12.2026 użyj hamulca 1 (plik `data/STOP`) i niczego nie uzbrajaj na ten dzień.
 - **Kalendarz wygasa po 31.12.2027.** Od 2028-01-01 silnik traktuje każdy dzień jako „wygasły kalendarz" i nie wchodzi w pozycje. Zadbaj o aktualizację tabeli świąt przed końcem 2027 roku.
-- **Kopia zapasowa.** Katalog `data/` (dziennik SQLite, liczniki strat, stan kill switcha) kopiuj tylko po zatrzymaniu silnika: `docker compose -f docker/compose.yml stop`, potem `cp -a data data.kopia-$(date +%F)`.
+- **Kopia zapasowa.** Katalog `data/` (dziennik SQLite, liczniki strat, stan kill switcha) kopiuj tylko po zatrzymaniu silnika (hamulec 3) i **poza katalogiem projektu**: kopia wewnątrz repozytorium trafiłaby do kontekstu budowy obrazu i mogłaby trafić do publicznego repozytorium. Polecenie tworzy kopię w `~/gw-kopie` (dostęp tylko dla `claude`):
+
+```bash
+(umask 077; mkdir -p ~/gw-kopie && cp -a data ~/gw-kopie/data-$(date +%F-%H%M))
+```
+
+Po kopii uruchom silnik zwykłym startem (punkt 8.1).
 - **Restart serwera.** Po restarcie VPS kontener startuje sam (polityka `unless-stopped`), chyba że był zatrzymany ręcznie. Po każdym restarcie serwera sprawdź `ps` i `status`.
 
 ---
 
 ## 9. Rozwiązywanie problemów
 
-| Objaw | Sprawdź | Co zrobić |
-|---|---|---|
-| Kontener ciągle się restartuje (`Restarting`) | `docker inspect gw-stock-engine --format 'OOMKilled={{.State.OOMKilled}} kod={{.State.ExitCode}} restarty={{.RestartCount}}'` oraz `docker logs --tail 50 gw-stock-engine` | **Najpierw** `docker compose -f docker/compose.yml stop` (żeby nie zapętlać logowań do brokera). Kod 3: inna instancja (patrz `AlreadyRunning`). Kod 2: błąd konfiguracji lub pliku klucza (komunikat w logu, bez treści sekretów). `OOMKilled=true`: patrz następny wiersz |
-| `OOMKilled=true` (brak pamięci) | `docker stats --no-stream`, `free -m`, plik `~/gw-pomiar-po.txt` | `stop`, zgłoś Claude z wynikiem pomiaru. **Nie podnoś limitu** `mem_limit` na własną rękę: serwer dzieli pamięć z botem z prawdziwymi pieniędzmi |
-| Status `unhealthy` | `docker inspect gw-stock-engine --format '{{json .State.Health.Log}}'`; `status` (wiek tętna); `docker logs --tail 50 gw-stock-engine` | Kontrola zdrowia jest zielona, gdy tętno jest świeższe niż 120 s. Gdy nie jest, silnik wisi albo nie zapisuje do `data/` (miejsce na dysku, uprawnienia). `stop`, odczytaj logi, `up -d`; jeśli się powtarza, zgłoś |
-| `refused: another engine instance holds /data/engine.lock` (kod 3, `AlreadyRunning`) | `docker ps`, czy działa inny kontener silnika albo `bind-account` / `smoke` | Zatrzymaj drugą instancję. Plik `engine.lock` zwalnia się sam po zakończeniu procesu: **nie usuwaj go ręcznie**. `bind-account`, `smoke` i `clear-kill` działają tylko przy zatrzymanym silniku |
-| Błąd logowania, alarm `LOGIN_FAILED` | `tail -n 30 data/alerts.log` | **Nie ponawiaj logowania w pętli** (limit brokera: 1 logowanie na sekundę, a seria błędów grozi zablokowaniem klucza). Po 3 nieudanych próbach silnik sam przestaje się logować i włącza `SOFT` (`LOGIN_LOCKOUT`). Zatrzymaj silnik, odczekaj co najmniej 10 minut, sprawdź w Capital.com, czy klucz API nie został wymieniony lub wyłączony i czy hasło się zgadza, zweryfikuj plik klucza (punkt 1.3), wykonaj **jedną** próbę (punkt 1.8), dopiero potem `up -d`. Silnik zapomina serię błędów po restarcie; plik `data/LOGIN_RESET` zdejmuje blokadę logowań bez restartu |
-| Silnik w `dry_run`, mimo że uzbrojony | `docker logs gw-stock-engine 2>&1 \| grep "mode:"` oraz `status` (linia `mode (files)`) | Silnik sam podaje powód. Możliwe powody: `live_allowed is not true` (sprawdź `grep live_allowed config/runtime.toml`); `data/ARM_LIVE does not exist`; `no bound account` (zrób `bind-account`); `no frozen pre-registration fingerprint` albo `fingerprint differs` (nie zrobiono `prereg --write` albo zmieniono pliki strategii, ryzyka lub kosztów); po starcie także kontrola rachunku u brokera (rachunek nieaktywny, saldo 0, waluta inna niż EUR, rachunek sesji inny niż powiązany). Po każdej zmianie plików: `stop`, potem `up -d` (tryb wybiera się przy starcie) |
-| Zegar serwera się rozjechał | polecenie poniżej tabeli; `timedatectl` | Różnica powyżej 2 s jest podejrzana, powyżej 10 s wymaga naprawy synchronizacji czasu (NTP) przez administratora serwera. Do czasu naprawy `touch data/STOP` |
-| `Permission denied` w `data/` albo przy kluczu | `ls -ln data`; `cat docker/.env`; wynik próby izolacji (punkt 1.10); `getenforce` | Numery właściciela w `ls -ln` muszą równać się `GW_UID` i `GW_GID`. Jeśli katalog `data` powstał jako `root`, jako `root` wykonaj `chown -R claude:claude /home/claude/gw-stock-engine/data`. Jeśli `getenforce` pokazuje `Enforcing` i uprawnienia są poprawne, zgłoś to: **nie dodawaj sam** oznaczeń `:z` do montowań (zmieniają etykiety plików w katalogu domowym) |
-| `error while interpolating ... GW_UID` | `ls docker/.env` | Brak pliku `docker/.env`: wykonaj polecenie z punktu 1.5. Jednorazowo można też użyć `export GW_UID=$(id -u claude) GW_GID=$(id -g claude)` w tej samej sesji |
-| `bind-account aborted: ... nothing written` | treść komunikatu | Uruchom polecenie jeszcze raz i wpisz poprawny numer pozycji oraz ostatnie 4 znaki numeru rachunku (punkt 1.11) |
-| Brak alarmów i tętna po zmianie czasu | `docker logs --tail 50 gw-stock-engine` | Silnik liczy czas przez strefę czasową, zmiana czasu nie wymaga żadnych działań. Jeśli wątpisz, sprawdź punkt 3 w następnej sesji |
+Tabela mówi, co oznacza objaw i które polecenia z listy pod tabelą wykonać (numery w nawiasach). **Wszystkie polecenia są w blokach pod tabelą**, nie w samej tabeli.
 
-Pomiar różnicy zegara względem serwera Capital.com (zapytanie bez logowania, bez ryzyka dla klucza; wynik w milisekundach, zawiera opóźnienie sieci, więc kilkaset ms jest normalne):
+| Objaw | Co to znaczy i co sprawdzić | Co zrobić |
+|---|---|---|
+| Kontener ciągle się restartuje (`Restarting`) | Proces kończy się błędem zaraz po starcie. Kod wyjścia i `OOMKilled` pokaże polecenie 2, przyczynę polecenie 3 | **Najpierw zatrzymaj** (polecenie 1), żeby nie zapętlać logowań do brokera: **każdy restart daje 3 nowe próby logowania**. Kod 3: inna instancja (wiersz `AlreadyRunning`). Kod 2: błąd konfiguracji lub pliku klucza (komunikat w logu, bez treści sekretów; zob. też wiersz o katalogu zamiast pliku klucza). `OOMKilled=true`: następny wiersz |
+| `OOMKilled=true` (brak pamięci) | Jądro zabiło proces po przekroczeniu 256 MB (polecenia 2 i 4, plik `~/gw-pomiar-po.txt`) | Zatrzymaj (1), zgłoś Claude z wynikiem pomiaru. **Nie podnoś limitu** `mem_limit` na własną rękę: serwer dzieli pamięć z botem z prawdziwymi pieniędzmi |
+| Status `unhealthy` | Tętno starsze niż 120 s: silnik wisi albo nie zapisuje do `data/` (miejsce na dysku, uprawnienia). Polecenia 5, 6 i 3 | Zatrzymaj (1), odczytaj logi (3), uruchom (polecenie z punktu 8.1); jeśli się powtarza, zgłoś |
+| `refused: another engine instance holds ...` (kod 3, `AlreadyRunning`) | Inny silnik, `bind-account`, `smoke`, `clear-kill` albo `reset-position` trzyma blokadę (polecenie 7) | Zatrzymaj drugą instancję. Plik `engine.lock` zwalnia się sam po zakończeniu procesu: **nie usuwaj go ręcznie**. Polecenia `bind-account`, `smoke`, `clear-kill` i `reset-position` działają tylko przy zatrzymanym silniku |
+| **Błąd logowania, alarm `LOGIN_FAILED`** (kill switch miękki) | Capital.com odrzuca klucz lub hasło. Silnik liczy tylko odrzucenia danych logowania; błędy sieci nie wliczają się do licznika (silnik czeka wtedy 30 s, potem do 5 minut). Po 3 odrzuceniach z rzędu przestaje się logować (`LOGIN_LOCKOUT`) i włącza `SOFT`. Licznik jest tylko w pamięci, więc **każdy restart kontenera daje 3 nowe próby**. Alarmy: polecenie 8 | **Zasada: nie więcej niż jedna próba logowania po alarmie albo problemie z kluczem.** Procedura: (a) zatrzymaj silnik (1), (b) odczekaj co najmniej 10 minut, (c) sprawdź w Capital.com, czy klucz API nie został wymieniony lub wyłączony i czy hasło się zgadza; zweryfikuj plik klucza (punkt 1.3), (d) wykonaj **jedną** próbę: pojedyncze logowanie (polecenie 9), **nie** pełny zestaw 8 logowań i **nie** wielokrotne uruchamianie silnika, (e) gdy próba przeszła: zdejmij kill switch (polecenie 10, silnik jest zatrzymany), potem uruchom silnik. Miękki kill switch od nieudanego logowania **nie znika sam po restarcie**: bez `clear-kill` silnik nie wejdzie w pozycję. (f) gdy próba nie przeszła: STOP, nie ponawiaj, zapytaj |
+| Silnik w `dry_run`, mimo że uzbrojony | Silnik sam podaje powód w logu przy starcie i w `status` (polecenia 11 i 6) | Możliwe powody: `live_allowed is not true` (sprawdź polecenie 12); `data/ARM_LIVE does not exist` (pamiętaj: usunięcie pliku wyłącza wejścia do restartu); `no bound account` (zrób `bind-account`); `no frozen pre-registration fingerprint` albo `fingerprint differs` (nie zrobiono pre-rejestracji albo zmieniono pliki strategii, ryzyka lub kosztów); po starcie także kontrola rachunku u brokera (rachunek nieaktywny, saldo 0, waluta inna niż EUR, rachunek sesji inny niż powiązany). Po każdej zmianie plików: zatrzymaj, potem uruchom (tryb wybiera się przy starcie) |
+| Zegar serwera się rozjechał | Decyzje i kontrola ciszy notowań liczą czas z zegara serwera (polecenia 13 i 14) | Różnica powyżej 2 s jest podejrzana, powyżej 10 s wymaga naprawy synchronizacji czasu (NTP) przez administratora serwera. Do czasu naprawy hamulec 1 (plik `data/STOP`) |
+| `Permission denied` w `data/` albo przy kluczu | Numer właściciela plików nie zgadza się z użytkownikiem kontenera (polecenia 15 i 16, wynik próby izolacji z punktu 1.10) | Numery w wyniku polecenia 15 muszą równać się `GW_UID` i `GW_GID`. Jeśli katalog `data` powstał jako `root`, napraw go jako `root` (polecenia 17 i 18). Jeśli polecenie 19 pokazuje `Enforcing`, a uprawnienia są poprawne, zgłoś to: **nie dodawaj sam** oznaczeń `:z` do montowań (zmieniają etykiety plików w katalogu domowym) |
+| **Katalog zamiast pliku klucza**: próba izolacji pokazuje, że klucz nie jest plikiem, albo Docker zgłasza błąd montowania | Gdy plik klucza nie istniał w chwili uruchomienia polecenia docker compose, **Docker (jako root) założył w jego miejscu pusty KATALOG** o tej nazwie, a klucz nie jest czytelny (polecenie 20 pokaże `d` na początku uprawnień) | Zatrzymaj wszystko (1). Wróć na konto `root` (polecenie 17) i usuń **pusty** katalog poleceniem `rmdir` (polecenie 21; `rmdir` odmówi usunięcia czegokolwiek niepustego). Wróć na `claude` (polecenie 22) i załóż plik od nowa według Dodatku A. Zanim ponownie uruchomisz cokolwiek, powtórz punkt 1.3 |
+| `error while interpolating ... GW_UID` | Brak pliku `docker/.env` | Wykonaj polecenie z punktu 1.5. Jednorazowo, tylko w tej sesji, można też użyć polecenia 23 |
+| `bind-account aborted: ... nothing written` | Pomyłka w numerze pozycji albo w ostatnich 4 znakach numeru rachunku | Uruchom polecenie jeszcze raz (punkt 1.11) |
+| Brak alarmów i tętna po zmianie czasu | Silnik liczy czas przez strefę czasową, zmiana czasu nie wymaga żadnych działań | Sprawdź logi (3). Jeśli wątpisz, sprawdź punkt 3 w następnej sesji |
+
+### Polecenia do tabeli
+
+1\. Zatrzymanie silnika:
+
+```bash
+docker compose -f docker/compose.yml stop
+```
+
+2\. Kod wyjścia, brak pamięci i licznik restartów:
+
+```bash
+docker inspect gw-stock-engine --format 'OOMKilled={{.State.OOMKilled}} kod={{.State.ExitCode}} restarty={{.RestartCount}}'
+```
+
+3\. Ostatnie logi silnika:
+
+```bash
+docker logs --tail 50 gw-stock-engine
+```
+
+4\. Zużycie pamięci kontenera i serwera:
+
+```bash
+docker stats --no-stream gw-stock-engine
+```
+
+```bash
+free -m
+```
+
+5\. Dziennik kontroli zdrowia:
+
+```bash
+docker inspect gw-stock-engine --format '{{json .State.Health.Log}}'
+```
+
+6\. Stan silnika (kill switch, tętno, tryb):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock status
+```
+
+7\. Działające kontenery (czy jest inny silnik):
+
+```bash
+docker ps
+```
+
+8\. Ostatnie alarmy:
+
+```bash
+tail -n 30 data/alerts.log
+```
+
+9\. Pojedyncze logowanie (jedna próba klucza, silnik musi być zatrzymany):
+
+```bash
+docker compose -f docker/compose.yml --profile test run --rm gw-stock-live-readonly python -m pytest -m integration_live_readonly -k test_accounts_listed -v -p no:cacheprovider
+```
+
+10\. Zdjęcie kill switcha po nieudanym logowaniu **[po zadaniu 14b]** (silnik zatrzymany):
+
+```bash
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel
+```
+
+11\. Powód trybu `dry_run` z logu startowego:
+
+```bash
+docker logs gw-stock-engine 2>&1 | grep "mode:"
+```
+
+12\. Wartość `live_allowed` (druga linia komentarza nie jest wypisywana):
+
+```bash
+grep '^live_allowed' config/runtime.toml
+```
+
+13\. Różnica zegara serwera względem serwera Capital.com (zapytanie bez logowania, bez ryzyka dla klucza; wynik w milisekundach i zawiera opóźnienie sieci, więc kilkaset ms jest normalne):
 
 ```bash
 S=$(curl -sS -m 10 https://api-capital.backend-capital.com/api/v1/time | grep -o '[0-9]\{13\}'); echo "różnica zegara serwera względem Capital.com [ms]: $(( $(date +%s%3N) - S ))"
+```
+
+14\. Stan synchronizacji czasu:
+
+```bash
+timedatectl
+```
+
+15\. Numery właściciela plików w `data/`:
+
+```bash
+ls -ln data
+```
+
+16\. Zawartość pliku z numerami użytkownika (nie zawiera sekretów):
+
+```bash
+cat docker/.env
+```
+
+17\. Przełączenie na konto `root` (wyjście z konta `claude`):
+
+```bash
+exit
+```
+
+18\. Jako `root`: naprawa właściciela katalogu danych:
+
+```bash
+chown -R claude:claude /home/claude/gw-stock-engine/data
+```
+
+19\. Tryb SELinux:
+
+```bash
+getenforce
+```
+
+20\. Rodzaj ścieżki klucza (pierwszy znak `-` to plik, `d` to katalog):
+
+```bash
+ls -ld /home/claude/.config/gw/capitalcom.json
+```
+
+21\. Jako `root`: usunięcie pustego katalogu założonego przez Dockera w miejscu pliku klucza:
+
+```bash
+rmdir /home/claude/.config/gw/capitalcom.json
+```
+
+22\. Powrót na konto `claude`:
+
+```bash
+su - claude
+```
+
+23\. Jednorazowe ustawienie zmiennych w bieżącej sesji (po nim wróć do katalogu projektu):
+
+```bash
+export GW_UID=$(id -u claude) GW_GID=$(id -g claude)
 ```
 
 ---
@@ -979,19 +1266,20 @@ S=$(curl -sS -m 10 https://api-capital.backend-capital.com/api/v1/time | grep -o
 Uzbrajasz (punkt 6) dopiero, gdy **każda** pozycja jest zaznaczona. Nie ma „prawie".
 
 - [ ] Testy w obrazie przeszły (`passed`, zero `failed` i `error`).
-- [ ] Odczyty live tylko do odczytu przeszły: wszystkie `PASSED`, zero `SKIPPED`, także po `bind-account`.
+- [ ] Odczyty live tylko do odczytu przeszły: jeden pełny przebieg (8 testów) z samymi `PASSED` i zero `SKIPPED`, a po `bind-account` pojedyncze logowanie z wynikiem `1 passed`.
 - [ ] Pamięć zmierzona i w zielonych progach: po 10 minutach do 100 MiB, szczyt po pełnej sesji do 170 MiB, `available` serwera co najmniej 400 MB, `OOMKilled=false`, pozostałe kontenery bez zmian.
 - [ ] `memory.swap.max` ma wartość `0` (kontener naprawdę nie używa swapu).
 - [ ] Próba izolacji (punkt 1.10): `WYNIK: WSZYSTKO OK`.
 - [ ] Co najmniej jedna pełna sesja `dry_run` bez rozbieżności i bez alarmów `ERROR` w `data/alerts.log`.
 - [ ] Pierwsza świeca zweryfikowana z wykresem w aplikacji (punkt 3), na co najmniej dwóch dniach; znacznik czasu świecy potwierdzony.
-- [ ] Ćwiczenia wykonane i kill switch zdjęty po każdym: `STOP`, `HARD_STOP`, `kill -9`, odcięcie sieci.
+- [ ] Ćwiczenia wykonane i kill switch zdjęty po każdym: `STOP`, `HARD_STOP`, docker kill (ćwiczenie 4.3), odcięcie sieci.
+- [ ] Awaria procesu wewnątrz kontenera (ćwiczenie 4.3b): kontener wstał sam, bez błędów w logach i bez nowych alarmów `ERROR`.
 - [ ] `bind-account` wykonane, `data/account.json` istnieje, rachunek to ten z 40 € w EUR.
 - [ ] Pre-rejestracja zamrożona [po zadaniu 15], od tego czasu żadnych zmian w `strategy_v1.toml`, `risk_v1.toml`, `costs_v1.toml`.
 - [ ] `smoke` zakończony `PASS smoke: N/N`, krok [6] (drugie zamknięcie) na `PASS`, stop obejrzany w aplikacji albo zgłoszony Claude.
 - [ ] Po `smoke` usunięto `data/ARM_LIVE` i `live_allowed` wróciło do `false`; uzbrojenie na stałe jest osobną, świadomą decyzją.
 - [ ] W aplikacji Capital.com nie ma żadnej otwartej pozycji DE40, a saldo zgadza się z oczekiwanym.
-- [ ] Wiesz, jak rozbroić (punkt 6) i jak zatrzymać natychmiast (`touch data/STOP`, `docker compose -f docker/compose.yml stop`).
+- [ ] Wiesz, jak rozbroić (punkt 6) i jak zatrzymać natychmiast (szybkie hamulce 1 do 3 z początku dokumentu).
 - [ ] Sprawdzono kalendarz: gdy zbliża się 30.12.2026, aktualizacja `early_closes` jest zrobiona (punkt 8.6).
 
 ---

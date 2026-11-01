@@ -1,5 +1,6 @@
 # dane robocze silnika (dziennik, ARM_LIVE, account.json) i notatki robocze agentów
 data/
+data*/
 .superpowers/
 
 # Python

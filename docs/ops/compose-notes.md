@@ -268,7 +268,7 @@ Szkic z tej sekcji został zastąpiony plikiem `docker/compose.yml`; zmiany wobe
 - wolumeny `../data:/data`, `../config:/app/config:ro` i `${GW_SECRET_FILE:-/home/claude/.config/gw/capitalcom.json}:/secrets/capitalcom.json:ro` (ścieżki względne od katalogu pliku, patrz sekcja 4),
 - `tmpfs: ["/tmp:size=32m"]` (sprawdzone lokalnie, sekcja 1.8),
 - healthcheck `["CMD", "python", "-m", "gwstock", "health"]`, `interval` 60 s, `timeout` 15 s, `start_period` 120 s (sekcja 1.9),
-- dodane: `cpus: 0.5`, `container_name: gw-stock-engine`, `logging` (`json-file`, `max-size` 10m, `max-file` 3), `name: gw-stock-engine`, `build` z celem `runtime`, drugi serwis `gw-stock-test` w profilu `test` z celem `test`, `data` tylko do odczytu i bez healthchecku,
+- dodane: `cpus: 0.5`, `container_name: gw-stock-engine`, `logging` (`json-file`, `max-size` 10m, `max-file` 3), `name: gw-stock-engine`, `build` z celem `runtime`; dwa serwisy w profilu `test` z celem `test` (runda poprawek 1: podział wg najmniejszych uprawnień): `gw-stock-test` (testy logiki: **bez klucza, bez danych i z `network_mode: none`**) oraz `gw-stock-live-readonly` (testy `integration_live_readonly`: klucz i dane tylko do odczytu, z siecią, domyślne polecenie uruchamia wyłącznie te testy); oba bez healthchecku,
 - bez zmian: `read_only`, `mem_limit` 256m, `memswap_limit` 256m, `mem_reservation` 128m, `oom_score_adj` 1000, `pids_limit` 64, `restart: unless-stopped`, `init`, `stop_grace_period` 30s, `cap_drop: [ALL]`, `no-new-privileges`, brak `ports`.
 
 Test `tests/unit/test_compose.py` pilnuje tych ustawień (w tym brak innych woluminów niż trzy wymienione, brak sekretów w `environment`).
@@ -282,7 +282,8 @@ Test `tests/unit/test_compose.py` pilnuje tych ustawień (w tym brak innych wolu
 | Czy `mem_reservation` trafia do `memory.low` | do potwierdzenia w dry_run lub w odczytach live | Sekcja 4 pkt 3 |
 | Czy rozmiar tmpfs w formie krótkiej jest respektowany | sprawdzone lokalnie (sekcja 7); na VPS do potwierdzenia | sonda z runbooka (pkt 1.10), `df -h /tmp` |
 | Pamięć szczytowa procesu pod limitem (cel ok. 100 MB to założenie) | do potwierdzenia w dry_run lub w odczytach live | `docker stats` w `dry_run`, Zadanie 18 |
-| Odstęp między restartami `unless-stopped` | do potwierdzenia w dry_run lub w odczytach live | Obserwacja w teście awarii; nie opisany w przeczytanych stronach. Zabicie ręczne (`docker kill`) nie uruchamia restartu (sekcja 1.10) |
+| Odstęp między restartami `unless-stopped` | do potwierdzenia w dry_run lub w odczytach live | Obserwacja w teście awarii; nie opisany w przeczytanych stronach. Zabicie ręczne (`docker kill`) nie uruchamia restartu (sekcja 1.10); samoczynny restart po awarii procesu wewnątrz kontenera sprawdza ćwiczenie 4.3b z runbooka (lokalnie: restart po ok. 1 s, `RestartCount` +1) |
+| Samoczynny restart po awarii procesu w kontenerze (bez `docker kill`) i uzgadnianie startowe bez błędów | zaobserwowane lokalnie; na VPS do potwierdzenia | Ćwiczenie 4.3b z runbooka |
 | Wartości `pids_limit`, `mem_reservation`, `stop_grace_period` | do potwierdzenia w dry_run lub w odczytach live | Pomiar w `dry_run` |
 
 ## 7. Weryfikacja lokalna w Zadaniu 16 (co sprawdzono, a czego nie)
@@ -303,3 +304,13 @@ Sprawdzone (`udokumentowane` przez obserwację, wynik do powtórzenia na VPS wed
 | Testy w obrazie testowym (`read_only`, uid 1000, `/tmp` 128 MiB, limit 384 MiB) | pełny zestaw bez testów live biegnie w ok. 35 s i nie jest zabijany przez limit pamięci |
 
 Nie sprawdzono (do zrobienia na VPS według runbooka): nazwy plików cgroup v2 (`memory.swap.max` itd.) i ich wartości, rachunkowość swapu w jądrze VPS, `memory.peak` (wymaga jądra 5.19 lub nowszego), SELinux przy montowaniach z katalogu domowego, pamięć silnika w sesji z prawdziwym połączeniem do brokera, zachowanie obrazu bazowego przy `docker build` na VPS (budowa lokalna użyła dodatkowego certyfikatu proxy sandboxa tylko dla `pip`, plik `docker/Dockerfile` go nie zawiera).
+
+### 7.1 Uzupełnienie po rundzie poprawek 1 (Zadanie 16)
+
+| Co | Wynik |
+|---|---|
+| Awaria procesu wewnątrz kontenera | Obraz nie ma `pkill`, `pgrep` ani `ps`. PID 1 to `/sbin/docker-init`, silnik to jego dziecko (`python -m gwstock`, tu PID 7). Zabicie dziecka sygnałem KILL przeszukaniem `/proc` w `docker exec sh -c` kończy kontener (init przekazuje kod), Docker traktuje to jako awarię (nie „ręczne zatrzymanie") i po ok. sekundzie uruchamia go sam: `RestartCount` 0 -> 1, `healthy` po kilkunastu sekundach, logi poprzedniego uruchomienia zachowane, brak alarmów, `kill switch: NONE`, `unresolved orders: 0` |
+| `network_mode: none` dla `gw-stock-test` | Pętla loopback działa (serwery atrap adaptera słuchają na `127.0.0.1`): `tests/unit` 1724 passed, 18 skipped w 8 s, `tests/fault` bez `test_watchdog.py` 488 passed, w kontenerze z systemem plików tylko do odczytu i bez montowań |
+| `gw-stock-live-readonly` | Domyślne polecenie zbiera 8 testów live; `-k test_accounts_listed` wybiera dokładnie 1 z 8 (jedno logowanie). Pełny zestaw to 8 logowań (każdy test ma fixture `live` z osobnym logowaniem) |
+| `.dockerignore` `data*/` | Próba kontekstu budowy (`COPY . /ctx`): z wzorcem `data*/` katalog `data.kopia-test` i `data` nie trafiają do kontekstu; kontrola negatywna bez tego wzorca: `data.kopia-test` trafia |
+
