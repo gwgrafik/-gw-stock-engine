@@ -689,14 +689,38 @@ def test_recovered_read_but_failing_write_stays_unsynced_and_keeps_retrying(
     assert journal.kill_state().level is KillLevel.SOFT
 
 
-def test_clear_after_an_unreadable_start_is_the_explicit_way_out(
+def test_clear_refuses_while_the_stored_state_is_unreadable(
     journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
 ):
-    break_method(monkeypatch, journal, "kill_state", JournalReadError("locked"))
+    journal.set_kill(KillLevel.HARD, "original", clock.now_utc())  # zapisany HARD, którego silnik nie umie odczytać
+    set_kill_calls.clear()
+    real_state = journal.kill_state
+    state = flaky_kill_state(monkeypatch, journal)
     ks = KillSwitch(journal, clock, data_dir, notifier)
+    alerts_before, audit_before = list(notifier.alerts), audit(journal)
+    with pytest.raises(ValueError, match=r"cannot be read; refusing to clear \(it may be HARD\)"):
+        ks.clear("owner")
+    assert state["calls"] == 2  # start + ponowiona próba odczytu w clear()
+    assert ks.level() is KillLevel.SOFT and set_kill_calls == []  # niczego nie zdjęto i nie nadpisano
+    assert (real_state().level, real_state().reason) == (KillLevel.HARD, "original")
+    assert notifier.alerts == alerts_before and audit(journal) == audit_before
+
+
+def test_clear_reports_the_stored_hard_after_recovery(journal, clock, data_dir, notifier, monkeypatch, set_kill_calls):
+    journal.set_kill(KillLevel.HARD, "original", clock.now_utc())
+    set_kill_calls.clear()
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    assert ks.level() is KillLevel.SOFT  # zapisanego HARD jeszcze nie widać
+    state["down"] = False  # baza wróciła przed jawnym zdjęciem
+    clock.advance(60)
     ks.clear("owner")
-    assert ks.level() is KillLevel.NONE
-    assert set_kill_calls[-1][0] is KillLevel.NONE
+    assert ks.level() is KillLevel.NONE and journal.kill_state().level is KillLevel.NONE
+    entry = audit(journal)[-1]
+    assert entry["event"] == "CLEAR" and entry["requested_by"] == "owner"
+    assert (entry["previous_level"], entry["previous_reason"]) == ("HARD", "original")  # zdjęto naprawdę HARD
+    level, message = notifier.alerts[-1]
+    assert level == "CLEAR" and "was HARD: original" in message
     ks.soft("w")  # po jawnym zdjęciu stan jest znany, więc soft znów jest zapisywany
     assert set_kill_calls[-1] == (KillLevel.SOFT, "w")
 

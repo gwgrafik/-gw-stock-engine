@@ -67,10 +67,12 @@ Kill switch (`KillSwitch`) to awaryjny wyłącznik. Poziom jest w pamięci (decy
 - Każda zmiana zostawia wiersz audytu (`journal.append_raw("kill.audit", ...)`), więc historia przyczyn nie ginie
   mimo jednego wiersza stanu.
 - `clear(requested_by)` wymaga niepustego `requested_by`, odmawia (ValueError), dopóki leży `data/STOP` lub
-  `data/HARD_STOP` (inaczej `scan_files` włączyłby kill switch od razu) albo nie da się tego sprawdzić.
+  `data/HARD_STOP` (inaczej `scan_files` włączyłby kill switch od razu) albo nie da się tego sprawdzić, a także
+  dopóki nie da się odczytać zapisanego stanu (mógł tam być HARD; `clear` sam ponawia odczyt). Alarm i audyt
+  zdjęcia podają poziom po scaleniu z dziennikiem.
 - Nie da się odczytać zapisanego stanu przy starcie: start od SOFT (`KILL_STATE_UNREADABLE`, nie znamy poprzedniego
   poziomu). Dopóki stanu nie znamy, `soft` nie nadpisuje dziennika (mógł tam być HARD), a każdy alarm niesie znacznik
-  NOT_PERSISTED: poziom jest tylko w pamięci. Odczyt jest ponawiany przy każdym `soft`/`hard`/`scan_files`; po
+  NOT_PERSISTED: poziom jest tylko w pamięci. Odczyt jest ponawiany przy każdym `soft`/`hard`/`scan_files`/`clear`; po
   sukcesie zapisany poziom wchodzi do pamięci (HARD wraca, nigdy nie obniżamy), a poziom z pamięci, jeśli jest
   wyższy od zapisanego, trafia do dziennika (wiersz stanu + audyt). HARD zapisuje się od razu (niczego nie obniży).
 - `data/HARD_STOP`, którego obecności nie da się sprawdzić (błąd systemu plików inny niż brak pliku), włącza tylko
@@ -475,7 +477,13 @@ class KillSwitch:
             self._retry_unsynced()
 
     def clear(self, requested_by: str) -> None:
-        """Jawne zdjęcie poziomu. Rzuca ValueError (brak `requested_by`, plik STOP) i błąd zapisu dziennika."""
+        """Jawne zdjęcie poziomu. Rzuca ValueError (brak `requested_by`, plik STOP, nieczytelny zapisany stan) i błąd
+        zapisu dziennika.
+
+        Najpierw ponawia odczyt nieznanego stanu startowego: dopóki go nie znamy, odmawia (mógł tam być HARD, a
+        zdjęcie nadpisałoby go po ciemku). Alarm i audyt podają poziom po scaleniu z dziennikiem ("was HARD", gdy
+        odczyt odzyskał zapisany HARD), nie ten, od którego silnik wystartował.
+        """
         if not isinstance(requested_by, str) or not requested_by.strip():
             raise ValueError(f"requested_by: a non-empty name of who clears the kill switch, got {requested_by!r}")
         who = requested_by.strip()
@@ -490,7 +498,10 @@ class KillSwitch:
                     f"{path} exists: remove it first, otherwise scan_files() would engage the kill switch again at once"
                 )
         with self._lock:
-            previous_level, previous_reason = self._level, self._reason
+            self._resolve_unknown()
+            if self._state_unknown:
+                raise ValueError("the stored kill state cannot be read; refusing to clear (it may be HARD)")
+            previous_level, previous_reason = self._level, self._reason  # już scalone z zapisanym stanem
             ts = self._now()
             self._journal.set_kill(KillLevel.NONE, f"CLEARED by {who}", ts)  # błąd: poziom w pamięci zostaje
             self._level, self._reason = KillLevel.NONE, ""
