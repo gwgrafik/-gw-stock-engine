@@ -859,6 +859,149 @@ async def test_mismatch_since_is_set_while_pending_and_cleared_when_resolved(jou
     assert not journal.get_meta("mismatch_since") and kill_sink.calls == []
 
 
+# --- O-1: zamknięcie silnika, którego historia brokera jeszcze nie pokazuje → osobny alarm ----------------------------
+
+
+def lagging_history(fake, monkeypatch):
+    """Historia brokera z opóźnieniem: dopóki `lag["on"]`, `closed_since` (wciąż wywołany i zapisany w `calls`) jest
+    pusty; potem pokazuje zamknięcia jak zwykle."""
+    lag = {"on": True}
+    real = fake.closed_since
+
+    async def closed_since(since):
+        found = await real(since)
+        return [] if lag["on"] else found
+
+    monkeypatch.setattr(fake, "closed_since", closed_since)
+    return lag
+
+
+def engine_close_record(journal, ts, deal_id="DEAL-1", **extra):
+    """Surowy zapis wykonawcy tuż po wywołaniu zamykającym (jak `Executor._raw(SOURCE_CLOSE, ...)`)."""
+    payload = {"deal_id": deal_id, "flatten_reason": "FORCED", **extra}
+    journal.append_raw("broker.close_position", json.dumps(payload), ts)
+
+
+CLOSURE_ALERT = (
+    "CLOSURE_NOT_IN_HISTORY DEAL-1: closed by the engine at {closed}, gone at the broker, no history entry after "
+    "{waited} s; booking waits; the kill switch stays SOFT until clear-kill"
+)
+
+
+async def test_closure_not_in_history_after_an_engine_close_raises_a_specific_alert_once(
+    journal, fake, clock, kill_sink, risk_cfg, booker, notifier, monkeypatch
+):
+    rec = Reconciler(journal, fake, clock, kill_sink, risk_cfg, EPIC, booker=booker, notifier=notifier)
+    journal.upsert_position(held(P.EXITING))  # wykonawca: EXITING, potem wywołanie zamykające
+    put(fake, at_broker())
+    await fake.close_position("DEAL-1")
+    engine_close_record(journal, T0, response=None)
+    fake.calls.clear()
+    lag = lagging_history(fake, monkeypatch)
+
+    clock.advance(10)
+    first = await rec.run_once()  # pierwszy przebieg po zamknięciu: brak u brokera i w historii
+    assert has_note(first, "LOCAL_POSITION_MISSING") and position(journal) == held(P.BLOCKED)
+    clock.advance(risk_cfg.mismatch_tolerance_s)
+    await rec.run_once()  # równo w tolerancji: jeszcze nic
+    assert notifier.alerts == [] and kill_sink.calls == []
+
+    clock.advance(1)
+    timed_out = await rec.run_once()
+
+    waited = 10 + risk_cfg.mismatch_tolerance_s + 1
+    assert kill_sink.calls == ["MISMATCH_TIMEOUT"]  # zachowanie bez zmian: ten sam kill switch miękki
+    assert notifier.alerts == [("ERROR", CLOSURE_ALERT.format(closed=T0.isoformat(), waited=waited))]
+    assert has_note(timed_out, "CLOSURE_NOT_IN_HISTORY") and has_note(timed_out, "MISMATCH_TIMEOUT")
+    [event] = [e for e in payloads(journal, "reconcile.event") if e["event"] == "CLOSURE_NOT_IN_HISTORY"]
+    assert event == {
+        "event": "CLOSURE_NOT_IN_HISTORY", "deal_id": "DEAL-1", "closed_at": T0.isoformat(), "waited_s": waited,
+        "mismatch_since": (T0 + 10 * SECONDS).isoformat(),
+    }
+
+    for _ in range(3):  # ten sam incydent: kill switch dalej co przebieg, alarm i zdarzenie tylko raz
+        clock.advance(risk_cfg.reconcile_interval_s)
+        await rec.run_once()
+    assert len(notifier.alerts) == 1 and kill_sink.calls == ["MISMATCH_TIMEOUT"] * 4
+    assert [e["event"] for e in payloads(journal, "reconcile.event")].count("CLOSURE_NOT_IN_HISTORY") == 1
+
+    lag["on"] = False  # historia dogoniła: zwykłe księgowanie, kill switch zostaje do decyzji właściciela
+    booked = await rec.run_once()
+    assert len(booked.closed) == 1 and booked.closed[0].reason == "MANUAL" and len(booker.calls) == 1
+    assert position(journal) == PositionRecord(EPIC, P.FLAT) and not journal.get_meta("mismatch_since")
+    assert len(notifier.alerts) == 1 and fake.calls.count("close_position") == 0
+
+
+async def time_out_a_missing_deal(rec, clock, risk_cfg):
+    for step in (10, risk_cfg.mismatch_tolerance_s + 1):
+        clock.advance(step)
+        result = await rec.run_once()
+    return result
+
+
+@pytest.mark.parametrize(
+    "case", ["broker_stop", "close_refused_market_closed", "close_rejected", "other_deal_closed"]
+)
+async def test_closure_not_in_history_is_raised_only_for_a_close_the_engine_sent(
+    journal, fake, clock, kill_sink, risk_cfg, notifier, monkeypatch, case
+):
+    rec = Reconciler(journal, fake, clock, kill_sink, risk_cfg, EPIC, notifier=notifier)
+    journal.upsert_position(held())
+    put(fake, at_broker())
+    fake.trigger_stop("DEAL-1", STOP)  # pozycja zniknęła bez naszego zamknięcia (stop u brokera)
+    if case == "close_refused_market_closed":
+        engine_close_record(journal, T0, error="MarketClosed", message="market DE40 is closed")
+    elif case == "close_rejected":
+        engine_close_record(journal, T0, error="BrokerRejected", message="X", rejection="POSITION_NOT_FOUND")
+    elif case == "other_deal_closed":
+        engine_close_record(journal, T0, deal_id="DEAL-0", response=None)
+    lagging_history(fake, monkeypatch)
+
+    result = await time_out_a_missing_deal(rec, clock, risk_cfg)
+
+    assert kill_sink.calls == ["MISMATCH_TIMEOUT"] and has_note(result, "MISMATCH_TIMEOUT")
+    assert notifier.alerts == [] and not has_note(result, "CLOSURE_NOT_IN_HISTORY")
+
+
+async def test_closure_not_in_history_needs_a_history_read(journal, fake, clock, kill_sink, risk_cfg, notifier):
+    rec = Reconciler(journal, fake, clock, kill_sink, risk_cfg, EPIC, notifier=notifier)
+    journal.upsert_position(held(P.EXITING, opened_at=None))  # bez początku historii: odczytu nie było
+    engine_close_record(journal, T0, response=None)
+
+    result = await time_out_a_missing_deal(rec, clock, risk_cfg)
+
+    assert has_note(result, "HISTORY_START_UNKNOWN") and kill_sink.calls == ["MISMATCH_TIMEOUT"]
+    assert notifier.alerts == [] and fake.calls.count("closed_since") == 0
+
+
+@pytest.mark.parametrize("sink", ["no_notifier", "failing_notifier"])
+async def test_closure_not_in_history_is_journaled_even_when_the_alert_cannot_be_sent(
+    journal, fake, clock, kill_sink, risk_cfg, notifier, monkeypatch, sink
+):
+    notifier.fail = RuntimeError("alert channel down")
+    rec = Reconciler(
+        journal, fake, clock, kill_sink, risk_cfg, EPIC, notifier=None if sink == "no_notifier" else notifier
+    )
+    journal.upsert_position(held(P.EXITING))
+    put(fake, at_broker())
+    await fake.close_position("DEAL-1")
+    engine_close_record(journal, T0, response=None)
+    fake.calls.clear()
+    lagging_history(fake, monkeypatch)
+
+    result = await time_out_a_missing_deal(rec, clock, risk_cfg)  # awaria kanału alarmów nie przerywa przebiegu
+
+    assert not result.skipped and kill_sink.calls == ["MISMATCH_TIMEOUT"]
+    assert [e["event"] for e in payloads(journal, "reconcile.event")].count("CLOSURE_NOT_IN_HISTORY") == 1
+    assert len(notifier.alerts) == (0 if sink == "no_notifier" else 1)
+
+
+def test_engine_close_source_is_the_executor_raw_source():
+    from gwstock import execution
+
+    assert reconcile_module.SOURCE_ENGINE_CLOSE == execution.SOURCE_CLOSE
+
+
 # --- idempotencja i księgowanie ---------------------------------------------------------------------------
 
 

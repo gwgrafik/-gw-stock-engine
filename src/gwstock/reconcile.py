@@ -47,7 +47,10 @@ Macierz (J = pozycja w dzienniku, B = pozycje brokera na naszym instrumencie, D 
 - inna pozycja w B obok D → BLOCKED + kill FOREIGN_POSITION; zlecenie oczekujące na naszym instrumencie →
   `working_orders` + kill FOREIGN_WORKING_ORDER (nigdy nie anulujemy);
 - rozbieżność oczekująca (zlecenie nierozstrzygnięte albo J BLOCKED) dłużej niż `mismatch_tolerance_s` → kill
-  MISMATCH_TIMEOUT (znacznik `mismatch_since` w dzienniku).
+  MISMATCH_TIMEOUT (znacznik `mismatch_since` w dzienniku); gdy to D, które zamknął silnik (surowy zapis
+  `broker.close_position` wykonawcy), a udany odczyt historii go jeszcze nie pokazuje (opóźnienie historii, O-1),
+  dodatkowo zdarzenie i alarm CLOSURE_NOT_IN_HISTORY raz na incydent w procesie (wg możliwości; stan, kill switch i
+  księgowanie bez zmian: zaksięguje kolejny przebieg, gdy historia dogoni, kill switch zdejmuje właściciel).
 
 Niezmienniki (prawdziwe pieniądze):
 - uzgadnianie tylko CZYTA u brokera: nie zamyka pozycji, nie ustawia stopu, nie anuluje zleceń;
@@ -63,6 +66,8 @@ Niezmienniki (prawdziwe pieniądze):
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -72,16 +77,24 @@ from gwstock.broker.base import Broker
 from gwstock.clock import Clock
 from gwstock.config import RiskConfig
 from gwstock.journal import Journal, OrderRecord, PositionRecord
+from gwstock.notify import Notifier
 from gwstock.orders.fsm import check_order_transition, check_position_transition
 from gwstock.orders.manager import HISTORY_MARGIN, UNKNOWN_CHECK_INTERVAL_S, UNKNOWN_CHECKS, match_entry_positions
 from gwstock.serialization import dump
 from gwstock.types import BrokerRejected, ClosedDeal, OpenPosition, OrderState, PositionState, WorkingOrder
+
+_LOG = logging.getLogger(__name__)
 
 SOURCE_POSITIONS = "broker.list_positions"
 SOURCE_WORKING_ORDERS = "broker.list_working_orders"
 SOURCE_CLOSED = "broker.closed_since"
 SOURCE_EVENT = "reconcile.event"
 SOURCE_ERROR = "broker.error"  # wyjątek odczytu brokera (typ i treść), zapisany przed propagacją
+# Surowy zapis wykonawcy tuż po wywołaniu zamykającym (`execution.SOURCE_CLOSE`; test pilnuje zgodności): dowód, że
+# zamknięcie wysłał silnik. Tylko do odczytu; uzgadnianie samo nigdy nie zamyka.
+SOURCE_ENGINE_CLOSE = "broker.close_position"
+
+CLOSURE_NOT_IN_HISTORY = "CLOSURE_NOT_IN_HISTORY"
 
 META_MISMATCH_SINCE = "mismatch_since"  # ISO-8601 pierwszego wykrycia rozbieżności oczekującej; "" = brak
 META_CLOSED_MARKER = "closed_marker"  # ISO-8601 czasu ostatniego zaksięgowanego zamknięcia
@@ -162,6 +175,10 @@ class _Plan:
     closed: list[ClosedDeal] = field(default_factory=list)
     unprotected: list[OpenPosition] = field(default_factory=list)
     resolved: set[str] = field(default_factory=set)
+    history_since: datetime | None = None  # początek udanego odczytu historii w tym przebiegu (None: bez odczytu)
+    missing: PositionRecord | None = None  # nasza pozycja, której nie ma ani na liście, ani w historii
+    mismatch_started: datetime | None = None  # `mismatch_since`, gdy w tym przebiegu wypalił MISMATCH_TIMEOUT
+    alerts: list[tuple[tuple[str, str], str, str]] = field(default_factory=list)  # (klucz incydentu, poziom, treść)
 
     def record(self, code: str, **details: Any) -> None:
         self.events.append({"event": code, **details})
@@ -185,6 +202,7 @@ class Reconciler:
         epic: str,
         booker: TradeBooker | None = None,
         entry_gate: Callable[[], bool] | None = None,
+        notifier: Notifier | None = None,
     ) -> None:
         if not isinstance(epic, str) or not epic:
             raise ValueError(f"epic: expected a non-empty instrument name, got {epic!r}")
@@ -196,6 +214,8 @@ class Reconciler:
         self._epic = epic
         self._booker = booker
         self._entry_gate = entry_gate
+        self._notifier = notifier  # alarmy opisowe (CLOSURE_NOT_IN_HISTORY), wg możliwości; None: tylko zdarzenie
+        self._closure_alerted: set[tuple[str, str]] = set()  # (deal_id, mismatch_since): raz na incydent w procesie
 
     @property
     def booker(self) -> TradeBooker | None:
@@ -237,6 +257,7 @@ class Reconciler:
         final = plan.position or current
         unresolved_left = any(o.order_id not in plan.resolved for o in live)
         self._plan_mismatch(plan, pending=unresolved_left or final.state is _P.BLOCKED)
+        self._plan_closure_not_in_history(plan)
 
         # 3. ponowne sprawdzenie migawki, potem alarm i zapisy (bez `await` od sprawdzenia do pierwszego zapisu)
         if self._gate_closed():
@@ -435,6 +456,7 @@ class Reconciler:
             else:
                 target = replace(ours, state=_P.BLOCKED)  # zamknięcia nie wymyślamy: rozbieżność oczekująca
                 plan.record("LOCAL_POSITION_MISSING", deal_id=ours.deal_id)
+                plan.missing = ours
         if others:
             # zachowuje pola naszej pozycji; po zaksięgowaniu (FLAT bez pól) BLOCKED bez pól zdejmie się sam
             target = replace(target, state=_P.BLOCKED)
@@ -456,6 +478,51 @@ class Reconciler:
         elif now - since > timedelta(seconds=self._cfg.mismatch_tolerance_s):
             plan.kill("MISMATCH_TIMEOUT")
             plan.record("MISMATCH_TIMEOUT", since=since)
+            plan.mismatch_started = since
+
+    def _plan_closure_not_in_history(self, plan: _Plan) -> None:
+        """O-1 (opcja A, bez zmiany zachowania): MISMATCH_TIMEOUT wypalił, bo NASZA pozycja zniknęła u brokera po
+        zamknięciu wysłanym przez silnik, a udany odczyt historii jeszcze go nie pokazuje (opóźnienie historii).
+        Zdarzenie i alarm CLOSURE_NOT_IN_HISTORY raz na incydent (deal_id, `mismatch_since`) w tym procesie: właściciel
+        wie, że księgowanie czeka na historię, a kill switch miękki zostaje do `clear-kill`. Stan, kill switch i
+        księgowanie bez zmian. Zamknięcie odrzucone (rynek zamknięty, odmowa brokera) albo zniknięcie bez zamknięcia
+        silnika (stop u brokera) nie daje tego alarmu."""
+        missing, started = plan.missing, plan.mismatch_started
+        if missing is None or started is None or plan.history_since is None or missing.deal_id is None:
+            return
+        key = (missing.deal_id, started.isoformat())
+        if key in self._closure_alerted:
+            return
+        closed_at = self._engine_close_time(missing.deal_id)
+        if closed_at is None:
+            return
+        waited = int((self._clock.now_utc() - closed_at).total_seconds())
+        plan.record(
+            CLOSURE_NOT_IN_HISTORY, deal_id=missing.deal_id, closed_at=closed_at, waited_s=waited, mismatch_since=started
+        )
+        plan.alerts.append((
+            key,
+            "ERROR",
+            f"{CLOSURE_NOT_IN_HISTORY} {missing.deal_id}: closed by the engine at {closed_at.isoformat()}, gone at the "
+            f"broker, no history entry after {waited} s; booking waits; the kill switch stays SOFT until clear-kill",
+        ))
+
+    def _engine_close_time(self, deal_id: str) -> datetime | None:
+        """Czas (zegar silnika) ostatniego surowego zapisu wywołania zamykającego `deal_id`, które mogło zamknąć
+        pozycję: udane albo niejasne (timeout, sesja). Odmowa (`rejection`) i zamknięty rynek nic nie zamknęły."""
+        latest = None
+        for event in self._journal.events(SOURCE_ENGINE_CLOSE):
+            try:
+                data = json.loads(event.payload)
+            except ValueError:
+                continue
+            if not isinstance(data, dict) or data.get("deal_id") != deal_id or "rejection" in data:
+                continue
+            if str(data.get("error", "")).startswith("MarketClosed"):
+                continue
+            if latest is None or event.ts > latest:
+                latest = event.ts
+        return latest
 
     # --- odczyty pomocnicze ---------------------------------------------------------------------
 
@@ -479,6 +546,7 @@ class Reconciler:
         since = min(starts)
         closures = await self._read("closed_since", self._broker.closed_since(since))
         self._raw(SOURCE_CLOSED, {"since": since, "response": closures})
+        plan.history_since = since
         return closures
 
     def _empty_reads(self, order: OrderRecord) -> int:
@@ -495,6 +563,14 @@ class Reconciler:
         pominięta; zamknięcie jest zaksięgowane, a księga idempotentna)."""
         for reason in plan.kills:
             self._kill.soft(reason)
+        for key, level, message in plan.alerts:  # wg możliwości: awaria kanału alarmów nie przerywa przebiegu
+            self._closure_alerted.add(key)
+            if self._notifier is None:
+                continue
+            try:
+                self._notifier.alert(level, message)
+            except Exception as exc:
+                _LOG.warning("alert not sent (%s: %s): %s", type(exc).__name__, exc, message)
         for event in plan.events:  # ślad decyzji przed księgowaniem: zostaje także przy jego błędzie
             self._raw(SOURCE_EVENT, event)
         if plan.book is not None and self._booker is not None:
