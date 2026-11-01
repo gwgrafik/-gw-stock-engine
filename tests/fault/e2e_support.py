@@ -173,7 +173,7 @@ def boot(world: World, path: Path) -> Stack:
     )  # fmt: skip
     reconciler = Reconciler(
         journal, world.broker, world.clock, kill, world.risk, EPIC, booker=executor,
-        entry_gate=lambda: manager.in_flight,
+        entry_gate=lambda: manager.in_flight, notifier=notifier,
     )  # fmt: skip
     return Stack(journal, notifier, kill, manager, gate, executor, reconciler)
 

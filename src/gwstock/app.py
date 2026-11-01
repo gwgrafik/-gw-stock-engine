@@ -455,7 +455,7 @@ class Engine:
     def _build_reconciler(self) -> Reconciler:
         return Reconciler(
             self.journal, self.broker, self.clock, self.kill, self.risk, self._epic, booker=self.executor,
-            entry_gate=lambda: self.manager.in_flight,
+            entry_gate=lambda: self.manager.in_flight, notifier=self.alerts,
         )  # fmt: skip
 
     def _downgrade(self, reason: str) -> None:

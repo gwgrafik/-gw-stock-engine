@@ -722,6 +722,26 @@ async def test_downgrade_keeps_the_executor_memory_of_sent_closes(engine, broker
     assert broker.calls.count("close_position") == 1 and position(engine) == PositionRecord("DE40", P.FLAT)
 
 
+async def test_a_lagging_history_after_the_1725_close_reaches_the_owner_as_closure_not_in_history(
+    engine, broker, clock, notifier, monkeypatch
+):
+    # O-1 (opcja A): historia Capital.com pokazuje zamknięcie dopiero 90 s po nim; uzgadnianie robi BLOCKED, po
+    # tolerancji MISMATCH_TIMEOUT, a właściciel dostaje alarm z uzgadniania (silnik podaje mu swój kanał alarmów)
+    real = broker.closed_since
+
+    async def lagging(since):
+        return [c for c in await real(since) if c.ts + timedelta(seconds=90) <= clock.now_utc()]
+
+    monkeypatch.setattr(broker, "closed_since", lagging)
+    rep = await engine.run_day(DAY)
+    assert "CLOSURE_NOT_IN_HISTORY" in [p["event"] for p in payloads(engine.journal, "reconcile.event")]
+    [(level, message)] = alerts(notifier, "CLOSURE_NOT_IN_HISTORY")
+    assert level == "ERROR" and "DEAL-1" in message and "clear-kill" in message
+    assert "MISMATCH_TIMEOUT" in kill_reasons(engine.journal)
+    [t] = engine.journal.trades()  # historia dogoniła: zaksięgowane raz
+    assert t.exit_reason == "FORCED" and rep.final_position_state is P.FLAT
+
+
 async def test_startup_restores_loss_limit_kills_from_the_journal(make_engine, broker, clock):
     engine = make_engine(Mode.LIVE)
     yesterday_exit = datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc)  # piątek
