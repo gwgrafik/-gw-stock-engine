@@ -43,7 +43,10 @@ DEFAULT_DATA_DIR = "data"
 JOURNAL_FILE = "journal.sqlite"  # ta sama nazwa co w `gwstock.cli` (pilnuje tego test)
 
 STATEMENT = "To pomiar, nie prognoza. Wynik netto po kosztach; brak przewagi nie jest wykazany ani wykluczony."
-L1_INSTRUCTION = "Aby dopuścić wielkość według reguł utwórz plik data/L1_PASSED (kod go nigdy nie tworzy)."
+L1_INSTRUCTION = (
+    "Aby dopuścić wielkość według reguł utwórz plik data/L1_PASSED (kod go nigdy nie tworzy). To informacja dla "
+    "właściciela, nie zgoda: plik tworzysz dopiero po własnym przeglądzie raportu (runbook, sekcja 7)."
+)
 L1_VERDICT_TAIL = "(cały dziennik; ocena wyjaśnień należy do właściciela)"
 L1_EUR_CAVEAT = (
     "  uwaga: koszty w EUR są zaokrąglane do 0,01 € przy wielkości 0,001, więc ratio w EUR jest zgrubne; "

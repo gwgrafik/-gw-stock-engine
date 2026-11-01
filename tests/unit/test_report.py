@@ -769,7 +769,10 @@ def test_report_exposes_the_ledger_vs_counter_mismatch(journal, capsys, config_e
 
 CAVEAT = ("  uwaga: koszty w EUR są zaokrąglane do 0,01 € przy wielkości 0,001, więc ratio w EUR jest zgrubne; "
           "poślizg stopu przy wyjściu NIE jest mierzony")  # fmt: skip
-INSTRUCTION = "Aby dopuścić wielkość według reguł utwórz plik data/L1_PASSED (kod go nigdy nie tworzy)."
+INSTRUCTION = (
+    "Aby dopuścić wielkość według reguł utwórz plik data/L1_PASSED (kod go nigdy nie tworzy). To informacja dla "
+    "właściciela, nie zgoda: plik tworzysz dopiero po własnym przeglądzie raportu (runbook, sekcja 7)."
+)
 VERDICT_TAIL = "(cały dziennik; ocena wyjaśnień należy do właściciela)"
 
 
@@ -833,6 +836,15 @@ def test_report_l1_block_passes_with_five_clean_sessions_and_prints_the_instruct
     assert lines.index(CAVEAT) < lines.index(INSTRUCTION)
     assert not any(line.startswith("  powód:") for line in lines)
     assert not any("dowody są skąpe" in line for line in lines)  # to jest wariant dla n < wymagane
+
+
+def test_l1_pass_line_says_it_is_information_not_consent(journal, capsys, config_env, jpath):
+    # AD-b: przy PASS zdanie o pliku nie może brzmieć jak zgoda ani polecenie
+    five_clean_sessions(journal)
+    _, out, _ = run(["--journal", jpath], capsys)
+    [line] = [line for line in out.splitlines() if "L1_PASSED" in line]
+    assert line == report_cli.L1_INSTRUCTION
+    assert "nie zgoda" in line and "po własnym przeglądzie raportu" in line and "(runbook, sekcja 7)" in line
 
 
 def test_report_gate_verdict_is_entry_slippage_not_the_spread_and_not_the_rounded_euro_ratio(
