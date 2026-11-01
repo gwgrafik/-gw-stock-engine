@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """Strażnik live / live guard (zadanie 17, spec §9 i §14). Czysta biblioteka standardowa, Python 3.9+.
 
-Pilnuje trzech rzeczy w plikach zapisywanych przez agenta (hook `PreToolUse` Claude Code) oraz w całym repozytorium
+Pilnuje czterech rzeczy w plikach zapisywanych przez agenta (hook `PreToolUse` Claude Code) oraz w całym repozytorium
 (`--scan`, CI):
 
   1. Pliki uzbrojenia `data/ARM_LIVE` i `data/L1_PASSED` tworzy WYŁĄCZNIE właściciel. Kod ani agent nie mogą ich
      tworzyć ani zapisywać (`open(..., 'w')`, `Path.touch()`, `write_text`, `os.mknod`, `shutil.copy`, `touch`, `>`,
-     `tee`, `cp`, `ln -s`, ...). Sprawdzanie (`.exists()`), odczyt, usuwanie i proza w komentarzach są dozwolone.
-  2. Klucz API ani hasło nie mogą być zaszyte w kodzie (`X-CAP-API-KEY`, `api_key`, `api_password`, `password` z
-     literałem co najmniej 12 znaków [A-Za-z0-9], który nie jest oczywistym wypełniaczem). Repozytorium jest publiczne.
-  3. Zapis `live_allowed = true` do `config/runtime.toml` przestawia wyłącznie właściciel.
+     `tee`, `cp`, `ln -s`, ...) ani zapisać pliku o takiej nazwie narzędziem Write/Edit. Sprawdzanie (`.exists()`),
+     odczyt, usuwanie i proza w komentarzach są dozwolone.
+  2. Klucz API ani hasło nie mogą być zaszyte w kodzie: nagłówek `X-CAP-API-KEY`, pola `api_key`, `api_password`,
+     `password`, `secret` z literałem w cudzysłowie (klucz: co najmniej 12 znaków [A-Za-z0-9] z rzędu; hasło: co najmniej
+     12 znaków niebiałych), zmienne `export X_API_KEY=...`, `ENV`, `- X_API_KEY=...`, `X_API_KEY: ...` w plikach
+     powłoki, YAML, Dockerfile i Makefile, oraz `os.environ['..._KEY'] = '...'` i `monkeypatch.setenv`. Wypełniacze
+     (`<...>`, `xxxx`, `changeme`, `${VAR}`, `$VAR`, `${{ secrets.X }}`, `test-...` w tests/) są dozwolone.
+  3. Zapis `live_allowed = true` do `config/runtime.toml` przestawia wyłącznie właściciel (zapis przez Write/Edit w tym
+     pliku oraz skrypt .py/.sh/.yml, który taki zapis wykonuje).
+  4. Skanowane jest wszystko poza prozą (`*.md`, `docs/**`, `.claude/settings.json`), danymi silnika (`data/**`) i
+     binariami; także pliki bez przyrostka (`Procfile`, `justfile`, `Containerfile`, `scripts/arm`), `.service`, `.json`.
 
 To bariera przed WYPADKIEM, nie granica bezpieczeństwa. Hook widzi tylko narzędzia Write, Edit i MultiEdit; polecenie
 Bash, zmienna zbudowana z kawałków w czasie działania, `getattr`, kodowanie base64 czy aliasy z innego pliku go
 omijają (lista luk: raport zadania 17). Ostateczną bramką jest właściciel, który sam tworzy `ARM_LIVE` i `L1_PASSED`.
+
+ŚCIEŻKI: najpierw są wyznaczane względem korzenia repozytorium (korzeń = dwa poziomy nad tym plikiem, a także
+`CLAUDE_PROJECT_DIR`, jeśli wskazuje katalog ze strażnikiem w środku). `docs/`, `tests/` i lista wyjątków działają
+wyłącznie na ścieżce względnej (porównanie od początku), więc repozytorium sklonowane pod katalogiem `docs/` albo
+`tests/` nie traci ochrony, a plik spoza repozytorium dostaje pełne reguły bez żadnych wyjątków.
 
 KOD WYJŚCIA hooka (dokumentacja hooków Claude Code): 0 = przepuść, 2 = zablokuj (stderr trafia do modelu). Każdy inny
 kod to błąd niezablokujący, dlatego w `.claude/settings.json` hook ma też `onFailure: "block"`.
@@ -22,10 +34,10 @@ DECYZJA fail-closed: wejście hooka, którego nie da się odczytać (puste, nie-
 treści), BLOKUJE wywołanie (kod 2). Błędne wejście nie może być celowym obejściem (agent nie kontroluje stdin hooka),
 więc fail-open byłby bezpieczny; fail-closed wybrano, bo spec §14 każe hookom być fail-closed, a zmiana formatu hooka
 w przyszłej wersji Claude Code ma się ujawnić głośno (zablokowany zapis), a nie po cichu wyłączyć ochronę.
-Koszt: błąd w tym skrypcie blokuje Write/Edit do czasu naprawy przez właściciela (Bash nie jest objęty hookiem).
+Koszt: błąd w tym skrypcie blokuje Write/Edit do naprawy przez właściciela (Bash nie jest objęty hookiem).
 
-LISTA WYJĄTKÓW (nie skanowane; ścieżki dopasowywane po całych członach od końca, `/` lub `\\`). Każdy wpis jest tu
-uzasadniony, a test `test_the_allow_list_has_no_stale_or_unneeded_entries` pilnuje, żeby plik naprawdę coś naruszał:
+LISTA WYJĄTKÓW (ścieżki względem korzenia repozytorium, porównanie dokładne). Każdy wpis jest tu uzasadniony, a test
+`test_the_allow_list_has_no_stale_or_unneeded_entries` pilnuje, żeby plik naprawdę coś naruszał:
 
   ARMING_EXEMPT (reguła tworzenia plików uzbrojenia nie obowiązuje):
     scripts/hooks/guard_live.py     sam strażnik: w opisie trzyma przykłady wzorców (np. `(data_dir / ARM_FILE).write_text`)
@@ -41,14 +53,9 @@ uzasadniony, a test `test_the_allow_list_has_no_stale_or_unneeded_entries` pilnu
   KEY_EXEMPT (reguła zaszytych kluczy nie obowiązuje; reguła uzbrojenia nadal tak):
     scripts/hooks/guard_live.py     sam strażnik: wzorce kluczy w napisach
     tests/unit/test_guard_live.py   testy strażnika: przykłady zaszytych kluczy jako dane testowe
-    tests/unit/test_capitalcom_adapter.py
-                                    sztuczne dane logowania `SECRETS` (`key-ABCDEF123456`, ...) do pliku sekretów w
-                                    tmp_path; nic z tego nie jest prawdziwym kluczem, a adapter ma ich wymagać w
-                                    określonym kształcie
-  Poza listą: `docs/**` i każdy plik poza przyrostkami .py .sh .bash .toml .yml .yaml .cfg .ini .env (oraz Dockerfile i
-  Makefile), czyli proza (`*.md`), `.claude/settings.json` (zawiera wzorce reguł deny) i dane. Pliki w `tests/` mogą
-  mieć sztuczne wartości zaczynające się od `test`, `fake`, `dummy` lub `mock`; prawdziwie wyglądający klucz w testach
-  też blokuje. `.github/workflows/ci.yml` NIE jest wyjątkiem: przechodzi strażnika.
+  Poza listą: `docs/**` i `*.md` (proza), `.claude/settings.json` (zawiera wzorce reguł `deny` i `ask`, nie kod) oraz
+  `data/**` (dane silnika). Pliki w `tests/` mogą mieć sztuczne wartości zaczynające się od `test`, `fake`, `dummy` lub
+  `mock`; prawdziwie wyglądający klucz w testach też blokuje. `.github/workflows/ci.yml` NIE jest wyjątkiem.
 
 Użycie:
     python3 scripts/hooks/guard_live.py            czyta JSON hooka ze stdin (tryb hooka)
@@ -67,6 +74,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+ARMING_NAMES = ("ARM_LIVE", "L1_PASSED")
 ARMING_EXEMPT = frozenset({
     "scripts/hooks/guard_live.py",
     "tests/unit/test_guard_live.py",
@@ -77,23 +85,30 @@ ARMING_EXEMPT = frozenset({
 KEY_EXEMPT = frozenset({
     "scripts/hooks/guard_live.py",
     "tests/unit/test_guard_live.py",
-    "tests/unit/test_capitalcom_adapter.py",
 })  # fmt: skip
 
-SCANNED_SUFFIXES = frozenset({".py", ".sh", ".bash", ".toml", ".yml", ".yaml", ".cfg", ".ini", ".env"})
-SCANNED_NAMES = frozenset({"Dockerfile", "Makefile"})
+PROSE_SUFFIXES = frozenset({".md", ".markdown", ".rst"})
+PROSE_FILES = frozenset({".claude/settings.json"})  # dokument z wzorcami reguł deny/ask, nie kod
+BINARY_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".whl",
+    ".so", ".dll", ".exe", ".class", ".jar", ".pyc", ".pyo", ".sqlite", ".sqlite3", ".db", ".woff", ".woff2", ".ttf",
+    ".otf", ".mp3", ".mp4", ".bin",
+})  # fmt: skip
+QUOTED_ONLY_SUFFIXES = frozenset({".py", ".pyi", ".toml", ".json", ".ipynb"})  # tu wartość bez cudzysłowu to nie napis
 GUARDED_TOOLS = ("Write", "Edit", "MultiEdit")
-MIN_SECRET_RUN = 12  # tyle znaków [A-Za-z0-9] z rzędu w literale uznajemy za klucz
+MIN_SECRET_RUN = 12  # klucz: tyle znaków [A-Za-z0-9] z rzędu w literale
+MIN_PASSWORD_LEN = 12  # hasło: tyle znaków niebiałych w literale (symbole i myślniki wliczone)
 MAX_JOIN_LINES = 40  # ile fizycznych linii wolno skleić w jedną instrukcję (nawiasy, `\`)
 MAX_EDIT_FILE_BYTES = 5_000_000
+MAX_SCAN_BYTES = 5_000_000
 MAX_CALL_SPAN = 3000  # ile znaków nawiasu analizujemy w jednym wywołaniu (ochrona przed kwadratowym czasem)
 MAX_RECEIVER_SPAN = 600
 MAX_SHELL_SPAN = 300  # ile znaków wolno między poleceniem (`touch`, `cp`, `>`) a nazwą pliku
+MAX_ALIASES = 128  # ile aliasów nazwy pliku (zmiennych) śledzimy naraz; najstarsze wypadają (ochrona czasu)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAN_SKIP_TOP = ("data", ".git", ".superpowers")  # tylko na pierwszym poziomie skanowanego korzenia (`data*`)
 SCAN_SKIP_ANYWHERE = frozenset({"__pycache__", ".pytest_cache", "node_modules", ".mypy_cache", ".ruff_cache", ".tox"})
-
 
 @dataclass(frozen=True)
 class Finding:
@@ -127,7 +142,20 @@ def _code_view(line: str) -> tuple[str, int]:
     return line, depth
 
 
-_LITERAL_JOIN = re.compile(r"""(["'])\s*(?:\+\s*)?["']""")
+_STR = r"""'(?:[^'\\\n]|\\.){0,2000}'|"(?:[^"\\\n]|\\.){0,2000}\""""
+_LITERAL_ONE = re.compile(_STR)
+_LITERAL_RUN = re.compile(rf"(?:{_STR})(?:\s*\+?\s*(?:{_STR}))+")
+
+
+def _merge_literals(statement: str) -> str:
+    """Sąsiednie literały ('a' 'b', 'a' + "b") składa w jeden; pusty literał ('' w replace) zostaje, jak był."""
+
+    def merge(match: re.Match[str]) -> str:
+        parts = _LITERAL_ONE.findall(match.group(0))
+        quote = parts[0][0]
+        return quote + "".join(part[1:-1] for part in parts) + quote
+
+    return _LITERAL_RUN.sub(merge, statement)
 
 
 def _logical_lines(text: str) -> list[tuple[int, str]]:
@@ -151,7 +179,7 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
             parts.append(nxt)
             depth = max(depth + delta, 0)
         statement = " ".join(p.strip() for p in parts)
-        statement = _LITERAL_JOIN.sub("", statement)
+        statement = _merge_literals(statement)
         if statement.strip():
             out.append((start + 1, statement))
         i += 1
@@ -167,11 +195,29 @@ _BASE_MARKERS = (
 )
 
 
-@functools.lru_cache(maxsize=64)
-def _marker_re(aliases: frozenset[str]) -> re.Pattern[str]:
-    parts = list(_BASE_MARKERS)
-    parts += [rf"(?<![A-Za-z0-9]){re.escape(a)}(?![A-Za-z0-9_])" for a in sorted(aliases)]
-    return re.compile("|".join(parts), re.IGNORECASE)
+_BASE_MARK = re.compile("|".join(_BASE_MARKERS), re.IGNORECASE)
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class _Marker:
+    """Czy tekst zawiera nazwę pliku uzbrojenia: stała nazwa, identyfikator (`ARM_FILE`) albo alias (zmienna z tego pliku).
+
+    Aliasy sprawdzamy po tokenach, a nie wyrażeniem regularnym zbudowanym z ich listy: kompilacja wyrażenia przy każdej
+    nowej zmiennej robiła czas kwadratowy w pliku z wieloma aliasami.
+    """
+
+    def __init__(self, aliases: dict[str, str] | frozenset[str]) -> None:
+        self._aliases = {a.lower() for a in aliases}
+
+    def search(self, text: str) -> re.Match[str] | None:
+        found = _BASE_MARK.search(text)
+        if found or not self._aliases:
+            return found
+        return next((tok for tok in _IDENT.finditer(text) if tok.group(0).lower() in self._aliases), None)
+
+
+def _mentions_alias(statement: str, aliases: dict[str, bool]) -> bool:
+    return bool(aliases) and any(tok in aliases for tok in _IDENT.findall(statement))
 
 
 def _marker_name(matched: str, aliases: dict[str, str]) -> str:
@@ -301,7 +347,7 @@ def _write_mode(args: str) -> bool:
     return False
 
 
-def _call_hit(statement: str, mark: re.Pattern[str]) -> re.Match[str] | None:
+def _call_hit(statement: str, mark: _Marker) -> re.Match[str] | None:
     """Pierwsze trafienie znacznika pliku uzbrojenia w miejscu, gdzie wywołanie tworzy lub zapisuje plik."""
 
     def has(text: str) -> re.Match[str] | None:
@@ -350,62 +396,162 @@ def _call_hit(statement: str, mark: re.Pattern[str]) -> re.Match[str] | None:
 _VERBS = r"(?:touch|tee|install|ln|cp|mv|dd|truncate|rsync|mknod|mkfifo)"
 
 
-@functools.lru_cache(maxsize=64)
-def _shell_res(mark_pattern: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
-    path_chars = rf"""[^\s"';|&<>]{{0,{MAX_SHELL_SPAN}}}"""
-    redirect = re.compile(rf"""(?<![-=])(?:\d*>>?|&>>?|>\|)\s*["']?{path_chars}(?:{mark_pattern})""", re.IGNORECASE)
-    verb = re.compile(rf"""(?<![\w./-]){_VERBS}(?![\w-])[^\n;|&,]{{0,{MAX_SHELL_SPAN}}}?(?:{mark_pattern})""", re.IGNORECASE)
-    return redirect, verb
+_REDIRECT = re.compile(rf"""(?<![-=])(?:\d*>>?|&>>?|>\|)\s*["']?(?P<t>[^\s"';|&<>]{{0,{MAX_SHELL_SPAN}}})""")
+_VERB_CMD = re.compile(rf"""(?<![\w.-]){_VERBS}(?=\s)(?P<rest>[^\n;|&,]{{0,{MAX_SHELL_SPAN}}})""")
 
 
-def _shell_hit(statement: str, mark: re.Pattern[str]) -> re.Match[str] | None:
+def _shell_hit(statement: str, mark: _Marker) -> re.Match[str] | None:
     """Polecenia powłoki tworzące plik: przekierowanie `>`/`>>` do pliku oraz `touch`, `tee`, `cp`, `ln`, ..."""
-    redirect, verb = _shell_res(mark.pattern)
-    return redirect.search(statement) or verb.search(statement)
+    for m in _REDIRECT.finditer(statement):
+        if hit := mark.search(m.group("t")):
+            return hit
+    for m in _VERB_CMD.finditer(statement):
+        if hit := mark.search(m.group("rest")):
+            return hit
+    return None
 
 
 # --- klucze API ----------------------------------------------------------------------------------------------------------
 
 _Q = r"""\\?["']"""
+_NAME_KEYS = r"api[_-]?key|api[_-]?password|api[_-]?secret|password|passwd|secret(?:[_-]?key)?"
 _KEY_HEADER_QUOTED = re.compile(rf"""(?P<k>X-CAP-API-KEY){_Q}?\s*\]?\s*[:=,]\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)""", re.I)
 _KEY_HEADER_RAW = re.compile(r"""(?P<k>X-CAP-API-KEY):\s*(?P<v>[^\s"'\\]+)""", re.I)
-_KEY_NAMED = re.compile(
-    rf"""(?P<k>api_key|api_password|password){_Q}?\s*[:=]\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)""",
+_KEY_NAMED = re.compile(rf"""(?P<k>{_NAME_KEYS}){_Q}?\s*[:=]\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)""", re.I)
+_ENV_SET = re.compile(
+    rf"""(?:environ\s*\[\s*{_Q}(?P<n>[^"'\\\n]{{1,80}}){_Q}\s*\]\s*=|(?:setenv|setdefault|putenv)\s*\(\s*{_Q}"""
+    rf"""(?P<n2>[^"'\\\n]{{1,80}}){_Q}\s*,)\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)"""
+)
+# wartości bez cudzysłowu: `export X=v`, `ENV X=v`, `- X=v`, `X: v`, `X := v`, `-e X=v`, `--api-key v` (tylko pliki nie-Pythonowe)
+_UNQ_START = re.compile(
+    r"""^\s*(?:-\s+)?(?:(?:export|ENV|ARG|set|setx|local|readonly|declare(?:\s+-\w+)*)\s+)?"""
+    r"""(?P<n>[A-Za-z0-9_.-]{1,80})\s*(?::=|=|:)\s*(?P<v>[^\s"'#][^\s"'#]*)"""
+)
+_UNQ_TOKEN = re.compile(r"""(?:^|[\s;&|(])(?P<n>[A-Za-z0-9_.-]{1,80})(?::=|=)(?P<v>[^\s"'#][^\s"'#]*)""")
+_UNQ_ENV_SPACE = re.compile(r"""^\s*ENV\s+(?P<n>[A-Za-z0-9_.-]{1,80})\s+(?P<v>[^\s"'#=][^\s"'#]*)""")
+_UNQ_FLAG = re.compile(r"""(?:^|\s)--(?P<n>[A-Za-z][A-Za-z0-9-]{0,40})\s+(?P<v>[^\s"'#-][^\s"'#]*)""")
+_CODE_LIKE = re.compile(r"[()\[\]]|\.[A-Za-z_]")  # wywołanie, indeksowanie, atrybut: to odczyt, nie literał
+_PLACEHOLDER = re.compile(
+    r"<|>|…|\.\.\.|\$\{|\$[A-Za-z_(]|\{\{|\}\}|%\(|%[sd]|x{4,}|\*{3,}|change[-_ ]?me|placeholder|redacted|your[-_ ]"
+    r"|example|dummy|todo",
     re.I,
 )
-_KEY_ENV = re.compile(
-    r"""^\s*(?:export\s+)?(?:[A-Z0-9]+_)*(?P<k>API_KEY|API_PASSWORD|PASSWORD)\s*=\s*["']?(?P<v>[^"'\s#]+)""", re.I
-)
-_PLACEHOLDER = re.compile(r"<|>|…|\.\.\.|[{}$%]|x{4,}|\*{3,}|change[-_ ]?me|placeholder|redacted|your[-_ ]|example|dummy|todo", re.I)
 _TEST_VALUE = re.compile(r"^(?:test|fake|dummy|mock)[-_]", re.I)
 
 
-def _secret_literal(value: str, test_values_ok: bool) -> bool:
-    if not re.search(rf"[A-Za-z0-9]{{{MIN_SECRET_RUN},}}", value) or _PLACEHOLDER.search(value):
-        return False
-    return not (test_values_ok and _TEST_VALUE.match(value))
-
-
-def _key_hit(statement: str, *, test_values_ok: bool, env: bool) -> str | None:
-    patterns = [_KEY_HEADER_QUOTED, _KEY_HEADER_RAW, _KEY_NAMED] + ([_KEY_ENV] if env else [])
-    for pattern in patterns:
-        for m in pattern.finditer(statement):
-            if _secret_literal(m.group("v"), test_values_ok):
-                return m.group("k")
+def _secret_kind(name: str) -> str | None:
+    """"key" dla nazw kończących się na api_key, "password" dla password/passwd/secret/secret_key, inaczej None."""
+    low = name.lower().replace("-", "_").strip("_.")
+    if re.search(r"(?:password|passwd|secret|secret_key)$", low):
+        return "password"
+    if re.search(r"api_?key$", low):
+        return "key"
     return None
+
+
+def _secret_literal(kind: str, value: str, test_values_ok: bool) -> bool:
+    if _PLACEHOLDER.search(value) or (test_values_ok and _TEST_VALUE.match(value)):
+        return False
+    if kind == "key":
+        return re.search(rf"[A-Za-z0-9]{{{MIN_SECRET_RUN},}}", value) is not None
+    return len(re.sub(r"\s", "", value)) >= MIN_PASSWORD_LEN
+
+
+_TEST_NAME = re.compile(r"^(?:test|fake|dummy|mock)_", re.I)
+
+
+def _is_test_name(statement: str, start: int, test_values_ok: bool) -> bool:
+    """Pod tests/ identyfikator zaczynający się od TEST_/FAKE_/DUMMY_/MOCK_ (np. `TEST_PASSWORD = ...`) to fixture."""
+    if not test_values_ok:
+        return False
+    return bool(_TEST_NAME.match(re.search(r"[A-Za-z0-9_]*$", statement[:start]).group(0)))  # type: ignore[union-attr]
+
+
+def _key_hit(statement: str, *, test_values_ok: bool, unquoted: bool) -> str | None:
+    """Nazwa pola z zaszytym sekretem w instrukcji (bez wartości) albo None."""
+    for pattern in (_KEY_HEADER_QUOTED, _KEY_HEADER_RAW):
+        for m in pattern.finditer(statement):
+            if _secret_literal("key", m.group("v"), test_values_ok):
+                return m.group("k")
+    for m in _KEY_NAMED.finditer(statement):
+        kind = _secret_kind(m.group("k")) or "password"
+        if _secret_literal(kind, m.group("v"), test_values_ok) and not _is_test_name(statement, m.start("k"), test_values_ok):
+            return m.group("k")
+    for m in _ENV_SET.finditer(statement):
+        name = m.group("n") or m.group("n2")
+        kind = _secret_kind(name)
+        if kind and _secret_literal(kind, m.group("v"), test_values_ok):
+            return name
+    if unquoted:
+        for pattern in (_UNQ_START, _UNQ_TOKEN, _UNQ_ENV_SPACE, _UNQ_FLAG):
+            for m in pattern.finditer(statement):
+                kind = _secret_kind(m.group("n"))
+                value = m.group("v")
+                if kind and not _CODE_LIKE.search(value) and _secret_literal(kind, value, test_values_ok):
+                    return m.group("n")
+    return None
+
+
+# --- live_allowed w skryptach --------------------------------------------------------------------------------------------
+
+_RT_TARGET = re.compile(r"runtime\.toml", re.I)
+_LIVE = re.compile(r"live_allowed", re.I)
+_TRUE = re.compile(r"(?<![\w-])true(?![\w-])", re.I)
+_RT_WRITE = re.compile(
+    r"write_text|write_bytes|\.write\s*\(|\bopen\s*\(|\bdump\s*\(|\.replace\s*\(|\bsub\s*\(|\bsed\s+(?:-\w+\s+)*-i|\btee\b",
+    re.I,
+)
+_RT_REDIRECT = re.compile(r""">>?\s*["']?\S*runtime\.toml""", re.I)
+_RT_ASSIGN_TRUE = re.compile(
+    r"""(?:\[\s*["']live_allowed["']\s*\]|\.live_allowed)\s*=\s*(?:True\b|true\b|[\w.]*bool\w*\(\s*["']?true)""", re.I
+)
+
+
+def _runtime_hit(statement: str, rt_aliases: dict[str, bool]) -> bool:
+    """Instrukcja zapisuje `live_allowed = true` do runtime.toml (plik, alias ścieżki albo uchwyt otwartego pliku)."""
+    if _RT_ASSIGN_TRUE.search(statement):
+        return True
+    if not (_LIVE.search(statement) and _TRUE.search(statement)):
+        return False
+    mentions = bool(_RT_TARGET.search(statement)) or _mentions_alias(statement, rt_aliases)
+    return mentions and bool(_RT_WRITE.search(statement) or _RT_REDIRECT.search(statement))
+
+
+def _track_runtime_aliases(statement: str, rt_aliases: dict[str, bool]) -> None:
+    """Zmienne i uchwyty (`p = Path('config/runtime.toml')`, `with open(RT, 'a') as fh`) wskazujące runtime.toml."""
+    mentions = bool(_RT_TARGET.search(statement)) or _mentions_alias(statement, rt_aliases)
+    if not mentions:
+        return
+    assign = _ASSIGN.match(statement)
+    if assign and not _CHECK_ONLY.search(assign.group("rhs")):
+        rhs = assign.group("rhs")
+        if _RT_TARGET.search(rhs) or _mentions_alias(rhs, rt_aliases):
+            rt_aliases[assign.group("lhs")] = True
+            while len(rt_aliases) > MAX_ALIASES:
+                del rt_aliases[next(iter(rt_aliases))]
+    handle = re.search(r"\bas\s+([A-Za-z_]\w*)", statement)
+    if handle and re.search(r"\bopen\s*\(", statement):
+        rt_aliases[handle.group(1)] = True
 
 
 # --- skan tekstu ---------------------------------------------------------------------------------------------------------
 
 
 def scan_text(
-    text: str, *, arming: bool = True, key: bool = True, test_values_ok: bool = False, env: bool = False
+    text: str,
+    *,
+    arming: bool = True,
+    key: bool = True,
+    runtime: bool = True,
+    test_values_ok: bool = False,
+    unquoted: bool = True,
 ) -> list[Finding]:
     """Naruszenia w tekście (jedno na instrukcję i regułę). Nigdy nie zawiera wartości klucza w komunikacie."""
     findings: list[Finding] = []
     aliases: dict[str, str] = {}
+    rt_aliases: dict[str, bool] = {}
+    mark = _Marker(aliases)
     for line, statement in _logical_lines(text):
-        mark = _marker_re(frozenset(aliases))
         if arming:
             hit = _call_hit(statement, mark) or _shell_hit(statement, mark)
             if hit:
@@ -425,10 +571,18 @@ def scan_text(
                 found = mark.search(rhs)
                 if found and not _CHECK_ONLY.search(rhs):
                     aliases[lhs] = _marker_name(found.group(0), aliases)
+                    while len(aliases) > MAX_ALIASES:
+                        del aliases[next(iter(aliases))]
+                    mark = _Marker(aliases)
                 elif lhs in aliases:
                     del aliases[lhs]
+                    mark = _Marker(aliases)
+        if runtime:
+            if _runtime_hit(statement, rt_aliases):
+                findings.append(Finding(line, "runtime", _RUNTIME_MESSAGE))
+            _track_runtime_aliases(statement, rt_aliases)
         if key:
-            what = _key_hit(statement, test_values_ok=test_values_ok, env=env)
+            what = _key_hit(statement, test_values_ok=test_values_ok, unquoted=unquoted)
             if what:
                 findings.append(
                     Finding(
@@ -448,7 +602,11 @@ def violates(text: str) -> bool:
 
 # --- skan z uwzględnieniem ścieżki ---------------------------------------------------------------------------------------
 
-_RUNTIME_TRUE = re.compile(r"""^\s*"?live_allowed"?\s*=\s*true(?![\w-])""", re.I)
+_RUNTIME_TRUE = re.compile(r"""^\s*(?:"live_allowed"|'live_allowed'|live_allowed)\s*=\s*true(?![\w-])""", re.I)
+_RUNTIME_MESSAGE = (
+    "live_allowed = true w config/runtime.toml przestawia wyłącznie właściciel (only the owner flips live_allowed)"
+)
+_DRIVE = re.compile(r"^[A-Za-z]:/")
 
 
 def _normalize(path: str) -> str:
@@ -456,48 +614,93 @@ def _normalize(path: str) -> str:
     return norm[2:] if norm.startswith("./") else norm
 
 
+def _is_absolute(norm: str) -> bool:
+    return norm.startswith("/") or bool(_DRIVE.match(norm))
+
+
+def _fold(norm: str) -> str:
+    return norm.lower() if _DRIVE.match(norm) else norm  # litera dysku Windows: bez rozróżniania wielkości
+
+
+def _default_roots() -> list[str]:
+    """Korzenie repozytorium: ten plik oraz `CLAUDE_PROJECT_DIR`, jeśli jest bezwzględny i ma w środku strażnika."""
+    roots = [REPO_ROOT.as_posix(), os.path.abspath(str(REPO_ROOT)).replace("\\", "/")]
+    env = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if env and _is_absolute(_normalize(env)):
+        try:
+            if (Path(env) / "scripts" / "hooks" / "guard_live.py").is_file():
+                roots += [_normalize(env), Path(env).resolve().as_posix()]
+        except OSError:
+            pass
+    return list(dict.fromkeys(_normalize(r) for r in roots))
+
+
+def _relative_to_root(norm: str, roots: list[str]) -> str | None:
+    """Ścieżka względem korzenia repozytorium albo None, gdy plik leży poza repozytorium."""
+    if not _is_absolute(norm):
+        return None if norm == ".." or norm.startswith("../") else norm
+    candidates = [norm]
+    if norm.startswith("/"):
+        try:
+            candidates.append(Path(norm).resolve().as_posix())
+        except (OSError, RuntimeError):
+            pass
+    for cand in candidates:
+        for root in roots:
+            base = root.rstrip("/")
+            if _fold(cand) == _fold(base):
+                return ""
+            if _fold(cand).startswith(_fold(base) + "/"):
+                return cand[len(base) + 1 :]
+    return None
+
+
 def _tail_match(norm: str, rel: str) -> bool:
     return norm == rel or norm.endswith("/" + rel)
 
 
-def _is_scanned_name(norm: str) -> bool:
-    name = posixpath.basename(norm)
-    if name in SCANNED_NAMES or name.startswith("Dockerfile.") or name == ".env" or name.startswith(".env."):
-        return True
-    return posixpath.splitext(name)[1].lower() in SCANNED_SUFFIXES
+def _content_is_scanned(norm: str, rel: str | None, text: str) -> bool:
+    """Czy treść pliku podlega regułom: nie proza, nie dane silnika, nie binarium."""
+    suffix = posixpath.splitext(posixpath.basename(norm))[1].lower()
+    if suffix in PROSE_SUFFIXES or suffix in BINARY_SUFFIXES or "\x00" in text[:8192]:
+        return False
+    if rel is not None and (rel.startswith("docs/") or rel in PROSE_FILES or rel.startswith("data/")):
+        return False
+    return True
 
 
-def _is_env_file(norm: str) -> bool:
-    name = posixpath.basename(norm)
-    return name == ".env" or name.endswith(".env") or name.startswith(".env.")
-
-
-def _under_tests(norm: str) -> bool:
-    return norm.startswith("tests/") or "/tests/" in norm
-
-
-def scan_path_text(path: str, text: str) -> list[Finding]:
+def scan_path_text(path: str, text: str, roots: list[str] | None = None) -> list[Finding]:
+    """Naruszenia w pliku o danej ścieżce. `roots`: korzenie repozytorium (domyślnie ten plik i CLAUDE_PROJECT_DIR)."""
     norm = _normalize(path)
+    rel = _relative_to_root(norm, _default_roots() if roots is None else roots)
+    inside = rel is not None
     findings: list[Finding] = []
-    prose = norm.startswith("docs/") or "/docs/" in norm
-    if not prose and _is_scanned_name(norm):
-        arming = not any(_tail_match(norm, rel) for rel in ARMING_EXEMPT)
-        key = not any(_tail_match(norm, rel) for rel in KEY_EXEMPT)
+    name = posixpath.basename(norm)
+    if name in ARMING_NAMES:
+        findings.append(
+            Finding(
+                1,
+                "arming",
+                f"zapis pliku uzbrojenia {name} po nazwie: tworzy go wyłącznie właściciel "
+                f"(writing the owner-only arming file {name} by name)",
+            )
+        )
+    if _content_is_scanned(norm, rel, text):
+        in_tests = inside and rel.startswith("tests/")
+        suffix = posixpath.splitext(name)[1].lower()
         findings += scan_text(
-            text, arming=arming, key=key, test_values_ok=_under_tests(norm), env=_is_env_file(norm)
+            text,
+            arming=not (inside and rel in ARMING_EXEMPT),
+            key=not (inside and rel in KEY_EXEMPT),
+            runtime=not in_tests,
+            test_values_ok=in_tests,
+            unquoted=suffix not in QUOTED_ONLY_SUFFIXES,
         )
     if _tail_match(norm, "config/runtime.toml"):
         for number, raw in enumerate(text.splitlines(), start=1):
             if _RUNTIME_TRUE.match(_code_view(raw)[0]):
-                findings.append(
-                    Finding(
-                        number,
-                        "runtime",
-                        "live_allowed = true w config/runtime.toml przestawia wyłącznie właściciel "
-                        "(only the owner flips live_allowed)",
-                    )
-                )
-    return sorted(findings, key=lambda f: (f.line, f.rule))
+                findings.append(Finding(number, "runtime", _RUNTIME_MESSAGE))
+    return sorted(set(findings), key=lambda f: (f.line, f.rule))
 
 
 def violates_in(path: str, text: str) -> list[str]:
@@ -607,8 +810,8 @@ def hook_main(raw: bytes) -> int:
 # --- tryb --scan ---------------------------------------------------------------------------------------------------------
 
 
-def _iter_files(root: Path, top: Path):
-    for current, dirs, files in os.walk(root, followlinks=False):
+def _iter_files(top: Path):
+    for current, dirs, files in os.walk(top, followlinks=False):
         here = Path(current)
         at_top = here == top
         dirs[:] = sorted(
@@ -621,8 +824,7 @@ def _iter_files(root: Path, top: Path):
             and not (at_top and (d in SCAN_SKIP_TOP or d.startswith("data")))
         )
         for name in sorted(files):
-            if _is_scanned_name(name):
-                yield here / name
+            yield here / name
 
 
 def _display(file: Path) -> str:
@@ -636,16 +838,19 @@ def scan_paths(paths: list[Path]) -> tuple[int, int]:
     """Skanuje pliki i katalogi; zwraca (liczba naruszeń, liczba przeskanowanych plików)."""
     violations = scanned = 0
     for target in paths:
-        files = [target] if target.is_file() else list(_iter_files(target, target))
+        top = Path(os.path.abspath(target))
+        files = list(_iter_files(top)) if target.is_dir() else [top]
+        roots = [top.as_posix()] if target.is_dir() else None  # katalog skanu jest korzeniem dla swoich plików
         for file in files:
             try:
-                text = file.read_bytes().decode("utf-8", errors="replace")
+                data = file.read_bytes()
             except OSError as exc:
                 sys.stderr.write(f"{file}: nie można odczytać / cannot read ({exc.__class__.__name__})\n")
                 violations += 1
                 continue
+            text = "" if len(data) > MAX_SCAN_BYTES or b"\x00" in data[:8192] else data.decode("utf-8", errors="replace")
             scanned += 1
-            for finding in scan_path_text(file.as_posix(), text):
+            for finding in scan_path_text(file.as_posix(), text, roots):
                 print(f"{_display(file)}:{finding.line}: {finding.message}")
                 violations += 1
     return violations, scanned

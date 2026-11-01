@@ -1,6 +1,8 @@
 # CI gw-stock-engine (spec sekcja 12): testy logiki w macierzy Pythona oraz w obrazie Dockera.
 #
 # Zasady:
+# - Wyzwalacze: `push` tylko na `main`, `pull_request` dla każdej gałęzi z PR (bez podwójnych przebiegów), ręczne
+#   uruchomienie. Nowsze przebiegi na gałęziach anulują starsze; przebiegi na `main` nigdy się nie anulują.
 # - CI NIE dostaje żadnych sekretów, kluczy brokera ani dostępu do VPS (spec sekcja 12). Testy
 #   `integration_live_readonly` nie biegną tu nigdy (znacznik wyklucza je z kolejki), a wdrożenie jest ręczne.
 # - Uprawnienia tokenu: tylko odczyt zawartości. Żadnych uprzywilejowanych wyzwalaczy, zapisu ani publikacji.
@@ -13,6 +15,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -21,7 +24,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"

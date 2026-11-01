@@ -6,7 +6,7 @@ przestawia `live_allowed`), nie granica bezpieczeństwa: ostatecznie decyduje w�
 Ten plik zawiera celowo wzorce naruszeń (jako napisy), więc jest wyłączony ze skanu przez listę wyjątków w
 `scripts/hooks/guard_live.py`. Testy czytają `scripts/`, `.claude/`, `.github/` i `docs/`, których nie ma w obrazie
 testowym (`docs/` odfiltrowuje `.dockerignore`, etapy Dockerfile kopiują tylko wskazane ścieżki): tam cały plik jest
-pomijany, a w CI biegnie w zadaniu `tests`.
+pomijany WYŁĄCZNIE przy znaczniku `GW_TEST_IMAGE=1` (ustawia go Dockerfile), a w CI biegnie w zadaniu `tests`.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ from __future__ import annotations
 import functools
 import importlib.util
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -30,8 +32,10 @@ SETTINGS = ROOT / ".claude" / "settings.json"
 AGENTS_DIR = ROOT / ".claude" / "agents"
 CI_FILE = ROOT / ".github" / "workflows" / "ci.yml"
 
-IN_TEST_IMAGE = not (ROOT / "docs").is_dir()
-pytestmark = pytest.mark.skipif(IN_TEST_IMAGE, reason="docs/, scripts/, .claude/ i .github/ nie ma w obrazie testowym")
+# Obraz testowy (Dockerfile, cel test) ustawia GW_TEST_IMAGE=1 i nie zawiera docs/, scripts/, .claude/ ani .github/. Tylko wtedy
+# pomijamy cały plik; bez znacznika brak tych katalogów (sparse checkout, przeniesione docs/) wywala testy głośno.
+IN_TEST_IMAGE = os.environ.get("GW_TEST_IMAGE") == "1"
+pytestmark = pytest.mark.skipif(IN_TEST_IMAGE, reason="obraz testowy (GW_TEST_IMAGE=1): brak docs/, scripts/, .claude/, .github/")
 
 NAMES = ("ARM_LIVE", "L1_PASSED")
 
@@ -181,6 +185,9 @@ SHELL_CREATION = {
     "after-other-lines": "set -e\ncd /srv\ntouch data/@N@",
     "yaml-run": "    steps:\n      - run: touch data/@N@",
     "continued-line": "touch \\\n  data/@N@",
+    "systemd-unit": "ExecStartPre=/usr/bin/touch /data/@N@",
+    "absolute-cp": "/bin/cp /dev/null data/@N@",
+    "sudo-absolute-touch": "sudo /usr/bin/touch data/@N@",
 }
 
 
@@ -229,6 +236,9 @@ NOT_CREATION = {
     "subprocess-rm": "subprocess.run(['rm', '-f', 'data/@N@'])",
     "touch-other-file": "(d / 'x').touch()\nexists = (d / '@N@').exists()",
     "content-is-not-the-file": "name = (d / '@N@').read_text().strip()\n(d / name).touch()",
+    "replace-with-empty": "text = text.replace('@N@', '')",
+    "replace-with-empty-dq": 'cleaned = text.replace("@N@", "")',
+    "replace-empty-then-touch-other": "x = ''\n(d / 'other').touch()\ny = (d / '@N@').exists()",
 }
 
 
@@ -384,6 +394,21 @@ SCANNED_FILES = [
     "deploy.env",
     "docker/Dockerfile",
     "Makefile",
+    # odwrócone: skanujemy wszystko poza prozą i binariami (przegląd M5)
+    "scripts/arm",
+    "docker/entrypoint",
+    "Procfile",
+    "justfile",
+    "Containerfile",
+    "scripts/run.zsh",
+    "scripts/run.ps1",
+    "deploy/gw.service",
+    "deploy/gw.timer",
+    "export/notes.json",
+    "nb/analysis.ipynb",
+    "notes/todo.txt",
+    ".envrc",
+    "src/gwstock/x.pyi",
 ]
 
 
@@ -396,9 +421,20 @@ def test_scanned_files_report_the_violation(path):
 
 @pytest.mark.parametrize(
     "path",
-    ["README.md", "CLAUDE.md", "docs/ops/runbook.md", "notes.txt", "data/x.json", "image.png", ".claude/settings.json"],
+    [
+        "README.md",
+        "CLAUDE.md",
+        "docs/ops/runbook.md",
+        ".claude/agents/risk-reviewer.md",
+        ".claude/settings.json",
+        "notes/readme.markdown",
+        "image.png",
+        "src/gwstock/__pycache__/x.cpython-312.pyc",
+        "data/x.json",  # dane silnika (konto, dziennik), nie źródła
+        "data/journal.sqlite",
+    ],
 )
-def test_other_suffixes_are_not_scanned(path):
+def test_prose_binaries_and_engine_data_are_not_scanned(path):
     assert guard().violates_in(path, "touch data/ARM_LIVE\napi_key = 'abcd1234efgh5678'\n") == []
 
 
@@ -423,9 +459,11 @@ def test_a_clean_file_has_no_reasons():
 def test_the_allow_list_exempts_the_listed_paths_from_the_arming_rule(rel):
     text = "(data_dir / 'ARM_LIVE').write_text('')\n"
     assert guard().violates_in(rel, text) == []
-    assert guard().violates_in(f"/home/user/gw-stock-engine-work/{rel}", text) == []  # ścieżka bezwzględna z hooka
-    assert guard().violates_in("C:\\project\\" + rel.replace("/", "\\"), text) == []  # separatory Windows
+    assert guard().violates_in(str(ROOT / rel), text) == []  # ścieżka bezwzględna z hooka, pod korzeniem repozytorium
     assert guard().violates_in(f"src/gwstock/{Path(rel).name}", text) != []  # ta sama treść gdzie indziej: naruszenie
+    # plik o tej samej końcówce POZA repozytorium nie dostaje wyjątku (przegląd I3)
+    assert guard().violates_in("/x/" + rel, text) != []
+    assert guard().violates_in("C:\\project\\" + rel.replace("/", "\\"), text) != []
 
 
 def test_the_allow_list_matches_whole_path_components_only():
@@ -480,6 +518,7 @@ def test_the_allow_list_has_no_stale_or_unneeded_entries():
         assert (ROOT / rel).is_file(), f"{rel}: wpis na liście wyjątków bez pliku"
         findings = g.scan_text((ROOT / rel).read_text(encoding="utf-8"))
         assert any(f.rule == "arming" for f in findings), f"{rel}: wyjątek niepotrzebny (plik nic nie narusza)"
+    assert g.KEY_EXEMPT == {"scripts/hooks/guard_live.py", "tests/unit/test_guard_live.py"}  # przegląd M1: adapter bez wyjątku
     for rel in sorted(g.KEY_EXEMPT - {"scripts/hooks/guard_live.py"}):  # nagłówek strażnika nie zawiera kluczy
         assert (ROOT / rel).is_file(), f"{rel}: wpis na liście wyjątków bez pliku"
         findings = g.scan_text((ROOT / rel).read_text(encoding="utf-8"), test_values_ok=True)
@@ -514,10 +553,15 @@ def test_env_files_flag_unquoted_secret_assignments():
 # --- hook: stdin -> kod wyjścia ----------------------------------------------------------------------------------
 
 
-def run_hook(payload=None, *, raw: str | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def run_hook(
+    payload=None, *, raw: str | None = None, cwd: Path | None = None, env: dict | None = None
+) -> subprocess.CompletedProcess:
     stdin = raw if raw is not None else json.dumps(payload)
+    full_env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}  # test nie dziedziczy cudzego korzenia
+    full_env.update(env or {})
     return subprocess.run(
-        [sys.executable, str(GUARD)], input=stdin, capture_output=True, text=True, cwd=cwd, timeout=30, check=False
+        [sys.executable, str(GUARD)], input=stdin, capture_output=True, text=True, cwd=cwd, env=full_env, timeout=30,
+        check=False,
     )
 
 
@@ -618,21 +662,31 @@ def test_edit_of_runtime_toml_is_judged_on_the_whole_resulting_file(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "path",
+    "rel",
     [
-        "/work/tests/fault/engine_sim.py",
-        "/work/tests/fault/test_modes.py",
-        "/work/tests/fault/test_engine_day.py",
-        "/work/tests/unit/test_guard_live.py",
-        "/work/scripts/hooks/guard_live.py",
-        "C:\\work\\tests\\fault\\engine_sim.py",
+        "tests/fault/engine_sim.py",
+        "tests/fault/test_modes.py",
+        "tests/fault/test_engine_day.py",
+        "tests/unit/test_guard_live.py",
+        "scripts/hooks/guard_live.py",
     ],
 )
-def test_allow_listed_paths_pass_the_hook(path):
-    assert run_hook(write_event(path, "(data_dir / ARM_FILE).write_text('')\n")).returncode == 0
+def test_allow_listed_paths_pass_the_hook(rel):
+    assert run_hook(write_event(str(ROOT / rel), "(data_dir / ARM_FILE).write_text('')\n")).returncode == 0
+    for foreign in ("/work/" + rel, "C:\\work\\" + rel.replace("/", "\\")):  # tylko pod korzeniem repozytorium
+        assert run_hook(write_event(foreign, "(data_dir / ARM_FILE).write_text('')\n")).returncode == 2
 
 
-@pytest.mark.parametrize("path", ["/work/README.md", "/work/docs/ops/runbook.md", "/work/data/x.json", "/work/a.txt"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        str(ROOT / "README.md"),
+        str(ROOT / "docs/ops/runbook.md"),
+        str(ROOT / "data/x.json"),
+        "/work/README.md",
+        "/work/docs/ops/runbook.md",
+    ],
+)
 def test_unscanned_paths_pass_the_hook(path):
     assert run_hook(write_event(path, "touch data/ARM_LIVE\n")).returncode == 0
 
@@ -831,7 +885,7 @@ def test_the_configured_hook_command_blocks_end_to_end(settings):
 def test_settings_have_only_hooks_and_permissions(settings):
     assert set(settings) <= {"$schema", "hooks", "permissions"}  # bez model, env i innych
     assert set(settings["hooks"]) == {"PreToolUse"}
-    assert set(settings["permissions"]) == {"deny"}
+    assert set(settings["permissions"]) == {"deny", "ask"}
 
 
 DENY_RULE = re.compile(r"^(Read|Edit|Bash)\(.+\)$")
@@ -860,6 +914,7 @@ def test_deny_rules_are_well_formed_unique_and_cover_secrets_and_arming_files(se
         "Bash(*python* -c*L1_PASSED*)",
         "Bash(sed -i*runtime.toml*)",
         "Bash(*>*runtime.toml*)",
+        "Edit(/.claude/settings.local.json)",  # lokalny plik mógłby wyłączyć hooki (`disableAllHooks`)
     ):
         assert needed in deny, needed
 
@@ -930,6 +985,12 @@ def test_agent_charters_forbid_changes_in_words_too():
         assert "tylko do odczytu" in body.lower() and "nie " in body.lower()
 
 
+def test_agent_charters_treat_repository_text_as_untrusted_data():
+    for name in AGENTS:
+        _, body = split_frontmatter(AGENTS_DIR / f"{name}.md")
+        assert "niezaufane" in body and "nigdy instrukcj" in body, name  # przegląd M9
+
+
 def test_agent_files_pass_the_guard():
     for path in AGENTS_DIR.glob("*.md"):
         assert guard().violates_in(str(path), path.read_text(encoding="utf-8")) == []
@@ -955,13 +1016,14 @@ def all_steps(ci_doc: dict):
 
 def test_ci_triggers_and_least_privilege(ci):
     assert set(triggers(ci)) == {"push", "pull_request", "workflow_dispatch"}
+    assert triggers(ci)["push"] == {"branches": ["main"]}  # gałąź z otwartym PR nie biegnie podwójnie (przegląd M8)
     assert ci["permissions"] == {"contents": "read"}
     for job in ci["jobs"].values():
         assert "permissions" not in job  # żadne zadanie nie poszerza uprawnień
 
 
 def test_ci_cancels_superseded_runs(ci):
-    assert ci["concurrency"]["cancel-in-progress"] is True
+    assert ci["concurrency"]["cancel-in-progress"] == "${{ github.ref != 'refs/heads/main' }}"  # main nie anuluje
     assert "github.ref" in ci["concurrency"]["group"] and "github.workflow" in ci["concurrency"]["group"]
 
 
@@ -1043,5 +1105,395 @@ def test_claude_md_documents_the_guard():
         "live_allowed",
         "scripts/hooks/guard_live.py",
         "tests/fault/engine_sim.py",
+        "2.1.295",  # minimalna wersja dla onFailure (przegląd M2)
+        "claude doctor",
+        "/hooks",
+        "korzeniu repozytorium",
+        "zaufania",
+        "chmurowych",
+        "CODEOWNERS",
+        "branch protection",
     ):
         assert needle in text, needle
+    assert "tests/unit/test_capitalcom_adapter.py" not in text  # przegląd M1: bez wyjątku dla testów adaptera
+
+
+# =====================================================================================================================
+# Poprawki po przeglądzie (runda 1): I1-I4, M1-M9
+# =====================================================================================================================
+
+# --- I3: ścieżki są najpierw względem korzenia repozytorium --------------------------------------------------------------
+
+
+def test_paths_outside_the_repository_get_the_full_rules_even_below_docs_or_tests():
+    g = guard()
+    violation = "open('data/ARM_LIVE', 'w')\n"
+    for foreign in ("/srv/docs/gw/src/x.py", "/home/tests/gw/src/x.py", "/x/tests/fault/engine_sim.py", "/x/docs/y.py"):
+        assert g.violates_in(foreign, violation) != [], foreign
+    assert g.violates_in("/srv/docs/gw/src/x.py", "api_key = 'Zx9fLq2mTn8bVc4d'\n") != []
+    assert g.violates_in("/home/tests/gw/src/x.py", "password = 'test-Zx9fLq2mTn8bVc4d'\n") != []  # nie jest testem repo
+    # pod korzeniem repozytorium wyjątki działają jak dawniej (ścieżka bezwzględna z hooka)
+    assert g.violates_in(str(ROOT / "docs/ops/x.py"), violation) == []
+    assert g.violates_in(str(ROOT / "tests/fault/engine_sim.py"), "(d / ARM_FILE).touch()\n") == []
+    assert g.violates_in(str(ROOT / "src/gwstock/x.py"), violation) != []
+    assert g.violates_in(str(ROOT / "tests/unit/test_x.py"), "password = 'test-Zx9fLq2mTn8bVc4d'\n") == []
+    # katalogi o nazwach z repozytorium, ale u korzenia systemu plików, też są poza nim
+    for rooted in ("/tests/fault/engine_sim.py", "/docs/ops/x.py", "/data/export.json"):
+        assert g.violates_in(rooted, "(d / ARM_FILE).touch()\n") != [], rooted
+    assert g.violates_in("/tests/unit/test_x.py", "password = 'test-Zx9fLq2mTn8bVc4d'\n") != []
+    # względna ścieżka z `..` wychodząca z repozytorium nie dziedziczy wyjątków
+    assert g.violates_in("../tests/fault/engine_sim.py", "(d / ARM_FILE).touch()\n") != []
+
+
+def test_the_hook_repro_from_the_review_is_blocked():
+    for path in ("/srv/docs/gw/src/x.py", "/x/tests/fault/engine_sim.py", "/home/tests/gw/src/x.py"):
+        done = run_hook(write_event(path, 'open("data/ARM_LIVE","w")\n'))
+        assert done.returncode == 2, path
+    assert run_hook(write_event("/srv/docs/gw/src/x.py", "api_key='Zx9fLq2mTn8bVc4d'\n")).returncode == 2
+
+
+def test_a_checkout_below_a_directory_named_docs_or_tests_is_still_guarded(tmp_path):
+    root = tmp_path / "docs" / "tests" / "gw"
+    hook = root / "scripts" / "hooks" / "guard_live.py"
+    hook.parent.mkdir(parents=True)
+    shutil.copy(GUARD, hook)
+
+    def run(rel: str, text: str) -> int:
+        done = subprocess.run([sys.executable, str(hook)], input=json.dumps(write_event(str(root / rel), text)),
+                              capture_output=True, text=True, timeout=30, check=False,
+                              env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
+        return done.returncode
+
+    assert run("src/gwstock/x.py", "open('data/ARM_LIVE', 'w')\n") == 2
+    assert run("src/gwstock/y.py", "api_key = 'test-Zx9fLq2mTn8bVc4d'\n") == 2  # `tests` w ścieżce nie czyni z src/ testu
+    assert run("docs/ops/z.py", "touch data/ARM_LIVE\n") == 0  # docs/ liczone od korzenia: nadal proza
+    assert run("tests/fault/engine_sim.py", "(data_dir / ARM_FILE).write_text('')\n") == 0
+
+
+def test_claude_project_dir_is_honoured_only_when_it_holds_the_guard(tmp_path):
+    root = tmp_path / "checkout"
+    (root / "scripts" / "hooks").mkdir(parents=True)
+    (root / "scripts" / "hooks" / "guard_live.py").write_text("# stand-in\n")
+    other = tmp_path / "other"
+    other.mkdir()
+    event = write_event(str(root / "tests" / "fault" / "engine_sim.py"), "(data_dir / ARM_FILE).write_text('')\n")
+    assert run_hook(event, env={"CLAUDE_PROJECT_DIR": str(root)}).returncode == 0  # korzeń z hooka jest spójny
+    assert run_hook(event).returncode == 2  # bez zmiennej to plik spoza repozytorium
+    assert run_hook(event, env={"CLAUDE_PROJECT_DIR": str(other)}).returncode == 2  # niespójny: bez strażnika w środku
+    assert run_hook(event, env={"CLAUDE_PROJECT_DIR": ""}).returncode == 2
+    assert run_hook(event, env={"CLAUDE_PROJECT_DIR": "relative/dir"}).returncode == 2
+
+
+# --- pliki uzbrojenia zapisywane po nazwie (Write na data/ARM_LIVE) ------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_writing_an_arming_file_by_its_name_is_blocked(name):
+    path = f"/work/data/{name}"
+    events = [
+        write_event(path, ""),
+        edit_event(path, "a", "b"),
+        multi_event(path, [{"old_string": "a", "new_string": "b"}]),
+    ]
+    for event in events:
+        done = run_hook(event)
+        assert done.returncode == 2 and name in done.stderr, event["tool_name"]
+    assert run_hook(write_event(f"/work/data/{name}.bak", "")).returncode == 0  # inny plik
+    assert run_hook(write_event(f"/work/data/not_{name}", "")).returncode == 0
+
+
+def test_scan_flags_a_stray_arming_file_but_not_the_engine_data_directory(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "ARM_LIVE").write_text("")  # runtime właściciela, pomijany jak cały katalog danych
+    assert run_scan(str(tmp_path)).returncode == 0
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "L1_PASSED").write_text("")
+    done = run_scan(str(tmp_path))
+    assert done.returncode == 1 and "L1_PASSED" in done.stdout
+
+
+# --- M5: skanujemy wszystko poza prozą i binariami -----------------------------------------------------------------------
+
+
+def test_content_with_nul_bytes_is_binary_whatever_the_suffix():
+    assert guard().violates_in("export/blob.dat", "\x00\x01touch data/ARM_LIVE\n") == []
+    assert guard().violates_in("export/blob.dat", "touch data/ARM_LIVE\n") != []
+
+
+def test_scan_reads_extensionless_and_unusual_files_but_skips_binaries(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "arm").write_text("#!/bin/sh\ntouch data/ARM_LIVE\n")
+    done = run_scan(str(tmp_path))
+    assert done.returncode == 1 and re.search(r"arm:2: .*ARM_LIVE", done.stdout)
+    (tmp_path / "scripts" / "arm").unlink()
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01touch data/ARM_LIVE\n\x00")
+    (tmp_path / "blob.dat").write_bytes(b"\x00\x01touch data/ARM_LIVE\n\x00")
+    (tmp_path / "pic.png").write_bytes(b"\x89PNG\r\n touch data/ARM_LIVE")
+    (tmp_path / "notes.md").write_text("touch data/ARM_LIVE\n")
+    assert run_scan(str(tmp_path)).returncode == 0
+
+
+# --- M4: pusty literał nie znika --------------------------------------------------------------------------------------------
+
+
+def test_empty_string_literals_survive_normalisation():
+    assert not violates("p.replace('ARM_LIVE', '')")
+    assert not violates('p.replace("L1_PASSED", "")')
+    assert violates("open('data/' 'ARM_LIVE', 'w')")  # sklejanie sąsiednich literałów nadal działa
+    assert violates("open('data/' + \"ARM_\" + 'LIVE', 'w')")  # także mieszane cudzysłowy
+
+
+# --- I2: klucze bez cudzysłowu, hasła z symbolami, zmienne środowiskowe ----------------------------------------------------
+
+HARDCODED_KEYS_FIX1 = [
+    "export CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d",
+    "export CAPITALCOM_API_KEY='Zx9fLq2mTn8bVc4d'",
+    "environment:\n  - CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d",
+    "environment:\n  CAPITALCOM_API_KEY: Zx9fLq2mTn8bVc4d",
+    "env:\n  API_KEY: Zx9fLq2mTn8bVc4d",
+    "ENV CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d",
+    "ENV CAPITALCOM_API_KEY Zx9fLq2mTn8bVc4d",
+    "ARG API_PASSWORD=Tr0ub4dor3xKcdQz",
+    "API_KEY := Zx9fLq2mTn8bVc4d",
+    "api-key: Zx9fLq2mTn8bVc4d",
+    "apiKey: Zx9fLq2mTn8bVc4d",
+    "docker run -e CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d img",
+    "docker run --env API_PASSWORD=Tr0ub4dor3xKcdQz img",
+    "docker build --build-arg API_KEY=Zx9fLq2mTn8bVc4d .",
+    "docker login --password Tr0ub4dor3xKcdQz",
+    "tool --api-key=Zx9fLq2mTn8bVc4d run",
+    "CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d python -m gwstock",
+    "PASSWORD=hunter2hunter2xx",
+    "secret: Zx9fLq2mTn8bVc4dxx",
+    "password = 'Tr0ub4dor&3xKcdQ'",
+    "password = 'correct-horse-battery-staple'",
+    "api_password: 'correct horse battery'",
+    '"password": "p@ss-w0rd!#2024xyz"',
+    "os.environ['CAPITALCOM_API_KEY'] = 'Zx9fLq2mTn8bVc4d'",
+    'os.environ["GW_API_PASSWORD"] = "Tr0ub4dor&3xKcdQ"',
+    "os.environ.setdefault('X_API_KEY', 'Zx9fLq2mTn8bVc4d')",
+    "os.putenv('X_API_KEY', 'Zx9fLq2mTn8bVc4d')",
+    "monkeypatch.setenv('CAPITALCOM_API_KEY', 'Zx9fLq2mTn8bVc4d')",
+    "monkeypatch.setenv('GW_API_PASSWORD', 'Tr0ub4dor&3xKcdQ')",
+]
+
+
+@pytest.mark.parametrize("text", HARDCODED_KEYS_FIX1)
+def test_more_hardcoded_secret_forms_are_flagged(text):
+    assert violates(text)
+
+
+NOT_KEYS_FIX1 = [
+    "export CAPITALCOM_API_KEY=$CAPITALCOM_API_KEY",
+    'export API_KEY="${API_KEY}"',
+    "- CAPITALCOM_API_KEY=${CAPITALCOM_API_KEY}",
+    "API_KEY: ${{ secrets.API_KEY }}",
+    "password: ${{ secrets.PW }}",
+    "ENV API_KEY=",
+    "ENV API_KEY=changeme",
+    "export API_KEY=xxxxxxxxxxxxxxxx",
+    "API_KEY=<your key>",
+    'export API_KEY=""',
+    "docker run -e CAPITALCOM_API_KEY img",
+    "docker run -e CAPITALCOM_API_KEY=$KEY img",
+    "docker login --password-stdin",
+    "docker login --password $PW",
+    "tool --api-key=${API_KEY} run",
+    "export CAPITALCOM_API_KEY=$CAPITALCOMEXCHANGEKEY",
+    "- GW_PASSWORD=${GW_PASSWORD_FROM_VAULT}",
+    'PASSWORD="$(cat /run/secrets/password-file)"',
+    'api_key = "${CAPITALCOMEXCHANGEKEY}"',
+    "password = os.environ['GW_PASSWORD']",
+    "password = os.environ.get('GW_PASSWORD', '')",
+    "api_password = self._creds.api_password",
+    "api_key = creds['api_key']",
+    "os.environ['X_API_KEY'] = key",
+    "os.environ['X_API_KEY'] = os.environ['Y_API_KEY']",
+    "os.environ['GW_PASSWORD'] = ''",
+    "monkeypatch.setenv('GW_CAPITALCOM_KEY_FILE', '/secrets/capitalcom.json')",
+    "monkeypatch.setenv('GW_DATA_DIR', str(tmp_path / 'data'))",
+    "monkeypatch.setenv('GW_API_KEY', '<redacted>')",
+    "GW_CAPITALCOM_KEY_FILE: /secrets/capitalcom.json",
+    "password_file: /run/secrets/password-file-path",
+    "--password-file /run/secrets/password-file-path",
+    "secretName: my-long-secret-name-here",
+    "PASSWORD_MIN_LENGTH: 12345678901234",
+    "password = 'short-pass'",
+    "password = ''",
+    "password: hunter2",
+    "# export API_KEY=Zx9fLq2mTn8bVc4d",
+]
+
+
+@pytest.mark.parametrize("text", NOT_KEYS_FIX1)
+def test_references_placeholders_and_lookups_stay_clean_in_the_new_secret_forms(text):
+    assert not violates(text)
+
+
+def test_unquoted_secret_assignments_are_flagged_by_file_type_and_python_stays_quoted_only():
+    g = guard()
+    for path in ("scripts/run.sh", "docker/compose.yml", ".github/workflows/x.yml", "docker/Dockerfile", "Makefile"):
+        assert g.violates_in(path, "KEY=1\nCAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d\n") != [], path
+    assert g.violates_in("src/gwstock/x.py", "PASSWORD = somevariablename123\n") == []
+    assert g.violates_in("config/x.toml", "api_key = Zx9fLq2mTn8bVc4d\n") == []  # w TOML bez cudzysłowu to nie napis
+    assert g.violates_in("config/x.toml", "api_key = 'Zx9fLq2mTn8bVc4d'\n") != []
+
+
+def test_the_new_secret_forms_forgive_test_values_only_under_tests():
+    g = guard()
+    for text in (
+        "monkeypatch.setenv('CAPITALCOM_API_KEY', 'test-Zx9fLq2mTn8bVc4d')\n",
+        "os.environ['GW_API_PASSWORD'] = 'fake-Tr0ub4dor&3xKcdQ'\n",
+        "password = 'mock-password-value-1'\n",
+    ):
+        assert g.violates_in("tests/unit/test_x.py", text) == [], text
+        assert g.violates_in("src/gwstock/x.py", text) != [], text
+    assert g.violates_in("tests/unit/test_x.py", "password = 'Tr0ub4dor&3xKcdQ'\n") != []
+
+
+def test_fixture_names_with_a_test_prefix_are_forgiven_only_under_tests():
+    g = guard()
+    text = 'TEST_PASSWORD = "s3cr3t-api-pa55word"\n'
+    assert g.violates_in("tests/unit/fake_server.py", text) == []
+    assert g.violates_in("src/gwstock/x.py", text) != []
+    assert g.violates_in("tests/unit/fake_server.py", 'MY_PASSWORD = "s3cr3t-api-pa55word"\n') != []
+    assert g.violates_in("tests/unit/fake_server.py", 'TEST_PASSWORD = "Tr0ub4dor&3xKcdQ"\nPASSWORD = "Tr0ub4dor&3xKcdQ"\n') != []
+
+
+def test_the_adapter_test_fixtures_are_scanned_like_any_other_file():
+    path = "tests/unit/test_capitalcom_adapter.py"
+    assert path not in guard().KEY_EXEMPT
+    assert guard().violates_in(path, (ROOT / path).read_text(encoding="utf-8")) == []
+
+
+# --- M6: tekstowa reguła dla live_allowed w skryptach --------------------------------------------------------------------------
+
+RUNTIME_WRITERS = [
+    "Path('config/runtime.toml').write_text('live_allowed = true\\n')",
+    "open('config/runtime.toml', 'w').write('live_allowed = true')",
+    "p = Path('config') / 'runtime.toml'\np.write_text('live_allowed = true\\n')",
+    "RUNTIME = 'config/runtime.toml'\nwith open(RUNTIME, 'a') as fh:\n    fh.write('live_allowed = true\\n')",
+    "sed -i 's/live_allowed = false/live_allowed = true/' config/runtime.toml",
+    "sed -i 's/false/true/;s/live_allowed/live_allowed/' config/runtime.toml  # live_allowed",
+    "echo 'live_allowed = true' >> config/runtime.toml",
+    "printf 'live_allowed = true\\n' > config/runtime.toml",
+    "printf 'live_allowed = true\\n' | tee config/runtime.toml",
+    "python3 -c \"open('config/runtime.toml','w').write('live_allowed = true')\"",
+    "doc['live_allowed'] = True",
+    'table["live_allowed"] = true',
+]
+
+
+@pytest.mark.parametrize("text", RUNTIME_WRITERS)
+@pytest.mark.parametrize("path", ["src/gwstock/flip.py", "scripts/flip.sh", ".github/workflows/flip.yml"])
+def test_scripts_that_write_live_allowed_true_into_runtime_toml_are_flagged(path, text):
+    reasons = guard().violates_in(path, text)
+    assert reasons and any("live_allowed" in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "echo 'live_allowed = false' >> config/runtime.toml",
+        "grep '^live_allowed' config/runtime.toml",
+        "cat config/runtime.toml",
+        "# sed -i 's/false/true/' config/runtime.toml  live_allowed",
+        "runtime = load_runtime(config_dir, data_dir)\nif runtime.live_allowed is not True:\n    missing.append('live_allowed')",
+        "missing.append('live_allowed is not true in config/runtime.toml')",
+        "p = Path('config/runtime.toml')\ntext = p.read_text()",
+        "live_allowed = raw['live_allowed']",
+        'raw = {"live_allowed": True}  # fixture w pamięci',
+    ],
+)
+def test_reading_and_describing_live_allowed_is_not_a_flip(text):
+    assert guard().violates_in("src/gwstock/x.py", text) == []
+    assert guard().violates_in("scripts/x.sh", text) == [] or "sed -i" in text or ">>" in text
+
+
+def test_tests_may_write_live_allowed_true_to_temporary_configs():
+    text = "(tmp_path / 'runtime.toml').write_text('live_allowed = true\\n')\n"
+    assert guard().violates_in("tests/unit/test_config.py", text) == []
+    assert guard().violates_in(str(ROOT / "tests/fault/test_x.py"), text) == []
+    assert guard().violates_in("src/gwstock/x.py", text) != []
+
+
+@pytest.mark.parametrize("key", ["live_allowed", "'live_allowed'", '"live_allowed"'])
+def test_every_toml_spelling_of_the_key_is_caught(key):
+    assert guard().violates_in("config/runtime.toml", f"{key} = true\n") != []
+    assert guard().violates_in("config/runtime.toml", f"{key}=true # teraz\n") != []
+    assert guard().violates_in("config/runtime.toml", f"{key} = false\n") == []
+
+
+# --- I1/M7: znacznik obrazu testowego -----------------------------------------------------------------------------------------
+
+
+def test_the_test_stage_of_the_dockerfile_sets_the_marker_and_the_runtime_stage_does_not():
+    text = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+    test_stage, runtime_stage = text.split("FROM base AS test")[1].split("FROM base AS runtime")
+    assert re.search(r"^ENV GW_TEST_IMAGE=1$", test_stage, flags=re.M)
+    assert "GW_TEST_IMAGE" not in runtime_stage and "GW_TEST_IMAGE" not in text.split("FROM base AS test")[0]
+
+
+def test_tests_that_need_repository_files_skip_only_on_the_explicit_marker():
+    for rel in ("tests/unit/test_guard_live.py", "tests/unit/test_prereg.py"):
+        source = (ROOT / rel).read_text(encoding="utf-8")
+        assert 'os.environ.get("GW_TEST_IMAGE") == "1"' in source, rel
+        assert "(ROOT / " + '"docs").is_dir()' not in source, rel  # żadnego cichego pomijania po braku katalogu
+
+
+# --- M8: reszta CI -----------------------------------------------------------------------------------------------------------------
+
+
+def test_dependabot_updates_the_pinned_actions_weekly():
+    doc = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
+    assert doc["version"] == 2
+    [update] = doc["updates"]
+    assert update["package-ecosystem"] == "github-actions" and update["directory"] == "/"
+    assert update["schedule"]["interval"] == "weekly"
+
+
+def test_the_session_check_for_real_arming_files_lives_in_conftest():
+    from tests.conftest import arming_files_created
+
+    assert arming_files_created(Path("/nonexistent-data-dir"), frozenset()) == []
+    data = ROOT / "tests" / "__no_such_data__"  # tylko ścieżka; nic nie tworzymy w repozytorium
+    assert arming_files_created(data, frozenset()) == []
+    source = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+    assert 'scope="session"' in source and "autouse=True" in source
+
+
+def test_arming_files_created_during_the_run_are_reported_but_pre_existing_ones_are_not(tmp_path):
+    from tests.conftest import arming_files_created
+
+    assert arming_files_created(tmp_path, frozenset()) == []
+    (tmp_path / "ARM_LIVE").write_text("")  # tak wygląda plik właściciela albo test, który zapomniał o tmp_path
+    (tmp_path / "L1_PASSED").write_text("")
+    assert arming_files_created(tmp_path, frozenset()) == ["ARM_LIVE", "L1_PASSED"]
+    assert arming_files_created(tmp_path, frozenset({"ARM_LIVE"})) == ["L1_PASSED"]
+    assert arming_files_created(tmp_path, frozenset({"ARM_LIVE", "L1_PASSED"})) == []
+
+
+# --- I4: ochrona samego strażnika -----------------------------------------------------------------------------------------------
+
+ASK_RULES = [
+    "Edit(/scripts/hooks/**)",
+    "Edit(/tests/unit/test_guard_live.py)",
+    "Edit(/.github/**)",
+    "Edit(/.claude/**)",
+    "Edit(/config/runtime.toml)",
+]
+
+
+def test_editing_the_guard_ci_and_settings_needs_confirmation(settings):
+    ask = settings["permissions"]["ask"]
+    assert ask == ASK_RULES
+    assert all(DENY_RULE.match(rule) for rule in ask)
+    assert "Edit(/.claude/settings.local.json)" in settings["permissions"]["deny"]  # lokalny plik: zakaz, nie pytanie
+
+
+def test_codeowners_names_the_repository_owner():
+    lines = [ln.split() for ln in (ROOT / ".github" / "CODEOWNERS").read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    assert ["*", "@gwgrafik"] in lines  # właściciel z adresu origin: github.com/gwgrafik
+    for pattern in ("/scripts/hooks/", "/.claude/", "/.github/", "/config/runtime.toml", "/tests/unit/test_guard_live.py"):
+        assert [pattern, "@gwgrafik"] in lines, pattern

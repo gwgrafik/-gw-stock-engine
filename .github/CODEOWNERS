@@ -1,0 +1,10 @@
+# Właściciel repozytorium (login z adresu origin: github.com/gwgrafik). To NIE jest granica bezpieczeństwa sama w sobie:
+# działa dopiero z ochroną gałęzi `main` po stronie GitHub (wymagany przegląd właściciela, wymagany zielony CI).
+* @gwgrafik
+
+# Strażnik live, jego testy, ustawienia Claude Code, CI i plik przełącznika live (zmiany tylko za wiedzą właściciela)
+/scripts/hooks/ @gwgrafik
+/tests/unit/test_guard_live.py @gwgrafik
+/.claude/ @gwgrafik
+/.github/ @gwgrafik
+/config/runtime.toml @gwgrafik

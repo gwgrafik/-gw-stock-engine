@@ -1,0 +1,7 @@
+# Podbijanie przypiętych akcji GitHub (skróty SHA w .github/workflows/ci.yml). Dependabot zostawia komentarz z tagiem.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -51,7 +51,15 @@
       "Bash(*python* -c*L1_PASSED*)",
       "Bash(sed -i*runtime.toml*)",
       "Bash(tee *runtime.toml*)",
-      "Bash(*>*runtime.toml*)"
+      "Bash(*>*runtime.toml*)",
+      "Edit(/.claude/settings.local.json)"
+    ],
+    "ask": [
+      "Edit(/scripts/hooks/**)",
+      "Edit(/tests/unit/test_guard_live.py)",
+      "Edit(/.github/**)",
+      "Edit(/.claude/**)",
+      "Edit(/config/runtime.toml)"
     ]
   }
 }
