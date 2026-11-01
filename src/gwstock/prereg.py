@@ -173,7 +173,8 @@ def write_preregistration(config_dir: Path, data_dir: Path, now: datetime, *, fo
     Rekord: `fingerprint`, `files` (skrót SHA-256 każdego pliku), `adapter`, `instrument_class`, `written_at` (UTC).
     Ta sama konfiguracja co zamrożona: nic się nie zmienia i wraca istniejący rekord (data zamrożenia nie
     przesuwa się). Inny zamrożony odcisk albo nieczytelny plik: `PreregistrationConflict`, chyba że `force=True`
-    (zmieniona konfiguracja to nowy wariant, K+1).
+    (zmieniona konfiguracja to nowy wariant, K+1); wtedy nowy rekord ma klucz `previous` (odcisk i data zamrożenia
+    zastąpionego rekordu, zagnieżdżone aż do pierwszego), żeby ślad wariantów nie zginął.
     """
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise ValueError(f"now: expected a timezone-aware datetime, got {now!r}")
@@ -188,10 +189,13 @@ def write_preregistration(config_dir: Path, data_dir: Path, now: datetime, *, fo
                 f"{path} exists but cannot be read ({exc}); it was NOT changed. Repair it or use --force."
             ) from exc
         existing = None
+    previous = None
     if existing is not None:
         if existing["fingerprint"] == current:
             return existing
-        if not force:
+        if force:  # ślad wariantów: poprzedni odcisk i data zamrożenia (razem z jego własnym poprzednikiem)
+            previous = {key: existing[key] for key in ("fingerprint", "written_at", "previous") if key in existing}
+        else:
             raise PreregistrationConflict(
                 f"the configuration differs from the frozen pre-registration (frozen {existing['fingerprint'][:12]}, "
                 f"current {current[:12]}): a changed configuration is a new variant (K+1). {path} was NOT changed. "
@@ -205,6 +209,8 @@ def write_preregistration(config_dir: Path, data_dir: Path, now: datetime, *, fo
         "instrument_class": INSTRUMENT_CLASS,
         "written_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if previous is not None:
+        record["previous"] = previous
     _atomic_write_600(path, (json.dumps(record, indent=2) + "\n").encode("utf-8"))
     return record
 
@@ -245,23 +251,40 @@ def _print_current(config_dir: Path) -> int:
     return 0
 
 
+def _differing_files(record: dict[str, Any], contents: Sequence[tuple[str, bytes]]) -> list[str] | None:
+    """Nazwy zamrożonych plików, których skrót różni się od bieżącego; None, gdy rekord nie ma skrótów plików."""
+    stored = record.get("files")
+    if not isinstance(stored, dict):
+        return None
+    return [name for name, content in contents if stored.get(name) != hashlib.sha256(content).hexdigest()]
+
+
 def _check(config_dir: Path, data_dir: Path) -> int:
     path = Path(data_dir) / PREREG_FILE
-    current = config_fingerprint(config_dir)
+    contents = _config_contents(config_dir)
+    current = _digest(contents, ADAPTER, INSTRUMENT_CLASS)
     try:
-        frozen = frozen_fingerprint(data_dir)
+        record = _load_record(data_dir)
     except ValueError as exc:
         _say([f"NOT FROZEN: {exc}", f"current: {current}"])
         return 2
-    if frozen is None:
+    if record is None:
         _say([f"NOT FROZEN: no pre-registration in {path}; freeze it with: python -m gwstock.prereg --write",
               f"current: {current}"])  # fmt: skip
         return 2
+    frozen = record["fingerprint"]
     _say([f"frozen:  {frozen}", f"current: {current}"])
     if frozen == current:
         _say(["OK: the configuration matches the frozen pre-registration"])
         return 0
     _say(["MISMATCH: the configuration differs from the frozen pre-registration; this is a new variant (K+1)"])
+    differing = _differing_files(record, contents)
+    if differing is None:
+        _say(["the frozen record has no per-file hashes, so the differing file cannot be named"])
+    elif differing:
+        _say([f"files that differ: {', '.join(differing)}"])
+    else:
+        _say(["no frozen file differs: the adapter, the instrument class or the encoding changed"])
     return 1
 
 

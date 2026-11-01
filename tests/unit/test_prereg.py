@@ -337,6 +337,28 @@ def test_force_overwrites_a_different_frozen_fingerprint(config_dir, data_dir):
     assert second["written_at"] == "2026-11-03T07:00:00Z"
 
 
+def test_force_records_the_previous_fingerprint_so_the_variant_trail_survives(config_dir, data_dir):
+    first = prereg.write_preregistration(config_dir, data_dir, NOW)
+    assert "previous" not in first  # pierwsze zamrożenie nie ma poprzednika
+    (config_dir / "costs_v1.toml").write_text("# zmiana 1\n" + (config_dir / "costs_v1.toml").read_text())
+    second = prereg.write_preregistration(config_dir, data_dir, NOW + timedelta(days=1), force=True)
+    assert second["previous"] == {"fingerprint": first["fingerprint"], "written_at": first["written_at"]}
+    (config_dir / "costs_v1.toml").write_text("# zmiana 2\n" + (config_dir / "costs_v1.toml").read_text())
+    third = prereg.write_preregistration(config_dir, data_dir, NOW + timedelta(days=2), force=True)
+    assert third["previous"] == {
+        "fingerprint": second["fingerprint"], "written_at": second["written_at"], "previous": second["previous"],
+    }  # cały ślad wariantów, nie tylko ostatni krok
+    assert json.loads((data_dir / "preregistration.json").read_text()) == third
+    # ta sama konfiguracja z --force nic nie zmienia i nie dopisuje poprzednika
+    assert prereg.write_preregistration(config_dir, data_dir, NOW + timedelta(days=3), force=True) == third
+
+
+def test_force_over_an_unreadable_file_has_no_previous(config_dir, data_dir):
+    (data_dir / "preregistration.json").write_text("{broken")
+    record = prereg.write_preregistration(config_dir, data_dir, NOW, force=True)
+    assert "previous" not in record
+
+
 def test_malformed_existing_file_is_not_overwritten_without_force(config_dir, data_dir):
     path = data_dir / "preregistration.json"
     path.write_text("{broken")
@@ -441,6 +463,31 @@ def test_cli_check_exit_codes(env, config_dir, data_dir, capsys):
     assert "MISMATCH" in out and f"frozen:  {fingerprint}" in out
 
 
+def test_cli_check_names_the_files_that_differ(env, config_dir, capsys):
+    prereg.main(["--write"], now=NOW)
+    for name in ("risk_v1.toml", "strategy_v1.toml"):
+        (config_dir / name).write_text("# zmiana\n" + (config_dir / name).read_text())
+    capsys.readouterr()
+    assert prereg.main(["--check"]) == 1
+    out = capsys.readouterr().out
+    assert "files that differ: strategy_v1.toml, risk_v1.toml" in out.splitlines()  # kolejność jak w CONFIG_FILES
+    assert "costs_v1.toml" not in out
+
+
+def test_cli_check_when_no_file_differs_or_the_record_has_no_file_hashes(env, config_dir, data_dir, capsys):
+    prereg.main(["--write"], now=NOW)
+    record = json.loads((data_dir / "preregistration.json").read_text())
+    record["fingerprint"] = "0" * 64  # odcisk inny (np. adapter albo klasa), skróty plików te same
+    (data_dir / "preregistration.json").write_text(json.dumps(record))
+    capsys.readouterr()
+    assert prereg.main(["--check"]) == 1
+    message = "no frozen file differs: the adapter, the instrument class or the encoding changed"
+    assert message in capsys.readouterr().out
+    (data_dir / "preregistration.json").write_text(json.dumps({"fingerprint": "0" * 64}))
+    assert prereg.main(["--check"]) == 1
+    assert "the frozen record has no per-file hashes" in capsys.readouterr().out
+
+
 def test_cli_check_ignores_runtime_toml(env, config_dir, capsys):
     prereg.main(["--write"], now=NOW)
     (config_dir / "runtime.toml").write_text("live_allowed = true\n")
@@ -490,3 +537,28 @@ def test_python_dash_m_gwstock_prereg_runs(tmp_path, config_dir):
         [sys.executable, "-m", "gwstock.prereg", "--check"], capture_output=True, text=True, env=env, cwd=tmp_path
     )
     assert checked.returncode == 2
+
+
+# --- .gitattributes ----------------------------------------------------------------------------------------------
+
+
+def test_gitattributes_pins_line_endings_of_the_frozen_config_files():
+    # odcisk liczy SUROWE bajty, więc CRLF (np. z autocrlf) zmieniłby go bez zmiany treści
+    path = REPO / ".gitattributes"
+    assert path.is_file()
+    rules = [line.split() for line in path.read_text(encoding="utf-8").splitlines() if line.strip() and line[0] != "#"]
+    assert ["config/*.toml", "text", "eol=lf"] in rules
+    for name in CONFIG_NAMES:  # i same pliki w repozytorium nie mają CRLF ani BOM
+        raw = (REPO / "config" / name).read_bytes()
+        assert b"\r" not in raw and not raw.startswith(b"\xef\xbb\xbf")
+
+
+def test_preregistration_document_matches_what_the_tools_do():
+    text = (REPO / "docs" / "preregistration" / "v1.md").read_text(encoding="utf-8")
+    prefix = "docker compose -f docker/compose.yml"
+    assert f"{prefix} run --rm -T gw-stock-engine python -m gwstock.prereg --write" in text
+    assert f"{prefix} run --rm -T gw-stock-engine python -m gwstock.prereg --check" in text
+    assert f"{prefix} exec -T gw-stock-engine python -m gwstock.report --csv /data/ledger.csv" in text
+    assert "nie jest mierzony w v1" in text  # poślizg stopu przy wyjściu
+    assert "config/*.toml text eol=lf" in text
+    assert "previous" in text  # ślad wariantów po --force

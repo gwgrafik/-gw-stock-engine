@@ -26,12 +26,11 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.config import CostConfig, load_config
 from gwstock.journal import SCHEMA_VERSION, Journal, JournalError, TradeRecord
 from gwstock.report import gates
-from gwstock.report.gates import GateL1, format_ratio, read_events
-from gwstock.report.ledger import exact_sum, export_csv, trade_day, trades_summary
+from gwstock.report.gates import L1Details, format_ratio, read_events
+from gwstock.report.ledger import decimal_text, exact_sum, export_csv, local_day, trade_day, trades_summary
 
 __all__ = ["main", "open_journal_readonly", "JOURNAL_FILE"]
 
@@ -43,6 +42,15 @@ JOURNAL_FILE = "journal.sqlite"  # ta sama nazwa co w `gwstock.cli` (pilnuje teg
 
 STATEMENT = "To pomiar, nie prognoza. Wynik netto po kosztach; brak przewagi nie jest wykazany ani wykluczony."
 L1_INSTRUCTION = "Aby dopuścić wielkość według reguł utwórz plik data/L1_PASSED (kod go nigdy nie tworzy)."
+L1_VERDICT_TAIL = "(cały dziennik; ocena wyjaśnień należy do właściciela)"
+L1_EUR_CAVEAT = (
+    "  uwaga: koszty w EUR są zaokrąglane do 0,01 € przy wielkości 0,001, więc ratio w EUR jest zgrubne; "
+    "poślizg stopu przy wyjściu NIE jest mierzony"
+)
+L1_REJECTION_NOTE = (
+    "    liczy ENTRY_UNRESOLVED także po późniejszym rozstrzygnięciu zlecenia oraz zlecenia INTENT/SUBMITTING, "
+    "gdy raport powstaje w trakcie wejścia"
+)
 DAY_HEADER = "Dzień: {} (czas Europe/Berlin, dzień zamknięcia transakcji)"
 NO_DECISION = "brak zapisu decyzji"
 # Kody zdarzeń pokazywane osobnym licznikiem albo nie będące błędem; reszta idzie do „inne zdarzenia”.
@@ -50,7 +58,6 @@ BENIGN_EVENTS = frozenset({"TRADE_BOOKED"})
 LOGIN_LOCKOUT = "LOGIN_LOCKOUT"
 EVENT_SOURCES = (gates.SOURCE_EVENT, gates.SOURCE_RECONCILE, gates.SOURCE_WATCHDOG, gates.SOURCE_ENGINE)
 
-_CALENDAR = ExchangeCalendar(XETRA)
 _DAY_FORMAT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
@@ -123,7 +130,7 @@ class _Data:
 
 
 def _local_day(event) -> date:
-    return _CALENDAR.to_local(event.ts).date()
+    return local_day(event.ts)
 
 
 def _collect(journal: Journal, trades: list[TradeRecord], roles: list[str]) -> _Data:
@@ -195,7 +202,10 @@ def _collect(journal: Journal, trades: list[TradeRecord], roles: list[str]) -> _
 
 
 def _d(value: Decimal) -> str:
-    return format(value, "f")
+    """Kwota do wydruku: cyfry bez zmian; zero bez znaku i z dwoma miejscami (`0.00`, nie `0` ani `-0.00`)."""
+    if value.is_zero() and value.as_tuple().exponent > -2:
+        return "0.00"
+    return decimal_text(value)
 
 
 def _counts(counter: Counter) -> str:
@@ -258,18 +268,42 @@ def _summary_lines(trades: list[TradeRecord]) -> list[str]:
     return lines
 
 
-def _gate_lines(gate: GateL1, required: int, roles: list[str]) -> list[str]:
+def _days(days: tuple[date, ...]) -> str:
+    return "; dni: " + ", ".join(day.isoformat() for day in sorted(set(days))) if days else ""
+
+
+def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[str]:
+    gate, points = details.gate, details.points
     reasons = gate.reasons(required)
     missing = max(0, required - gate.sessions_at_min_size)
     lines = [
-        f"Bramka L1 (spec §11): {'PASS' if gate.passed(required) else 'NOT YET'}",
+        f"Bramka L1 (spec §11): {'PASS' if gate.passed(required) else 'NOT YET'} {L1_VERDICT_TAIL}",
         f"  sesje na wielkości minimalnej: {gate.sessions_at_min_size} z {required} (brakuje {missing})",
-        f"  rozbieżności pozycja/broker starsze niż 60 s: {gate.unreconciled_over_60s} (wymagane 0)",
-        f"  nieobsłużone odrzucenia: {gate.unhandled_rejections} (wymagane 0)",
-        f"  koszty zmierzone / model: {format_ratio(gate.cost_deviation_ratio)} "
-        f"(najwyżej {gates.COST_DEVIATION_LIMIT})",
+        "  rozbieżności pozycja/broker starsze niż 60 s: "
+        f"{gate.unreconciled_over_60s} (wymagane 0{_days(details.mismatch_days)})",
+        f"  nieobsłużone odrzucenia: {gate.unhandled_rejections} (wymagane 0{_days(details.rejection_days)})",
     ]
-    smoke, unknown = roles.count(gates.ROLE_SMOKE), roles.count(gates.ROLE_UNKNOWN)
+    if gate.unhandled_rejections:
+        lines.append(L1_REJECTION_NOTE)
+    label = "  koszty zmierzone / model (w punktach, bez zaokrągleń): "
+    if points.trades:
+        lines += [
+            f"{label}{format_ratio(gate.cost_deviation_ratio)} "
+            f"(najwyżej {gates.COST_DEVIATION_LIMIT}; transakcji w pomiarze: {points.trades})",
+            f"    średni spread w chwili decyzji: {_points(points.spread)} pkt",
+            f"    średni poślizg wejścia względem notowania decyzji: {_points(points.entry_slippage)} pkt "
+            f"(model: {costs.entry_slippage_points} pkt)",
+        ]
+    else:
+        lines.append(f"{label}brak danych (najwyżej {gates.COST_DEVIATION_LIMIT})")
+    lines.append(f"  koszty w EUR (informacyjnie): ratio {format_ratio(details.eur_ratio)}")
+    if details.default_vpp_trades:
+        lines.append(
+            f"  wartość punktu = {details.fallback_value_per_point} dla {details.default_vpp_trades} "
+            "transakcji bez kontekstu (koszty w EUR)"
+        )
+    lines.append(L1_EUR_CAVEAT)
+    smoke, unknown = details.roles.count(gates.ROLE_SMOKE), details.roles.count(gates.ROLE_UNKNOWN)
     if smoke:
         lines.append(f"  próby smoke (poza liczbą sesji): {smoke}")
     if unknown:
@@ -281,23 +315,8 @@ def _gate_lines(gate: GateL1, required: int, roles: list[str]) -> list[str]:
     return lines
 
 
-def _points_lines(trades: list[TradeRecord], costs: CostConfig) -> list[str]:
-    count, spread, slippage = gates.cost_points(trades)
-    if count == 0 or spread is None or slippage is None:
-        return []
-    return [
-        f"Pomiar kosztów w punktach (informacyjnie, bez zaokrągleń księgi; transakcji: {count}):",
-        f"  średni spread w chwili decyzji: {_points(spread)} pkt",
-        f"  średni poślizg wejścia względem notowania decyzji: {_points(slippage)} pkt "
-        f"(model: {costs.entry_slippage_points} pkt)",
-        "  uwaga: księga zaokrągla koszty do 0,01 €, więc przy wielkości minimalnej stosunek z bramki L1 jest zgrubny;",
-        "  te dwie średnie nie są zaokrąglane i lepiej pokazują rzeczywisty spread i poślizg.",
-        "",
-    ]
-
-
-def _points(value: Decimal) -> str:
-    return format(value.quantize(Decimal("0.01")), "f")
+def _points(value: Decimal | None) -> str:
+    return format(value.quantize(Decimal("0.01")), "f") if value is not None else "-"
 
 
 # --- polecenie --------------------------------------------------------------------------------------------------
@@ -321,15 +340,17 @@ def _build_parser() -> argparse.ArgumentParser:
     which.add_argument("--day", type=_parse_day, metavar="YYYY-MM-DD", help="dzień do pokazania")
     which.add_argument("--all", action="store_true", help="wszystkie dni z zapisami")
     parser.add_argument("--csv", type=Path, metavar="PATH", help="zapisz księgę do pliku CSV")
-    parser.add_argument("--journal", type=Path, metavar="PATH", help="plik dziennika (domyślnie $GW_DATA_DIR/journal.sqlite)")  # fmt: skip
+    parser.add_argument(
+        "--journal", type=Path, metavar="PATH", help="plik dziennika (domyślnie $GW_DATA_DIR/journal.sqlite)"
+    )
     return parser
 
 
 def _report(args: argparse.Namespace, journal_path: Path, journal: Journal, strat_sessions: int, costs: CostConfig):
     """Treść raportu (lista linii) i komunikat błędu eksportu CSV (None: brak błędu albo CSV niezamówione)."""
     trades = journal.trades()
-    roles = gates.trade_roles(journal, trades)
-    data = _collect(journal, trades, roles)
+    details = gates.l1_details(journal, costs=costs, trades=trades)
+    data = _collect(journal, trades, list(details.roles))
     lines = ["Raport gw-stock-engine (pomiar)", f"Dziennik: {journal_path}"]
     csv_error = None
     if args.csv is not None:
@@ -355,8 +376,7 @@ def _report(args: argparse.Namespace, journal_path: Path, journal: Journal, stra
     if data.unreadable:
         lines += [f"UWAGA: {data.unreadable} nieczytelnych zapisów zdarzeń pominięto w liczniku.", ""]
     lines += _summary_lines(trades)
-    lines += _gate_lines(gates.gate_l1_status(journal, costs=costs), strat_sessions, roles)
-    lines += _points_lines(trades, costs)
+    lines += _gate_lines(details, strat_sessions, costs)
     lines.append(STATEMENT)
     return lines, csv_error
 

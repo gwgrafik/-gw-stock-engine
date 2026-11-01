@@ -24,7 +24,7 @@ from typing import Any
 from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.journal import Journal, TradeRecord
 
-__all__ = ["LEDGER_COLUMNS", "export_csv", "trades_summary", "exact_sum", "trade_day"]
+__all__ = ["LEDGER_COLUMNS", "export_csv", "trades_summary", "exact_sum", "trade_day", "local_day", "decimal_text"]
 
 LEDGER_COLUMNS = (
     "instrument", "side", "size", "decision_bid", "decision_ask", "entry_fill", "exit_fill", "gross_pnl",
@@ -44,9 +44,19 @@ def exact_sum(values: Iterable[Decimal]) -> Decimal:
     return total
 
 
+def local_day(moment: datetime) -> date:
+    """Dzień lokalny giełdy (Europe/Berlin) chwili UTC."""
+    return _CALENDAR.to_local(moment).date()
+
+
 def trade_day(trade: TradeRecord) -> date:
     """Dzień sesji (czas lokalny giełdy) czasu zamknięcia transakcji."""
-    return _CALENDAR.to_local(trade.exit_ts).date()
+    return local_day(trade.exit_ts)
+
+
+def decimal_text(value: Decimal) -> str:
+    """Zwykły napis `Decimal` (bez notacji naukowej, cyfry bez zmian); zero bez znaku: `-0.00` to `0.00`."""
+    return format(abs(value) if value.is_zero() else value, "f")
 
 
 # --- CSV ---------------------------------------------------------------------------------------------------------
@@ -54,7 +64,7 @@ def trade_day(trade: TradeRecord) -> date:
 
 def _cell(value: Any) -> str:
     if isinstance(value, Decimal):
-        return format(value, "f")
+        return decimal_text(value)
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     if hasattr(value, "value"):  # enum (Side)
