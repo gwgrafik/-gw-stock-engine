@@ -1514,6 +1514,31 @@ async def test_waiting_login_raises_when_the_shared_session_is_gone(broker, monk
         await broker.keepalive()
 
 
+@pytest.mark.parametrize("leader_ends", ["cancelled", "failed"])
+async def test_a_waiting_login_retries_when_the_shared_attempt_was_cancelled(server, broker, leader_ends):
+    server.delay_next("/session", 2.0 if leader_ends == "cancelled" else 0.3, method="POST")
+    if leader_ends == "failed":
+        server.fail_next("/session", 503, {"errorCode": "error.service.unavailable"}, method="POST")
+    leader = asyncio.create_task(broker.login())
+    await wait_for_request(server, "POST", "/session")
+    follower = asyncio.create_task(broker.login())
+    await asyncio.sleep(0)  # czekający już czeka na wspólną próbę (blokada logowania)
+    if leader_ends == "cancelled":
+        await cancel(leader)  # np. asyncio.wait_for silnika: anulowanie to nie nieudane logowanie
+        await follower  # więc czekający loguje się sam, jeden raz
+        assert server.count("POST", "/session") == 2
+        await broker.keepalive()
+        assert server.log[-1].status == 200
+        await asyncio.gather(broker.login(), broker.login())  # po udanej próbie znów jedno wspólne logowanie
+        assert server.count("POST", "/session") == 3
+    else:
+        with pytest.raises(BrokerError, match="503"):
+            await leader
+        with pytest.raises(BrokerError, match="concurrent login attempt"):
+            await follower  # wspólna próba naprawdę zawiodła: bez własnego logowania (ochrona przed blokadą)
+        assert server.count("POST", "/session") == 1
+
+
 async def test_select_account_refuses_any_account_but_the_bound_one(server, make_broker):
     broker = make_broker(account_id="ACC-EMPTY")
     await broker.login()

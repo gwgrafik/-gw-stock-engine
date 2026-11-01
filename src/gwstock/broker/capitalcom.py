@@ -461,6 +461,7 @@ class CapitalComBroker(TradingMixin):
         self._login_accounts: dict[str, str | None] = {}  # rachunki z ostatniego logowania: id → waluta
         self._login_seq = 0  # liczba zakończonych prób logowania (udanych i nieudanych)
         self._last_login_error: str | None = None
+        self._last_login_cancelled = False  # czy ostatnia próba logowania została anulowana (nie zawiodła)
         self._seen_tokens: deque[str] = deque(maxlen=64)  # do czyszczenia komunikatów także ze starych tokenów
         # świeżość notowań: epic → (ostatnio obserwowana krotka, chwila jej ostatniej zmiany na zegarze silnika)
         self._quote_marks: dict[str, tuple[tuple, datetime]] = {}
@@ -472,11 +473,13 @@ class CapitalComBroker(TradingMixin):
         """Nowa sesja (`POST /session`) i, jeśli trzeba, jednorazowe przełączenie na rachunek związany.
 
         Równoległe wywołania (i ponowne logowanie po 401) dzielą jedną próbę. Porażka → `BrokerError`, a adapter
-        zostaje bez sesji (każde żądanie → `SessionExpired` bez wysyłki), aż kolejne `login()` się uda.
+        zostaje bez sesji (każde żądanie → `SessionExpired` bez wysyłki), aż kolejne `login()` się uda. Wspólna próba
+        ANULOWANA (np. `asyncio.wait_for` innego wywołującego) nie jest porażką logowania: czekający loguje się wtedy
+        sam, jeden raz.
         """
         seen = self._login_seq
         async with self._auth_lock:
-            if self._login_seq == seen:
+            if self._login_seq == seen or self._last_login_cancelled:
                 await self._login_locked()
                 return
             failure = None if self._tokens is not None else (self._last_login_error or "the session was dropped")
@@ -496,12 +499,14 @@ class CapitalComBroker(TradingMixin):
             self._drop_session()
             interrupted = f"login interrupted ({type(exc).__name__})"
             self._last_login_error = str(exc) if isinstance(exc, BrokerError) else interrupted
+            self._last_login_cancelled = isinstance(exc, asyncio.CancelledError)
             self._login_seq += 1
             raise
         self._tokens = tokens
         self._session_account_id = account_id
         self._login_accounts = accounts
         self._last_login_error = None
+        self._last_login_cancelled = False
         self._login_seq += 1
 
     async def _open_session(self) -> tuple[_Tokens, str, dict[str, str | None]]:
