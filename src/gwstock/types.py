@@ -126,6 +126,10 @@ class InstrumentRules:
 
     `stop_step` to krok odległości stopu w punktach (DE40: `minStepDistance` = 0,1; hipoteza, że dotyczy stopu,
     do potwierdzenia na próbie `smoke`). 0 oznacza brak kroku, czyli stop nie jest zaokrąglany.
+
+    `min_size`, `size_step`, `value_per_point` i `margin_rate` muszą być > 0: strategia dzieli przez wartość punktu,
+    zaokrągla wielkość do kroku, a depozyt i ryzyko mnożą się przez te pola, więc zero lub liczba ujemna od brokera
+    to błąd danych (adapter i tak ich nie przepuszcza), a nie reguła. `min_stop_distance` = 0 oznacza brak minimum.
     """
 
     epic: str
@@ -139,6 +143,9 @@ class InstrumentRules:
     def __post_init__(self) -> None:
         for name in ("min_size", "size_step", "value_per_point", "margin_rate", "min_stop_distance", "stop_step"):
             _require_decimal(self, name)
+        for name in ("min_size", "size_step", "value_per_point", "margin_rate"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"InstrumentRules.{name}: expected > 0, got {getattr(self, name)}")
         if self.stop_step < 0:
             raise ValueError(f"InstrumentRules.stop_step: expected >= 0, got {self.stop_step}")
 

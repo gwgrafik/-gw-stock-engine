@@ -26,8 +26,10 @@ W trybie minimalnym funkcja NIE sprawdza limitu straty: przy bardzo dużym ATR (
 stratę 1.50 EUR > `max_loss_per_trade`, a mimo to zwracany jest sygnał. Zablokuje go bramka ryzyka (LOSS_PER_TRADE).
 
 Arytmetyka: wyłącznie `Decimal`, w jawnym kontekście 60 cyfr znaczących (niezależnym od kontekstu otoczenia);
-zaokrąglenia do kroku są dokładne (ułamki), bez utraty precyzji. Wyjątek (zły typ ATR, ujemny `session_index`, wartość
-punktu lub mid <= 0 przy liczeniu wielkości) oznacza błąd wywołującego lub adaptera, a nie brak sygnału.
+zaokrąglenia do kroku są dokładne (ułamki), bez utraty precyzji. Limity wielkości wg reguł (strata i dźwignia) liczone są
+w całości w dokładnych ułamkach (`Fraction`), więc dzielenie nie zaokrągla ich w górę ponad dokładną wartość.
+Wyjątek (zły typ ATR, ujemny `session_index`, wartość punktu lub mid <= 0 przy liczeniu wielkości, świeca, notowanie i
+reguły z różnych instrumentów) oznacza błąd wywołującego lub adaptera, a nie brak sygnału.
 """
 
 from __future__ import annotations
@@ -116,10 +118,15 @@ def _check_step_args(fn: str, value: object, step: object) -> None:
         raise ValueError(f"{fn}: step must be a finite Decimal > 0, got {step!r}")
 
 
+def _floor_to_step(value: Fraction, step: Decimal) -> Decimal:
+    """Największa wielokrotność `step` nie większa niż dokładna wartość `value` (ułamek)."""
+    return _EXACT.multiply(Decimal(math.floor(value / Fraction(step))), step)
+
+
 def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
     """Największa wielokrotność `step` nie większa niż `value` (ku −∞). Dokładne; `step` <= 0 to ValueError."""
     _check_step_args("round_down_to_step", value, step)
-    return _EXACT.multiply(Decimal(math.floor(Fraction(value) / Fraction(step))), step)
+    return _floor_to_step(Fraction(value), step)
 
 
 def round_up_to_step(value: Decimal, step: Decimal) -> Decimal:
@@ -162,19 +169,27 @@ def atr14(daily: list[Candle]) -> Decimal:
 
 
 def _rule_size(stop: Decimal, quote: Quote, rules: InstrumentRules, risk: RiskConfig) -> Decimal:
-    """Wielkość wg reguł: mniejszy z limitów straty i dźwigni, w dół do kroku wielkości."""
+    """Wielkość wg reguł: mniejszy z limitów straty i dźwigni, w dół do kroku wielkości (wszystko w dokładnych ułamkach)."""
     vpp = rules.value_per_point
-    mid = _CALC.divide(_CALC.add(quote.bid, quote.ask), Decimal(2))
+    mid = (Fraction(quote.bid) + Fraction(quote.ask)) / 2
     if vpp <= 0:
         raise ValueError(f"decide: rules.value_per_point must be > 0 to size a position, got {vpp}")
     if mid <= 0:
-        raise ValueError(f"decide: quote.mid must be > 0 to size a position, got {mid}")
-    loss_limit = _CALC.divide(risk.max_loss_per_trade, _CALC.multiply(stop, vpp))
-    leverage_limit = _CALC.divide(
-        _CALC.multiply(risk.max_effective_leverage, risk.virtual_capital),
-        _CALC.multiply(mid, vpp),
-    )
-    return round_down_to_step(min(loss_limit, leverage_limit), rules.size_step)
+        raise ValueError(f"decide: quote.mid must be > 0 to size a position, got {quote.mid}")
+    if rules.size_step <= 0:
+        raise ValueError(f"decide: rules.size_step must be > 0 to size a position, got {rules.size_step}")
+    loss_limit = Fraction(risk.max_loss_per_trade) / (Fraction(stop) * Fraction(vpp))
+    leverage_limit = Fraction(risk.max_effective_leverage) * Fraction(risk.virtual_capital) / (mid * Fraction(vpp))
+    return _floor_to_step(min(loss_limit, leverage_limit), rules.size_step)
+
+
+def _require_same_epic(first: Candle | None, quote: Quote, rules: InstrumentRules) -> None:
+    """Świeca (jeśli jest), notowanie i reguły muszą dotyczyć tego samego instrumentu; inaczej to błąd wywołującego."""
+    epics = {"quote": quote.epic, "rules": rules.epic}
+    if first is not None:
+        epics["candle"] = first.epic
+    if len(set(epics.values())) != 1:
+        raise ValueError(f"decide: candle, quote and rules must be for the same epic, got {epics}")
 
 
 def decide(
@@ -196,6 +211,7 @@ def decide(
         raise TypeError(f"decide: atr: expected Decimal, got {type(atr).__name__} {atr!r}")
     if isinstance(session_index, bool) or not isinstance(session_index, int) or session_index < 0:
         raise ValueError(f"decide: session_index: expected a non-negative integer, got {session_index!r}")
+    _require_same_epic(first, quote, rules)
 
     if first is None or not atr.is_finite() or atr <= 0:
         return Skip(NO_SIGNAL_DATA)

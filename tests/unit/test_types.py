@@ -156,3 +156,36 @@ def test_instrument_rules_accepts_explicit_zero_stop_step():
         "DE40", Decimal("0.001"), Decimal("0.001"), Decimal("1"), Decimal("0.05"), Decimal("2.6"), Decimal("0")
     )
     assert rules.stop_step == Decimal("0")
+
+
+def _rules_kwargs(**changes):
+    base = dict(
+        epic="DE40",
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.001"),
+        value_per_point=Decimal("1"),
+        margin_rate=Decimal("0.05"),
+        min_stop_distance=Decimal("2.6"),
+    )
+    return {**base, **changes}
+
+
+@pytest.mark.parametrize("field", ["min_size", "size_step", "value_per_point", "margin_rate"])
+@pytest.mark.parametrize("value", [Decimal("0"), Decimal("-0.001"), Decimal("-0")])
+def test_instrument_rules_require_positive_size_step_value_and_margin(field, value):
+    """Zero lub liczba ujemna w tych polach to błąd danych brokera: dzielą, mnożą wielkość albo depozyt."""
+    with pytest.raises(ValueError, match=field):
+        InstrumentRules(**_rules_kwargs(**{field: value}))
+
+
+def test_instrument_rules_accept_the_smallest_positive_values_and_zero_min_stop_distance():
+    rules = InstrumentRules(
+        **_rules_kwargs(
+            min_size=Decimal("1E-9"),
+            size_step=Decimal("1E-9"),
+            value_per_point=Decimal("1E-9"),
+            margin_rate=Decimal("1E-9"),
+            min_stop_distance=Decimal("0"),
+        )
+    )
+    assert rules.min_stop_distance == 0 and rules.margin_rate == Decimal("1E-9")

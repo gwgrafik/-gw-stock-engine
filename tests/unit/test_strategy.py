@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, localcontext
+from decimal import Context, Decimal, localcontext
 from fractions import Fraction
 from pathlib import Path
 
@@ -510,15 +511,119 @@ def test_huge_atr_in_minimum_size_mode_returns_a_signal_that_the_risk_gate_must_
     assert s.size * s.stop_distance * D("1") > RISK.max_loss_per_trade
 
 
+def _rules_with_zero_vpp() -> InstrumentRules:
+    """Reguły z zerową wartością punktu: konstruktor ich nie przepuszcza (L15-c), więc obejście tylko dla testu straży."""
+    rules = make_rules()
+    object.__setattr__(rules, "value_per_point", D("0"))
+    return rules
+
+
+def test_instrument_rules_with_zero_value_per_point_cannot_be_built():
+    with pytest.raises(ValueError, match="value_per_point"):
+        make_rules(vpp="0")
+
+
+# --- przypięcie: limit dźwigni liczony od MID, wielkość zaokrąglana do kroku wielkości ---------------------------
+
+
+def test_leverage_limit_uses_the_mid_price_not_bid_or_ask():
+    """Szeroki spread rozdziela trzy warianty: mid 25000 → 0.200; bid 24800 dałby 0.201, ask 25200 dałby 0.198."""
+    risk = dataclasses.replace(RISK, virtual_capital=D("1000"), max_loss_per_trade=D("1000"))
+    quote = make_quote("24800", "25200")  # spread 400, mid 25000
+    s = run(atr="15000", risk=risk, quote=quote)  # stop 1500 >= 3 × 400; limit straty 1000/1500 = 0.667 nie wiąże
+    assert s.stop_distance == D("1500.00") and s.size == D("0.200")
+    step = D("0.001")
+    from_bid = round_down_to_step(D("5") * D("1000") / D("24800"), step)
+    from_ask = round_down_to_step(D("5") * D("1000") / D("25200"), step)
+    assert (from_bid, from_ask) == (D("0.201"), D("0.198"))  # oba warianty dałyby inną wielkość niż mid
+
+
+def test_rule_size_is_floored_to_the_size_step_not_to_the_minimum_size():
+    # min. wielkość 0.002, krok 0.001; mid 26000: limit 0.0076923… → w dół do kroku 0.007 (do min. wielkości byłoby 0.006)
+    s = run(rules=make_rules(min_size="0.002", step="0.001"), quote=make_quote(*QUOTE_26000))
+    assert s.size == D("0.007")
+    # odwrotnie: krok 0.004 przy min. wielkości 0.001; limit 0.008 → 0.008, a limit 0.0076923… → 0.004 (nie 0.007)
+    assert run(rules=make_rules(min_size="0.001", step="0.004")).size == D("0.008")
+    assert run(rules=make_rules(min_size="0.001", step="0.004"), quote=make_quote(*QUOTE_26000)).size == D("0.004")
+
+
+def test_rule_size_limits_are_computed_exactly_not_in_60_digit_decimals():
+    """2/3 w 60 cyfrach zaokrągla się W GÓRĘ do kroku 0.66…67, więc dzielenie `Decimal` dałoby wielkość większą niż
+    dokładny limit (ryzyko 2.0000…01 przy limicie 2); dokładne ułamki dają 0 < min. wielkość → pominięcie."""
+    step = Context(prec=60).divide(D(2), D(3))  # 0.666…667 (60 cyfr): ciut powyżej 2/3
+    assert Fraction(step) > Fraction(2, 3)
+    risk = dataclasses.replace(RISK, max_loss_per_trade=D("2"), virtual_capital=D("1000"))
+    # stop 3.00 (ATR 30), vpp 1, mid 1: limit straty 2/3 dokładnie, limit dźwigni 5000 nie wiąże
+    result = run(atr="30", risk=risk, quote=make_quote("1", "1"), rules=make_rules(min_size="0.5", step=str(step)))
+    assert result == Skip(SKIPPED_MIN_SIZE)
+
+
+def test_rule_size_never_exceeds_the_exact_loss_and_leverage_limits_on_a_grid():
+    checked = 0
+    for atr, vpp, bid, ask, step in itertools.product(
+        ("37", "123.45", "999.9", "1500"), ("1", "2.5", "0.3"), ("24999", "26000.3"), ("26001", "26000.9"),
+        ("0.001", "0.003", "0.1"),
+    ):  # fmt: skip
+        if D(ask) < D(bid):
+            continue
+        q = make_quote(bid, ask)
+        rules = make_rules(vpp=vpp, step=step, min_size=step)
+        s = run(atr=atr, rules=rules, quote=q)
+        if isinstance(s, Skip):
+            continue
+        checked += 1
+        assert Fraction(s.size) * Fraction(s.stop_distance) * Fraction(vpp) <= Fraction(RISK.max_loss_per_trade)
+        mid = (Fraction(q.bid) + Fraction(q.ask)) / 2
+        assert Fraction(s.size) * mid * Fraction(vpp) <= Fraction(RISK.max_effective_leverage * RISK.virtual_capital)
+        assert Fraction(s.size) % Fraction(step) == 0
+    assert checked >= 20  # siatka nie może zdegenerować się do samych pominięć
+
+
 def test_rule_mode_rejects_non_positive_divisors():
     with pytest.raises(ValueError, match="value_per_point"):
-        run(rules=make_rules(vpp="0"))
+        run(rules=_rules_with_zero_vpp())
     with pytest.raises(ValueError, match="mid"):
         run(quote=make_quote("0", "0"))
 
 
 def test_minimum_size_mode_does_not_divide_so_zero_vpp_does_not_matter():
-    assert run(rules=make_rules(vpp="0"), session_index=2).size == D("0.001")
+    assert run(rules=_rules_with_zero_vpp(), session_index=2).size == D("0.001")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# spójność instrumentu: świeca, notowanie i reguły muszą dotyczyć tego samego epic
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_decide_raises_when_candle_quote_and_rules_are_for_different_epics():
+    other_candle = dataclasses.replace(BULL, epic="US500")
+    other_quote = dataclasses.replace(make_quote(), epic="US500")
+    other_rules = dataclasses.replace(make_rules(), epic="US500")
+    with pytest.raises(ValueError, match="epic"):
+        run(first=other_candle)
+    with pytest.raises(ValueError, match="epic"):
+        run(quote=other_quote)
+    with pytest.raises(ValueError, match="epic"):
+        run(rules=other_rules)
+    # tak samo w trybie minimalnym wielkości (kontrola nie zależy od polityki wielkości)
+    with pytest.raises(ValueError, match="epic"):
+        run(rules=other_rules, session_index=0, rule_size_allowed=False)
+    # wszystkie trzy zgodne, choć inne niż w bazowym scenariuszu: bez błędu
+    assert isinstance(run(first=other_candle, quote=other_quote, rules=other_rules), EntrySignal)
+
+
+def test_epic_mismatch_is_an_error_not_a_skip_even_without_a_first_candle():
+    """Brak świecy to normalny `NO_SIGNAL_DATA`, ale notowanie i reguły innego instrumentu to błąd wywołującego."""
+    assert run(first=None) == Skip(NO_SIGNAL_DATA)
+    with pytest.raises(ValueError, match="epic"):
+        run(first=None, rules=dataclasses.replace(make_rules(), epic="US500"))
+
+
+def test_epic_mismatch_is_checked_before_the_skip_reasons():
+    with pytest.raises(ValueError, match="epic"):
+        run(first=make_candle("25000", "25000"), rules=dataclasses.replace(make_rules(), epic="US500"))  # doji
+    with pytest.raises(ValueError, match="epic"):
+        run(atr="0", quote=dataclasses.replace(make_quote(), epic="US500"))  # zły ATR
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -600,7 +705,7 @@ def test_sizing_uses_the_rounded_stop_so_risk_never_grows():
     risk = dataclasses.replace(RISK, virtual_capital=D("1000"))
     rounded = run(atr="1111.1", risk=risk, rules=make_rules(stop_step="0.1"))
     assert rounded.stop_distance == D("111.2")
-    assert rounded.size == D("0.008")  # 1/111.2 = 0.008992… (z 111.11 wyszłoby 0.009: ryzyko 1.0000 > 1.00 przy 111.2)
+    assert rounded.size == D("0.008")  # 1/111.2 = 0.008992… (z 111.11 wyszłoby 0.009: ryzyko 0.009 × 111.2 = 1.0008 > 1.00)
     unrounded = run(atr="1111.1", risk=risk, rules=make_rules(stop_step="0"))
     assert unrounded.stop_distance == D("111.11")
     assert unrounded.size == D("0.009")
