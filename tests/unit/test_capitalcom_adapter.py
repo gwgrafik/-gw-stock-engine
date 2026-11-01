@@ -38,7 +38,11 @@ from tests.unit.fake_capital_server import TEST_API_KEY, TEST_IDENTIFIER, TEST_P
 UTC = timezone.utc
 T0 = datetime(2026, 11, 2, 7, 30, tzinfo=UTC)  # = start fixture `clock`
 SRC = Path(__file__).resolve().parents[2] / "src"
-SECRETS = {"api_key": "key-ABCDEF123456", "identifier": "login-XYZ@example.test", "api_password": "pass-QWERTY987"}
+SECRETS = {
+    "api_key": "test-key-ABCDEF123456",
+    "identifier": "login-XYZ@example.test",
+    "api_password": "test-pass-QWERTY987",
+}
 
 
 def at(seconds: float) -> datetime:
@@ -177,8 +181,8 @@ def test_credentials_repr_and_str_hide_secrets():
         ("api_key", 1234567, TypeError),
         ("identifier", None, TypeError),
         ("api_password", b"bytes-secret", TypeError),
-        ("api_key", " key-ABCDEF123456", ValueError),
-        ("api_password", "pass-QWERTY987\n", ValueError),
+        ("api_key", " test-key-ABCDEF123456", ValueError),
+        ("api_password", "test-pass-QWERTY987\n", ValueError),
         ("api_key", "key-ABC\r\nX-Injected: 1", ValueError),
         ("identifier", "login\x00XYZ", ValueError),
         ("api_key", "key-ÄBCDEF123456", ValueError),  # nagłówek HTTP: tylko widoczne ASCII
@@ -498,7 +502,7 @@ async def test_401_with_failing_relogin_raises_session_expired(server, make_brok
     elif failure == "timeout":
         server.delay_next("/session", 2.0, method="POST")
     else:
-        server.password = "rotated-by-owner"
+        server.password = "test-rotated-by-owner"
     with pytest.raises(SessionExpired) as info:
         await broker.keepalive()
     assert "re-login failed" in str(info.value)

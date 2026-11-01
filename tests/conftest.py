@@ -263,3 +263,30 @@ def capital_broker(
 ) -> CapitalComBroker:
     """Adapter Capital.com na lokalnym serwerze testowym, z zegarem testu; niezalogowany."""
     return CapitalComBroker(capital_credentials, capital_http, clock, base_url=fake_capital_server.base_url)
+
+
+# --- strażnik live: żaden test nie tworzy prawdziwych plików uzbrojenia w `<repo>/data` -------------------------------------
+
+ARMING_FILE_NAMES = ("ARM_LIVE", "L1_PASSED")
+
+
+def arming_files_created(data_dir: Path, existed_before: frozenset[str]) -> list[str]:
+    """Pliki uzbrojenia, które pojawiły się w `data_dir` w trakcie przebiegu (te sprzed przebiegu, np. właściciela, nie)."""
+    return [name for name in ARMING_FILE_NAMES if name not in existed_before and (data_dir / name).exists()]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_test_creates_the_real_arming_files():
+    """Test, który zapomniał o tmp_path i uzbroił prawdziwy `data/`, ma wywalić przebieg (spec §9: uzbraja tylko właściciel).
+
+    Sprawdzamy tylko wtedy, gdy `<repo>/data` istnieje (VPS, dev po uruchomieniu silnika); plik, który istniał przed
+    przebiegiem (utworzył go właściciel), nie jest błędem.
+    """
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+    if not data_dir.is_dir():
+        yield
+        return
+    before = frozenset(name for name in ARMING_FILE_NAMES if (data_dir / name).exists())
+    yield
+    created = arming_files_created(data_dir, before)
+    assert not created, f"testy utworzyły prawdziwe pliki uzbrojenia w {data_dir}: {created} (uzbraja tylko właściciel)"
