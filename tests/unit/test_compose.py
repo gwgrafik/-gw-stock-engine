@@ -35,6 +35,9 @@ GITIGNORE = ROOT / ".gitignore"
 SOURCES = ROOT / "src" / "gwstock"
 SECRET_MOUNT_TARGET = "/secrets/capitalcom.json"
 DEFAULT_SECRET_SOURCE = "${GW_SECRET_FILE:-/home/claude/.config/gw/capitalcom.json}"
+# Obraz testowy (Dockerfile, cel test) ustawia GW_TEST_IMAGE=1 i nie zawiera docs/ ani .gitignore. Tylko wtedy testy,
+# które je czytają, się pomijają; bez znacznika brak tych plików ma wywalić testy głośno.
+IN_TEST_IMAGE = os.environ.get("GW_TEST_IMAGE") == "1"
 
 
 def _compose() -> dict:
@@ -359,10 +362,17 @@ def test_dockerignore_does_not_hide_what_the_build_needs() -> None:
         assert needed not in patterns and f"{needed}/" not in patterns, needed
 
 
+def test_repository_file_checks_skip_only_on_the_explicit_test_image_marker() -> None:
+    """Brak docs/ albo .gitignore poza obrazem testowym ma wywalić testy głośno, nie wyłączyć ich po cichu."""
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert 'os.environ.get("GW_TEST_IMAGE") == "1"' in source
+    for name in ("RUNBOOK", "GITIGNORE", "SOURCES"):
+        assert "not " + name + ".exists()" not in source, name
+
+
+@pytest.mark.skipif(IN_TEST_IMAGE, reason="obraz testowy (GW_TEST_IMAGE=1) nie zawiera .gitignore")
 def test_gitignore_keeps_data_backups_and_the_uid_env_file_out_of_the_repo() -> None:
     """Kopie `data*` (np. data.kopia-...) i `docker/.env` nie mogą trafić do publicznego repozytorium."""
-    if not GITIGNORE.exists():
-        pytest.skip(".gitignore nie jest w obrazie testowym")
     patterns = [ln.strip() for ln in GITIGNORE.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert "data/" in patterns and "data*/" in patterns
     assert ".env" in patterns  # wzorzec bez ukośnika dopasowuje `.env` na każdej głębokości, także docker/.env
@@ -448,7 +458,7 @@ def test_compose_config_refuses_to_render_without_uid_or_gid(missing: str) -> No
 
 # --- runbook ------------------------------------------------------------------------------------------------------------
 
-needs_runbook = pytest.mark.skipif(not RUNBOOK.exists(), reason="docs/ nie ma w obrazie testowym")
+needs_runbook = pytest.mark.skipif(IN_TEST_IMAGE, reason="obraz testowy (GW_TEST_IMAGE=1) nie zawiera docs/")
 
 
 def _runbook_blocks() -> list[tuple[str, str]]:
@@ -638,15 +648,24 @@ _QUOTED_FROM_SOURCES = {
         "zaksięgowano transakcję",
         "DOKŁADNIE z potwierdzenia",
         "[ESTIMATED]",
+        "odmowa: zapisanego stanu kill switcha nie da się odczytać",
+        "UNREADABLE (",
+        "wejście przyjęte przez uzgadnianie, nie przez potwierdzenie",
+        "WARN [2]",
     ),
-    "watchdog.py": ("another engine instance holds", "LOGIN_FAILED", "LOGIN_LOCKOUT", "QUOTE_SILENCE"),
+    "watchdog.py": (
+        "another engine instance holds", "LOGIN_FAILED", "LOGIN_LOCKOUT", "QUOTE_SILENCE",
+        "follow the runbook (section 9, LOGIN_FAILED)",
+    ),
+    "report/cli.py": ("nie zgoda: plik tworzysz dopiero po własnym przeglądzie raportu",),
+    "reconcile.py": ("booking waits; the kill switch stays SOFT until clear-kill", "CLOSURE_NOT_IN_HISTORY"),
+    "orders/manager.py": ("is open and NOT managed by the engine (it does not check its stop ", "REJECTED_BUT_LISTED"),
     "risk.py": ("KILL_STATE_UNREADABLE", "HARD_STOP_FILE", "STOP_FILE", "kill switch escalated"),
     "app.py": ("engine started: mode", "NOT_SESSION", "DayReport", "NO_SIGNAL_DATA"),
 }
 
 
 @needs_runbook
-@pytest.mark.skipif(not SOURCES.exists(), reason="brak src/gwstock")
 def test_strings_quoted_in_the_runbook_still_exist_in_the_sources() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
     missing_in_runbook = []
