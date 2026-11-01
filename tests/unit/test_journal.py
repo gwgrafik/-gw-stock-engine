@@ -165,7 +165,8 @@ def test_open_refuses_foreign_non_empty_database(tmp_path):
 def raw_pragmas(path) -> tuple:
     raw = sqlite3.connect(path)
     try:
-        return tuple(raw.execute(f"PRAGMA {n}").fetchone()[0] for n in ("user_version", "application_id", "journal_mode"))
+        names = ("user_version", "application_id", "journal_mode")
+        return tuple(raw.execute(f"PRAGMA {n}").fetchone()[0] for n in names)
     finally:
         raw.close()
 
@@ -298,7 +299,8 @@ def test_events_roundtrip_filter_and_order(journal):
 
 
 def test_events_after_id_and_limit_page_through_in_id_order(journal):
-    ids = [journal.append_raw(src, f"p{i}", T0) for i, src in enumerate(["broker", "event", "broker", "broker", "event"])]
+    sources = ["broker", "event", "broker", "broker", "event"]
+    ids = [journal.append_raw(src, f"p{i}", T0) for i, src in enumerate(sources)]
     assert [e.id for e in journal.events()] == ids  # domyślnie bez zmian: wszystko
     assert [e.id for e in journal.events(after_id=ids[1])] == ids[2:]
     assert [e.id for e in journal.events(limit=2)] == ids[:2]
@@ -516,7 +518,8 @@ def test_count_entry_orders_rejects_datetime_day(journal):
 MIXED_ORDER_IDS = [
     "gws-20261102-DE40-1-entry", "gws-20261102-DE40-2-smoke", "gws-20261102-DE40-3-ENTRY", "gws-20261102-DE40-4-xentry",
     "gws-20261102-entry", "gws-20261102-", "gws-20261102-é-entry", "gws-20261102-\x7f", "gws-20261102-DE40-5-entry ",
-    "gws-20261102", "gws-20261102.", "gws-20261102.x-entry", "gws-202611020-DE40-1-entry", "gws-20261102/-entry", "GWS-20261102-DE40-1-entry",
+    "gws-20261102", "gws-20261102.", "gws-20261102.x-entry", "gws-202611020-DE40-1-entry", "gws-20261102/-entry",
+    "GWS-20261102-DE40-1-entry",
     "gws-20261101-DE40-1-entry", "gws-20261103-DE40-1-entry", "gws-20261103-DE40-2-entry", "xgws-20261102-DE40-1-entry",
     "manual-20261102-x-entry",
 ]  # fmt: skip
