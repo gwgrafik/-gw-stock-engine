@@ -20,7 +20,16 @@ import pytest
 from gwstock.journal import Journal, PositionRecord
 from gwstock.orders.manager import HISTORY_MARGIN, EntryBlocked, OrderManager
 from gwstock.reconcile import Reconciler
-from gwstock.types import BrokerError, BrokerTimeout, ClosedDeal, OpenPosition, OrderState, PositionState, Side
+from gwstock.types import (
+    BrokerError,
+    BrokerRejected,
+    BrokerTimeout,
+    ClosedDeal,
+    OpenPosition,
+    OrderState,
+    PositionState,
+    Side,
+)
 from tests.conftest import RecordingKillSink
 
 T0 = datetime(2026, 11, 2, 7, 30, tzinfo=timezone.utc)  # = clock.now_utc() na starcie fixture `clock`
@@ -278,6 +287,28 @@ async def test_a_crash_after_the_history_read_before_the_block_still_ends_blocke
         assert_blocked_lost_trade(j2, req)  # uzgadnianie samo doszło do UNMATCHED_CLOSED_DEAL
         assert kills.calls[:1] == ["UNMATCHED_CLOSED_DEAL"] and "MISMATCH_TIMEOUT" in kills.calls
     assert fake.calls.count("open_position") == 1
+
+
+async def test_deferred_rejection_and_stop_out_before_the_list_read_is_blocked_not_rejected(
+    journal, fake, mgr, req, clock, kill_sink, risk_cfg, monkeypatch
+):
+    # przegląd G4 (I-1): broker odrzuca w potwierdzeniu, choć POST otworzył DEAL-1, a stop zamyka ją przed odczytem
+    # listy; dawniej REJECTED + FLAT bez śladu (zlecenie końcowe, uzgadnianie nie miało czego szukać)
+    fake.fail_next("confirm", BrokerRejected("INSUFFICIENT_FUNDS"))
+    fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True)
+    written = spy_states(journal, monkeypatch)
+    rec = await mgr.submit_entry(req)
+    assert rec.state is OrderState.UNKNOWN and rec.note == "UNMATCHED_CLOSED_DEAL CAUSE=confirm:BrokerRejected"
+    assert_blocked_lost_trade(journal, req)
+
+    reconciler = reconciler_for(journal, fake, clock, kill_sink, risk_cfg, mgr)
+    for _ in range(8):  # uzgadnianie nie zdejmuje blokady, po tolerancji kill switch miękki
+        clock.advance(risk_cfg.reconcile_interval_s * 2)
+        assert (await reconciler.run_once()).blocked
+    assert_blocked_lost_trade(journal, req)
+    assert "MISMATCH_TIMEOUT" in kill_sink.calls
+    assert OrderState.REJECTED not in written["order"] and OrderState.NOT_PLACED not in written["order"]
+    assert PositionState.FLAT not in written["position"] and fake.calls.count("open_position") == 1
 
 
 # --- d. wiele przebiegów z pustą listą pozycji nie zdejmuje blokady --------------------------------------

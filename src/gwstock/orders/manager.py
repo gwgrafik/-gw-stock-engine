@@ -21,9 +21,10 @@ Niezmienniki (prawdziwe pieniądze):
   `submit_entry` lub `resolve_unknown` w tym czasie to `RuntimeError` przed jakimkolwiek zapisem.
 
 Odrzucenie: odrzucony POST (`open_position`) to REJECTED od razu (nic nie powstało). Odrzucenie odroczone (POST
-przyjęty, REJECTED dopiero w `confirm`) to REJECTED tylko po udanym odczycie listy pozycji bez dopasowania; nasza
-pozycja na liście → UNKNOWN REJECTED_BUT_LISTED i pozycja BLOCKED, nieczytelna lista → UNKNOWN
-`CAUSE=confirm:BrokerRejected_UNVERIFIED` z pozycją ENTERING (rozstrzyga uzgadnianie).
+przyjęty, REJECTED dopiero w `confirm`) to REJECTED tylko po udanym odczycie listy pozycji bez dopasowania i udanym
+odczycie historii bez zamknięcia na naszym instrumencie; nasza pozycja na liście → UNKNOWN REJECTED_BUT_LISTED i
+pozycja BLOCKED, zamknięcie w historii → UNKNOWN UNMATCHED_CLOSED_DEAL i pozycja BLOCKED, nieczytelna lista albo
+historia → UNKNOWN `CAUSE=confirm:BrokerRejected_UNVERIFIED` z pozycją ENTERING (rozstrzyga uzgadnianie).
 
 Rozstrzyganie UNKNOWN: tylko zlecenie UNKNOWN z pozycją ENTERING (BLOCKED to decyzja uzgadniania lub właściciela,
 OPEN to pozycja już przejęta). Do `UNKNOWN_CHECKS` rund co `UNKNOWN_CHECK_INTERVAL_S` (zegar silnika); w rundzie,
@@ -56,6 +57,7 @@ from gwstock.orders.fsm import check_order_transition, check_position_transition
 from gwstock.serialization import dump
 from gwstock.types import (
     BrokerRejected,
+    ClosedDeal,
     EntryRequest,
     MarketClosed,
     OpenPosition,
@@ -83,6 +85,7 @@ SOURCE_EVENT = "order.event"
 
 CHECK_REJECTED_CONFIRM = "rejected_confirm"  # pole `check` surowego odczytu listy po odrzuceniu w potwierdzeniu
 CAUSE_REJECTION_UNVERIFIED = "CAUSE=confirm:BrokerRejected_UNVERIFIED"
+CAUSE_REJECTED_CONFIRM = "CAUSE=confirm:BrokerRejected"  # REJECTED w potwierdzeniu, któremu przeczy historia
 
 T = TypeVar("T")
 
@@ -200,24 +203,46 @@ class OrderManager:
         return self._confirm(order, snapshot, "", deal_reference=ref)
 
     async def _deferred_rejection(self, order: OrderRecord, rejection: BrokerRejected, ref: str) -> OrderRecord:
-        """Odrzucenie w potwierdzeniu po przyjętym POST (także `MarketClosedRejection`): REJECTED dopiero po jednym
-        udanym odczycie listy pozycji (surowa odpowiedź najpierw) bez naszej pozycji.
+        """Odrzucenie w potwierdzeniu po przyjętym POST (także `MarketClosedRejection`): REJECTED dopiero po udanym
+        odczycie listy pozycji bez naszej pozycji ORAZ udanym odczycie historii zamknięć bez zamknięcia na naszym
+        instrumencie (surowe odpowiedzi najpierw), jak przed każdym NOT_PLACED.
 
         Dopasowanie `match_entry_positions` → BLOCKED REJECTED_BUT_LISTED (sprzeczne dowody: decyduje uzgadnianie lub
-        właściciel); nieudany odczyt → UNKNOWN `CAUSE=confirm:BrokerRejected_UNVERIFIED` z pozycją ENTERING (bez rund
-        menedżera: rozstrzyga uzgadnianie). Odrzucenie samego POST (`open_position`) zostaje REJECTED bez odczytu.
+        właściciel). Zamknięcie w historii od INTENT − `HISTORY_MARGIN` (POST otworzył pozycję, a stop albo broker
+        zamknął ją przed odczytem listy) → UNKNOWN UNMATCHED_CLOSED_DEAL i pozycja BLOCKED, jak zgubiona transakcja
+        (bez księgowania, decyduje właściciel). Nieudany odczyt listy albo historii → UNKNOWN
+        `CAUSE=confirm:BrokerRejected_UNVERIFIED` z pozycją ENTERING (bez rund menedżera: rozstrzyga uzgadnianie).
+        Odrzucenie samego POST (`open_position`) zostaje REJECTED bez odczytu.
+
+        Ryzyko przyjęte świadomie (to samo co na zwykłej ścieżce NOT_PLACED): lista opóźniona względem wykonania
+        (pozycji jeszcze nie widać), historia czysta, bo pozycja jest jeszcze otwarta, a stop zamyka ją, zanim zobaczy
+        ją kolejny przebieg uzgadniania (co `reconcile_interval_s`); taka transakcja zostaje bez śladu.
         """
         try:
             positions = await self._call(self._broker.list_positions())
         except Exception as exc:
             self._record_error(SOURCE_POSITIONS, order, exc, check=CHECK_REJECTED_CONFIRM)
-            self._event(order, "REJECTION_UNVERIFIED", reason=rejection.reason, error=type(exc).__name__)
-            return self._transition(order, OrderState.UNKNOWN, note=CAUSE_REJECTION_UNVERIFIED, deal_reference=ref)
+            return self._rejection_unverified(order, rejection, ref, stage="positions", error=type(exc).__name__)
         self._record(SOURCE_POSITIONS, order, check=CHECK_REJECTED_CONFIRM, response=positions)
         matches = match_entry_positions(order, positions)
         if matches:
             return self._block(order, "REJECTED_BUT_LISTED", deal_reference=ref, deal_ids=[p.deal_id for p in matches])
+        ours = await self._entry_closures(order, check=CHECK_REJECTED_CONFIRM)
+        if ours is None:
+            return self._rejection_unverified(order, rejection, ref, stage="history")
+        if ours:
+            return self._block(
+                order, "UNMATCHED_CLOSED_DEAL", deal_reference=ref, deal_ids=[c.deal_id for c in ours],
+                cause=CAUSE_REJECTED_CONFIRM, details={"reason": rejection.reason},
+            )  # fmt: skip
         return self._reject(order, rejection.reason, deal_reference=ref)
+
+    def _rejection_unverified(
+        self, order: OrderRecord, rejection: BrokerRejected, ref: str, *, stage: str, **details: Any
+    ) -> OrderRecord:
+        """Odrzucenia nie da się sprawdzić (lista albo historia nieczytelna): UNKNOWN, pozycja ENTERING."""
+        self._event(order, "REJECTION_UNVERIFIED", reason=rejection.reason, stage=stage, **details)
+        return self._transition(order, OrderState.UNKNOWN, note=CAUSE_REJECTION_UNVERIFIED, deal_reference=ref)
 
     # --- rozstrzyganie UNKNOWN ------------------------------------------------------------------
 
@@ -325,17 +350,24 @@ class OrderManager:
         ENTERING; `details` trafiają do zdarzenia). Zamknięcia spoza instrumentu i sprzed okna (adapter zwrócił więcej)
         nie są dowodem.
         """
+        ours = await self._entry_closures(order)
+        if ours is None:
+            return self._incomplete(order, cause, **details, history_read=False)
+        if ours:
+            return self._block(order, "UNMATCHED_CLOSED_DEAL", deal_ids=[c.deal_id for c in ours], cause=cause)
+        return self._not_placed(order, _note(not_placed, cause))
+
+    async def _entry_closures(self, order: OrderRecord, **payload: Any) -> list[ClosedDeal] | None:
+        """Historia zamknięć od INTENT − `HISTORY_MARGIN` (pełna albo wyjątek; surowa odpowiedź lub błąd najpierw):
+        zamknięcia na naszym instrumencie w tym oknie, albo None przy nieudanym odczycie (nigdy dowód braku)."""
         since = order.created_at - HISTORY_MARGIN
         try:
             closures = await self._call(self._broker.closed_since(since))
         except Exception as exc:
-            self._record_error(SOURCE_CLOSED, order, exc, since=since)
-            return self._incomplete(order, cause, **details, history_read=False)
-        self._record(SOURCE_CLOSED, order, since=since, response=closures)
-        ours = [c for c in closures if c.epic == order.epic and c.ts >= since]
-        if ours:
-            return self._block(order, "UNMATCHED_CLOSED_DEAL", deal_ids=[c.deal_id for c in ours], cause=cause)
-        return self._not_placed(order, _note(not_placed, cause))
+            self._record_error(SOURCE_CLOSED, order, exc, since=since, **payload)
+            return None
+        self._record(SOURCE_CLOSED, order, since=since, **payload, response=closures)
+        return [c for c in closures if c.epic == order.epic and c.ts >= since]
 
     def _incomplete(self, order: OrderRecord, cause: str, **details: Any) -> OrderRecord:
         """Za mało udanych odczytów, żeby cokolwiek orzec: zlecenie zostaje UNKNOWN, pozycja ENTERING."""
@@ -382,10 +414,19 @@ class OrderManager:
         return self._transition(order, OrderState.CONFIRMED, deal_id=pos.deal_id, note=note, **fields)
 
     def _block(
-        self, order: OrderRecord, code: str, *, deal_ids: list[str], cause: str = "", **fields: Any
+        self,
+        order: OrderRecord,
+        code: str,
+        *,
+        deal_ids: list[str],
+        cause: str = "",
+        details: dict[str, Any] | None = None,
+        **fields: Any,
     ) -> OrderRecord:
-        """Sprzeczne dowody: pozycja BLOCKED, zlecenie zostaje UNKNOWN (decyduje uzgadnianie lub właściciel)."""
-        self._event(order, code, deal_ids=deal_ids)
+        """Sprzeczne dowody: pozycja BLOCKED, zlecenie zostaje UNKNOWN (decyduje uzgadnianie lub właściciel).
+
+        `details`: dodatkowe pola zdarzenia `order.event`; `fields`: pola zapisu zlecenia."""
+        self._event(order, code, deal_ids=deal_ids, **(details or {}))
         self._move_position(PositionRecord(order.epic, PositionState.BLOCKED))
         note = _note(code, cause)
         if order.state is OrderState.UNKNOWN:

@@ -528,13 +528,72 @@ async def test_deferred_rejection_on_confirm_is_terminal_and_logged(journal, fak
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.REJECTED and rec.note == "INSUFFICIENT_FUNDS" and rec.deal_reference == "REF-1"
     assert position(journal).state == PositionState.FLAT
-    assert fake.calls == ["open_position", "confirm", "list_positions"]  # REJECTED dopiero po pustej liście
+    # REJECTED dopiero po pustej liście i czystej historii
+    assert fake.calls == ["open_position", "confirm", "list_positions", "closed_since"]
     [ack] = payloads(journal, "broker.open_position")
     [raw] = payloads(journal, "broker.confirm")
     [listed] = payloads(journal, "broker.list_positions")
+    [history] = payloads(journal, "broker.closed_since")
     assert ack["response"] == {"deal_reference": "REF-1"}
     assert raw["error"] == "BrokerRejected" and raw["reason"] == "INSUFFICIENT_FUNDS"
     assert listed["response"] == [] and listed["check"] == "rejected_confirm"
+    assert history["response"] == [] and history["check"] == "rejected_confirm"
+    assert history["since"] == (T0 - HISTORY_MARGIN).isoformat()
+
+
+def _filled_rejected_and_stopped_before_the_list(fake):
+    """Repro z przeglądu G4 (I-1): POST otworzył DEAL-1, potwierdzenie mówi REJECTED, a stop zamyka pozycję tuż przed
+    odczytem listy."""
+    fake.fail_next("confirm", BrokerRejected("INSUFFICIENT_FUNDS"))
+    fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True)
+
+
+EMPTY_LIST_AFTER_REJECTION = {
+    "stopped_out": (
+        _filled_rejected_and_stopped_before_the_list,
+        OrderState.UNKNOWN, "UNMATCHED_CLOSED_DEAL CAUSE=confirm:BrokerRejected",
+        PositionRecord("DE40", PositionState.BLOCKED),
+    ),
+    "history_unreadable": (
+        lambda fake: (fake.reject_next_entry("INSUFFICIENT_FUNDS"), fake.fail_next("closed_since", BrokerTimeout())),
+        OrderState.UNKNOWN, "CAUSE=confirm:BrokerRejected_UNVERIFIED", PositionRecord("DE40", PositionState.ENTERING),
+    ),
+    "clean": (
+        lambda fake: fake.reject_next_entry("INSUFFICIENT_FUNDS"),
+        OrderState.REJECTED, "INSUFFICIENT_FUNDS", PositionRecord("DE40", PositionState.FLAT),
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("setup", "state", "note", "pos"), list(EMPTY_LIST_AFTER_REJECTION.values()), ids=list(EMPTY_LIST_AFTER_REJECTION)
+)
+async def test_a_rejected_confirm_with_an_empty_list_reads_the_history_before_rejecting(
+    journal, fake, mgr, req, monkeypatch, setup, state, note, pos
+):
+    # pusta lista nie wystarcza: wejście mogło się wykonać i zostać wybite, zanim przeczytaliśmy listę (jak przed
+    # NOT_PLACED); zamknięcie → BLOCKED jak zgubiona transakcja, nieczytelna historia → UNKNOWN, czysta → REJECTED
+    setup(fake)
+    log = spy_writes(journal, monkeypatch)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == state and rec.note == note and rec.deal_reference == "REF-1"
+    assert position(journal) == pos and journal.trades() == []
+    assert fake.calls == ["open_position", "confirm", "list_positions", "closed_since"]
+    [history] = payloads(journal, "broker.closed_since")
+    assert history["check"] == "rejected_confirm" and history["since"] == (T0 - HISTORY_MARGIN).isoformat()
+    raw = ["broker.open_position", "broker.confirm", "broker.list_positions", "broker.closed_since"]
+    assert all(set(raw) <= set(sources) for _, _, sources in log[2:])  # surowa historia przed decyzją
+    events = payloads(journal, "order.event")
+    if state is OrderState.REJECTED:
+        assert events == []
+    elif pos.state is PositionState.BLOCKED:
+        [event] = events
+        assert event["event"] == "UNMATCHED_CLOSED_DEAL" and event["deal_ids"] == ["DEAL-1"]
+        assert event["reason"] == "INSUFFICIENT_FUNDS"
+    else:
+        [event] = events
+        assert event["event"] == "REJECTION_UNVERIFIED" and event["stage"] == "history"
+        assert event["reason"] == "INSUFFICIENT_FUNDS" and history["error"] == "BrokerTimeout"
 
 
 @pytest.mark.parametrize(
@@ -655,7 +714,7 @@ async def test_positions_are_journaled_before_adoption(journal, fake, mgr, req, 
 
 
 CHECKED = ["broker.open_position"] + ["broker.list_positions"] * 3 + ["broker.closed_since"]
-REJECTION_CHECKED = ["broker.open_position", "broker.confirm", "broker.list_positions"]
+REJECTION_CHECKED = ["broker.open_position", "broker.confirm", "broker.list_positions", "broker.closed_since"]
 
 
 @pytest.mark.parametrize(
