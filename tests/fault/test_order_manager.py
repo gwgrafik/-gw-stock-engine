@@ -33,6 +33,10 @@ T0 = datetime(2026, 11, 2, 7, 30, tzinfo=timezone.utc)  # = clock.now_utc() na s
 FILL = Decimal("25782.3")  # BUY po ask z fixture `quote`
 STOP = FILL - Decimal("30")
 SKEW_BEYOND_TOLERANCE = timedelta(seconds=6)  # tolerancja zegara brokera to 5 s
+UNMANAGED_DEAL_1 = (  # REJECTED_BUT_LISTED: tekst dla właściciela w notatce (alarm, status) i w zdarzeniu
+    "broker position DEAL-1 is open and NOT managed by the engine (it does not check its stop or close it): "
+    "check and close it at Capital.com"
+)
 
 
 def order(journal, req):
@@ -247,51 +251,60 @@ def _rejected_in_round_1(fake, *, filled):
         fake.fail_next("confirm", BrokerTimeout())
 
 
+TIMEOUT_CAUSE = "CAUSE=confirm:BrokerTimeout"
 REJECTED_IN_RESOLUTION = {
     "listed": (
         lambda fake: _rejected_in_round_1(fake, filled=True),
-        OrderState.UNKNOWN, "REJECTED_BUT_LISTED", PositionRecord("DE40", PositionState.BLOCKED),
+        OrderState.UNKNOWN,
+        f"REJECTED_BUT_LISTED REJECTED=INSUFFICIENT_FUNDS {TIMEOUT_CAUSE} - {UNMANAGED_DEAL_1}",
+        PositionRecord("DE40", PositionState.BLOCKED),
     ),
     "stopped_out": (
         lambda fake: (
             _rejected_in_round_1(fake, filled=True),
             fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True),
         ),
-        OrderState.UNKNOWN, "UNMATCHED_CLOSED_DEAL", PositionRecord("DE40", PositionState.BLOCKED),
+        OrderState.UNKNOWN, f"UNMATCHED_CLOSED_DEAL {TIMEOUT_CAUSE}", PositionRecord("DE40", PositionState.BLOCKED),
     ),
     "history_unreadable": (
         lambda fake: (_rejected_in_round_1(fake, filled=False), fake.fail_next("closed_since", BrokerTimeout())),
-        OrderState.UNKNOWN, "CHECKS_INCOMPLETE", PositionRecord("DE40", PositionState.ENTERING),
+        OrderState.UNKNOWN, f"CHECKS_INCOMPLETE {TIMEOUT_CAUSE}", PositionRecord("DE40", PositionState.ENTERING),
     ),
     "list_unreadable_every_round": (
         lambda fake: (
             _rejected_in_round_1(fake, filled=False),
             *(fake.fail_next("list_positions", BrokerTimeout()) for _ in range(3)),
         ),
-        OrderState.UNKNOWN, "CHECKS_INCOMPLETE", PositionRecord("DE40", PositionState.ENTERING),
+        OrderState.UNKNOWN, f"CHECKS_INCOMPLETE {TIMEOUT_CAUSE}", PositionRecord("DE40", PositionState.ENTERING),
     ),
     "clean": (
         lambda fake: _rejected_in_round_1(fake, filled=False),
-        OrderState.NOT_PLACED, "REJECTED_ON_CONFIRM=INSUFFICIENT_FUNDS", PositionRecord("DE40", PositionState.FLAT),
+        OrderState.NOT_PLACED, f"REJECTED_ON_CONFIRM=INSUFFICIENT_FUNDS {TIMEOUT_CAUSE}",
+        PositionRecord("DE40", PositionState.FLAT),
     ),
 }
 
 
 @pytest.mark.parametrize(
-    ("setup", "state", "code", "pos"), list(REJECTED_IN_RESOLUTION.values()), ids=list(REJECTED_IN_RESOLUTION)
+    ("setup", "state", "note", "pos"), list(REJECTED_IN_RESOLUTION.values()), ids=list(REJECTED_IN_RESOLUTION)
 )
 async def test_rejected_on_confirm_during_resolution_checks_the_list_and_history_before_not_placed(
-    journal, fake, mgr, req, setup, state, code, pos
+    journal, fake, mgr, req, setup, state, note, pos
 ):
     # REJECTED na referencję w trakcie rozstrzygania nie jest dowodem braku pozycji: POST mógł ją otworzyć
     setup(fake)
     rec = await mgr.submit_entry(req)
-    assert rec.state == state and rec.note == f"{code} CAUSE=confirm:BrokerTimeout"
+    assert rec.state == state and rec.note == note
     assert position(journal) == pos and journal.trades() == []
     assert fake.calls.count("open_position") == 1
     if state is OrderState.NOT_PLACED:  # NOT_PLACED tylko po udanym odczycie listy i czystej historii
         assert fake.calls[-2:] == ["list_positions", "closed_since"]
         assert [p["response"] for p in payloads(journal, "broker.closed_since")] == [[]]
+    if note.startswith("REJECTED_BUT_LISTED"):
+        [event] = payloads(journal, "order.event")
+        assert (event["reason"], event["managed_by_engine"], event["message"]) == (
+            "INSUFFICIENT_FUNDS", False, UNMANAGED_DEAL_1,
+        )
 
 
 async def test_ambiguous_match_blocks_and_never_guesses(journal, fake, mgr, req):
@@ -607,13 +620,30 @@ async def test_a_rejected_confirm_with_our_position_listed_blocks_instead_of_rej
     fake.fail_next("confirm", exc)
     log = spy_writes(journal, monkeypatch)
     rec = await mgr.submit_entry(req)
-    assert rec.state == OrderState.UNKNOWN and rec.note == "REJECTED_BUT_LISTED" and rec.deal_reference == "REF-1"
+    assert rec.state == OrderState.UNKNOWN and rec.deal_reference == "REF-1"
+    assert rec.note == f"REJECTED_BUT_LISTED REJECTED={exc.reason} - {UNMANAGED_DEAL_1}"
     assert position(journal) == PositionRecord("DE40", PositionState.BLOCKED)
     assert fake.calls == ["open_position", "confirm", "list_positions"] and list(fake.positions) == ["DEAL-1"]
     [event] = payloads(journal, "order.event")
-    assert event["event"] == "REJECTED_BUT_LISTED" and event["deal_ids"] == ["DEAL-1"]
+    assert event == {
+        "order_id": req.client_id, "event": "REJECTED_BUT_LISTED", "deal_ids": ["DEAL-1"], "reason": exc.reason,
+        "managed_by_engine": False, "message": UNMANAGED_DEAL_1,
+    }
     raw = ["broker.open_position", "broker.confirm", "broker.list_positions", "order.event"]
     assert log[2:] == [("position", PositionState.BLOCKED, raw), ("order", OrderState.UNKNOWN, raw)]
+
+
+async def test_the_owner_alert_for_rejected_but_listed_says_the_broker_position_is_not_managed(
+    executor, signal, rules, fake, notifier
+):
+    # alarm właściciela (ENTRY_UNRESOLVED wykonawcy) i `status` pokazują notatkę zlecenia: musi mówić wprost, co robić
+    fake.accounts = [a for a in fake.accounts if a.account_id == "ACC-1"]  # rachunek z saldem 40 EUR
+    fake.fail_next("confirm", BrokerRejected("INSUFFICIENT_FUNDS"))
+    rec = await executor.enter(signal, rules, T0.date(), smoke=True)  # smoke: bramka bez okna wejścia
+    assert rec.state == OrderState.UNKNOWN and rec.note.split()[0] == "REJECTED_BUT_LISTED"
+    [alert] = [message for _, message in notifier.alerts if message.startswith("ENTRY_UNRESOLVED")]
+    assert "REJECTED=INSUFFICIENT_FUNDS" in alert and UNMANAGED_DEAL_1 in alert
+    assert fake.calls.count("open_position") == 1 and "close_position" not in fake.calls
 
 
 async def test_a_rejected_confirm_with_an_unreadable_position_list_stays_unknown(

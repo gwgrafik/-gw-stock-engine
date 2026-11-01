@@ -226,7 +226,7 @@ class OrderManager:
         self._record(SOURCE_POSITIONS, order, check=CHECK_REJECTED_CONFIRM, response=positions)
         matches = match_entry_positions(order, positions)
         if matches:
-            return self._block(order, "REJECTED_BUT_LISTED", deal_reference=ref, deal_ids=[p.deal_id for p in matches])
+            return self._rejected_but_listed(order, rejection.reason, matches, deal_reference=ref)
         ours = await self._entry_closures(order, check=CHECK_REJECTED_CONFIRM)
         if ours is None:
             return self._rejection_unverified(order, rejection, ref, stage="history")
@@ -312,7 +312,7 @@ class OrderManager:
                     continue  # odrzucenia nie da się sprawdzić w tej rundzie
                 matches = match_entry_positions(order, positions)
                 if matches:
-                    return self._block(order, "REJECTED_BUT_LISTED", deal_ids=[p.deal_id for p in matches], cause=cause)
+                    return self._rejected_but_listed(order, rejected, matches, cause=cause)
                 return await self._check_history_before_not_placed(
                     order, cause, not_placed=f"REJECTED_ON_CONFIRM={rejected}", rejected=rejected
                 )
@@ -413,6 +413,23 @@ class OrderManager:
             note = _note(note, f"FILLED_SIZE={pos.size} REQUESTED={order.size}")
         return self._transition(order, OrderState.CONFIRMED, deal_id=pos.deal_id, note=note, **fields)
 
+    def _rejected_but_listed(
+        self, order: OrderRecord, reason: str, matches: list[OpenPosition], *, cause: str = "", **fields: Any
+    ) -> OrderRecord:
+        """REJECTED w potwierdzeniu, a broker pokazuje pasującą pozycję: BLOCKED bez deal_id, więc silnik jej NIE
+        prowadzi (nie sprawdza stopu, nie zamyka). Powód odrzucenia i ostrzeżenie dla właściciela trafiają do
+        zdarzenia i do notatki zlecenia (notatkę pokazują alarm ENTRY_UNRESOLVED wykonawcy i `status`)."""
+        deal_ids = [p.deal_id for p in matches]
+        warning = (
+            f"broker position {', '.join(deal_ids)} is open and NOT managed by the engine (it does not check its stop "
+            "or close it): check and close it at Capital.com"
+        )
+        return self._block(
+            order, "REJECTED_BUT_LISTED", deal_ids=deal_ids,
+            details={"reason": reason, "managed_by_engine": False, "message": warning},
+            note=_note("REJECTED_BUT_LISTED", f"REJECTED={reason}", cause, f"- {warning}"), **fields,
+        )  # fmt: skip
+
     def _block(
         self,
         order: OrderRecord,
@@ -421,14 +438,16 @@ class OrderManager:
         deal_ids: list[str],
         cause: str = "",
         details: dict[str, Any] | None = None,
+        note: str | None = None,
         **fields: Any,
     ) -> OrderRecord:
         """Sprzeczne dowody: pozycja BLOCKED, zlecenie zostaje UNKNOWN (decyduje uzgadnianie lub właściciel).
 
-        `details`: dodatkowe pola zdarzenia `order.event`; `fields`: pola zapisu zlecenia."""
+        `details`: dodatkowe pola zdarzenia `order.event`; `note`: pełna notatka zamiast `code cause` (pierwsze słowo
+        to zawsze `code`); `fields`: pozostałe pola zapisu zlecenia."""
         self._event(order, code, deal_ids=deal_ids, **(details or {}))
         self._move_position(PositionRecord(order.epic, PositionState.BLOCKED))
-        note = _note(code, cause)
+        note = _note(code, cause) if note is None else note
         if order.state is OrderState.UNKNOWN:
             return self._annotate(order, note, **fields)
         return self._transition(order, OrderState.UNKNOWN, note=note, **fields)
