@@ -593,6 +593,33 @@ def test_hard_written_while_the_state_is_unreadable_is_persisted_and_ends_the_un
     assert state["calls"] == calls  # niepewność skończona: odczytu nie ponawiamy
 
 
+@pytest.mark.parametrize("via", ["hard", "hard_stop_file"])
+def test_hard_is_in_memory_before_a_slow_read_of_an_unknown_stored_state(
+    journal, clock, data_dir, notifier, monkeypatch, via
+):
+    # Start z nieczytelnym stanem (SOFT tylko w pamięci). Ponowny odczyt może trwać do 5 s (busy timeout bazy); każdy
+    # odczyt zapisuje, jaki poziom widziała w tej chwili reszta silnika: HARD ma obowiązywać, zanim odczyt się zacznie.
+    seen: list[KillLevel] = []
+    switch: list[KillSwitch] = []
+
+    def slow_kill_state():
+        if switch:
+            seen.append(switch[0].level())
+        raise JournalReadError("database is locked")
+
+    monkeypatch.setattr(journal, "kill_state", slow_kill_state)
+    switch.append(KillSwitch(journal, clock, data_dir, notifier))
+    ks = switch[0]
+    assert ks.level() is KillLevel.SOFT
+    if via == "hard":
+        ks.hard("NO_STOP")
+    else:
+        (data_dir / "HARD_STOP").write_text("")
+        ks.scan_files()
+    assert ks.level() is KillLevel.HARD
+    assert seen and all(level is KillLevel.HARD for level in seen), seen
+
+
 def test_scan_files_retries_the_stored_state_read_and_persists_after_recovery(
     journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
 ):

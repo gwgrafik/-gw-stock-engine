@@ -56,7 +56,9 @@ NO_STOP, LOSS_PER_TRADE, LEVERAGE, MARGIN, DAILY_LOSS, TOTAL_DRAWDOWN, STALE_DAT
 Kill switch (`KillSwitch`) to awaryjny wyłącznik. Poziom jest w pamięci (decyduje natychmiast) i w dzienniku
 (przeżywa restart, `set_kill`), a zdjąć go może wyłącznie jawne `clear`:
 
-- `soft`/`hard` NIGDY nie rzucają: poziom w pamięci jest ustawiany przed zapisem, awaria zapisu do dziennika
+- `soft`/`hard` NIGDY nie rzucają: poziom w pamięci jest ustawiany jako pierwszy krok, przed jakimkolwiek odczytem
+  i zapisem dziennika (także przed ponowieniem odczytu nieznanego stanu startowego, który na zajętej bazie trwa
+  sekundy; `scan_files` sprawdza pliki przed tym odczytem), awaria zapisu do dziennika
   (JournalWriteError lub cokolwiek innego) kończy się alarmem z napisem JOURNAL_WRITE_FAILED, a awaria
   notyfikatora tylko wpisem do logu. Nieudany zapis stanu jest ponawiany przy kolejnym `soft`/`hard`/`scan_files`.
 - Idempotencja: zapis do dziennika i alarm tylko gdy poziom rośnie albo przyczyna jest nowa na danym poziomie;
@@ -419,6 +421,11 @@ class KillSwitch:
         self._data_dir = Path(data_dir)
         self._notifier = notifier
         self._lock = threading.RLock()
+        # Najwyższy poziom zgłoszony przez soft/hard od ostatniego clear(), ustawiany jako PIERWSZY krok, bez blokady
+        # `_lock` i przed jakimkolwiek odczytem dziennika (ten może czekać do 5 s na zajętą bazę): `level()` widzi go
+        # od razu. `_floor_lock` chroni tylko to przypisanie i nigdy nie jest trzymany przy I/O.
+        self._floor_lock = threading.Lock()
+        self._floor = KillLevel.NONE
         self._level = KillLevel.NONE
         self._reason = ""
         self._reasons: set[str] = set()  # przyczyny już zapisane na bieżącym poziomie
@@ -430,7 +437,7 @@ class KillSwitch:
     # --- odczyt ---
 
     def level(self) -> KillLevel:
-        return self._level
+        return max(self._level, self._floor)
 
     def reason(self) -> str:
         return self._reason
@@ -447,11 +454,10 @@ class KillSwitch:
         """`data/HARD_STOP` włącza HARD, `data/STOP` włącza SOFT.
 
         Pliku, którego obecności nie da się sprawdzić, nie pomijamy: włącza SOFT (`STOP_FILE_UNREADABLE`), także dla
-        HARD_STOP (świadomy fail-safe, zob. dokumentacja modułu). Ponawia też odczyt nieznanego stanu startowego
-        i niedokończony zapis stanu do dziennika.
+        HARD_STOP (świadomy fail-safe, zob. dokumentacja modułu). Najpierw pliki (HARD z pliku wchodzi do pamięci przed
+        jakimkolwiek odczytem dziennika), potem ponowienie odczytu nieznanego stanu startowego i niedokończonego zapisu
+        stanu do dziennika.
         """
-        with self._lock:
-            self._resolve_unknown()
         for name, engage, reason in (
             ("HARD_STOP", self.hard, HARD_STOP_FILE),
             ("STOP", self.soft, STOP_FILE),
@@ -465,6 +471,7 @@ class KillSwitch:
             if present:
                 engage(reason)
         with self._lock:
+            self._resolve_unknown()
             self._retry_unsynced()
 
     def clear(self, requested_by: str) -> None:
@@ -487,6 +494,8 @@ class KillSwitch:
             ts = self._now()
             self._journal.set_kill(KillLevel.NONE, f"CLEARED by {who}", ts)  # błąd: poziom w pamięci zostaje
             self._level, self._reason = KillLevel.NONE, ""
+            with self._floor_lock:
+                self._floor = KillLevel.NONE
             self._reasons.clear()
             self._suppressed.clear()
             self._unsynced = False
@@ -522,6 +531,11 @@ class KillSwitch:
             self._level, self._reason, self._reasons = level, reason, {reason}
 
     def _engage(self, level: KillLevel, reason: object) -> None:
+        # Najpierw pamięć, zanim czekamy na blokadę i zanim cokolwiek czyta dziennik: od tej chwili bramka blokuje,
+        # a HARD obowiązuje wykonawcę, nawet gdy odczyt nieznanego stanu startowego trwa sekundy.
+        with self._floor_lock:
+            if level > self._floor:
+                self._floor = level
         try:
             text = _reason_text(reason)
             with self._lock:
