@@ -3,8 +3,9 @@
 Opcje: `--day YYYY-MM-DD` (domyślnie ostatni dzień z transakcją lub decyzją, a gdy takich nie ma, ostatni dzień
 z zapisem błędu), `--all` (wszystkie dni), `--csv PATH` (eksport księgi), `--journal PATH` (domyślnie
 `$GW_DATA_DIR/journal.sqlite`, `GW_DATA_DIR` domyślnie `data`; konfiguracja z `$GW_CONFIG_DIR`, domyślnie `config`).
-Kody wyjścia: 0 raport wypisany, 1 błąd (brak/uszkodzony dziennik, brak konfiguracji, nieudany eksport CSV),
-2 błąd użycia.
+Kody wyjścia: 0 raport wypisany, 1 błąd (brak/uszkodzony dziennik, brak konfiguracji, nieudany eksport CSV,
+wartości poza zakresem arytmetyki; to ostatnia deska ratunku, a pojedynczy dziwny zapis nie przerywa raportu:
+liczby, których nie da się wydrukować, wychodzą jako `n/a`), 2 błąd użycia.
 
 Dziennik otwieramy TYLKO DO ODCZYTU (URI `mode=ro` + `query_only`): raport można puścić, gdy silnik pracuje, a plik
 nie zmienia się ani o bajt. Raport nie drukuje identyfikatorów rachunku, deali ani zleceń, tylko liczby i kody zdarzeń.
@@ -23,7 +24,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 from gwstock.config import CostConfig, load_config
@@ -49,7 +50,8 @@ L1_EUR_CAVEAT = (
 )
 L1_RATIO_LABEL = "  koszty zmierzone / model (poślizg wejścia w punktach, bez zaokrągleń): "
 L1_EXCLUDED_LABEL = (
-    "  wykluczone z pomiaru kosztów i z liczby sesji (brak kontekstu wejścia albo uszkodzona wartość punktu): "
+    "  wykluczone z pomiaru kosztów i z liczby sesji "
+    "(brak kontekstu wejścia, uszkodzona wartość punktu albo nieużyteczne notowanie decyzji): "
 )
 L1_REJECTION_NOTE = (
     "    liczy ENTRY_UNRESOLVED także po późniejszym rozstrzygnięciu zlecenia oraz zlecenia INTENT/SUBMITTING, "
@@ -289,8 +291,8 @@ def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[st
     ]
     if gate.unhandled_rejections:
         lines.append(L1_REJECTION_NOTE)
-    verdict = f"{format_ratio(gate.cost_deviation_ratio)}" if points.trades else "brak danych"
     limit = gates.COST_DEVIATION_LIMIT
+    verdict = format_ratio(gate.cost_deviation_ratio, limit) if points.trades else "brak danych"
     lines.append(f"{L1_RATIO_LABEL}{verdict} (najwyżej {limit}; próbki pomiaru: {points.trades} z {required})")
     if points.trades:
         lines += [
@@ -308,7 +310,8 @@ def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[st
             "    informacyjnie, nie wpływa na werdykt: spread + poślizg wejścia / model (spread + poślizg): "
             f"{format_ratio(points.combined_ratio)}"
         )
-    lines.append(f"  koszty w EUR (informacyjnie): ratio {format_ratio(details.eur_ratio)}")
+    eur = f"ratio {format_ratio(details.eur_ratio)}" if details.eur_samples else "brak danych"
+    lines.append(f"  koszty w EUR (informacyjnie): {eur}")
     lines.append(L1_EUR_CAVEAT)
     if details.excluded_trades:
         lines.append(f"{L1_EXCLUDED_LABEL}{details.excluded_trades}")
@@ -320,6 +323,11 @@ def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[st
             f"  uwaga: dowody są skąpe: pomiar kosztów z {points.trades} transakcji przy wymaganych {required}; "
             "to za mało, by oceniać koszty"
         )
+    elif points.trades == required:
+        lines.append(
+            f"  uwaga: dowody nadal skąpe przy n = wymaganej liczbie sesji ({required}); "
+            "to wciąż mało, by oceniać koszty"
+        )
     lines += [f"  powód: {reason}" for reason in reasons]
     if not reasons:
         lines.append(L1_INSTRUCTION)
@@ -328,10 +336,16 @@ def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[st
 
 
 def _points(value: Decimal | None) -> str:
-    """Punkty do wydruku z dwoma miejscami; nigdy `-0.00` (zero po zaokrągleniu jest bez znaku)."""
+    """Punkty do wydruku z dwoma miejscami, tym samym zaokrągleniem co `format_ratio` (ROUND_HALF_UP); nigdy `-0.00`,
+    a wartość niemożliwa do zapisania (poza zakresem precyzji, nieskończona, NaN) to `n/a`."""
     if value is None:
         return "-"
-    rounded = value.quantize(Decimal("0.01"))
+    try:
+        rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except ArithmeticError:
+        return "n/a"
+    if rounded.is_nan():
+        return "n/a"
     return format(abs(rounded) if rounded.is_zero() else rounded, "f")
 
 

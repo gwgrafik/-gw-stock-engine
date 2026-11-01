@@ -907,7 +907,7 @@ Co przeglądasz po każdej sesji i na koniec piątej (warunki bramki L1 ze specy
 
 - **zero** niewyjaśnionych rozbieżności pozycja/broker starszych niż 60 sekund (w `alerts.log` nie ma `ERROR` bez wyjaśnienia),
 - **zero** nieobsłużonych odrzuceń zleceń,
-- spread i poślizg stopów zmierzone i porównane z modelem; rozbieżność kosztów większa niż 2 razy model oznacza przegląd z Claude,
+- v1 mierzy poślizg wejścia i spread; koszty wyjść STOP są niezmierzone (raport tylko liczy takie wyjścia); rozbieżność kosztów większa niż 2 razy model oznacza przegląd z Claude; próbki kosztu to transakcje wejścia ORAZ próby smoke dowolnej wielkości, a nie jedna próbka na sesję; listę próbek czyta właściciel (eksport CSV z opcją `--csv`),
 - transakcje w raporcie zgadzają się z historią w aplikacji Capital.com (cena wejścia, wyjścia, wynik),
 - pamięć nadal w zielonych progach (punkt 2.4).
 

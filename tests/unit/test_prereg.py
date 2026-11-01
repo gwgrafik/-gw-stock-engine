@@ -562,3 +562,29 @@ def test_preregistration_document_matches_what_the_tools_do():
     assert "nie jest mierzony w v1" in text  # poślizg stopu przy wyjściu
     assert "config/*.toml text eol=lf" in text
     assert "previous" in text  # ślad wariantów po --force
+
+
+NEW_WORDING = "v1 mierzy poślizg wejścia i spread; koszty wyjść STOP są niezmierzone (raport tylko liczy takie wyjścia)"
+OLD_WORDING = "spread i poślizg stopów zmierzone i porównane z modelem"
+SAMPLES_CLAUSE = "próbki kosztu to transakcje wejścia ORAZ próby smoke dowolnej wielkości"
+
+
+def test_cost_wording_is_aligned_in_spec_preregistration_and_runbook():
+    spec = (REPO / "docs/superpowers/specs/2026-10-31-engine-design-v2.md").read_text(encoding="utf-8")
+    prereg_doc = (REPO / "docs/preregistration/v1.md").read_text(encoding="utf-8")
+    runbook = (REPO / "docs/ops/runbook.md").read_text(encoding="utf-8")
+    for name, text in (("spec", spec), ("prereg", prereg_doc), ("runbook", runbook)):
+        assert OLD_WORDING not in text, name  # raport nie mierzy poślizgu stopu, więc zdanie obiecywało za dużo
+        assert NEW_WORDING in text, name
+    assert spec.count(NEW_WORDING) == 1 and prereg_doc.count(NEW_WORDING) == 1 and runbook.count(NEW_WORDING) == 1
+    for text in (prereg_doc, runbook):
+        assert SAMPLES_CLAUSE in text  # licznik 5 z 5 nie znaczy jednej próbki na sesję
+    assert "eksport CSV" in runbook.split(SAMPLES_CLAUSE)[1][:200]
+
+
+def test_preregistration_document_states_the_known_limits_of_the_l1_numbers():
+    text = (REPO / "docs" / "preregistration" / "v1.md").read_text(encoding="utf-8")
+    assert "cztery liczby" not in text  # są pięć: cztery warunki bramki i liczba próbek kosztu
+    assert "pięć wielkości" in text
+    # gdy wszystkie wejścia o wielkości minimalnej nie mają użytecznego kontekstu, próg przesuwa się dalej
+    assert "przesuwa się na kolejną wielkość" in text and "ostrożnie" in text
