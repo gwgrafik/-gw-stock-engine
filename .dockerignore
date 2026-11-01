@@ -1,0 +1,38 @@
+# Kontekst budowy obrazu = korzeń repozytorium. Do Dockera nie trafia historia, dane robocze, sekrety ani notatki.
+# Etapy Dockerfile kopiują wyłącznie wskazane ścieżki (src/, requirements*.lock; dla celu test także tests/, config/,
+# docker/, pyproject.toml, .dockerignore), więc `tests`, `config` i `docker` zostają w kontekście, a obraz runtime
+# i tak ich nie zawiera.
+
+# historia i notatki robocze
+.git
+.superpowers
+.claude
+
+# dane silnika (dziennik, ARM_LIVE, account.json, alerts.log, heartbeat.json): montowane w czasie pracy, nigdy w obrazie
+data
+
+# sekrety i środowisko
+.env
+**/.env
+.env.*
+**/capitalcom*.json
+**/*.pem
+**/*.key
+.config
+
+# bazy i logi
+*.sqlite*
+**/*.sqlite*
+*.log
+
+# artefakty Pythona i narzędzi
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.venv
+venv*
+*.egg-info
+
+# dokumentacja nie jest potrzebna w obrazie
+docs
+README.md

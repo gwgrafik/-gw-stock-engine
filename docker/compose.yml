@@ -1,0 +1,99 @@
+# Compose dla silnika gw-stock-engine (spec §13). Współdzielony VPS: ścisłe limity zasobów i izolacja.
+#
+# Uruchamiać z korzenia repozytorium jako użytkownik `claude`, ZAWSZE z `-f docker/compose.yml`. Procedura: docs/ops/runbook.md.
+#
+# Ścieżki względne w tym pliku (`..`) liczą się od katalogu TEGO pliku (docker/), nie od katalogu, w którym stoi
+# użytkownik. Dlatego `../data` to <repozytorium>/data: działa z dowolnego katalogu roboczego i nie powstaje przypadkiem
+# drugi, pusty katalog danych (z zerowanymi licznikami strat).
+#
+# Wymagane zmienne (brak = jawny błąd, nigdy cichy powrót do roota):
+#   GW_UID, GW_GID   uid i gid właściciela plików na hoście (użytkownik `claude`); patrz runbook, sekcja 1.
+# Opcjonalna:
+#   GW_SECRET_FILE   ścieżka pliku z kluczem na hoście (domyślnie /home/claude/.config/gw/capitalcom.json).
+name: gw-stock-engine
+
+services:
+  gw-stock-engine:
+    image: gw-stock-engine:local
+    container_name: gw-stock-engine   # jedna instancja; stałe nazwy w `docker logs`, `docker stats`, `docker exec`
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+
+    # --- użytkownik i uprawnienia ---
+    user: "${GW_UID:?GW_UID nie ustawione - patrz runbook sekcja 1}:${GW_GID:?GW_GID nie ustawione - patrz runbook sekcja 1}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp:size=32m"]   # jedyne zapisywalne miejsce poza /data; zapis do tmpfs liczy się do mem_limit
+    init: true        # PID 1 przekazuje SIGTERM do procesu Pythona i sprząta procesy potomne
+
+    # --- limity zasobów (współdzielony VPS z botami na prawdziwe pieniądze) ---
+    mem_limit: 256m
+    memswap_limit: 256m   # równy mem_limit = brak swapu; czy jądro to egzekwuje, sprawdza runbook (memory.swap.max = 0)
+    mem_reservation: 128m
+    oom_score_adj: 1000   # przy braku pamięci na hoście jądro zabija NAS pierwszego (stop jest u brokera)
+    pids_limit: 64
+    cpus: 0.5
+
+    # --- praca ciągła ---
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-m", "gwstock", "health"]   # kod 0 tylko, gdy plik tętna jest świeższy niż 120 s
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # --- dane, konfiguracja, klucz; zero portów, silnik nic nie wystawia ---
+    volumes:
+      - ../data:/data                  # jedyny zapisywalny wolumen: dziennik SQLite, tętno, alarmy, pliki właściciela
+      - ../config:/app/config:ro       # właściciel edytuje config/runtime.toml na hoście; kontener tylko czyta
+      - ${GW_SECRET_FILE:-/home/claude/.config/gw/capitalcom.json}:/secrets/capitalcom.json:ro
+    environment:   # tylko ścieżki; ŻADNYCH sekretów w zmiennych środowiskowych
+      GW_CONFIG_DIR: /app/config
+      GW_DATA_DIR: /data
+      GW_CAPITALCOM_KEY_FILE: /secrets/capitalcom.json
+
+  # Testy w obrazie (profil `test`, nie startuje z `docker compose up`). Te same zasady izolacji; dane tylko do odczytu.
+  # Użycie: runbook, sekcja 1 (testy logiki i odczyty live tylko do odczytu).
+  gw-stock-test:
+    profiles: ["test"]
+    image: gw-stock-engine:test
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: test
+    user: "${GW_UID:?GW_UID nie ustawione - patrz runbook sekcja 1}:${GW_GID:?GW_GID nie ustawione - patrz runbook sekcja 1}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp:size=128m"]   # pytest (tmp_path, dzienniki SQLite) potrzebuje więcej niż silnik; liczy się do mem_limit
+    init: true
+    mem_limit: 384m
+    memswap_limit: 384m
+    mem_reservation: 128m
+    oom_score_adj: 1000
+    pids_limit: 128
+    cpus: 1.0
+    restart: "no"
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ../data:/data:ro               # testy live odczytują tylko data/account.json; nigdy nie piszą do danych silnika
+      - ${GW_SECRET_FILE:-/home/claude/.config/gw/capitalcom.json}:/secrets/capitalcom.json:ro
+    environment:
+      GW_DATA_DIR: /data
+      GW_CAPITALCOM_KEY_FILE: /secrets/capitalcom.json

@@ -4,6 +4,8 @@ Odczyt dokumentacji: 2026-10-31. Dokument jest podstawą Zadania 16 (Docker, Com
 
 Dokument nie zawiera kluczy, haseł ani danych rachunku.
 
+Aktualizacja Zadania 16 (2026-11-01): fakty rozstrzygnięte przy budowie `docker/Dockerfile`, `docker/compose.yml` i `docs/ops/runbook.md` są oznaczone „Zadanie 16" i zebrane w sekcji 7. Polecenia walidacji z sekcji 4 są użyte w runbooku (punkty 1.6, 1.10, 2.4).
+
 ## 0. Źródła i znaczenie statusów
 
 | Skrót | Źródło |
@@ -42,9 +44,10 @@ Wymóg spec §13: kontener `python:3.12-slim`, użytkownik bez uprawnień, syste
 | `oom_score_adj` | opisana w [D1] | do zmierzenia na VPS (pkt 4) | `1000` | do potwierdzenia w dry_run lub w odczytach live |
 | `pids_limit` | opisana w [D1] | do zmierzenia na VPS (pkt 4) | `64` (początkowa, do pomiaru) | do potwierdzenia w dry_run lub w odczytach live |
 | `read_only` | opisana w [D1] | wynika wprost z opisu | `true` | udokumentowane |
-| `tmpfs` | opisana w [D1] i [D10]; rozmiar w formie skróconej (`size=`) nie jest wymieniony w [D1] | do sprawdzenia `df -h /tmp` (pkt 1.8) | `/tmp` z ograniczeniem rozmiaru | do potwierdzenia w dry_run lub w odczytach live |
+| `tmpfs` | opisana w [D1] i [D10]; rozmiar w formie skróconej (`size=`) nie jest wymieniony w [D1] | do sprawdzenia `df -h /tmp` (pkt 1.8); sprawdzone lokalnie w Zadaniu 16 (sekcja 7) | `/tmp:size=32m` (silnik), `/tmp:size=128m` (usługa testowa) | do potwierdzenia w dry_run lub w odczytach live (sonda w runbooku, pkt 1.10, sprawdza rozmiar) |
 | `healthcheck` | opisana w [D1] i [D7] | wynika wprost z opisu | polecenie sprawdzające świeżość pliku tętna | udokumentowane |
 | `restart` | opisana w [D1] i [D6] | wynika wprost z opisu | `unless-stopped` | udokumentowane |
+| `cpus` (Zadanie 16) | opisana w [D1] (limit CPU jako liczba dziesiętna) | `docker inspect` `NanoCpus` = `500000000`; w cgroup v2 `cpu.max` = `50000 100000` | `0.5` (silnik), `1.0` (usługa testowa) | do potwierdzenia w dry_run lub w odczytach live |
 
 Znaczenie kolumn: "Semantyka" to pytanie, czy pole istnieje i co oznacza w Compose; "Efekt na hoście" to pytanie, czy na konkretnym VPS (jądro, cgroup, wersja Docker Engine i runc) wartość faktycznie zadziała. Dla pól pamięci i procesów efekt zależy od hosta, więc jest do pomiaru. Napis statusu występuje tylko w kolumnie "Status pozycji" i jest najsłabszym ogniwem z semantyki i efektu.
 
@@ -139,7 +142,9 @@ Opcje wymienione w [D1] dla formy skróconej: `mode`, `uid`, `gid`. Dłuższa li
 
 Semantyka jest opisana w [D1] i [D10]. Rozmiar w formie krótkiej (`size=`) nie jest wymieniony w [D1] dla formy Compose, więc jego respektowanie sprawdza polecenie `docker exec <kontener> df -h /tmp`.
 
-Status pozycji: `do potwierdzenia w dry_run lub w odczytach live`.
+**Zadanie 16:** forma skrócona `tmpfs: ["/tmp:size=32m"]` sprawdzona lokalnie (Compose 5.6.1, Docker Engine 29.9.2, demon prywatny, cgroup v1): `docker compose config` zachowuje ją bez zmian, `df -h /tmp` w kontenerze pokazuje 32M, opcje montowania to `rw,nosuid,nodev,noexec,size=32768k`, zapis 40 MB do `/tmp` kończy się błędem `No space left on device`. Bez `size` rozmiar wynosił 7,9 GB (połowa pamięci hosta testowego, zgodnie z [D10]), a wzrost `/tmp` kończyłby się zabiciem procesu przez OOM zamiast błędu zapisu. Decyzja: `/tmp:size=32m` dla silnika, `/tmp:size=128m` dla usługi testowej (pytest, dzienniki SQLite w `tmp_path`). Sonda z runbooka (pkt 1.10) sprawdza rozmiar także na VPS.
+
+Status pozycji: `do potwierdzenia w dry_run lub w odczytach live` (na VPS rozstrzyga sonda z runbooka, pkt 1.10).
 
 ### 1.9 `healthcheck`
 
@@ -162,6 +167,7 @@ healthcheck:
 - Domyślne wartości [D7]: `interval` 30s, `timeout` 30s, `start_period` 0s, `start_interval` 5s, `retries` 3. Kod wyjścia polecenia: `0` zdrowy, `1` niezdrowy, `2` zarezerwowany, nie używać [D7]. Przy przekroczeniu `timeout` polecenie jest przerywane sygnałem SIGKILL [D7]. Wyjście (do 4096 bajtów) zapisuje się w stanie zdrowia i jest dostępne w `docker inspect` [D7].
 - Status zdrowia to `starting`, `healthy`, `unhealthy` [D7]. **Dokumentacja Compose ani [D6] nie mówią, że `unhealthy` powoduje restart kontenera.** Polityka `restart` reaguje na wyjście procesu, nie na zdrowie [D6]. Healthcheck służy więc do obserwacji (`docker ps`, alarm), a nie do samonaprawy; za zakończenie nieudanej sesji odpowiada sam proces (watchdog, spec §13).
 - Dla silnika: polecenie sprawdzające świeżość pliku tętna (np. `["CMD", "python", "-m", "gwstock.healthcheck"]`, kod 1, gdy plik starszy niż próg). Samo uruchomienie interpretera Pythona co 30 s kosztuje chwilową pamięć, więc `interval` nie mniejszy niż 30s, a pamięć szczytowa polecenia liczy się do limitu kontenera.
+- **Zadanie 16 (decyzja):** polecenie to `["CMD", "python", "-m", "gwstock", "health"]` (nie `gwstock.healthcheck`): kod 0 tylko, gdy `data/heartbeat.json` jest świeższy niż 120 s; `interval` 60s, `timeout` 15s, `retries` 3, `start_period` 120s. Każde sprawdzenie to osobny proces Pythona z importem `aiohttp` (zmierzone lokalnie ok. 45 MB szczytu), więc `interval` 60 s zamiast 30 s. Obserwacja lokalna (Docker 29.9.2): w `start_period` Docker sprawdza co `start_interval` (domyślnie 5 s), więc kontener osiągnął `healthy` po kilkunastu sekundach, a nie po 60 s.
 
 Status: `udokumentowane`.
 
@@ -178,13 +184,15 @@ Szczegóły [D6]:
 
 Wartość v1: `restart: unless-stopped` (test Zadania 16). Status: `udokumentowane`.
 
+**Zadanie 16 (obserwacja lokalna, Docker 29.9.2):** kontener zabity poleceniem `docker kill -s KILL` przy polityce `unless-stopped` **zostaje** w stanie `Exited (137)` i nie wstaje sam (zachowanie zgodne z regułą „ręcznie zatrzymany kontener nie jest restartowany" z [D6]); `docker stop` także. Ćwiczenie awaryjne w runbooku (pkt 4.3) kończy się więc ręcznym `up -d`; ponowne uruchomienie po prawdziwej awarii (np. zabiciu przez OOM) obsługuje polityka. Po restarcie hosta lub demona kontener zatrzymany ręcznie nie wstaje.
+
 ### 1.11 Pola dodatkowe, przydatne w Zadaniu 16 (opcjonalne)
 
 Wszystkie `udokumentowane` w [D1] (semantyka), wartości do decyzji Zadania 16:
 
 | Pole | Cytat [D1] | Zastosowanie |
 |---|---|---|
-| `user` | "`user` overrides the user used to run the container process. The default is set by the image ... If it's not set, then `root`." | Użytkownik bez uprawnień (spec §13) |
+| `user` | "`user` overrides the user used to run the container process. The default is set by the image ... If it's not set, then `root`." | Użytkownik bez uprawnień (spec §13). **Zadanie 16:** `user: "${GW_UID:?...}:${GW_GID:?...}"`, czyli uid/gid właściciela plików na hoście (użytkownik `claude`); `:?` daje jawny błąd zamiast cichego roota (sprawdzone: `docker compose config` kończy się kodem 1 z nazwą zmiennej). Obraz ma domyślnego użytkownika 10001, nadpisywanego przez Compose |
 | `init` | "`init` runs an init process (PID 1) inside the container that forwards signals and reaps processes." | Poprawna obsługa SIGTERM i zombie |
 | `stop_grace_period` | "how long Compose must wait when attempting to stop a container ... before sending SIGKILL"; domyślnie 10 s | Czas na czyste zamknięcie połączeń i zapis tętna |
 | `stop_signal` | "If unset containers are stopped by Compose by sending `SIGTERM`." | Domyślny SIGTERM wystarcza |
@@ -211,11 +219,15 @@ Wnioski dla pól pamięci:
 
 Status: do potwierdzenia w dry_run lub w odczytach live (cała sekcja 2 dotyczy efektu na VPS). Rozstrzyga ją sekcja 4.
 
+**Zadanie 16:** sonda z runbooka (pkt 1.10) rozpoznaje wersję cgroup po istnieniu `/sys/fs/cgroup/memory.max`. Dla cgroup v2 sprawdza `memory.max`, `memory.swap.max` (`0`), `pids.max`; dla cgroup v1 odpowiedniki `memory/memory.limit_in_bytes`, `memory/memory.memsw.limit_in_bytes` (równe limitowi = brak swapu) i `pids/pids.max`. Gałąź v1 przetestowana lokalnie; gałąź v2 odczytuje pliki z [D5] i [D12] i **nie była uruchomiona** (sandbox ma cgroup v1), więc pierwsze uruchomienie na VPS jest jej testem. Runbook (pkt 1.2) zatrzymuje procedurę na hoście z cgroup v1: dalsze pliki pomiaru (pkt 2.4) zakładają v2.
+
 ## 3. Wersja Compose
 
 Spec §13 odnosi się do "Compose v5.6.0". Wydanie v5.6.0 istnieje i ma datę 2026-10-02 [D13]; wśród zmian jest "Feat(compose): warn on unsupported compose-file attributes" (#14196), czyli nowsza wersja ostrzega o nieobsługiwanych atrybutach. Strona [D1] jest opisem aktualnej Compose Specification i nie podaje wersji dla każdego pola; jawnie wersje podano tylko dla `start_interval` (Compose 2.20.2) i `tmpfs.mode` w formie długiej (2.14.0). Notatki wydania v5.6.0 nie wspominają o zmianach w `mem_limit`, `memswap_limit`, `mem_reservation`, `oom_score_adj`, `pids_limit`. Wersja Compose zainstalowana na VPS: do potwierdzenia w dry_run lub w odczytach live (`docker compose version`).
 
 ## 4. Walidacja na VPS (polecenia)
+
+**Zadanie 16, dwie pułapki ścieżek (sprawdzone na Compose 5.6.1):** (1) Compose liczy ścieżki względne od katalogu pliku Compose (`docker/`), a nie od katalogu bieżącego, dlatego `docker/compose.yml` używa `../data`, `../config` i `context: ..`; wynik `docker compose config` pokazuje bezwzględne ścieżki `<repozytorium>/data` i `<repozytorium>/config`. (2) Plik `.env` jest czytany z katalogu projektu, czyli z `docker/.env`, a **nie** z korzenia repozytorium (`.env` w korzeniu nie zostaje użyty przy `-f docker/compose.yml`); runbook zapisuje tam `GW_UID` i `GW_GID`. Wszystkie polecenia `docker compose` w runbooku mają jawne `-f docker/compose.yml`.
 
 Zasada ze spec §13: na współdzielonym VPS nic nie jest uruchamiane bez pomiaru pamięci i zgody właściciela. Polecenia z punktów 1 i 2 niczego nie uruchamiają; reszta wymaga zgody.
 
@@ -248,43 +260,18 @@ Zasada ze spec §13: na współdzielonym VPS nic nie jest uruchamiane bez pomiar
 
    Polecenia `docker inspect --format` i pliki `memory.*`, `pids.max` są wiedzą ogólną o Docker i cgroup v2, nie cytatem z przeczytanych stron; dlatego ich wynik jest właśnie tym, co ma potwierdzić Zadanie 18. Jeśli `memory.swap.max` nie jest `0`, nie wdrażać; wtedy sprawdzić wersję runc (poprawki w 1.2.1 wg [D12]) i rachunkowość swapu w jądrze (parametry z [D8] dotyczą cgroup v1), a decyzję podjąć z właścicielem (spec pyt. 9 i 16).
 
-## 5. Szkic fragmentu `docker/compose.yml` (do Zadania 16, wartości początkowe)
+## 5. Finalny `docker/compose.yml` (Zadanie 16) i różnice względem szkicu z Zadania 1
 
-To szkic z samych pól opisanych powyżej; wartości `mem_reservation`, `pids_limit`, `stop_grace_period` i rozmiar tmpfs są wyjściowe i podlegają pomiarowi. Montowanie `./data:/data` i tylko-do-odczytu klucza jest zgodne z planem (Zadanie 16) i spec §13; montowanie `./config:/app/config:ro` jest propozycją do zatwierdzenia w Zadaniu 16.
+Szkic z tej sekcji został zastąpiony plikiem `docker/compose.yml`; zmiany wobec szkicu:
 
-```yaml
-services:
-  gw-stock-engine:
-    image: gw-stock-engine:<tag>
-    user: "10001:10001"
-    read_only: true
-    tmpfs:
-      - /tmp:size=16m,mode=1777   # rozmiar w formie skróconej: do sprawdzenia (pkt 1.8)
-    volumes:
-      - ./config:/app/config:ro
-      - ./data:/data
-      - <ścieżka-na-VPS>/capitalcom.json:/secrets/capitalcom.json:ro
-    mem_limit: 256m
-    memswap_limit: 256m
-    mem_reservation: 128m
-    oom_score_adj: 1000
-    pids_limit: 64
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 30s
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    healthcheck:
-      test: ["CMD", "python", "-m", "gwstock.healthcheck"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-```
+- `user: "${GW_UID:?...}:${GW_GID:?...}"` zamiast stałego `10001:10001` (klucz `capitalcom.json` jest własnością użytkownika `claude` w trybie 600),
+- wolumeny `../data:/data`, `../config:/app/config:ro` i `${GW_SECRET_FILE:-/home/claude/.config/gw/capitalcom.json}:/secrets/capitalcom.json:ro` (ścieżki względne od katalogu pliku, patrz sekcja 4),
+- `tmpfs: ["/tmp:size=32m"]` (sprawdzone lokalnie, sekcja 1.8),
+- healthcheck `["CMD", "python", "-m", "gwstock", "health"]`, `interval` 60 s, `timeout` 15 s, `start_period` 120 s (sekcja 1.9),
+- dodane: `cpus: 0.5`, `container_name: gw-stock-engine`, `logging` (`json-file`, `max-size` 10m, `max-file` 3), `name: gw-stock-engine`, `build` z celem `runtime`, drugi serwis `gw-stock-test` w profilu `test` z celem `test`, `data` tylko do odczytu i bez healthchecku,
+- bez zmian: `read_only`, `mem_limit` 256m, `memswap_limit` 256m, `mem_reservation` 128m, `oom_score_adj` 1000, `pids_limit` 64, `restart: unless-stopped`, `init`, `stop_grace_period` 30s, `cap_drop: [ALL]`, `no-new-privileges`, brak `ports`.
 
-Brak sekcji `ports` (silnik nie wystawia nic na zewnątrz; test Zadania 16). Nazwa modułu `gwstock.healthcheck` jest propozycją: w planie nie ma jeszcze takiego modułu, jest tętno w pliku (Zadanie 14); Zadanie 16 musi dodać polecenie sprawdzające jego świeżość.
+Test `tests/unit/test_compose.py` pilnuje tych ustawień (w tym brak innych woluminów niż trzy wymienione, brak sekretów w `environment`).
 
 ## 6. Co zostaje do ustalenia
 
@@ -293,7 +280,26 @@ Brak sekcji `ports` (silnik nie wystawia nic na zewnątrz; test Zadania 16). Naz
 | Czy `memswap_limit` = `mem_limit` realnie wyłącza swap na VPS (`memory.swap.max` = `0`) | do potwierdzenia w dry_run lub w odczytach live | Zadanie 18, sekcja 4 pkt 3 |
 | Wersja cgroup, runc i Engine na VPS | do potwierdzenia w dry_run lub w odczytach live | Sekcja 4 pkt 1 |
 | Czy `mem_reservation` trafia do `memory.low` | do potwierdzenia w dry_run lub w odczytach live | Sekcja 4 pkt 3 |
-| Czy rozmiar tmpfs w formie krótkiej jest respektowany | do potwierdzenia w dry_run lub w odczytach live | `df -h /tmp` |
+| Czy rozmiar tmpfs w formie krótkiej jest respektowany | sprawdzone lokalnie (sekcja 7); na VPS do potwierdzenia | sonda z runbooka (pkt 1.10), `df -h /tmp` |
 | Pamięć szczytowa procesu pod limitem (cel ok. 100 MB to założenie) | do potwierdzenia w dry_run lub w odczytach live | `docker stats` w `dry_run`, Zadanie 18 |
-| Odstęp między restartami `unless-stopped` | do potwierdzenia w dry_run lub w odczytach live | Obserwacja w teście awarii; nie opisany w przeczytanych stronach |
+| Odstęp między restartami `unless-stopped` | do potwierdzenia w dry_run lub w odczytach live | Obserwacja w teście awarii; nie opisany w przeczytanych stronach. Zabicie ręczne (`docker kill`) nie uruchamia restartu (sekcja 1.10) |
 | Wartości `pids_limit`, `mem_reservation`, `stop_grace_period` | do potwierdzenia w dry_run lub w odczytach live | Pomiar w `dry_run` |
+
+## 7. Weryfikacja lokalna w Zadaniu 16 (co sprawdzono, a czego nie)
+
+Środowisko: prywatny `dockerd` w sandboxie deweloperskim (Docker Engine 29.9.2, runc 1.5.2, containerd 2.4.2, sterownik `vfs`, **cgroup v1**, bez iptables i mostu, czyli kontenery bez dostępu do sieci) oraz Compose 5.6.1. To nie jest VPS (AlmaLinux, Docker 29.9.1, Compose 5.6.0, prawdopodobnie cgroup v2), więc fakty o jądrze się nie przenoszą; fakty o samym Compose i Dockerfile tak.
+
+Sprawdzone (`udokumentowane` przez obserwację, wynik do powtórzenia na VPS według runbooka):
+
+| Co | Wynik |
+|---|---|
+| `docker inspect` po `docker compose up --no-start` | `Memory` 268435456, `MemorySwap` 268435456, `MemoryReservation` 134217728, `OomScoreAdj` 1000, `PidsLimit` 64, `ReadonlyRootfs` true, `NanoCpus` 500000000, `CapDrop` [ALL], `SecurityOpt` [no-new-privileges:true], `Init` true, `RestartPolicy` unless-stopped, `Config.User` 1000:1000, brak `PortBindings`; trzy montowania (data rw, config ro, klucz ro) |
+| Sonda z runbooka (pkt 1.10) w kontenerze z `user 1000:1000` | klucz (tryb 600, własność tego uid) czytelny; zapis do `/data` i `/tmp` działa, do `/app` i `/app/config` odmowa; rozmiar `/tmp` 32 MiB; `NoNewPrivs` 1; `oom_score_adj` procesu 1 = 1000; w cgroup v1 `memory.limit_in_bytes` = `memory.memsw.limit_in_bytes` = 268435456 (brak swapu), `pids.max` 64 |
+| `init: true` | PID 1 to `/sbin/docker-init`; `docker stop` dostarcza SIGTERM do Pythona, zatrzymanie w 0,26 s, kod 0 (`engine stopped (shutdown requested); no open position`) |
+| Silnik w kontenerze (dzień bez sesji, klucz atrapa, brak sieci) | start, tętno co kilka sekund, `healthy` po kilkunastu sekundach, `status` przez `exec` działa, `python -m gwstock health` kod 0; `touch data/STOP` daje `SOFT` po ok. 12 s, usunięcie pliku **nie** zdejmuje poziomu, `HARD_STOP` eskaluje do `HARD`; po `docker kill -s KILL` i `up -d` poziom `HARD` zostaje; `bind-account` przy działającym silniku odmawia (`refused: another engine instance holds /data/engine.lock`), nie logując się |
+| `docker network disconnect/connect` na działającym kontenerze | działa, kontener zostaje `healthy` |
+| Pamięć (silnik w bezczynności) | `docker stats`: ok. 28 MiB; maksimum cgroup z `exec status` w tle: 49 MB; `VmHWM` po `import gwstock.app`: 44 MB (sam interpreter 10 MB, `aiohttp` +31 MB) |
+| Obraz | `python:3.12.16-slim` przypięty tagiem i skrótem indeksu `sha256:8523d6ab...ecfbec07` (skrót zgodny z sumą SHA-256 treści manifestu odczytanego z rejestru); runtime 134 MB, test 151 MB; warstwa bazowa zawiera `usr/share/zoneinfo/Europe/Berlin` (pakiet Debian `tzdata`), więc **`tzdata` z pip nie jest potrzebny**; etap `runtime` i `test` sprawdzają to w czasie budowy (`ZoneInfo("Europe/Berlin")` i import `gwstock.calendar`) |
+| Testy w obrazie testowym (`read_only`, uid 1000, `/tmp` 128 MiB, limit 384 MiB) | pełny zestaw bez testów live biegnie w ok. 35 s i nie jest zabijany przez limit pamięci |
+
+Nie sprawdzono (do zrobienia na VPS według runbooka): nazwy plików cgroup v2 (`memory.swap.max` itd.) i ich wartości, rachunkowość swapu w jądrze VPS, `memory.peak` (wymaga jądra 5.19 lub nowszego), SELinux przy montowaniach z katalogu domowego, pamięć silnika w sesji z prawdziwym połączeniem do brokera, zachowanie obrazu bazowego przy `docker build` na VPS (budowa lokalna użyła dodatkowego certyfikatu proxy sandboxa tylko dla `pip`, plik `docker/Dockerfile` go nie zawiera).
