@@ -17,7 +17,7 @@ from decimal import Decimal
 
 import pytest
 
-from gwstock.broker import capitalcom, capitalcom_history
+from gwstock.broker import capitalcom, capitalcom_history, capitalcom_parse
 from gwstock.broker.capitalcom import CapitalComBroker
 from gwstock.broker.capitalcom_history import history_windows, split_window
 from gwstock.broker.capitalcom_parse import is_market_closed_code
@@ -761,6 +761,17 @@ def position_item(**changes) -> dict:
         else:
             item[part][name] = value
     return item
+
+
+def test_position_row_requires_the_stop_level_reported_flag():
+    # brak domyślnej wartości: każdy, kto buduje wiersz, musi powiedzieć, czy broker podał `stopLevel` wprost (C6)
+    fields = dict(
+        deal_id="D-1", working_order_id=None, epic="DE40", side=Side.BUY, size=Decimal("0.001"), level=OFFER,
+        opened_at=at(0.2), stop_reported=True, stop_level=OFFER - 30,
+    )  # fmt: skip
+    with pytest.raises(TypeError, match="stop_level_reported"):
+        capitalcom_parse.PositionRow(**fields)
+    assert capitalcom_parse.PositionRow(**fields, stop_level_reported=True).stop_level_reported is True
 
 
 async def test_list_positions_parses_the_documented_fields_exactly(server, broker):

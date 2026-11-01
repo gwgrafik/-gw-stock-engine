@@ -547,7 +547,8 @@ def check_amendment(payload: Any, deal_id: str) -> tuple[bool, Decimal | None]:
 class PositionRow:
     """Element `GET /positions` / `GET /positions/{dealId}` (§2.11). `stop_reported`: jakikolwiek klucz stopu był w
     odpowiedzi; `stop_level_reported`: był klucz `stopLevel` (poziom podany wprost, nie wyliczony z `stopDistance`,
-    którego punkt odniesienia, wykonanie czy notowanie, jest niepotwierdzony: C6)."""
+    którego punkt odniesienia, wykonanie czy notowanie, jest niepotwierdzony: C6). Wszystkie pola są wymagane: wartość
+    domyślna flagi stopu mogłaby po cichu wyłączyć porównanie poziomu w `set_stop`."""
 
     deal_id: str
     working_order_id: str | None
@@ -558,7 +559,7 @@ class PositionRow:
     opened_at: datetime
     stop_reported: bool
     stop_level: Decimal | None
-    stop_level_reported: bool = False
+    stop_level_reported: bool
 
 
 def parse_position(item: Any, where: str = "") -> PositionRow:
