@@ -2,14 +2,20 @@
 
 Zasady:
 - kwoty i ułamki w TOML są napisami ("1.00") parsowanymi do Decimal; liczba TOML-float jest odrzucana;
+  napis to wyłącznie zwykły zapis dziesiętny `cyfry` albo `cyfry.cyfry` (ASCII, bez spacji, `_`, wykładnika i plusa);
 - liczniki i sekundy są liczbami całkowitymi, flagi są wartościami bool TOML;
-- brakujący klucz, nieznany klucz lub zły typ to ValueError z nazwą klucza (literówka nie przechodzi po cichu);
+- granice (sprawdzane przy wczytaniu, nie w konstruktorach): pola `*_s`, `max_entries_per_day`, `range_minutes`
+  oraz kwoty i dźwignia ryzyka (`virtual_capital`, `max_*`) są > 0 (to dzielniki, okresy i limity), pola `*_fraction`
+  i `fx_markup` leżą w [0, 1], pozostałe liczby są >= 0 (zero ma tam sens według specyfikacji);
+- brakujący klucz, nieznany klucz, zły typ lub poza granicą to ValueError z nazwą pliku i klucza (literówka nie
+  przechodzi po cichu); plik TOML, którego nie da się odczytać, to ValueError z nazwą pliku;
 - wszystkie dataclasses są niemutowalne.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation
@@ -62,29 +68,59 @@ class RuntimeConfig:
 
 _T = TypeVar("_T")
 
+# Zwykły zapis dziesiętny: tylko cyfry ASCII, opcjonalna część ułamkowa i opcjonalny minus (odrzucany niżej jako
+# wartość ujemna). `Decimal(napis)` przyjmuje też spacje, `_`, wykładnik, plus i cyfry spoza ASCII, a konfiguracja
+# jest wprowadzana ręcznie, więc zapis ma być jednoznaczny.
+_PLAIN_DECIMAL = re.compile(r"-?[0-9]+(\.[0-9]+)?")
+
+
+def _is_positive_field(key: str) -> bool:
+    """Pola, które muszą być > 0: okresy `*_s`, dzielniki i limity ryzyka, liczba wejść i długość zakresu."""
+    return key.endswith("_s") or key in {
+        "virtual_capital",
+        "max_loss_per_trade",
+        "max_daily_loss",
+        "max_total_drawdown",
+        "max_effective_leverage",
+        "max_entries_per_day",
+        "range_minutes",
+    }
+
+
+def _is_unit_fraction_field(key: str) -> bool:
+    """Ułamki, które muszą leżeć w [0, 1]: pola `*_fraction` i narzut walutowy."""
+    return key.endswith("_fraction") or key == "fx_markup"
+
 
 def _convert(source: str, key: str, value: Any, expected: type) -> Any:
     where = f"{source}: {key}"
-    if isinstance(value, float):
-        raise ValueError(f"{where}: TOML float is not allowed, use string decimals (e.g. \"1.00\")")
     if expected is Decimal:
+        if isinstance(value, float):
+            raise ValueError(f"{where}: TOML float is not allowed, use string decimals (e.g. \"1.00\")")
         if not isinstance(value, str):
             raise ValueError(f"{where}: use string decimals, got {type(value).__name__}")
-        try:
-            number = Decimal(value)
-        except InvalidOperation:
-            raise ValueError(f"{where}: {value!r} is not a decimal number") from None
-        if not number.is_finite() or number < 0:
+        if _PLAIN_DECIMAL.fullmatch(value) is None:
+            raise ValueError(f"{where}: {value!r} is not a plain decimal number (digits with an optional fraction)")
+        number = Decimal(value)
+        if number.is_signed():  # także „-0”
             raise ValueError(f"{where}: {value!r} must be a finite, non-negative decimal")
+        if _is_positive_field(key) and number <= 0:
+            raise ValueError(f"{where}: {value!r} must be a decimal > 0")
+        if _is_unit_fraction_field(key) and number > 1:
+            raise ValueError(f"{where}: {value!r} must be a fraction in [0, 1]")
         return number
     if expected is bool:
         if not isinstance(value, bool):
             raise ValueError(f"{where}: expected TOML bool (true/false), got {type(value).__name__}")
         return value
     if expected is int:
+        if isinstance(value, float):
+            raise ValueError(f"{where}: expected integer, got TOML float {value!r}")
         # bool jest podklasą int, więc musi być odrzucone jawnie
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{where}: expected non-negative integer, got {value!r}")
+        if _is_positive_field(key) and value == 0:
+            raise ValueError(f"{where}: expected positive integer (> 0), got {value!r}")
         return value
     if expected is str:
         if not isinstance(value, str) or not value.strip():
@@ -93,9 +129,17 @@ def _convert(source: str, key: str, value: Any, expected: type) -> Any:
     raise TypeError(f"unsupported config field type {expected!r} for {where}")
 
 
+def _read_toml(path: Path) -> dict[str, Any]:
+    """Wczytuje plik TOML; błąd składni albo kodowania to ValueError z nazwą pliku (brak pliku: FileNotFoundError)."""
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{path.name}: cannot read the TOML file: {exc}") from None
+
+
 def _load_table(path: Path, cls: type[_T]) -> _T:
-    with path.open("rb") as fh:
-        raw = tomllib.load(fh)
+    raw = _read_toml(path)
     hints = get_type_hints(cls)
     names = [f.name for f in fields(cls)]  # type: ignore[arg-type]
     unknown = sorted(set(raw) - set(names))
@@ -119,8 +163,7 @@ def load_config(config_dir: Path) -> tuple[StrategyConfig, RiskConfig, CostConfi
 def _load_live_allowed(path: Path) -> bool:
     if not path.exists():
         return False
-    with path.open("rb") as fh:
-        raw = tomllib.load(fh)
+    raw = _read_toml(path)
     unknown = sorted(set(raw) - {"live_allowed"})
     if unknown:
         raise ValueError(f"{path.name}: unknown key(s): {', '.join(unknown)}")
@@ -138,6 +181,12 @@ def _load_account_id(path: Path) -> str | None:
         raise ValueError(f"{path.name}: malformed account file (not valid JSON): {exc}") from None
     if not isinstance(data, dict) or "account_id" not in data:
         raise ValueError(f"{path.name}: malformed account file, expected object with key account_id")
+    extra = sorted(str(key) for key in data if key != "account_id")
+    if extra:
+        # plik wiążący rachunek ma jeden klucz; nieznany klucz to literówka albo ręczna edycja (bez wartości w komunikacie)
+        raise ValueError(
+            f"{path.name}: nieznane klucze: {', '.join(extra)}; plik wiążący rachunek zawiera wyłącznie account_id"
+        )
     account_id = data["account_id"]
     if not isinstance(account_id, str) or not account_id.strip():
         raise ValueError(f"{path.name}: account_id must be a non-empty string")
