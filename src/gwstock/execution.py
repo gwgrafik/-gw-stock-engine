@@ -46,8 +46,9 @@ Niezmienniki (prawdziwe pieniądze):
   awaryjne spłaszczenie WYSYŁA zamknięcie nawet wtedy, gdy zapis EXITING zawiedzie (dziennik wg możliwości, alarm,
   kill switch miękki JOURNAL_WRITE_FAILED; uzgadnianie dogoni stan), a zdarzenie PROTECTION_FAILED pisze się dopiero po
   awaryjnym spłaszczeniu;
-- pozycja bez stopu: stop (3 próby co 3 s; gdy żadna nie odpowiedziała, a z budżetu 10 s została co najmniej 1 s,
-  jeden odczyt listy: nasz deal z tym stopem podanym przez brokera = stop jest) albo kill switch twardy
+- pozycja bez stopu: stop (3 próby co 3 s od startu każdej, limit 2 s na próbę; gdy żadna nie odpowiedziała, a
+  z budżetu 10 s od pierwszej porażki została co najmniej 1 s, jeden odczyt listy: nasz deal z tym stopem podanym
+  przez brokera = stop jest) albo kill switch twardy
   UNPROTECTED_POSITION i awaryjne spłaszczenie;
   HARD włącza się także wtedy, gdy zabezpieczenie przerwie wyjątek lub anulowanie (wtedy spłaszczenie wykona silnik);
 - awaryjne spłaszczenie: no-op przy FLAT; inaczej do `EMERGENCY_ATTEMPTS` prób ze skróconym limitem czasu; pozycja
@@ -173,10 +174,12 @@ _EMERGENCY_RETRY = frozenset({OUTCOME_STILL_OPEN, OUTCOME_UNVERIFIED})  # pozycj
 SETTLE_ATTEMPTS = 3  # odczyty historii po zamknięciu
 SETTLE_PAUSE_S = 2  # przed każdym odczytem historii
 PROTECT_ATTEMPTS = 3
-PROTECT_PAUSE_S = 3
-# Od pierwszej nieudanej próby do decyzji HARD: 3 + 2 + 3 + 2 = 10 s (spec §9: bez stopu najdłużej 10 s).
+PROTECT_PAUSE_S = 3  # odstęp między STARTAMI kolejnych prób set_stop (0, 3, 6 s), niezależny od czasu odpowiedzi
 PROTECT_CALL_TIMEOUT_S = 2
-PROTECT_BUDGET_S = 10  # budżet od pierwszej porażki; reszta po trzech próbach idzie na odczyt listy (stop mógł dojść)
+# Budżet od pierwszej porażki do decyzji HARD (spec §9: bez stopu najdłużej 10 s). Przy limitach czasu: porażki po 2, 5
+# i 8 s od startu, więc na jeden odczyt listy (stop mógł dojść mimo braku odpowiedzi) zostają 4 s, a odczyt trwa
+# najwyżej `PROTECT_CALL_TIMEOUT_S`: decyzja najpóźniej 8 s po pierwszej porażce.
+PROTECT_BUDGET_S = 10
 PROTECT_VERIFY_MIN_S = 1  # najkrótszy sensowny odczyt listy; mniej zostało: HARD bez odczytu
 EMERGENCY_ATTEMPTS = 5
 EMERGENCY_PAUSE_S = 1
@@ -989,17 +992,21 @@ class Executor:
         return False
 
     async def _attach_stop(self, position: OpenPosition, level: Decimal, failures: list[str]) -> bool:
-        """Do `PROTECT_ATTEMPTS` prób `set_stop` (ponowienie tego samego poziomu jest bezpieczne); zapisy wg możliwości,
-        więc awaria dziennika nie skraca procedury. Gdy wszystkie zawiodą, a z budżetu `PROTECT_BUDGET_S` (od pierwszej
-        porażki) zostało co najmniej `PROTECT_VERIFY_MIN_S`: jeden odczyt listy (limit = reszta budżetu), bo stop mógł
-        zostać ustawiony mimo braku odpowiedzi; nasz deal z tym poziomem stopu podanym przez brokera (nie wyliczonym
-        przez adapter) = stop jest."""
+        """Do `PROTECT_ATTEMPTS` prób `set_stop` co `PROTECT_PAUSE_S` od startu każdej (ponowienie tego samego poziomu
+        jest bezpieczne); zapisy wg możliwości, więc awaria dziennika nie skraca procedury. Gdy wszystkie zawiodą, a
+        z budżetu `PROTECT_BUDGET_S` (od pierwszej porażki) zostało co najmniej `PROTECT_VERIFY_MIN_S`: jeden odczyt
+        listy (limit: reszta budżetu, najwyżej `PROTECT_CALL_TIMEOUT_S`), bo stop mógł zostać ustawiony mimo braku
+        odpowiedzi; nasz deal z tym poziomem stopu podanym przez brokera (nie wyliczonym przez adapter) = stop jest."""
         deal_id = position.deal_id
         timeout = min(self._timeout, PROTECT_CALL_TIMEOUT_S)
+        started = self._now()
         first_failure: datetime | None = None
         for attempt in range(1, PROTECT_ATTEMPTS + 1):
-            if attempt > 1:
-                await self._clock.sleep(PROTECT_PAUSE_S)
+            if attempt > 1:  # stały rytm od startu procedury: czas oczekiwania na odpowiedź nie przesuwa kolejnej próby
+                due = started + timedelta(seconds=(attempt - 1) * PROTECT_PAUSE_S)
+                wait = (due - self._now()).total_seconds()
+                if wait > 0:
+                    await self._clock.sleep(wait)
             try:
                 await _with_timeout(self._broker.set_stop(deal_id, level), timeout)
             except Exception as exc:
@@ -1023,7 +1030,8 @@ class Executor:
         remaining = PROTECT_BUDGET_S - spent
         if remaining < PROTECT_VERIFY_MIN_S:
             return False
-        read_ok, at_broker, _ = await self._find_at_broker(deal_id, remaining, failures, context="protection")
+        read_timeout = min(remaining, PROTECT_CALL_TIMEOUT_S)
+        read_ok, at_broker, _ = await self._find_at_broker(deal_id, read_timeout, failures, context="protection")
         if not read_ok or at_broker is None or at_broker.stop_level != level or at_broker.stop_derived is not False:
             return False
         self._alert(

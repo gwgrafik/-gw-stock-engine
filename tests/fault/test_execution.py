@@ -982,6 +982,37 @@ async def test_protection_confirms_a_stop_by_a_list_read_before_going_hard(
     assert [lvl for lvl, _ in alerts(notifier, "STOP_ATTACHED")] == ["INFO"]
 
 
+def timing_out_set_stop(fake, clock, seconds=execution.PROTECT_CALL_TIMEOUT_S):
+    """Każde wywołanie `set_stop` bez odpowiedzi kosztuje cały limit czasu (produkcja: `wait_for` na 2 s)."""
+    fake.on_call("set_stop", lambda: clock.advance(seconds))
+
+
+async def test_protection_confirms_a_stop_by_a_list_read_when_every_set_stop_times_out(
+    executor, signal, rules, journal, fake, kill, clock, monkeypatch
+):
+    await entered(executor, signal, rules, fake)
+    fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
+    for _ in range(3):
+        fake.fail_next("set_stop", BrokerTimeout(), applied=True)  # PUT doszedł, odpowiedź zgubiona
+    tries, reads = times_of(fake, clock, "set_stop"), times_of(fake, clock, "list_positions")  # chwila startu
+    timing_out_set_stop(fake, clock)
+    limits = []
+    real = execution._with_timeout
+
+    async def spy(call, timeout):
+        limits.append(timeout)
+        return await real(call, timeout)
+
+    monkeypatch.setattr(execution, "_with_timeout", spy)
+    assert await executor.protect_unprotected(fake.positions["DEAL-1"]) is True
+    # próby co 3 s od startu każdej (0, 3, 6; każda trwa 2 s), pierwsza porażka po 2 s: odczyt listy po 8 s,
+    # z limitem 2 s (zostały 4 s budżetu 10 s), więc decyzja najpóźniej 8 s po pierwszej porażce
+    assert tries == [0, 3, 6] and reads == [8] and fake.calls == ["set_stop"] * 3 + ["list_positions"]
+    assert limits == [execution.PROTECT_CALL_TIMEOUT_S] * 4
+    assert kill.level() is KillLevel.NONE and "close_position" not in fake.calls
+    assert events(journal, "STOP_ATTACHED")[0]["verified_by"] == "list"
+
+
 @pytest.mark.parametrize("broker_view", ["no_stop", "derived_stop", "other_level", "list_unreadable", "budget_spent"])
 async def test_protection_still_goes_hard_when_the_list_shows_no_or_a_derived_stop(
     executor, signal, rules, journal, fake, kill, clock, broker_view
@@ -990,6 +1021,10 @@ async def test_protection_still_goes_hard_when_the_list_shows_no_or_a_derived_st
     fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
     for _ in range(3):
         fake.fail_next("set_stop", BrokerTimeout())  # nic nie ustawione
+    # budget_spent: pętla zdarzeń stoi, każda próba trwa 4.75 s (dłużej niż własny limit): z budżetu 10 s od pierwszej
+    # porażki zostaje 0.5 s (< 1 s); inaczej każda próba trwa realne 2 s
+    timing_out_set_stop(fake, clock, 4.75 if broker_view == "budget_spent" else execution.PROTECT_CALL_TIMEOUT_S)
+    closes = times_of(fake, clock, "close_position")
     if broker_view in ("derived_stop", "other_level"):
         level, derived = (STOP, True) if broker_view == "derived_stop" else (STOP - 1, False)
 
@@ -999,14 +1034,14 @@ async def test_protection_still_goes_hard_when_the_list_shows_no_or_a_derived_st
         fake.on_call("list_positions", broker_stop, once=True)
     elif broker_view == "list_unreadable":
         fake.fail_next("list_positions", BrokerError("HTTP 502"))
-    elif broker_view == "budget_spent":  # każda próba czeka 1.75 s: z budżetu 10 s zostaje 0.5 s (< 1 s)
-        fake.on_call("set_stop", lambda: clock.advance(1.75))
     assert await executor.protect_unprotected(fake.positions["DEAL-1"]) is False
     assert kill.level() is KillLevel.HARD and kill.reason() == "UNPROTECTED_POSITION"
     assert fake.calls[:3] == ["set_stop"] * 3 and fake.calls.count("close_position") == 1
     reads = 0 if broker_view == "budget_spent" else 1  # bez budżetu: od razu HARD i awaryjne zamknięcie
     assert fake.calls[3:4 + reads] == ["list_positions"] * reads + ["close_position"]
     assert events(journal, "STOP_ATTACHED") == []
+    if broker_view != "budget_spent":
+        assert closes == [8]  # decyzja HARD 6 s po pierwszej porażce (spec §9: najdłużej 10 s)
 
 
 async def test_protection_without_any_distance_ends_hard(build, fake, kill, journal):
