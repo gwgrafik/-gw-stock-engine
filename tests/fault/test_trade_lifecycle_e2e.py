@@ -1102,7 +1102,7 @@ async def test_engine_journal_failure_between_the_trade_and_pnl_statements_books
 
 async def test_bug_e2e_2_the_owner_books_a_blocked_lost_trade_with_resolve_lost_trade(rig, world, cfgs):
     """Reprodukcja z raportu (bez referencji: broker nie poda danych wejścia): uzgadnianie czeka na właściciela,
-    `resolve-lost-trade` przy zatrzymanym silniku księguje najgorszą stratę ze stopu jedyną ścieżką księgowania, a po
+    `resolve-lost-trade` przy zatrzymanym silniku księguje ostrożny szacunek straty jedyną ścieżką księgowania, a po
     restarcie uzgadnianie nie widzi już rozbieżności."""
     from gwstock.app import Engine, Mode
     from gwstock.cli import DEAL_PROMPT, ESTIMATE_PROMPT, ESTIMATE_WORD, resolve_lost_trade
@@ -1120,7 +1120,7 @@ async def test_bug_e2e_2_the_owner_books_a_blocked_lost_trade_with_resolve_lost_
     [closure] = await world.broker.closed_since(T_ENTRY - timedelta(minutes=1))
     rig.stop()  # właściciel zatrzymuje silnik (polecenie działa tylko przy zatrzymanym)
     calls = len(world.broker.calls)
-    answers = {DEAL_PROMPT: DEAL, ESTIMATE_PROMPT: ESTIMATE_WORD}
+    answers = {DEAL_PROMPT.format(code="UNMATCHED_CLOSED_DEAL"): DEAL, ESTIMATE_PROMPT: ESTIMATE_WORD}
     out: list[str] = []
     journal = Journal.open(str(rig.path))
     try:
@@ -1134,7 +1134,7 @@ async def test_bug_e2e_2_the_owner_books_a_blocked_lost_trade_with_resolve_lost_
     assert set(world.broker.calls[calls:]) <= reads  # u brokera tylko odczyty
     disk = read_disk(rig.path)
     [t] = disk.trades
-    # najgorsza strata ze stopu: −(wielkość × 30 pkt × wartość punktu) − modelowy poślizg wyjścia STOP
+    # szacunek ze stopu: −(wielkość × 30 pkt × wartość punktu) − modelowy poślizg wyjścia STOP
     stop_slippage = ((world.costs.entry_slippage_points + world.costs.stop_exit_extra_slippage_points) * SIZE
                      * RULES.value_per_point).quantize(CENT, rounding=ROUND_HALF_UP)  # fmt: skip
     assert t.gross_pnl == -(SIZE * STOP_DISTANCE * RULES.value_per_point).quantize(CENT)

@@ -1196,6 +1196,7 @@ BROKER_READS = frozenset({
     "login", "account", "list_positions", "list_working_orders", "closed_since", "confirm", "instrument_rules", "quote",
 })  # fmt: skip
 LOST_CID = "gws-20261102-DE40-1-entry"
+LOST_DEAL_PROMPT = cli.DEAL_PROMPT.format(code="UNMATCHED_CLOSED_DEAL")  # m9: pytanie nazywa kod przypadku
 
 
 def lose_the_ack(broker, *, reference_known=False, close=None):
@@ -1254,7 +1255,7 @@ def resolve_audit(journal) -> list[dict]:
     return payloads(journal, "owner.resolve")
 
 
-async def test_resolve_lost_trade_books_the_worst_case_loss_when_the_broker_knows_no_entry(
+async def test_resolve_lost_trade_books_a_conservative_estimate_when_the_broker_knows_no_entry(
     engine, broker, clock, journal_path
 ):
     order = await lost_trade(engine, broker, clock)
@@ -1263,7 +1264,7 @@ async def test_resolve_lost_trade_books_the_worst_case_loss_when_the_broker_know
     owner = Typed("DEAL-1", "SZACUNEK")
     before = len(broker.calls)
     assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append) == 0, lines
-    assert owner.prompts == [cli.DEAL_PROMPT, cli.ESTIMATE_PROMPT]
+    assert owner.prompts == [LOST_DEAL_PROMPT, cli.ESTIMATE_PROMPT]
     j = engine.journal
     # wejście przyjęte = wyjście + 30 pkt (stop strategii); brutto −30 × 0.001 = −0.03; poślizg STOP 0.0015 → 0.00
     [booked] = j.trades()
@@ -1291,7 +1292,8 @@ async def test_resolve_lost_trade_books_the_worst_case_loss_when_the_broker_know
                     "order_id": LOST_CID, "net_pnl": "-0.03", "booked": "ESTIMATED"}  # fmt: skip
     assert set(broker.calls[before:]) <= BROKER_READS and "open_position" not in broker.calls[before:]
     text = "\n".join(lines)
-    assert "  DEAL-1  STOP  poziom" in text and "NAJGORSZA możliwa strata ze stopu (SZACUNEK)" in text
+    assert "  DEAL-1  STOP  poziom" in text and "ostrożny szacunek straty (nie górna granica) (SZACUNEK)" in text
+    assert "= -0.03 EUR przed kosztami" in text  # m9: kwota w groszach, nie -0.0300
     assert "zaksięgowano transakcję DEAL-1 (SZACUNEK): wynik netto -0.03 EUR, dzień 2026-11-02" in text
     assert "kill switch nadal SOFT" in text and "ACC-" not in text
     assert engine.kill.level() is KillLevel.SOFT  # kill switch zdejmuje właściciel osobno (clear-kill)
@@ -1307,7 +1309,7 @@ async def test_resolve_lost_trade_books_exactly_from_the_confirm_when_the_refere
     owner = Typed("DEAL-1")
     before = len(broker.calls)
     assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append) == 0, lines
-    assert owner.prompts == [cli.DEAL_PROMPT]  # dokładne dane: bez drugiego potwierdzenia
+    assert owner.prompts == [LOST_DEAL_PROMPT]  # dokładne dane: bez drugiego potwierdzenia
     snapshot = await broker.confirm("REF-1")
     j = engine.journal
     [booked] = j.trades()
@@ -1327,13 +1329,13 @@ async def test_resolve_lost_trade_estimates_when_the_broker_answers_the_referenc
     engine, broker, clock
 ):
     # potwierdzenie stale odpowiada REJECTED (np. odrzucenie, a potem pusta lista i zamknięcie w historii): dokładnych
-    # danych wejścia nie będzie nigdy, więc szacunek najgorszej straty (z drugim potwierdzeniem), a nie wieczna odmowa
+    # danych wejścia nie będzie nigdy, więc ostrożny szacunek (z drugim potwierdzeniem), a nie wieczna odmowa
     await lost_trade(engine, broker, clock, reference_known=True)
     broker._confirms["REF-1"] = _Rejected("REJECTED_SAFETY")
     lines: list[str] = []
     owner = Typed("DEAL-1", "SZACUNEK")
     assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append) == 0, lines
-    assert owner.prompts == [cli.DEAL_PROMPT, cli.ESTIMATE_PROMPT]
+    assert owner.prompts == [LOST_DEAL_PROMPT, cli.ESTIMATE_PROMPT]
     assert engine.journal.trade_flags("DEAL-1") == "ESTIMATED RESOLVED_BY_OWNER"
     assert any("odrzucenie (REJECTED_SAFETY)" in line for line in lines)
     booking = resolve_audit(engine.journal)[0]
@@ -1348,8 +1350,9 @@ async def test_resolve_lost_trade_never_books_a_profit_from_an_estimate(engine, 
     await lost_trade(engine, broker, clock, close=close_by_hand_with_a_profit)
     assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1", "SZACUNEK"), out=lambda _: None) == 0
     [booked] = engine.journal.trades()
-    assert booked.exit_fill == MID + 50 and booked.entry_fill == MID + 80 and booked.exit_reason == "MANUAL"
-    assert booked.gross_pnl == D("-0.03") and booked.net_pnl < 0  # nadal najgorsza strata ze stopu, nie zysk
+    # nadal strata, nie zysk: większa z odległości stopu (30) i od notowania decyzji (ask) do wyjścia (49)
+    assert booked.exit_fill == MID + 50 and booked.entry_fill == MID + 50 + 49 and booked.exit_reason == "MANUAL"
+    assert booked.gross_pnl == D("-0.05") and booked.net_pnl < 0
 
 
 async def test_resolve_lost_trade_ignores_a_closure_already_booked_as_another_trade(engine, broker, clock):
@@ -1370,6 +1373,214 @@ def trade_like(closed):
     t = closed.ts
     return TradeRecord("DE40", Side.BUY, D("0.001"), MID, MID, MID, closed.exit_level, D("0.00"), D("0.00"), D("0.00"),
                        D("0.00"), D("0.00"), D("0.00"), t, t, t, t, 0, "MANUAL")  # fmt: skip
+
+
+async def rejected_but_listed(engine, broker, clock, *, size_factor="1", with_stop=True):
+    """REJECTED_BUT_LISTED: POST wypełniony, potwierdzenie odrzucone, a lista brokera (zapisana w dzienniku przez
+    menedżera) pokazuje pozycję z jej prawdziwą wielkością i stopem (albo bez stopu); silnik jej nie prowadzi."""
+    broker.fill_size_factor = D(size_factor)
+
+    def reject_the_confirm():
+        broker._confirms["REF-1"] = _Rejected("REJECTED_SAFETY")
+        if not with_stop:
+            broker.positions["DEAL-1"] = replace(broker.positions["DEAL-1"], stop_level=None)
+
+    broker.on_call("confirm", reject_the_confirm, once=True)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    [order] = engine.journal.unresolved_orders()
+    assert order.note.split()[0] == "REJECTED_BUT_LISTED", order
+    assert engine.journal.current_position("DE40") == PositionRecord("DE40", P.BLOCKED)
+    return order
+
+
+async def test_resolve_lost_trade_books_exactly_from_the_journaled_listing_of_an_overfilled_deal(engine, broker, clock):
+    # I1: potwierdzenie odrzucone, ale dziennik ma listę brokera z TYM dealem (wielkość 0.003): księgujemy dokładnie,
+    # a nie szacunek żądanej wielkości 0.001 (−0.03 zamiast prawdziwej straty −0.09)
+    order = await rejected_but_listed(engine, broker, clock, size_factor="3")
+    listed = broker.positions["DEAL-1"]
+    broker.trigger_stop("DEAL-1", listed.stop_level)
+    lines: list[str] = []
+    owner = Typed("DEAL-1")
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append) == 0, lines
+    assert owner.prompts == [cli.DEAL_PROMPT.format(code="REJECTED_BUT_LISTED")]  # dokładnie: bez SZACUNEK
+    j = engine.journal
+    [booked] = j.trades()
+    assert (booked.size, booked.entry_fill, booked.exit_fill) == (D("0.003"), listed.open_level, listed.stop_level)
+    assert booked.net_pnl == D("-0.09") and j.realized_pnl(DAY) == D("-0.09")
+    assert j.trade_flags("DEAL-1") == "RESOLVED_BY_OWNER" and j.get_meta("entry_by_deal:DEAL-1") == order.order_id
+    booking = resolve_audit(j)[0]
+    assert booking["source"] == "LISTING" and booking["listing"]["size"] == "0.003" and booking["estimate"] is None
+    assert any("dane wejścia z listy pozycji brokera zapisanej w dzienniku" in line for line in lines)
+    assert j.get_order(order.order_id).note.startswith("RESOLVED_BY_OWNER BOOKED=EXACT CLOSURE=DEAL-1")
+
+
+async def test_resolve_lost_trade_books_exactly_a_listed_deal_without_a_stop_closed_by_hand(engine, broker, clock):
+    # I1: pozycja na liście bez stopu (silnik jej nie prowadził), właściciel zamknął ją 80 pkt niżej: −0.08, nie −0.03
+    await rejected_but_listed(engine, broker, clock, with_stop=False)
+    listed = broker.positions.pop("DEAL-1")
+    assert listed.stop_level is None
+    broker._closed.append(ClosedDeal("DEAL-1", "DE40", listed.open_level - 80, "MANUAL", clock.now_utc()))
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1"), out=lines.append) == 0, lines
+    [booked] = engine.journal.trades()
+    assert booked.net_pnl == D("-0.08") and booked.entry_fill == listed.open_level and booked.exit_reason == "MANUAL"
+    assert resolve_audit(engine.journal)[0]["listing"]["stop_level"] is None
+
+
+async def test_resolve_lost_trade_refuses_a_chosen_closure_the_journal_never_tied_to_the_order(engine, broker, clock):
+    order = await lost_trade(engine, broker, clock)  # dziennik zapisał dla zlecenia zamknięcie DEAL-1
+    broker._closed[:] = [replace(broker._closed[0], deal_id="DEAL-4")]  # historia pokazuje inny deal
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-4"), out=lines.append) == 1
+    assert f"dziennik zapisał dla zlecenia {order.order_id} deale DEAL-1, a wpisano DEAL-4" in lines[-1]
+    assert engine.journal.trades() == []
+
+
+async def test_resolve_lost_trade_estimate_takes_the_larger_of_the_stop_and_the_decision_to_exit_distance(
+    engine, broker, clock
+):
+    # I1/m8: szacunek nie mniejszy od żadnej granicy z dowodów: stop 30 pkt albo notowanie decyzji − wyjście (49 pkt)
+    def close_by_hand_far_away(deal_id):
+        broker.positions.pop(deal_id)
+        broker._closed.append(ClosedDeal(deal_id, "DE40", MID + 1 - 49, "MANUAL", clock.now_utc()))
+
+    await lost_trade(engine, broker, clock, close=close_by_hand_far_away)
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1", "SZACUNEK"), out=lines.append) == 0
+    [booked] = engine.journal.trades()
+    assert booked.entry_fill == MID + 1 and booked.gross_pnl == D("-0.05")  # 49 × 0.001 = 0.049 → −0.05
+    estimate = resolve_audit(engine.journal)[0]["estimate"]
+    assert (estimate["points"], estimate["decision_to_exit"], estimate["stop_distance"]) == ("49.0", "49.0", "30.0")
+    text = "\n".join(lines)
+    assert "ostrożny szacunek straty (nie górna granica)" in text and "= -0.05 EUR przed kosztami" in text
+    assert "NAJGORSZA" not in text and "najgorsz" not in text
+
+
+@pytest.mark.parametrize("raised", [EOFError, KeyboardInterrupt], ids=["eof", "ctrl_c"])
+@pytest.mark.parametrize("at", [0, 1], ids=["deal_prompt", "szacunek_prompt"])
+async def test_resolve_lost_trade_aborts_cleanly_on_eof_or_ctrl_c_at_a_prompt(
+    engine, broker, clock, journal_path, raised, at
+):
+    await lost_trade(engine, broker, clock)
+    rows = journal_rows(journal_path)
+    answers = ["DEAL-1"][:at]
+
+    def owner(prompt):
+        if answers:
+            return answers.pop(0)
+        raise raised()
+
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append) == 2
+    assert lines[-1].startswith("przerwano: ") and lines[-1].endswith("nic nie zmieniono")
+    assert journal_rows(journal_path) == rows
+    assert [a["phase"] for a in resolve_audit(engine.journal)] == ["ABORTED"]
+
+
+def test_owner_input_lets_the_first_ctrl_c_interrupt_the_prompt(monkeypatch):
+    # m4: pod asyncio.run pierwszy Ctrl-C tylko anuluje zadanie i czeka na Enter; przy pytaniu ma przerwać od razu
+    import signal
+
+    def typing(prompt):
+        os.kill(os.getpid(), signal.SIGINT)
+        return "DEAL-1"  # bez przerwania właściciel „wpisałby" odpowiedź mimo Ctrl-C
+
+    monkeypatch.setattr("builtins.input", typing)
+    previous = signal.signal(signal.SIGINT, lambda *_: None)  # jak obsługa Runnera: przerwanie odroczone
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            cli._owner_input("Wpisz: ")
+        assert signal.getsignal(signal.SIGINT) is not signal.default_int_handler  # poprzednia obsługa wraca
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+async def test_resolve_lost_trade_rerun_applies_the_loss_limits_and_prints_the_booked_net(
+    engine, broker, clock, monkeypatch
+):
+    # m1: przerwanie tuż po zapisie księgi (przed kill switchem i TRADE_BOOKED); ponowne uruchomienie ma pokazać
+    # bieżący poziom kill switcha i wynik z księgi
+    await lost_trade(engine, broker, clock)
+    j = engine.journal
+    j.add_realized_pnl(DAY, D("-2.97"))
+    real_record = j.record_trade
+
+    def record_then_die(*args, **kwargs):
+        real_record(*args, **kwargs)
+        raise Died()
+
+    monkeypatch.setattr(j, "record_trade", record_then_die)
+    with pytest.raises(Died):
+        await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1", "SZACUNEK"), out=lambda _: None)
+    monkeypatch.setattr(j, "record_trade", real_record)
+    assert len(j.trades()) == 1 and engine.kill.level() is KillLevel.SOFT  # przerwanie przed kontrolą limitów
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1"), out=lines.append) == 0
+    assert engine.kill.level() is KillLevel.HARD and "kill switch nadal HARD (DAILY_LOSS_2X)" in lines[-1]
+    assert "wynik netto -0.03 EUR" in lines[-1] and resolve_audit(j)[-1]["net_pnl"] == "-0.03"
+
+
+async def test_resolve_lost_trade_never_resumes_a_closure_resolved_for_another_order(engine, broker, clock):
+    # m2: zamknięcie zaksięgowane przez właściciela dla INNEGO zlecenia nie jest „przerwanym uruchomieniem" tego
+    await lost_trade(engine, broker, clock)
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1", "SZACUNEK"), out=lambda _: None) == 0
+    [closure] = await broker.closed_since(clock.now_utc() - timedelta(hours=1))
+    t = closure.ts + timedelta(seconds=30)  # drugie zlecenie w zapasie HISTORY_MARGIN po tamtym zamknięciu
+    engine.journal.insert_order(OrderRecord(
+        "gws-20261102-DE40-2-entry", "DE40", Side.BUY, D("0.001"), D("30"), OrderState.UNKNOWN, None, None, t, t,
+    ))  # fmt: skip
+    engine.journal.upsert_position(PositionRecord("DE40", P.ENTERING))
+    engine.journal.upsert_position(PositionRecord("DE40", P.BLOCKED))
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1"), out=lines.append) == 2
+    assert any(line.startswith("  DEAL-1") and "już w księdze jako inna transakcja" in line for line in lines)
+    assert engine.journal.get_order("gws-20261102-DE40-2-entry").state is OrderState.UNKNOWN
+    assert len(engine.journal.trades()) == 1
+
+
+async def test_resolve_lost_trade_takes_only_closures_on_its_instrument_since_the_order(engine, broker, clock,
+                                                                                         monkeypatch):  # fmt: skip
+    # m5: filtry kandydatów (instrument, początek okna) w samym poleceniu, nie tylko w brokerze
+    order = await lost_trade(engine, broker, clock)
+    real = broker.closed_since
+    since = order.created_at - timedelta(minutes=1)
+
+    async def wider(start):
+        closures = await real(start)
+        return [*closures, ClosedDeal("DEAL-8", "US500", D("6800"), "STOP", clock.now_utc()),
+                ClosedDeal("DEAL-6", "DE40", MID, "MANUAL", since - timedelta(seconds=1))]  # fmt: skip
+
+    monkeypatch.setattr(broker, "closed_since", wider)
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1", "SZACUNEK"), out=lines.append) == 0
+    assert not any("DEAL-8" in line or "DEAL-6" in line for line in lines)
+    assert len(resolve_audit(engine.journal)[0]["closures"]) == 1
+
+
+def test_clear_kill_refuses_when_the_kill_state_read_fails_twice(data_dir, clock, monkeypatch):
+    # m5: odczyt przy starcie zawodzi, odczyt CLI działa, a ponowna budowa znów zawodzi: bez CLEAR po ciemku
+    soft_killed_journal(data_dir, clock, level="hard", reason="HARD_STOP_FILE")
+    real = Journal.kill_state
+    calls = {"n": 0}
+
+    def flaky(self):
+        calls["n"] += 1
+        if calls["n"] in (1, 3):
+            raise JournalReadError("database is locked")
+        return real(self)
+
+    monkeypatch.setattr(Journal, "kill_state", flaky)
+    lines: list[str] = []
+    owner = Typed()
+    assert cli.clear_kill(data_dir, "wlasciciel", owner, out=lines.append, clock=clock) == 1
+    assert owner.prompts == [] and "zawodzi z przerwami" in lines[-1]
+    monkeypatch.setattr(Journal, "kill_state", real)
+    journal = Journal.open(str(data_dir / "journal.sqlite"))
+    try:
+        assert journal.kill_state().level is KillLevel.HARD
+    finally:
+        journal.close()
 
 
 def add_unknown_order(engine, clock, order_id="gws-20261102-DE40-2-entry"):
@@ -1546,7 +1757,7 @@ async def test_resolve_lost_trade_rerun_after_a_crash_after_booking_finishes_wit
     lines: list[str] = []
     owner = Typed("DEAL-1")
     assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append) == 0, lines
-    assert owner.prompts == [cli.DEAL_PROMPT]  # już zaksięgowane: bez ponownego szacunku
+    assert owner.prompts == [LOST_DEAL_PROMPT]  # już zaksięgowane: bez ponownego szacunku
     assert len(j.trades()) == 1 and j.realized_pnl(DAY) == j.trades()[0].net_pnl
     assert j.get_order(LOST_CID).note.startswith("RESOLVED_BY_OWNER BOOKED=ESTIMATED CLOSURE=DEAL-1")
     assert j.current_position("DE40").state is P.FLAT
