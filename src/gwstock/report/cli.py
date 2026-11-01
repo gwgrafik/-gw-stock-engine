@@ -27,6 +27,7 @@ from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
+from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.config import CostConfig, load_config
 from gwstock.journal import SCHEMA_VERSION, Journal, JournalError, TradeRecord
 from gwstock.report import gates
@@ -59,12 +60,19 @@ L1_REJECTION_NOTE = (
 )
 DAY_HEADER = "Dzień: {} (czas Europe/Berlin, dzień zamknięcia transakcji)"
 NO_DECISION = "brak zapisu decyzji"
-# Kody zdarzeń pokazywane osobnym licznikiem albo nie będące błędem; reszta idzie do „inne zdarzenia”.
-BENIGN_EVENTS = frozenset({"TRADE_BOOKED"})
+# Kody zdarzeń pokazywane osobnym licznikiem albo nie będące błędem; reszta idzie do „inne zdarzenia”. CLOSURE_BOOKED
+# (uzgadnianie zaksięgowało zamknięcie) powtarza się przy idempotentnym ponownym księgowaniu: transakcje liczy księga.
+BENIGN_EVENTS = frozenset({"TRADE_BOOKED", "CLOSURE_BOOKED"})
+ESTIMATED_FLAG = "ESTIMATED"  # znacznik księgi szacunku właściciela (`Journal.trade_flags`)
+ESTIMATED_WARNING = (
+    "UWAGA: transakcja z {day} (wyjście {time} czasu Europe/Berlin, {reason}, netto {net}) zaksięgowana przez "
+    "właściciela jako SZACUNEK (najgorsza strata ze stopu); sprawdź wynik w Capital.com"
+)
 LOGIN_LOCKOUT = "LOGIN_LOCKOUT"
 EVENT_SOURCES = (gates.SOURCE_EVENT, gates.SOURCE_RECONCILE, gates.SOURCE_WATCHDOG, gates.SOURCE_ENGINE)
 
 _DAY_FORMAT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_CALENDAR = ExchangeCalendar(XETRA)
 
 
 class ReportError(Exception):
@@ -274,6 +282,20 @@ def _summary_lines(trades: list[TradeRecord]) -> list[str]:
     return lines
 
 
+def _estimated_lines(trades: list[TradeRecord], flags: list[str | None]) -> list[str]:
+    """Uwaga dla każdej transakcji zaksięgowanej przez właściciela jako SZACUNEK (`resolve-lost-trade`): jej wynik to
+    najgorsza strata ze stopu, nie pomiar. Bez identyfikatora deala (raport ich nie drukuje): dzień, godzina, wynik."""
+    lines = []
+    for trade, marks in zip(trades, flags, strict=True):
+        if ESTIMATED_FLAG not in (marks or "").split():
+            continue
+        local = _CALENDAR.to_local(trade.exit_ts)
+        lines.append(ESTIMATED_WARNING.format(
+            day=local.date().isoformat(), time=f"{local:%H:%M}", reason=trade.exit_reason, net=_d(trade.net_pnl),
+        ))  # fmt: skip
+    return lines
+
+
 def _days(days: tuple[date, ...]) -> str:
     return "; dni: " + ", ".join(day.isoformat() for day in sorted(set(days))) if days else ""
 
@@ -405,6 +427,9 @@ def _report(args: argparse.Namespace, journal_path: Path, journal: Journal, stra
         lines += _day_lines(journal, day, data.days.get(day, _Day()), trades)
     if data.unreadable:
         lines += [f"UWAGA: {data.unreadable} nieczytelnych zapisów zdarzeń pominięto w liczniku.", ""]
+    estimated = _estimated_lines(trades, journal.trade_flags())
+    if estimated:
+        lines += [*estimated, ""]
     lines += _summary_lines(trades)
     lines += _gate_lines(details, strat_sessions, costs)
     lines.append(STATEMENT)

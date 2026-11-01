@@ -45,8 +45,11 @@ from gwstock.app import (
     arm_file_exists,
 )
 from gwstock.config import RuntimeConfig, StrategyConfig, load_config, load_runtime
+from gwstock.execution import FLAGS_BY_OWNER, META_ENTRY_BY_DEAL, META_ENTRY_CTX, SOURCE_EVENT, BookingError
 from gwstock.journal import JournalError, PositionRecord
-from gwstock.orders.fsm import check_position_transition
+from gwstock.orders.fsm import check_order_transition, check_position_transition
+from gwstock.orders.manager import SOURCE_EVENT as SOURCE_ORDER_EVENT
+from gwstock.reconcile import SOURCE_EVENT as SOURCE_RECONCILE_EVENT
 from gwstock.serialization import dump
 from gwstock.strategy import EntrySignal, atr14, round_up_to_step
 from gwstock.types import BrokerRejected, KillLevel, OrderState, PositionState, Side
@@ -54,7 +57,7 @@ from gwstock.watchdog import AlreadyRunning, InstanceLock, heartbeat_age_s, read
 
 __all__ = [
     "Mode", "BindAccountError", "resolve_mode", "mode_decision", "bind_account", "smoke", "status", "health", "main",
-    "clear_kill", "reset_position",
+    "clear_kill", "reset_position", "resolve_lost_trade",
 ]  # fmt: skip
 
 _LOG = logging.getLogger("gwstock.cli")
@@ -85,6 +88,17 @@ CLEAR_WORD = "CLEAR"
 RESET_WORD = "RESET"
 NO_DEAL_ID_WORD = "NO-DEAL-ID"
 SOURCE_OWNER_RESET = "owner.reset"
+# resolve-lost-trade: komunikaty dla właściciela po polsku, słowa potwierdzeń w ASCII
+SOURCE_OWNER_RESOLVE = "owner.resolve"
+RESOLVE_EVENT = "OWNER_RESOLVE_LOST_TRADE"
+NOTHING_CHANGED = "nic nie zmieniono"
+DEAL_PROMPT = "Wpisz identyfikator zamknięcia (deal id) z alarmu UNMATCHED_CLOSED_DEAL, które jest tą transakcją: "
+ESTIMATE_WORD = "SZACUNEK"
+ESTIMATE_PROMPT = "Wpisz SZACUNEK, aby zaksięgować oszacowaną stratę: "  # runbook cytuje dosłownie
+NOT_PLACED_WORD = "NIEWYKONANE"
+NOT_PLACED_PROMPT = (
+    "Wpisz NIEWYKONANE, aby uznać zlecenie {order} za niewykonane (NOT_PLACED) i ustawić pozycję {epic} na FLAT: "
+)
 LEFT_OPEN_HINT = (
     "left open with its stop; start the engine (it reconciles and flattens at 17:25) or close it in the Capital.com app"
 )
@@ -643,10 +657,13 @@ def status(config_dir: Path, data_dir: Path, out: Callable[[str], None] = print,
         out(f"live sessions (trades without smoke): {sessions}; {L1_PASSED_FILE}: {'yes' if l1 else 'no'}")
         calendar = ExchangeCalendar(XETRA)
         today = calendar.to_local(now).date()
-        todays = [t for t in journal.trades() if calendar.to_local(t.exit_ts).date() == today]
+        booked = list(zip(journal.trades(), journal.trade_flags(), strict=True))
+        todays = [(t, flags) for t, flags in booked if calendar.to_local(t.exit_ts).date() == today]
         out(f"trades today ({today}): {len(todays)}")
-        for t in todays:
-            out(f"  {t.side.value} {t.size} entry {t.entry_fill} exit {t.exit_fill} net {t.net_pnl} ({t.exit_reason})")
+        for t, flags in todays:
+            mark = " [ESTIMATED]" if "ESTIMATED" in (flags or "").split() else ""  # szacunek właściciela, nie pomiar
+            out(f"  {t.side.value} {t.size} entry {t.entry_fill} exit {t.exit_fill} net {t.net_pnl} ({t.exit_reason})"
+                + mark)  # fmt: skip
     finally:
         journal.close()
     return 0
@@ -741,7 +758,8 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     unresolved = [o.order_id for o in journal.unresolved_orders() if o.epic == epic]
     if unresolved:
         out(f"refused: unresolved orders in the journal ({', '.join(unresolved)}): start the engine and let it "
-            "reconcile them; see the runbook, section 8.5")  # fmt: skip
+            "reconcile them; if the alarm says UNMATCHED_CLOSED_DEAL and the broker shows nothing, use "
+            "resolve-lost-trade (runbook, section 8.5)")  # fmt: skip
         return 1
     if position.state in (PositionState.OPEN, PositionState.EXITING):
         out(f"refused: position {epic} is {position.state.value}: the engine reconciles and books it itself; start "
@@ -843,6 +861,409 @@ async def _reset_history_check(engine: Engine, position: PositionRecord, out: Ca
             "run reset-position again only if the position is still BLOCKED")  # fmt: skip
         return None
     return f"AMBIGUOUS_{len(found)}_CLOSURES" if found else "NO_CLOSURE"
+
+
+# --- resolve-lost-trade (BUG-E2E-2) ---------------------------------------------------------------------------
+
+
+async def resolve_lost_trade(
+    engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print
+) -> int:
+    """Rozstrzygnięcie „zgubionej transakcji" przez właściciela (silnik zatrzymany: blokadę bierze wywołujący).
+
+    Stan: jedno zlecenie UNKNOWN na instrumencie i pozycja BLOCKED bez deal_id i bez pól (np. UNMATCHED_CLOSED_DEAL:
+    broker przyjął wejście, odpowiedź zginęła, a stop zamknął pozycję, zanim silnik ją zobaczył). Uzgadnianie czeka
+    wtedy na właściciela, a `reset-position` odmawia. Zawsze na dowodach brokera (tylko ODCZYTY), nigdy na samym słowie
+    właściciela:
+
+    (i) zamknięcie w pełnej historii brokera od INTENT − HISTORY_MARGIN → księgowanie jedyną ścieżką
+        (`Executor.book` → `Journal.record_trade`): DOKŁADNIE z `confirm(ref)` (znacznik RESOLVED_BY_OWNER), a gdy
+        broker nie zna wejścia (brak referencji albo `confirm` zwraca None) SZACUNEK najgorszej straty ze stopu
+        (wejście = wyjście ± odległość stopu, znacznik ESTIMATED, dodatkowe potwierdzenie `SZACUNEK`; zysku z szacunku
+        nigdy nie księgujemy), i to tylko przy jednym możliwym zamknięciu;
+    (ii) broker bez pozycji i zlecenia, historia pełna i bez zamknięcia, a dziennik nie zapisał dla zlecenia żadnej
+        pozycji ani zamknięcia u brokera → zlecenie NOT_PLACED, pozycja FLAT po wpisaniu `NIEWYKONANE`;
+    (iii) wszystko inne → odmowa z dokładnym powodem.
+
+    Kolejność zapisów po księgowaniu (każde przerwanie jest bezpieczne): księga (idempotentna; ponowne uruchomienie po
+    przerwaniu tylko dokańcza zapisy), zlecenie UNKNOWN → CONFIRMED (deal_id, notatka RESOLVED_BY_OWNER ...), pozycja
+    BLOCKED → FLAT (przerwanie przed tym zapisem dokańcza uzgadnianie), znacznik historii `closed_marker`. Kill switcha
+    nie dotyka. Audyt `owner.resolve` w każdym przypadku (odmowa i przerwanie wg możliwości); bez identyfikatorów
+    rachunków. Kody: 0 rozstrzygnięte, 1 odmowa (stan bez zmian), 2 przerwane przy pytaniu (stan bez zmian).
+    """
+    return await _LostTrade(engine, by, ask, out).run()
+
+
+class _LostTrade:
+    """Jedno uruchomienie `resolve-lost-trade` (patrz `resolve_lost_trade`)."""
+
+    def __init__(self, engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None]) -> None:
+        self.engine, self.ask, self.out = engine, ask, out
+        self.journal, self.epic, self.clock = engine.journal, engine.strat.instrument, engine.clock
+        self.who = by.strip()
+
+    # --- wynik i audyt ---
+
+    def audit(self, phase: str, *, mandatory: bool = True, **details: Any) -> None:
+        payload = {"event": RESOLVE_EVENT, "phase": phase, "by": self.who, **details}
+        try:
+            self.journal.append_raw(SOURCE_OWNER_RESOLVE, dump(payload), self.clock.now_utc())
+        except JournalError:
+            if mandatory:
+                raise
+            _LOG.warning("resolve-lost-trade: audit row %s not written", phase, exc_info=True)
+
+    def refuse(self, code: str, text: str) -> int:
+        self.out(f"odmowa: {text}; {NOTHING_CHANGED}")
+        self.audit("REFUSED", mandatory=False, code=code, reason=text)
+        return 1
+
+    def abort(self, text: str = "") -> int:
+        self.out(f"przerwano: {text + '; ' if text else ''}{NOTHING_CHANGED}")
+        self.audit("ABORTED", mandatory=False, reason=text)
+        return 2
+
+    # --- przebieg ---
+
+    async def run(self) -> int:
+        from gwstock.broker.capitalcom_history import HISTORY_MAX_RANGE
+        from gwstock.orders.manager import HISTORY_MARGIN
+
+        journal, epic, engine = self.journal, self.epic, self.engine
+
+        # 1. dziennik: dokładnie ten stan (rozpoznany po stanach, nie po treści notatki)
+        orders = [o for o in journal.unresolved_orders() if o.epic == epic]
+        position = journal.current_position(epic) or PositionRecord(epic, PositionState.FLAT)
+        if len(orders) != 1:
+            return self.refuse(
+                "NOTHING_TO_RESOLVE",
+                "w dzienniku nie ma zgubionej transakcji do rozstrzygnięcia (potrzebne dokładnie jedno zlecenie "
+                f"UNKNOWN na {epic} i pozycja BLOCKED bez deal id; niewyjaśnionych zleceń: {len(orders)})",
+            )
+        order = orders[0]
+        if order.state is not OrderState.UNKNOWN or position.state is not PositionState.BLOCKED or position.deal_id:
+            deal = f" z deal id {position.deal_id}" if position.deal_id else ""
+            return self.refuse(
+                "ENGINE_DECIDES",
+                f"zlecenie {order.order_id} jest {order.state.value} albo pozycja jest {position.state.value}{deal}: "
+                "uruchom silnik, niech uzgadnianie je rozstrzygnie (runbook 8.5)",
+            )
+        if _position_fields(position):
+            return self.refuse(
+                "BLOCKED_WITH_FIELDS",
+                f"pozycja {epic} w dzienniku jest BLOCKED z polami pozycji (kierunek, wielkość albo poziomy), ale bez "
+                "deal id: tego przypadku polecenie nie rozstrzyga; zapytaj Claude",
+            )
+
+        # 2. broker: związany rachunek, bez pozycji i bez zlecenia oczekującego na instrumencie
+        bound = engine.runtime.account_id
+        if bound is None:
+            return self.refuse("NO_BOUND_ACCOUNT", "brak związanego rachunku (uruchom bind-account)")
+        if not await engine.login():
+            return self.refuse("LOGIN_FAILED", "logowanie do brokera nie powiodło się")
+        try:
+            active = await engine.probe(engine.raw_broker.account)
+            positions = await engine.probe(engine.raw_broker.list_positions)
+            working = await engine.probe(engine.raw_broker.list_working_orders)
+        except Exception as exc:
+            return self.refuse("BROKER_UNREADABLE", f"brokera nie da się odczytać ({type(exc).__name__}: {exc})")
+        if active.account_id != bound:
+            return self.refuse("WRONG_ACCOUNT", "sesja nie jest na związanym rachunku")
+        mine = [p for p in positions if p.epic == epic]
+        if mine:
+            deals = ", ".join(f"{p.deal_id} {p.side.value} {p.size}" for p in mine)
+            return self.refuse(
+                "POSITION_AT_BROKER",
+                f"broker nadal pokazuje pozycję na {epic} ({deals}): zdecyduj o niej w aplikacji Capital.com",
+            )
+        pending = [w.order_id for w in working if w.epic == epic]
+        if pending:
+            return self.refuse(
+                "WORKING_ORDER",
+                f"na {epic} jest zlecenie oczekujące u brokera ({', '.join(pending)}): anuluj je w aplikacji",
+            )
+
+        # 3. pełna historia zamknięć od INTENT − HISTORY_MARGIN (adapter: całość albo wyjątek)
+        since = order.created_at - HISTORY_MARGIN
+        if self.clock.now_utc() - since > HISTORY_MAX_RANGE:
+            return self.refuse(
+                "HISTORY_OUT_OF_RANGE",
+                f"zlecenie {order.order_id} jest starsze niż {HISTORY_MAX_RANGE.days} dni, historia brokera go już "
+                "nie obejmuje; zapytaj Claude",
+            )
+        try:
+            closures = await engine.probe(engine.raw_broker.closed_since, since)
+        except Exception as exc:
+            return self.refuse(
+                "HISTORY_UNREADABLE",
+                f"historii brokera nie da się odczytać ({type(exc).__name__}: {exc}); spróbuj ponownie za kilka minut",
+            )
+        listed = [c for c in closures if c.epic == epic and c.ts >= since]
+        others = {c.deal_id for c in listed if journal.has_trade(c.deal_id) and not _owner_booked(journal, c.deal_id)}
+        candidates = [c for c in listed if c.deal_id not in others]
+        self._print_state(order, since, listed, others)
+        if not candidates:
+            return self._not_placed(order, since, others)
+
+        # 4. które zamknięcie: identyfikator z alarmu, wpisany (nigdy z opcji polecenia)
+        typed = self.ask(DEAL_PROMPT).strip()
+        chosen = [c for c in candidates if c.deal_id == typed]
+        if not chosen:
+            return self.abort(f"{typed!r} nie jest żadnym z wypisanych zamknięć")
+        if len(chosen) > 1:
+            return self.refuse(
+                "AMBIGUOUS_CLOSURE",
+                f"historia pokazuje {len(chosen)} zamknięcia deala {typed}: jest niejednoznaczna; zapytaj Claude",
+            )
+        closed = chosen[0]
+        acknowledged = [typed]
+        if journal.has_trade(closed.deal_id):  # przerwane wcześniejsze uruchomienie: zaksięgowane, dokańczamy zapisy
+            flags = (journal.trade_flags(closed.deal_id) or "").split()
+            booked_as = "ESTIMATED" if "ESTIMATED" in flags else "EXACT"
+            self.out(f"transakcja {closed.deal_id} jest już zaksięgowana przez wcześniejsze, przerwane uruchomienie: "
+                     "dokańczam zapisy bez ponownego księgowania")  # fmt: skip
+            self.audit("RESUMED", order_id=order.order_id, chosen=closed.deal_id, booked=booked_as,
+                       acknowledged=acknowledged)  # fmt: skip
+            return self._finish(order, closed, booked_as)
+
+        # 5. dane wejścia: potwierdzenie brokera (dokładnie) albo szacunek najgorszej straty ze stopu
+        snapshot = None
+        if order.deal_reference is not None:
+            try:
+                snapshot = await engine.probe(engine.raw_broker.confirm, order.deal_reference)
+            except BrokerRejected as exc:
+                return self.refuse(
+                    "CONFIRM_CONTRADICTS",
+                    f"potwierdzenie brokera mówi, że zlecenie odrzucono ({exc.reason}), a historia pokazuje zamknięcie "
+                    f"{closed.deal_id}: dowody są sprzeczne; zapytaj Claude",
+                )
+            except Exception as exc:
+                return self.refuse(
+                    "CONFIRM_UNREADABLE",
+                    f"potwierdzenia brokera nie da się teraz odczytać ({type(exc).__name__}); szacunku nie księgujemy, "
+                    "gdy dokładne dane mogą istnieć; spróbuj ponownie",
+                )
+            if snapshot is not None and (
+                snapshot.epic != epic or snapshot.side is not order.side or snapshot.deal_id != closed.deal_id
+            ):
+                return self.refuse(
+                    "CONFIRM_CONTRADICTS",
+                    f"potwierdzenie brokera wskazuje {snapshot.deal_id} {snapshot.side.value} {snapshot.epic}, a nie "
+                    f"wpisane zamknięcie {closed.deal_id}: dowody są sprzeczne; zapytaj Claude",
+                )
+        estimate: dict[str, Any] | None = None
+        if snapshot is not None:
+            self.out(f"dane wejścia z potwierdzenia brokera: kierunek {snapshot.side.value}, wielkość {snapshot.size}, "
+                     f"poziom otwarcia {snapshot.open_level}, czas {snapshot.opened_at.isoformat()}")  # fmt: skip
+            booked = PositionRecord(
+                epic, PositionState.BLOCKED, closed.deal_id, snapshot.side, snapshot.size, snapshot.open_level,
+                snapshot.stop_level, snapshot.opened_at,
+            )  # fmt: skip
+        else:
+            if len(candidates) > 1:
+                return self.refuse(
+                    "AMBIGUOUS_CLOSURE",
+                    f"historia pokazuje {len(candidates)} zamknięć na {epic}, a broker nie zna danych wejścia, które "
+                    "by je rozróżniły: nie da się udowodnić, które jest tą transakcją; zapytaj Claude",
+                )
+            estimate = await self._estimate(order, closed)
+            if not isinstance(estimate, dict):
+                return estimate
+            acknowledged.append(ESTIMATE_WORD)
+            booked = PositionRecord(
+                epic, PositionState.BLOCKED, closed.deal_id, estimate["side"], estimate["size"],
+                estimate["assumed_entry"], None, order.created_at,
+            )  # fmt: skip
+
+        # 6. księgowanie jedyną ścieżką, potem zlecenie, pozycja i znacznik historii
+        self.audit(
+            "BOOKING", order=order, position=position, closures=listed, chosen=closed.deal_id,
+            source="CONFIRM" if snapshot is not None else "ESTIMATE", snapshot=snapshot, estimate=estimate,
+            acknowledged=acknowledged,
+        )  # fmt: skip
+        if snapshot is not None:  # księga bierze prawdziwy kontekst wejścia (notowanie decyzji, czasy) tego zlecenia
+            journal.set_meta(META_ENTRY_BY_DEAL.format(closed.deal_id), order.order_id)
+        try:
+            await engine.executor.book(booked, closed, estimated=estimate is not None, by_owner=True)
+        except BookingError as exc:
+            self.out(f"odmowa: księgowanie nie powiodło się ({exc}); nic nie zaksięgowano, zlecenie i pozycja bez "
+                     "zmian; spróbuj ponownie albo zapytaj Claude")  # fmt: skip
+            return 1
+        return self._finish(order, closed, "EXACT" if estimate is None else "ESTIMATED")
+
+    def _print_state(self, order: Any, since: datetime, listed: list, others: set[str]) -> None:
+        epic = self.epic
+        created = order.created_at.isoformat()
+        self.out(f"zlecenie {order.order_id}: {order.state.value} ({order.note}), utworzone {created}")
+        self.out(f"pozycja {epic} w dzienniku: BLOCKED (bez deal id)")
+        self.out(f"broker: brak pozycji i zleceń oczekujących na {epic} na związanym rachunku")
+        self.out(f"zamknięcia na {epic} w historii brokera od {since.isoformat()}:")
+        for c in listed:
+            local = self.engine.calendar.to_local(c.ts)
+            tail = "  (już w księdze jako inna transakcja)" if c.deal_id in others else ""
+            self.out(f"  {c.deal_id}  {c.reason}  poziom {c.exit_level}  {c.ts.isoformat()} ({local:%H:%M} "
+                     f"{local.tzname()}){tail}")  # fmt: skip
+        if not listed:
+            self.out("  (brak)")
+
+    async def _estimate(self, order: Any, closed: Any) -> dict[str, Any] | int:
+        """Szacunek najgorszej straty ze stopu (wejście = wyjście ± odległość stopu) po wpisaniu SZACUNEK; inaczej kod
+        wyjścia (odmowa albo przerwanie). Wartość punktu z reguł brokera, tak jak policzy ją księgowanie szacunku."""
+        side, size, stop, ctx_vpp, inputs = _estimate_inputs(self.journal, order)
+        try:
+            rules = await self.engine.probe(self.engine.raw_broker.instrument_rules, self.epic)
+        except Exception as exc:
+            return self.refuse(
+                "RULES_UNREADABLE",
+                f"wartości punktu od brokera nie da się odczytać ({type(exc).__name__}); spróbuj ponownie za kilka "
+                "minut",
+            )
+        vpp = rules.value_per_point
+        if ctx_vpp is not None and ctx_vpp != vpp:
+            return self.refuse(
+                "VALUE_PER_POINT_MISMATCH",
+                f"wartość punktu w kontekście wejścia ({ctx_vpp}) różni się od reguł brokera ({vpp}): dowody są "
+                "sprzeczne; zapytaj Claude",
+            )
+        assumed = closed.exit_level + stop if side is Side.BUY else closed.exit_level - stop
+        self.out(f"brak danych wejścia u brokera: zostanie zaksięgowana NAJGORSZA możliwa strata ze stopu (SZACUNEK): "
+                 f"{size} x {stop} pkt x {vpp} EUR/pkt = -{size * stop * vpp} EUR przed kosztami; wiersz księgi "
+                 "dostanie znacznik ESTIMATED; zysku z szacunku nigdy nie księgujemy")  # fmt: skip
+        if self.ask(ESTIMATE_PROMPT).strip() != ESTIMATE_WORD:
+            return self.abort()
+        return {"side": side, "size": size, "stop_distance": stop, "value_per_point": vpp, "assumed_entry": assumed,
+                "inputs": inputs}  # fmt: skip
+
+    def _not_placed(self, order: Any, since: datetime, others: set[str]) -> int:
+        """Przypadek (ii): czysta historia i pusty broker. NOT_PLACED tylko wtedy, gdy dziennik nie zapisał dla
+        zlecenia żadnej pozycji ani zamknięcia u brokera (inaczej historia mogła się jeszcze nie pojawić: odmowa)."""
+        journal, epic = self.journal, self.epic
+        seen = sorted(_recorded_deals(journal, order.order_id) - others)
+        if seen:
+            return self.refuse(
+                "NO_CLOSURE_IN_HISTORY",
+                f"dziennik zapisał dla zlecenia {order.order_id} pozycję albo zamknięcie u brokera "
+                f"({', '.join(seen)}), a historia od {since.isoformat()} nie pokazuje żadnego zamknięcia na {epic}: "
+                "historia może się spóźniać; spróbuj ponownie za kilka minut, a jeśli to się powtarza, zapytaj Claude "
+                "(runbook 8.5)",
+            )
+        self.out(f"historia brokera nie pokazuje zamknięcia na {epic}, a broker nie ma pozycji ani zlecenia: zlecenie "
+                 "najpewniej nie zostało wykonane i nic nie zostanie zaksięgowane. Jeśli w ostatnich minutach "
+                 f"zamknąłeś pozycję {epic} w aplikacji, przerwij (historia brokera może się spóźniać)")  # fmt: skip
+        if self.ask(NOT_PLACED_PROMPT.format(order=order.order_id, epic=epic)).strip() != NOT_PLACED_WORD:
+            return self.abort()
+        self.audit("NOT_PLACED", order=order, since=since, acknowledged=[NOT_PLACED_WORD])
+        now = self.clock.now_utc()
+        check_order_transition(OrderState.UNKNOWN, OrderState.NOT_PLACED)
+        note = _note_tokens("RESOLVED_BY_OWNER", "NOT_PLACED_NO_CLOSURE", f"BY={_token(self.who)}", _causes(order.note))
+        journal.update_order(order.order_id, state=OrderState.NOT_PLACED, note=note, updated_at=now)
+        check_position_transition(PositionState.BLOCKED, PositionState.FLAT)
+        journal.upsert_position(PositionRecord(epic, PositionState.FLAT))
+        self.audit("DONE", order_id=order.order_id, outcome="NOT_PLACED")
+        self.out(f"zlecenie {order.order_id} → NOT_PLACED (RESOLVED_BY_OWNER), pozycja {epic} → FLAT; nic nie "
+                 f"zaksięgowano; {self._kill_hint()}")  # fmt: skip
+        return 0
+
+    def _finish(self, order: Any, closed: Any, booked_as: str) -> int:
+        """Zapisy po księdze (każdy idempotentny): zlecenie CONFIRMED, pozycja FLAT, znacznik historii, audyt."""
+        from gwstock.reconcile import META_CLOSED_MARKER
+
+        journal, epic = self.journal, self.epic
+        now = self.clock.now_utc()
+        check_order_transition(OrderState.UNKNOWN, OrderState.CONFIRMED)
+        note = _note_tokens(
+            "RESOLVED_BY_OWNER", f"BOOKED={booked_as}", f"CLOSURE={closed.deal_id}", f"BY={_token(self.who)}",
+            _causes(order.note),
+        )  # fmt: skip
+        journal.update_order(order.order_id, state=OrderState.CONFIRMED, deal_id=closed.deal_id, note=note,
+                             updated_at=now)  # fmt: skip
+        check_position_transition(PositionState.BLOCKED, PositionState.FLAT)
+        journal.upsert_position(PositionRecord(epic, PositionState.FLAT))
+        marker = journal.get_meta(META_CLOSED_MARKER)
+        if not marker or datetime.fromisoformat(marker) < closed.ts:
+            journal.set_meta(META_CLOSED_MARKER, closed.ts.isoformat())
+        net = _booked_net(journal, closed.deal_id)
+        self.audit("DONE", deal_id=closed.deal_id, order_id=order.order_id, net_pnl=net, booked=booked_as)
+        how = "DOKŁADNIE z potwierdzenia" if booked_as == "EXACT" else "SZACUNEK"
+        day = self.engine.calendar.to_local(closed.ts).date()
+        shown = net if net is not None else "?"
+        self.out(f"zaksięgowano transakcję {closed.deal_id} ({how}): wynik netto {shown} EUR, "
+                 f"dzień {day}; zlecenie {order.order_id} → CONFIRMED (RESOLVED_BY_OWNER), pozycja {epic} → FLAT; "
+                 f"{self._kill_hint()}")  # fmt: skip
+        return 0
+
+    def _kill_hint(self) -> str:
+        kill = self.engine.kill
+        if kill.level() is KillLevel.NONE:
+            return "kill switch: NONE; uruchom silnik"
+        return (f"kill switch nadal {kill.level().name} ({kill.reason()}): przeczytaj alarmy, zdejmij go poleceniem "
+                "clear-kill i uruchom silnik")  # fmt: skip
+
+
+def _position_fields(p: PositionRecord) -> bool:
+    return any(v is not None for v in (p.side, p.size, p.open_level, p.stop_level, p.opened_at))
+
+
+def _owner_booked(journal: Any, deal_id: str) -> bool:
+    """Transakcja zaksięgowana przez `resolve-lost-trade` (znacznik RESOLVED_BY_OWNER), np. przed przerwaniem."""
+    return FLAGS_BY_OWNER in (journal.trade_flags(deal_id) or "").split()
+
+
+def _recorded_deals(journal: Any, order_id: str) -> set[str]:
+    """Deale, które menedżer albo uzgadnianie zapisali dla zlecenia (pozycja na liście albo zamknięcie w historii:
+    UNMATCHED_CLOSED_DEAL, AMBIGUOUS_MATCH, CONFIRM_MISMATCH, REJECTED_BUT_LISTED, FOREIGN_POSITION ...)."""
+    seen: set[str] = set()
+    for source in (SOURCE_ORDER_EVENT, SOURCE_RECONCILE_EVENT):
+        for e in journal.events(source):
+            try:
+                data = json.loads(e.payload)
+            except ValueError:
+                continue
+            deals = data.get("deal_ids") if isinstance(data, dict) and data.get("order_id") == order_id else None
+            if isinstance(deals, list):
+                seen.update(d for d in deals if isinstance(d, str) and d)
+    return seen
+
+
+def _estimate_inputs(journal: Any, order: Any) -> tuple[Side, Decimal, Decimal, Decimal | None, str]:
+    """Kierunek, wielkość, odległość stopu i wartość punktu z kontekstu wejścia zlecenia; nieczytelny kontekst: pola
+    zlecenia (bez wartości punktu)."""
+    text = journal.get_meta(META_ENTRY_CTX.format(order.order_id))
+    try:
+        ctx = json.loads(text) if text else None
+        if isinstance(ctx, dict) and ctx.get("client_id") == order.order_id:
+            side = Side(ctx["side"])
+            size, stop, vpp = (Decimal(ctx[k]) for k in ("size", "stop_distance", "value_per_point"))
+            if side is order.side and all(v.is_finite() and v > 0 for v in (size, stop, vpp)):
+                return side, size, stop, vpp, "entry_ctx"
+    except (ValueError, TypeError, KeyError, ArithmeticError):
+        pass
+    return order.side, order.size, order.stop_distance, None, "order"
+
+
+def _booked_net(journal: Any, deal_id: str) -> Decimal | None:
+    """Wynik netto zaksięgowanej transakcji z jej zdarzenia TRADE_BOOKED (rekord księgi nie ma deal_id)."""
+    net = None
+    for e in journal.events(SOURCE_EVENT):
+        try:
+            data = json.loads(e.payload)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("event") == "TRADE_BOOKED" and data.get("deal_id") == deal_id:
+            net = data.get("net_pnl")
+    return Decimal(net) if isinstance(net, str) else None
+
+
+def _causes(note: str) -> str:
+    return " ".join(t for t in note.split() if t.startswith("CAUSE="))
+
+
+def _token(text: str) -> str:
+    return "_".join(text.split())
+
+
+def _note_tokens(*parts: str) -> str:
+    return " ".join(p for p in parts if p)
 
 
 # --- main ------------------------------------------------------------------------------------------------------
@@ -974,6 +1395,11 @@ async def _reset_engine(paths: Paths, by: str) -> int:
         return await _with_engine(paths, lambda engine: reset_position(engine, by, input), lock=lock)
 
 
+async def _resolve_engine(paths: Paths, by: str) -> int:
+    with _engine_stopped(paths) as lock:  # blokada instancji przed konfiguracją, dziennikiem i siecią
+        return await _with_engine(paths, lambda engine: resolve_lost_trade(engine, by, input), lock=lock)
+
+
 async def _bind(paths: Paths) -> int:
     import aiohttp
 
@@ -1009,6 +1435,10 @@ def _cmd_reset_position(paths: Paths, args: argparse.Namespace) -> int:
     return asyncio.run(_reset_engine(paths, args.by))
 
 
+def _cmd_resolve_lost_trade(paths: Paths, args: argparse.Namespace) -> int:
+    return asyncio.run(_resolve_engine(paths, args.by))
+
+
 def _cmd_bind(paths: Paths, args: argparse.Namespace) -> int:
     return asyncio.run(_bind(paths))
 
@@ -1029,6 +1459,7 @@ COMMANDS: dict[str, Callable[[Paths, argparse.Namespace], int]] = {
     "health": _cmd_health,
     "clear-kill": _cmd_clear_kill,
     "reset-position": _cmd_reset_position,
+    "resolve-lost-trade": _cmd_resolve_lost_trade,
 }
 
 _HELP = {
@@ -1039,6 +1470,8 @@ _HELP = {
     "health": "exit 0 if the heartbeat is fresher than 120 s (Docker healthcheck)",
     "clear-kill": "owner: clear the kill switch (engine stopped; asks for CLEAR)",
     "reset-position": "owner: set a BLOCKED position FLAT when the broker shows nothing (engine stopped; RESET)",
+    "resolve-lost-trade": "owner: book a lost trade (UNKNOWN order, BLOCKED position, broker flat) from the broker "
+    "history (engine stopped; asks for the closing deal id)",
 }
 
 
@@ -1066,7 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
         "--hold", type=_hold_seconds, default=0, metavar="SECONDS",
         help=f"keep the probe position open for 0-{SMOKE_HOLD_MAX_S} s under normal supervision before closing it",
     )  # fmt: skip
-    for name in ("clear-kill", "reset-position"):
+    for name in ("clear-kill", "reset-position", "resolve-lost-trade"):
         parsers[name].add_argument("--by", type=_owner_name, required=True, help="who does it (audit trail)")
     args = parser.parse_args(argv)
     command = args.command or "run"

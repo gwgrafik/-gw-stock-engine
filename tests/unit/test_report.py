@@ -1012,6 +1012,33 @@ def test_report_lists_other_events_and_warns_about_unreadable_rows(journal, caps
     assert "UWAGA: 1 nieczytelnych zapisów zdarzeń pominięto w liczniku." in lines
 
 
+ESTIMATE_WARNING = (
+    "UWAGA: transakcja z 2026-11-03 (wyjście 17:25 czasu Europe/Berlin, STOP, netto -0.22) zaksięgowana przez "
+    "właściciela jako SZACUNEK (najgorsza strata ze stopu); sprawdź wynik w Capital.com"
+)
+
+
+def test_report_warns_about_estimated_trades(journal, capsys, config_env, jpath):
+    book_session(journal, D1)
+    estimated = make_trade(D2, gross_pnl=Decimal("-0.21"), slippage_penalty=Decimal("0.01"), net_pnl=Decimal("-0.22"),
+                           exit_reason="STOP")  # fmt: skip
+    assert journal.record_trade(estimated, "DEAL-LOST-1", D2, flags="ESTIMATED RESOLVED_BY_OWNER")
+    exact = make_trade(D2, exit_ts=at(D2, 16, 26), exit_reason="STOP")
+    assert journal.record_trade(exact, "DEAL-LOST-2", D2, flags="RESOLVED_BY_OWNER")  # dokładnie: bez uwagi
+    _, out, _ = run(["--journal", jpath, "--all"], capsys)
+    lines = out.splitlines()
+    assert lines.count(ESTIMATE_WARNING) == 1 and "DEAL-" not in out  # bez identyfikatorów deali
+    assert lines.index(ESTIMATE_WARNING) < lines.index("Podsumowanie od początku dziennika:")
+
+
+def test_report_counts_closure_booked_as_benign_not_as_another_event(journal, capsys, config_env, jpath):
+    book_session(journal, D1)
+    for _ in range(2):  # ponowne (idempotentne) księgowanie powtarza CLOSURE_BOOKED: to nie błąd ani druga transakcja
+        emit(journal, "reconcile.event", {"event": "CLOSURE_BOOKED", "deal_id": "DEAL-X"}, at(D1, 16, 27))
+    _, out, _ = run(["--journal", jpath], capsys)
+    assert "CLOSURE_BOOKED" not in out and "Transakcje: 1" in out
+
+
 def test_report_never_prints_ids_or_secrets(journal, capsys, config_env, jpath):
     book_session(journal, D1)
     secret_payload = {"event": "COST_FALLBACK", "deal_id": "DEAL-SECRET-1", "accountId": "ACC-SECRET-2",

@@ -20,7 +20,7 @@ from __future__ import annotations
 import csv
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import pytest
 
@@ -40,6 +40,7 @@ from tests.fault.e2e_support import (
     MID,
     RULES,
     SIZE,
+    STOP_DISTANCE,
     STOP_LEVEL,
     T_ENTRY,
     T_FLATTEN,
@@ -1096,17 +1097,15 @@ async def test_engine_journal_failure_between_the_trade_and_pnl_statements_books
     assert (disk.kill.level, disk.kill.reason) == (KillLevel.SOFT, "JOURNAL_WRITE_FAILED")
 
 
-# --- BUG-E2E-2: zablokowana „zgubiona transakcja" nie ma wyjścia dla właściciela ----------------------------------------
+# --- BUG-E2E-2: zablokowaną „zgubioną transakcję" księguje właściciel (resolve-lost-trade) ----------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-E2E-2: after a lost ack + stop-out (UNKNOWN UNMATCHED_CLOSED_DEAL, position BLOCKED) the Reconciler "
-    "waits for the owner (BLOCKED_AWAITING_OWNER) but reset-position refuses while the order is unresolved: deadlock",
-)
-async def test_bug_e2e_2_the_owner_can_resolve_a_blocked_lost_trade_with_the_provided_tools(rig, world, cfgs):
+async def test_bug_e2e_2_the_owner_books_a_blocked_lost_trade_with_resolve_lost_trade(rig, world, cfgs):
+    """Reprodukcja z raportu (bez referencji: broker nie poda danych wejścia): uzgadnianie czeka na właściciela,
+    `resolve-lost-trade` przy zatrzymanym silniku księguje najgorszą stratę ze stopu jedyną ścieżką księgowania, a po
+    restarcie uzgadnianie nie widzi już rozbieżności."""
     from gwstock.app import Engine, Mode
-    from gwstock.cli import RESET_WORD, reset_position
+    from gwstock.cli import DEAL_PROMPT, ESTIMATE_PROMPT, ESTIMATE_WORD, resolve_lost_trade
     from gwstock.config import RuntimeConfig
     from gwstock.journal import Journal
 
@@ -1114,20 +1113,50 @@ async def test_bug_e2e_2_the_owner_can_resolve_a_blocked_lost_trade_with_the_pro
     await enter(rig)
     for _ in range(8):  # silnik pracuje dalej: uzgadnianie samo niczego nie rozstrzyga
         await reconcile(rig)
-    assert_lost_trade_is_blocked(read_disk(rig.path))
-    rig.stop()  # właściciel zatrzymuje silnik (reset-position działa tylko przy zatrzymanym)
-    journal = Journal.open(str(rig.path))
+    before = read_disk(rig.path)
+    assert_lost_trade_is_blocked(before)
+    assert before.kill.level is KillLevel.SOFT and "MISMATCH_TIMEOUT" in kill_reasons(before)
+    timeouts = before.codes("reconcile.event").count("MISMATCH_TIMEOUT")
+    [closure] = await world.broker.closed_since(T_ENTRY - timedelta(minutes=1))
+    rig.stop()  # właściciel zatrzymuje silnik (polecenie działa tylko przy zatrzymanym)
+    calls = len(world.broker.calls)
+    answers = {DEAL_PROMPT: DEAL, ESTIMATE_PROMPT: ESTIMATE_WORD}
     out: list[str] = []
+    journal = Journal.open(str(rig.path))
     try:
         engine = Engine(world.broker, journal, world.clock, world.calendar, cfgs, world.data_dir,
                         RuntimeConfig(live_allowed=False, account_id="ACC-1"), Mode.DRY_RUN)  # fmt: skip
-        code = await reset_position(engine, "owner", lambda _prompt: RESET_WORD, out.append)
+        code = await resolve_lost_trade(engine, "owner", answers.__getitem__, out.append)
     finally:
         journal.close()
-    assert code == 0, out  # oczekiwane: właściciel ma drogę wyjścia (broker pusty, historia sprawdzalna)
+    assert code == 0, out
+    reads = {"login", "account", "list_positions", "list_working_orders", "closed_since", "instrument_rules"}
+    assert set(world.broker.calls[calls:]) <= reads  # u brokera tylko odczyty
     disk = read_disk(rig.path)
+    [t] = disk.trades
+    # najgorsza strata ze stopu: −(wielkość × 30 pkt × wartość punktu) − modelowy poślizg wyjścia STOP
+    stop_slippage = ((world.costs.entry_slippage_points + world.costs.stop_exit_extra_slippage_points) * SIZE
+                     * RULES.value_per_point).quantize(CENT, rounding=ROUND_HALF_UP)  # fmt: skip
+    assert t.gross_pnl == -(SIZE * STOP_DISTANCE * RULES.value_per_point).quantize(CENT)
+    assert t.net_pnl == t.gross_pnl - stop_slippage and t.exit_fill == closure.exit_level and t.exit_reason == "STOP"
+    assert "ESTIMATED" in disk.meta[f"trade_flags:{DEAL}"].split()
+    order = disk.order(CID)
+    assert order.state is O.CONFIRMED and order.deal_id == DEAL and order.note.split()[0] == "RESOLVED_BY_OWNER"
     assert disk.position == PositionRecord(EPIC, P.FLAT)
-    assert disk.trades == [] and world.broker.positions == {}
+    assert disk.pnl == {DAY: t.net_pnl}  # strata trafiła do licznika dnia zamknięcia (limity strat ją widzą)
+    assert_books_balance(disk)
+    assert [p["phase"] for p in disk.payloads("owner.resolve")] == ["BOOKING", "DONE"]
+    assert disk.kill == before.kill  # kill switch zdejmuje właściciel osobno (clear-kill)
+
+    rig.start()  # po restarcie: dwa przebiegi uzgadniania bez nowej rozbieżności
+    for _ in range(2):
+        result = await reconcile(rig)
+        assert not result.blocked and not result.skipped
+    after = read_disk(rig.path)
+    assert after.position == PositionRecord(EPIC, P.FLAT) and len(after.trades) == 1
+    assert after.codes("reconcile.event").count("MISMATCH_TIMEOUT") == timeouts
+    assert after.meta.get("mismatch_since", "") == "" and after.kill.level is before.kill.level
+    assert_books_balance(after)
 
 
 async def test_g_a_fill_accepted_while_down_without_a_broker_stop_is_adopted_and_protected_with_the_entry_stop(
