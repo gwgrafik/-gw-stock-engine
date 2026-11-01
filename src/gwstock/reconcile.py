@@ -215,7 +215,8 @@ class Reconciler:
         self._booker = booker
         self._entry_gate = entry_gate
         self._notifier = notifier  # alarmy opisowe (CLOSURE_NOT_IN_HISTORY), wg możliwości; None: tylko zdarzenie
-        self._closure_alerted: set[tuple[str, str]] = set()  # (deal_id, mismatch_since): raz na incydent w procesie
+        # (deal_id, mismatch_since): raz na incydent w procesie, dopisywane po trwałym zapisie zdarzenia
+        self._closure_alerted: set[tuple[str, str]] = set()
 
     @property
     def booker(self) -> TradeBooker | None:
@@ -564,8 +565,7 @@ class Reconciler:
         pominięta; zamknięcie jest zaksięgowane, a księga idempotentna)."""
         for reason in plan.kills:
             self._kill.soft(reason)
-        for key, level, message in plan.alerts:  # wg możliwości: awaria kanału alarmów nie przerywa przebiegu
-            self._closure_alerted.add(key)
+        for _, level, message in plan.alerts:  # wg możliwości: awaria kanału alarmów nie przerywa przebiegu
             if self._notifier is None:
                 continue
             try:
@@ -574,6 +574,9 @@ class Reconciler:
                 _LOG.warning("alert not sent (%s: %s): %s", type(exc).__name__, exc, message)
         for event in plan.events:  # ślad decyzji przed księgowaniem: zostaje także przy jego błędzie
             self._raw(SOURCE_EVENT, event)
+        # Incydent jest zgłoszony dopiero, gdy jego zdarzenie trwale zapisano: błąd zapisu (wyjątek wyżej) zostawia go
+        # niezgłoszonym, więc następny przebieg ponowi zdarzenie (i alarm; duplikat alarmu jest do przyjęcia).
+        self._closure_alerted.update(key for key, _, _ in plan.alerts)
         if plan.book is not None and self._booker is not None:
             await self._booker.book(*plan.book)  # błąd: pozycja zostaje, następny przebieg ponowi
             closed = plan.book[1]

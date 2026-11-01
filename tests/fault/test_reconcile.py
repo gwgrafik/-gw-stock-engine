@@ -1000,6 +1000,51 @@ async def test_closure_not_in_history_is_journaled_even_when_the_alert_cannot_be
     assert len(notifier.alerts) == (0 if sink == "no_notifier" else 1)  # jedna próba wysyłki na incydent
 
 
+async def test_closure_not_in_history_event_write_failure_is_retried_on_the_next_pass(
+    journal, fake, clock, kill_sink, risk_cfg, notifier, monkeypatch
+):
+    # przegląd G4 (M-4): incydent liczy się jako zgłoszony dopiero po trwałym zapisie zdarzenia; drugi alarm jest do
+    # przyjęcia, zdarzenie, którego nigdy nie zapisano, nie
+    rec = Reconciler(journal, fake, clock, kill_sink, risk_cfg, EPIC, notifier=notifier)
+    journal.upsert_position(held(P.EXITING))
+    put(fake, at_broker())
+    await fake.close_position("DEAL-1")
+    engine_close_record(journal, T0, response=None)
+    fake.calls.clear()
+    lagging_history(fake, monkeypatch)
+    real = journal.append_raw
+    failed = []
+
+    def append_raw(source, payload, ts):
+        if source == "reconcile.event" and CLOSURE_NOT_IN_HISTORY_CODE in payload and not failed:
+            failed.append(payload)
+            raise JournalWriteError("disk full (once)")
+        return real(source, payload, ts)
+
+    monkeypatch.setattr(journal, "append_raw", append_raw)
+    clock.advance(10)
+    await rec.run_once()
+    clock.advance(risk_cfg.mismatch_tolerance_s + 1)
+    with pytest.raises(JournalWriteError):
+        await rec.run_once()  # alarm wyszedł, zapis zdarzenia zawiódł
+    assert len(failed) == 1 and len(notifier.alerts) == 1
+
+    def closure_events():
+        return [e["event"] for e in payloads(journal, "reconcile.event")].count(CLOSURE_NOT_IN_HISTORY_CODE)
+
+    assert closure_events() == 0
+    clock.advance(risk_cfg.reconcile_interval_s)
+    await rec.run_once()  # następny przebieg ponawia zdarzenie (i alarm)
+    assert closure_events() == 1 and len(notifier.alerts) == 2
+    for _ in range(3):
+        clock.advance(risk_cfg.reconcile_interval_s)
+        await rec.run_once()
+    assert closure_events() == 1 and len(notifier.alerts) == 2  # potem raz na incydent, jak zwykle
+
+
+CLOSURE_NOT_IN_HISTORY_CODE = "CLOSURE_NOT_IN_HISTORY"
+
+
 def test_engine_close_source_is_the_executor_raw_source():
     from gwstock import execution
 
