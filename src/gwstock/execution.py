@@ -1142,9 +1142,9 @@ class Executor:
 
         Właściciel (`resolve-lost-trade`): `by_owner=True` — dokładne dane brokera, znacznik księgi RESOLVED_BY_OWNER;
         `estimated=True` — SZACUNEK najgorszej straty ze stopu: `position.open_level` to przyjęte wejście, wiersz jest
-        rekordem zdegradowanym (mid wejścia = wejście, spready 0, wartość punktu jak w rekordzie zdegradowanym), znacznik
-        ESTIMATED RESOLVED_BY_OWNER, alarm ERROR LOST_TRADE_ESTIMATED; brutto >= 0 → `BookingError` (zysku ani zera z
-        szacunku nigdy nie księgujemy).
+        rekordem zdegradowanym (mid wejścia = wejście, spready 0, wartość punktu jak w rekordzie zdegradowanym),
+        znacznik ESTIMATED RESOLVED_BY_OWNER, alarm ERROR LOST_TRADE_ESTIMATED; brutto >= 0 → `BookingError` (zysku ani
+        zera z szacunku nigdy nie księgujemy).
         """
         await self._book(position, closed, self._timeout, estimated=estimated, by_owner=by_owner)
 
@@ -1164,7 +1164,7 @@ class Executor:
         except (JournalReadError, JournalWriteError):
             raise  # dziennik leży: księgowanie powtórzy się z pełnym kontekstem
         except BookingError:
-            raise  # szacunek właściciela, którego nie wolno zaksięgować (zysk, brak wartości punktu): bez zdegradowanego
+            raise  # szacunek, którego nie wolno zaksięgować (zysk, brak wartości punktu): bez zdegradowanego
         except Exception as exc:  # brak kontekstu, ujemny spread, złe typy: rekord zdegradowany, ale zaksięgowany
             fallback = NO_ENTRY_CONTEXT if isinstance(exc, _NoContext) else f"{type(exc).__name__}: {exc}"
             try:
