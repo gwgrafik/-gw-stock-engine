@@ -1,7 +1,10 @@
 """Testy zegara i kalendarza giełdy (profil XETRA). Uruchamiać z korzenia repozytorium."""
 
+import inspect
+import sys
 import time as wall_time
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -115,8 +118,15 @@ def test_easter_helper_known_values():
 
 
 def test_public_holidays_with_regular_trading_in_2026_are_session_days():
-    """Oficjalny kalendarz: w 2026 handel odbywa się w Boże Ciało, Wniebowstąpienie i Zielone Świątki."""
-    for d in (date(2026, 5, 14), date(2026, 5, 25), date(2026, 6, 4)):
+    """Oficjalny kalendarz: w 2026 handel odbywa się we Wniebowstąpienie, w Poniedziałek Zesłania Ducha Świętego
+    i w Boże Ciało (daty liczone od Wielkanocy, nie przepisane)."""
+    easter = _easter_sunday(2026)
+    ascension = easter + timedelta(days=39)  # czwartek
+    whit_monday = easter + timedelta(days=50)  # Poniedziałek Zesłania Ducha Świętego (Zielone Świątki to niedziela)
+    corpus_christi = easter + timedelta(days=60)  # czwartek
+    assert (ascension, whit_monday, corpus_christi) == (date(2026, 5, 14), date(2026, 5, 25), date(2026, 6, 4))
+    assert (ascension.weekday(), whit_monday.weekday(), corpus_christi.weekday()) == (3, 0, 3)
+    for d in (ascension, whit_monday, corpus_christi):
         assert cal.is_session_day(d)
 
 
@@ -161,6 +171,14 @@ def test_datetime_instead_of_date_is_rejected():
 
 
 # --- strefa czasowa i zmiana czasu -------------------------------------------------------------------
+
+
+def test_local_to_utc_rejects_a_datetime_instead_of_a_date():
+    """To samo zabezpieczenie co w `is_session_day`: datetime nie jest datą, a jego składnik czasu zostałby zignorowany."""
+    with pytest.raises(TypeError, match="datetime"):
+        cal.local_to_utc(datetime(2026, 12, 24, 10, 0), time(9, 0))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="datetime"):
+        cal.local_to_utc(datetime(2026, 11, 2, 0, 0, tzinfo=UTC), time(9, 0))  # type: ignore[arg-type]
 
 
 def test_dst_boundary_eu_2027_spring_forward():
@@ -269,9 +287,19 @@ def test_xetra_profile_definition():
 
 
 def test_module_name_does_not_shadow_stdlib_calendar():
+    """`import calendar` daje bibliotekę standardową, a `gwstock.calendar` to osobny moduł z tego pakietu."""
     import calendar as stdlib_calendar
 
-    assert hasattr(stdlib_calendar, "monthrange")
+    import gwstock.calendar as engine_calendar
+
+    package_dir = Path(engine_calendar.__file__).resolve().parent
+    assert hasattr(stdlib_calendar, "monthrange") and not hasattr(stdlib_calendar, "ExchangeCalendar")
+    assert Path(stdlib_calendar.__file__).resolve().parent != package_dir  # stdlib nie jest plikiem z src/gwstock
+    assert sys.modules["calendar"] is stdlib_calendar
+    assert sys.modules["gwstock.calendar"] is engine_calendar
+    assert engine_calendar is not stdlib_calendar
+    assert engine_calendar.__name__ == "gwstock.calendar"
+    assert str(package_dir) not in sys.path  # katalog pakietu nie jest na ścieżce, więc nic nie przesłania stdlib
 
 
 # --- zegary ------------------------------------------------------------------------------------------
@@ -315,6 +343,25 @@ async def test_fake_clock_sleep_of_non_positive_seconds_does_not_move_time():
     assert clock.now_utc() == start
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_fake_clock_advance_rejects_non_finite_seconds(bad):
+    """NaN nie jest ani ujemne, ani dodatnie: bez jawnej kontroli przeszłoby po cichu i nie przesunęło zegara."""
+    start = datetime(2026, 11, 2, 8, 0, tzinfo=UTC)
+    clock = FakeClock(start)
+    with pytest.raises(ValueError, match="seconds"):
+        clock.advance(bad)
+    assert clock.now_utc() == start
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+async def test_fake_clock_sleep_rejects_non_finite_seconds(bad):
+    start = datetime(2026, 11, 2, 8, 0, tzinfo=UTC)
+    clock = FakeClock(start)
+    with pytest.raises(ValueError, match="seconds"):
+        await clock.sleep(bad)
+    assert clock.now_utc() == start
+
+
 def test_fake_clock_rejects_naive_start():
     with pytest.raises(ValueError):
         FakeClock(datetime(2026, 11, 2, 8, 0))
@@ -340,9 +387,34 @@ async def test_system_clock_sleep_really_waits():
     assert wall_time.monotonic() - began >= 0.04
 
 
-def test_clocks_satisfy_protocol_structurally():
-    def uses(clock: Clock) -> datetime:
-        return clock.now_utc()
+def _protocol_members() -> dict[str, inspect.Signature]:
+    return {
+        name: inspect.signature(member)
+        for name, member in vars(Clock).items()
+        if callable(member) and not name.startswith("_")
+    }
 
-    assert uses(SystemClock()).tzinfo is not None
-    assert uses(FakeClock(datetime(2026, 11, 2, 8, 0, tzinfo=UTC))).tzinfo is not None
+
+@pytest.mark.parametrize("clock_cls", [SystemClock, FakeClock])
+def test_clocks_satisfy_protocol_structurally(clock_cls):
+    """Każda metoda protokołu `Clock` istnieje w implementacji z tymi samymi parametrami; `sleep` jest korutyną."""
+    members = _protocol_members()
+    assert set(members) == {"now_utc", "sleep"}  # nowa metoda protokołu ma zmusić do aktualizacji zegarów
+    for name, proto_sig in members.items():
+        impl = getattr(clock_cls, name)
+        impl_sig = inspect.signature(impl)
+        assert list(impl_sig.parameters) == list(proto_sig.parameters), (clock_cls.__name__, name)
+        assert inspect.iscoroutinefunction(impl) is inspect.iscoroutinefunction(getattr(Clock, name)), name
+
+
+async def test_clocks_work_through_the_protocol_type():
+    async def uses(clock: Clock) -> datetime:
+        before = clock.now_utc()
+        await clock.sleep(0)
+        after = clock.now_utc()
+        assert after >= before
+        return after
+
+    for clock in (SystemClock(), FakeClock(datetime(2026, 11, 2, 8, 0, tzinfo=UTC))):
+        now = await uses(clock)
+        assert now.tzinfo is not None and now.utcoffset() == timedelta(0)

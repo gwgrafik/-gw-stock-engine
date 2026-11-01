@@ -6,6 +6,7 @@ Wszystkie daty i godziny w projekcie są świadome strefy (UTC); zegar nigdy nie
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
@@ -27,7 +28,11 @@ class SystemClock:
 
 
 class FakeClock:
-    """Zegar testowy: `sleep` tylko przesuwa czas wewnętrzny i wraca natychmiast."""
+    """Zegar testowy: `sleep` tylko przesuwa czas wewnętrzny i wraca natychmiast.
+
+    Liczba sekund musi być skończona: NaN (nie jest ani ujemne, ani dodatnie) i nieskończoność to `ValueError`,
+    bo inaczej zegar milcząco stałby w miejscu albo wywalał się w `timedelta`.
+    """
 
     def __init__(self, start: datetime) -> None:
         if start.tzinfo is None or start.utcoffset() is None:
@@ -39,14 +44,21 @@ class FakeClock:
         return self._now
 
     async def sleep(self, seconds: float) -> None:
+        self._require_finite(seconds)
         # jak asyncio.sleep: czas niedodatni nie cofa ani nie przesuwa zegara
         if seconds > 0:
             self.advance(seconds)
 
     def advance(self, seconds: float) -> None:
+        self._require_finite(seconds)
         if seconds < 0:
             raise ValueError(f"seconds: time cannot go backwards, got {seconds}")
         self._now += timedelta(seconds=seconds)
 
     def elapsed_since_start(self) -> float:
         return (self._now - self._start).total_seconds()
+
+    @staticmethod
+    def _require_finite(seconds: float) -> None:
+        if not math.isfinite(seconds):
+            raise ValueError(f"seconds: expected a finite number, got {seconds}")

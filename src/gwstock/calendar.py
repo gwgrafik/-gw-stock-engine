@@ -69,7 +69,8 @@ class ExchangeProfile:
 # Wpis 31.12.2027 potwierdzają pełna tabela na eurexgroup.com („Friday 31 Dec 2027”) i tabela na
 # live.deutsche-boerse.com („New Years Eve, 31 December”); strona cashmarket w pobranej postaci nie pokazywała
 # komórek 31.12.2026/2027, ale PDF 2026 potwierdza 31.12.2026.
-# W 2026 handel odbywa się w święta: Wniebowstąpienie 14.05, Zielone Świątki 25.05, Boże Ciało 4.06 (nie ma ich tu).
+# W 2026 handel odbywa się w święta: Wniebowstąpienie 14.05, Poniedziałek Zesłania Ducha Świętego 25.05,
+# Boże Ciało 4.06 (nie ma ich tu).
 #
 # Skrócone sesje: oficjalny kalendarz nie wskazuje żadnej na 2026-2027 (w 2025 było skrócone 30.12 do 14:00),
 # więc `early_closes` jest puste. UWAGA: strona zastrzega, że „On December 30, 2026, deviating trading hours may
