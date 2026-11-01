@@ -239,6 +239,31 @@ def test_reopen_existing_database_keeps_schema_and_data(tmp_path):
     j2.close()
 
 
+def test_reopen_keeps_wal_and_synchronous_full(tmp_path, monkeypatch):
+    # synchronous dotyczy połączenia, nie pliku; ten build SQLite ma domyślnie FULL, więc obniżamy domyślną wartość
+    # (jak w buildach z SQLITE_DEFAULT_WAL_SYNCHRONOUS=1), żeby test widział brak jawnego ustawienia
+    real_connect = sqlite3.connect
+
+    def lowered_default(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", lowered_default)
+    p = tmp_path / "j.sqlite"
+    raw = sqlite3.connect(p)
+    assert raw.execute("PRAGMA synchronous").fetchone()[0] == 1  # założenie testu działa
+    raw.close()
+    open_journal(p).close()
+    j = open_journal(p)  # ponowne otwarcie istniejącego dziennika
+    assert (j.pragma("journal_mode"), j.pragma("synchronous")) == ("wal", 2)
+    j._conn = FailingConn(j._conn, "INSERT INTO raw_events", "ROLLBACK")
+    with pytest.raises(JournalWriteError):
+        j.append_raw("broker", "x", T0)
+    assert (j.pragma("journal_mode"), j.pragma("synchronous")) == ("wal", 2)  # połączenie otwarte na nowo w procesie
+    j.close()
+
+
 def test_close_is_idempotent_and_blocks_further_use(tmp_path):
     j = open_journal(tmp_path / "j.sqlite")
     j.close()
@@ -702,6 +727,25 @@ def test_mid_transaction_failure_rolls_back_and_wraps(journal, monkeypatch):
     monkeypatch.undo()
     assert journal.trades() == [] and journal.realized_pnl_total() == Decimal("0")
     assert journal.record_trade(make_trade(), "DEAL-1", DAY) is True
+
+
+@pytest.mark.parametrize("mode", ["ABORT", "FAIL", "ROLLBACK"])
+def test_a_failure_in_the_middle_of_a_write_rolls_back_all(tmp_path, mode):
+    # prawdziwy błąd SQLite w DRUGIEJ instrukcji zapisu (wiersz transakcji już wstawiony), nie odmowa przy BEGIN
+    p = tmp_path / "j.sqlite"
+    j = open_journal(p)
+    j._conn.execute(f"CREATE TRIGGER boom BEFORE INSERT ON realized_pnl BEGIN SELECT RAISE({mode}, 'boom'); END")
+    with pytest.raises(JournalWriteError) as caught:
+        j.record_trade(make_trade(), "DEAL-1", DAY)
+    assert isinstance(caught.value.__cause__, sqlite3.Error)
+    assert j._conn.in_transaction is False
+    assert j.trades() == [] and j.has_trade("DEAL-1") is False and j.realized_pnl_total() == Decimal("0")
+    raw = sqlite3.connect(p)  # inne połączenie też nic nie widzi
+    assert raw.execute("SELECT count(*) FROM trades").fetchone()[0] == 0
+    raw.close()
+    j._conn.execute("DROP TRIGGER boom")
+    assert j.record_trade(make_trade(), "DEAL-1", DAY) is True
+    j.close()
 
 
 def test_after_a_failed_rollback_reads_return_only_committed_data(tmp_path):
