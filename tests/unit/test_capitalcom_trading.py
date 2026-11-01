@@ -592,8 +592,46 @@ async def test_confirm_with_an_unexpected_status_or_shape_is_a_broker_error_neve
 
 
 @pytest.mark.parametrize(
+    "other",
+    [
+        {"dealId": "006011e7-0001-54c4-0000-0000805600ff", "status": "AMENDED"},  # netting z inną pozycją (C15)
+        {"dealId": "006011e7-0001-54c4-0000-0000805600ff", "status": "PARTIALLY_CLOSED"},
+        {"dealId": "006011e7-0001-54c4-0000-0000805600ff", "status": "FULLY_CLOSED"},
+        {"dealId": "006011e7-0001-54c4-0000-0000805600ff", "status": "DELETED"},
+        {"dealId": "006011e7-0001-54c4-0000-0000805600ff", "status": None},
+        {"dealId": "006011e7-0001-54c4-0000-0000805600ff"},
+        "OUR_DEAL_AMENDED",  # drugi wpis naszego dealId
+    ],
+    ids=["amended", "partially-closed", "fully-closed", "deleted", "null-status", "no-status", "ours-twice"],
+)
+async def test_open_confirm_with_another_affected_deal_is_not_a_clean_fill(server, broker, other):
+    # zlecenie dotknęło także innej pozycji (np. zmniejszyło przeciwną przy wyłączonym hedgingu): to nie jest czyste
+    # wykonanie, więc BrokerError (UNKNOWN), a decyzję podejmują rozstrzyganie i uzgadnianie, nie zgadywanie adaptera
+    await broker.login()
+    ack = await broker.open_position(entry())
+    fake = only_position(server)
+    confirmation = server.confirms[ack.deal_reference]
+    assert confirmation["affectedDeals"] == [{"dealId": fake.deal_id, "status": "OPENED"}]
+    extra = {"dealId": fake.deal_id, "status": "AMENDED"} if other == "OUR_DEAL_AMENDED" else other
+    confirmation["affectedDeals"].append(extra)
+    mark = since_mark(server)
+    for _ in range(2):  # nic nie jest zapamiętywane: kolejne potwierdzenie pyta brokera ponownie
+        with pytest.raises(BrokerError) as info:
+            await broker.confirm(ack.deal_reference)
+        assert type(info.value) is BrokerError
+        assert str(info.value).startswith(f"GET /confirms/{ack.deal_reference}: unexpected response: affectedDeals")
+    assert seq(server, mark) == [f"GET /confirms/{ack.deal_reference}"] * 2
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
-    [("epic", "US100"), ("direction", "SELL"), ("workingOrderId", "006011e7-0001-54c4-0000-0000805600ff")],
+    [
+        ("epic", "US100"),
+        ("direction", "SELL"),
+        ("workingOrderId", "006011e7-0001-54c4-0000-0000805600ff"),
+        ("size", Decimal("0.002")),  # pozycja większa niż wykonanie: zlecenie dołączyło do innej (C15)
+        ("size", Decimal("0.0005")),  # mniejsza: część już zamknięta albo inne wykonanie
+    ],
 )
 async def test_confirm_cross_checks_the_listed_position(server, broker, field, value):
     await broker.login()

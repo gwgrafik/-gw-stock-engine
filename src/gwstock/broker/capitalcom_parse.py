@@ -482,10 +482,12 @@ def _stop_key(root: dict[str, Any], where: str) -> tuple[bool, Decimal | None]:
 
 
 def parse_opening(payload: Any) -> Opening:
-    """Id pozycji = jedyny wpis `affectedDeals` ze statusem `OPENED` (notatki §2.15, C2); inaczej `ParseError`.
+    """Id pozycji = JEDYNY wpis `affectedDeals`, ze statusem `OPENED` (notatki §2.15, C2); inaczej `ParseError`.
 
     Brak wpisu `OPENED` (np. `AMENDED` przy agregacji z inną pozycją, C15) albo kilka takich wpisów: nie wiadomo,
-    którą pozycję utworzyło zlecenie, więc adapter nie zgaduje.
+    którą pozycję utworzyło zlecenie. Jakikolwiek inny wpis obok naszego `OPENED` (np. zlecenie zmniejszyło albo
+    zamknęło inną pozycję przy wyłączonym hedgingu, C15): to nie jest czyste wykonanie. W obu przypadkach adapter nie
+    zgaduje; wynik zlecenia rozstrzygają menedżer zleceń i uzgadnianie z listy pozycji.
     """
     root = obj(payload, "")
     affected = items(get(root, "affectedDeals", ""), "affectedDeals")
@@ -497,6 +499,10 @@ def parse_opening(payload: Any) -> Opening:
             opened.append(ident(deal, "dealId", where))
     if len(opened) != 1:
         raise ParseError(f"affectedDeals: expected exactly one OPENED deal, found {len(opened)}")
+    if len(affected) != 1:
+        raise ParseError(
+            f"affectedDeals: {len(affected) - 1} other affected deal(s) besides the OPENED one (not a clean fill)"
+        )
     order_id = root.get("dealId")
     stop_reported, stop_level = _stop_key(root, "")
     return Opening(

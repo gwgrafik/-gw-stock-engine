@@ -13,10 +13,12 @@ Zasady:
   429 ani błędzie połączenia (wynik nieznany rozstrzyga menedżer zleceń); jedyna powtórka to ta po 401 (żądanie nie
   zostało przetworzone); odpowiedź = tylko `dealReference` → `EntryAck`;
 - `confirm`: 404 `error.not-found.dealReference` → None (WYŁĄCZNIE ten kształt); dealStatus REJECTED →
-  `BrokerRejected(reason)`; ACCEPTED → migawka `OpenPosition` (id pozycji z `affectedDeals` `OPENED`, cena i
-  wielkość z potwierdzenia, `opened_at` z `createdDateUTC` pozycji, a gdy pozycji już nie ma: z wiersza otwarcia w
-  historii); każdy inny status lub kształt → `BrokerError` (nigdy odrzucenie); migawka jest zapamiętywana i nie
-  zmienia się po zamknięciu pozycji;
+  `BrokerRejected(reason)`; ACCEPTED → migawka `OpenPosition` (id pozycji z jedynego wpisu `affectedDeals`, który
+  musi mieć status `OPENED`, cena i wielkość z potwierdzenia, `opened_at` z `createdDateUTC` pozycji, a gdy pozycji
+  już nie ma: z wiersza otwarcia w historii); dodatkowy wpis `affectedDeals` (netting z inną pozycją, C15) albo
+  odczyt pozycji niezgodny z potwierdzeniem (dealId, epic, kierunek, wielkość, `workingOrderId`) → `BrokerError`
+  (wynik nieznany, nie czyste wykonanie); każdy inny status lub kształt → `BrokerError` (nigdy odrzucenie); migawka
+  jest zapamiętywana i nie zmienia się po zamknięciu pozycji;
 - stop pozycji: klucze `stopLevel`/`stopDistance` w odpowiedzi → wartość brokera (jawny `null` → brak stopu);
   kluczy brak (jak w oficjalnych przykładach) → zapis adaptera: poziom wykonania ∓ wysłane `stopDistance` (BUY
   minus, SELL plus; sprawdzony ze `stopLevel` potwierdzenia, jeśli je ma) albo poziom z potwierdzonego `set_stop`,
@@ -197,6 +199,7 @@ class TradingMixin:
                 ("dealId", row.deal_id == opening.deal_id),
                 ("epic", row.epic == opening.epic),
                 ("direction", row.side is opening.side),
+                ("size", row.size == opening.size),  # większa pozycja: zlecenie dołączyło do innej (C15)
                 # pozycja.workingOrderId == potwierdzenie.dealId (notatki §2.15, C2), gdy oba są podane
                 ("workingOrderId", None in (row.working_order_id, opening.order_id)
                  or row.working_order_id == opening.order_id),
