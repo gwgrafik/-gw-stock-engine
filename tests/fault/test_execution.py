@@ -825,26 +825,20 @@ async def test_guard_adopted_fill_leaves_exiting_blocked_flat_and_entering_alone
     assert position(journal) == record
 
 
-@pytest.mark.parametrize("failure", ["exiting_write", "position_left_open"])
-async def test_guard_adopted_fill_retries_when_the_exiting_write_of_its_flatten_fails(
-    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, monkeypatch, failure
+async def test_guard_adopted_fill_reruns_when_its_flatten_left_the_position_open(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, monkeypatch
 ):
+    # zapis EXITING, który zawodzi: test_a_guard_close_the_journal_cannot_record_escalates_to_hard_... (m5)
     fake.fill_size_factor = D("5")
     await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
-    if failure == "exiting_write":
-        failing = switchable(monkeypatch, journal, "upsert_position", JournalWriteError("disk full"))
-        with pytest.raises(JournalWriteError):  # zwykłe spłaszczenie: EXITING przed zamknięciem (spec §8)
-            await executor.guard_adopted_fill()
-        failing["on"] = False
-    else:  # spłaszczenie wróciło, a pozycja nadal OPEN (np. odmowa): znacznika nie ma, straż pobiegnie znowu
-        real = executor.flatten
+    real = executor.flatten
 
-        async def left_open(_position, _reason):
-            return None
+    async def left_open(_position, _reason):  # spłaszczenie wróciło, a pozycja nadal OPEN (np. odmowa)
+        return None
 
-        monkeypatch.setattr(executor, "flatten", left_open)
-        assert await executor.guard_adopted_fill() is True
-        monkeypatch.setattr(executor, "flatten", real)
+    monkeypatch.setattr(executor, "flatten", left_open)
+    assert await executor.guard_adopted_fill() is True
+    monkeypatch.setattr(executor, "flatten", real)
     assert "close_position" not in fake.calls and position(journal).state is P.OPEN
     assert journal.get_meta("fill_guarded:DEAL-1") is None  # straż pobiegnie znowu
     assert await executor.guard_adopted_fill() is True
@@ -2072,24 +2066,79 @@ async def test_a_close_refused_by_a_closed_market_is_not_remembered_as_sent(exec
     assert fake.calls[:1] == ["close_position"]  # zamknięty rynek to odmowa, nie niejasność: bez zbędnej listy
 
 
-async def test_journal_failure_alert_says_the_close_was_not_sent_when_a_mandatory_write_aborted_it(
-    executor, quote, rules, journal, fake, kill, notifier, monkeypatch
+async def test_journal_failure_alert_says_the_close_was_not_sent_when_none_reached_the_broker(
+    executor, signal, rules, journal, fake, kill, notifier, monkeypatch
 ):
-    fake.fill_slippage = D("10")  # straż poślizgu chce zamknąć
-    failing_raw(journal, monkeypatch, lambda s, p: s == "event" and "SLIPPAGE_GUARD" in p)  # wg możliwości: zawodzi
+    await entered(executor, signal, rules, fake)
+    journal.upsert_position(replace(position(journal), state=P.EXITING))  # wcześniejsze zamknięcie mogło dojść
+    kill.hard("HARD_STOP_FILE")
+    for _ in range(5):
+        fake.fail_next("list_positions", BrokerError("HTTP 502"))  # bez potwierdzenia nic nie wysyłamy
+    failing_raw(journal, monkeypatch, lambda s, p: s == "broker.list_positions")  # wg możliwości: zawodzi
+    await executor.emergency_flatten()
+    assert "close_position" not in fake.calls
+    [(level, message)] = alerts(notifier, "JOURNAL_WRITE_FAILED during emergency flatten")
+    assert level == "ERROR" and "the close was NOT sent" in message and "regardless" not in message
+
+
+async def test_a_journal_failure_after_the_guard_close_was_sent_does_not_escalate(
+    executor, adopting, signal, rules, journal, fake, clock, kill, risk_cfg, monkeypatch
+):
+    fake.fill_size_factor = D("5")
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    failing_raw(journal, monkeypatch, lambda s, p: s == "broker.close_position")  # surowa odpowiedź po wysyłce
+    with pytest.raises(JournalWriteError):  # zamknięcie poszło: zwykła ścieżka, uzgadnianie dogoni stan
+        await executor.guard_adopted_fill()
+    assert fake.calls.count("close_position") == 1 and "DEAL-1" not in fake.positions
+    assert kill.level() is KillLevel.SOFT and kill.reason() == "ENTRY_UNRESOLVED"  # bez HARD, bez awaryjnego
+    monkeypatch.undo()
+    clock.advance(risk_cfg.reconcile_interval_s)
+    await adopting.run_once()
+    assert position(journal) == PositionRecord("DE40", P.FLAT) and len(journal.trades()) == 1
+    assert fake.calls.count("close_position") == 1
+
+
+def failing_exiting_write(journal, monkeypatch):
+    """Zapis pozycji EXITING zawodzi zawsze (pełny dysk dla tego zapisu); pozostałe zapisy pozycji działają."""
     real = journal.upsert_position
 
     def upsert_position(rec):
         if rec.state is P.EXITING:
-            raise JournalWriteError("disk full")  # obowiązkowy EXITING przerywa spłaszczenie przed zamknięciem
+            raise JournalWriteError("disk full")
         return real(rec)
 
     monkeypatch.setattr(journal, "upsert_position", upsert_position)
-    rec = await executor.enter(EntrySignal(Side.BUY, D("30"), SIZE, quote), rules, DAY)
-    assert rec.state is O.CONFIRMED and "close_position" not in fake.calls
-    [(level, message)] = alerts(notifier, "JOURNAL_WRITE_FAILED during entry")
-    assert level == "ERROR" and "the close was NOT sent" in message and "regardless" not in message
-    assert kill.level() is KillLevel.SOFT and kill.reason() == "JOURNAL_WRITE_FAILED"
+
+
+@pytest.mark.parametrize("path", ["on_time_entry", "adopted"])
+async def test_a_guard_close_the_journal_cannot_record_escalates_to_hard_and_the_emergency_flatten(
+    executor, adopting, quote, signal, rules, journal, fake, clock, kill, risk_cfg, notifier, monkeypatch, path
+):
+    # ruling m5: ryzyko ponad limit nie czeka na dziennik; zwykłe spłaszczenie nie wyśle zamknięcia bez zapisu EXITING,
+    # więc straż przechodzi na ścieżkę awaryjną (zamknięcie niezależne od dziennika) z kill switchem HARD
+    if path == "on_time_entry":
+        fake.fill_slippage = D("10")
+        failing_exiting_write(journal, monkeypatch)
+        rec = await executor.enter(EntrySignal(Side.BUY, D("30"), SIZE, quote), rules, DAY)
+        assert rec.state is O.CONFIRMED
+    else:
+        fake.fill_size_factor = D("5")
+        await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+        failing_exiting_write(journal, monkeypatch)
+        assert await executor.guard_adopted_fill() is True
+    assert kill.level() is KillLevel.HARD and kill.reason() == "GUARD_EXIT_UNPERSISTED"
+    [(level, message)] = alerts(notifier, "GUARD_EXIT_UNPERSISTED: DEAL-1")  # (kill switch alarmuje osobno)
+    assert level == "ERROR" and "emergency flatten" in message
+    assert fake.calls.count("close_position") == 1 and "DEAL-1" not in fake.positions
+    assert len(journal.trades()) == 1 and position(journal).state is P.OPEN  # EXITING/FLAT dogoni uzgadnianie
+    assert journal.get_meta("fill_guarded:DEAL-1") is None
+    assert alerts(notifier, "the close was sent to the broker regardless")
+    monkeypatch.undo()
+    clock.advance(risk_cfg.reconcile_interval_s)
+    await adopting.run_once()  # deal zniknął, zamknięcie w historii: zaksięgowane już raz, teraz FLAT
+    assert position(journal) == PositionRecord("DE40", P.FLAT) and len(journal.trades()) == 1
+    fake.calls.clear()
+    assert await executor.guard_adopted_fill() is False and fake.calls == []
 
 
 async def test_journal_failure_alert_after_a_sent_close_says_it_was_sent(

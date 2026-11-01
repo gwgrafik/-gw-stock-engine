@@ -16,10 +16,13 @@ Niezmienniki (prawdziwe pieniądze):
   (> `slippage_guard_fraction` × stop) i ryzyko FAKTYCZNEJ wielkości i odległości stopu (> `max_loss_per_trade`);
   którakolwiek → zdarzenie i natychmiastowe spłaszczenie; dopiero potem znacznik `fill_guarded:<deal_id>` i zapis
   pomocniczy `entry_by_deal`. Zdarzenia straży, znacznik i zapis pomocniczy są „wg możliwości": ich awaria nie
-  zatrzymuje ochrony, tylko kończy się kill switchem miękkim JOURNAL_WRITE_FAILED;
+  zatrzymuje ochrony, tylko kończy się kill switchem miękkim JOURNAL_WRITE_FAILED; gdy dziennik nie zapisze EXITING
+  przed zamknięciem straży, pozycja ponad limit nie czeka: kill switch HARD GUARD_EXIT_UNPERSISTED i awaryjne
+  spłaszczenie (zamknięcie niezależne od dziennika);
 - te same straże dla wypełnienia przyjętego przez uzgadnianie (zgubione potwierdzenie, restart lub awaria dziennika po
   wysyłce): `guard_adopted_fill` po każdym udanym przebiegu uzgadniania (po zabezpieczeniu stopem), dla pozycji OPEN
-  bez znacznika `fill_guarded`; z kontekstem wejścia obie straże, bez niego ryzyko wielkości z odległości stopu
+  bez znacznika `fill_guarded` (przy HARD nic: zamyka awaryjne spłaszczenie tego taktu); z kontekstem wejścia obie
+  straże, bez niego ryzyko wielkości z odległości stopu
   pozycji i wartości punktu brokera. Znacznik (nie wynik uzgadniania) jest kluczem idempotencji: zapisany, gdy żadna
   straż nie zadziałała, albo po spłaszczeniu, które wyprowadziło pozycję z OPEN, więc przerwanie w dowolnym miejscu
   kończy się ponowieniem straży;
@@ -144,6 +147,7 @@ FILL_GUARD_NO_CONTEXT_PASS = "NO_CONTEXT_PASS"
 ENTRY_EXCEPTION = "ENTRY_EXCEPTION"
 ENTRY_UNRESOLVED = "ENTRY_UNRESOLVED"
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
+GUARD_EXIT_UNPERSISTED = "GUARD_EXIT_UNPERSISTED"  # straż chce zamknąć, a dziennik nie zapisze EXITING: HARD i awaryjne
 DAILY_LOSS = "DAILY_LOSS"
 DAILY_LOSS_2X = "DAILY_LOSS_2X"
 TOTAL_DRAWDOWN = "TOTAL_DRAWDOWN"
@@ -415,11 +419,35 @@ class Executor:
             )
             if causes:
                 closes_before = self._closes_started
-                await self.flatten(position, "FORCED")
+                await self._guard_flatten(position, causes, failures)
             self._mark_fill_guarded(position, causes, FILL_GUARD_PASS, failures)
             self._set_meta(META_ENTRY_BY_DEAL.format(rec.deal_id), rec.order_id, best_effort=failures)
         finally:
             self._report_journal_failures(failures, f"entry {rec.order_id}", closes_before=closes_before)
+
+    async def _guard_flatten(self, position: PositionRecord, causes: list[str], failures: list[str]) -> None:
+        """Spłaszczenie po zadziałaniu straży: zwykłe (EXITING przed zamknięciem, spec §8). Gdy zapis obowiązkowy
+        zawiedzie, zanim zamknięcie poszło (np. EXITING na pełnym dysku), pozycja ponad limit nie czeka na dziennik:
+        kill switch HARD GUARD_EXIT_UNPERSISTED, alarm i awaryjne spłaszczenie (zamknięcie niezależne od dziennika),
+        jak przy pozycji bez stopu. Błąd zapisu PO wysłanym zamknięciu propaguje się (kolejna próba zaczyna od listy)."""
+        closes_before = self._closes_started
+        try:
+            await self.flatten(position, "FORCED")
+        except JournalWriteError as exc:
+            if self._closes_started > closes_before:
+                raise
+            self._kill.hard(GUARD_EXIT_UNPERSISTED)
+            self._alert(
+                "ERROR",
+                f"{GUARD_EXIT_UNPERSISTED}: {position.deal_id} is over the risk limit ({' + '.join(causes)}) and the "
+                f"journal cannot record the exit ({type(exc).__name__}: {exc}); kill switch HARD, emergency flatten "
+                "(the close does not wait for the journal)",
+            )
+            self._event(
+                GUARD_EXIT_UNPERSISTED, best_effort=failures, deal_id=position.deal_id, causes=causes,
+                error=type(exc).__name__, message=str(exc),
+            )  # fmt: skip
+            await self.emergency_flatten()
 
     async def guard_adopted_fill(self) -> bool:
         """Straże po wypełnieniu (poślizg, ryzyko faktycznej wielkości) dla pozycji, której wejścia nie sprawdził
@@ -431,8 +459,9 @@ class Executor:
         wejścia: notowanie decyzji, żądana wielkość, odległość stopu i wartość punktu z kontekstu. Bez niego (albo
         z nieczytelnym): tylko ryzyko wielkości z odległości stopu pozycji i wartości punktu brokera; pozycja bez stopu
         czeka na zabezpieczenie, nieczytelne reguły brokera → alarm FILL_GUARD_UNAVAILABLE i ponowienie w następnym
-        przebiegu. Zadziałała straż → spłaszczenie FORCED. True: straż zadziałała i spłaszczenie ruszyło. Błąd zapisu
-        obowiązkowego spłaszczenia (EXITING) propaguje się; znacznika wtedy nie ma, więc straż pobiegnie znowu.
+        przebiegu. Zadziałała straż → spłaszczenie FORCED (`_guard_flatten`: gdy dziennik nie zapisze EXITING, HARD
+        i awaryjne spłaszczenie). True: straż zadziałała i spłaszczenie ruszyło. Błąd zapisu po wysłanym zamknięciu
+        propaguje się; znacznika wtedy nie ma, a pozycja jest EXITING (dalej prowadzi ją silnik, lista najpierw).
         """
         position = self._journal.current_position(self._epic)
         self._remember_deal(position)  # każdy przebieg: ostatni nasz deal dla awaryjnego spłaszczenia bez dziennika
@@ -471,7 +500,7 @@ class Executor:
             )  # fmt: skip
             if causes:
                 closes_before = self._closes_started
-                await self.flatten(position, "FORCED")
+                await self._guard_flatten(position, causes, failures)
             self._mark_fill_guarded(position, causes, passed, failures)
             if found is not None:
                 self._set_meta(META_ENTRY_BY_DEAL.format(deal_id), order_id, best_effort=failures)
