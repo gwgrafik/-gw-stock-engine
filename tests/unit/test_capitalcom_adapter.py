@@ -1088,8 +1088,8 @@ async def test_candles_5m_request_uses_utc_window_without_zone_suffix(server, br
     start = OPEN.astimezone(berlin)  # 09:00 w Berlinie = 08:00 UTC; parametr jest w UTC
     await broker.candles_5m("DE40", start, start + 2 * M5)
     [req] = server.requests("GET", "/prices/DE40")
-    # `to` = min(end + przesunięcie, teraz): nigdy w przyszłości; `max` z obciętego okna (2 sloty + zapas)
-    assert req.query == {"resolution": "MINUTE_5", "from": "2026-11-02T08:00:00", "to": "2026-11-02T08:10:00", "max": "4"}
+    # `to` = min(end + przesunięcie, teraz − 5 s): nigdy w przyszłości; `max` z obciętego okna (1 pełny slot + zapas)
+    assert req.query == {"resolution": "MINUTE_5", "from": "2026-11-02T08:00:00", "to": "2026-11-02T08:09:55", "max": "3"}
 
 
 async def test_candles_use_snapshot_time_utc_only(server, broker, clock):
@@ -1179,11 +1179,11 @@ async def test_candle_stamp_as_period_end_shifts_start_back_by_one_period(server
     monkeypatch.setattr(capitalcom, "CANDLE_STAMP_IS_PERIOD_START", False)
     await broker.login()
     server.set_candles("DE40", "MINUTE_5", [candle(OPEN + M5), candle(OPEN + 2 * M5), candle(OPEN + 3 * M5)])
-    advance_to(clock, OPEN + 2 * M5)
+    advance_to(clock, OPEN + 2 * M5 + timedelta(seconds=capitalcom.CANDLE_TO_SKEW_MARGIN_S))
     got = await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)
     assert [c.start for c in got] == [OPEN, OPEN + M5]  # znaczniki 08:05 i 08:10 = końce świec 08:00 i 08:05
     [req] = server.requests("GET", "/prices/DE40")
-    assert (req.query["from"], req.query["to"]) == ("2026-11-02T08:05:00", "2026-11-02T08:10:00")  # = teraz
+    assert (req.query["from"], req.query["to"]) == ("2026-11-02T08:05:00", "2026-11-02T08:10:00")  # = teraz − 5 s
     day = datetime(2026, 11, 1, tzinfo=UTC)
     server.set_candles("DE40", "DAY", [candle(day), candle(day + timedelta(days=1))])
     daily = await broker.daily_candles("DE40", 2)
@@ -1393,7 +1393,7 @@ async def test_opening_range_read_at_0810_never_asks_for_the_future(server, brok
     got = await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)
     assert [c.start for c in got] == [OPEN, OPEN + M5]
     [req] = server.requests("GET", "/prices/DE40")
-    assert (req.query["to"], req.status) == ("2026-11-02T08:10:00", 200)
+    assert (req.query["to"], req.status) == ("2026-11-02T08:09:55", 200)  # teraz − margines rozjazdu zegarów
 
 
 async def test_fake_server_really_rejects_a_future_to(server, broker, clock):
@@ -1404,16 +1404,73 @@ async def test_fake_server_really_rejects_a_future_to(server, broker, clock):
         await broker._request("GET", "/prices/DE40", params=params)
 
 
-@pytest.mark.parametrize("now", [OPEN + 2 * M5, OPEN + 2 * M5 + timedelta(seconds=7, microseconds=500)])
-async def test_flipped_stamp_semantics_never_asks_for_the_future(server, broker, clock, monkeypatch, now):
+@pytest.mark.parametrize(
+    ("now", "starts"),
+    [
+        (OPEN + 2 * M5, [OPEN]),  # świeca 08:05 (znacznik 08:10) przyjdzie w odczycie po upływie marginesu
+        (OPEN + 2 * M5 + timedelta(seconds=5), [OPEN, OPEN + M5]),
+        (OPEN + 2 * M5 + timedelta(seconds=7, microseconds=500), [OPEN, OPEN + M5]),
+    ],
+)
+async def test_flipped_stamp_semantics_never_asks_for_the_future(server, broker, clock, monkeypatch, now, starts):
     monkeypatch.setattr(capitalcom, "CANDLE_STAMP_IS_PERIOD_START", False)
     await broker.login()
     server.set_candles("DE40", "MINUTE_5", [candle(OPEN + M5), candle(OPEN + 2 * M5)])  # znaczniki = końce świec
     advance_to(clock, now)
     got = await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)
+    assert [c.start for c in got] == starts
+    [req] = server.requests("GET", "/prices/DE40")
+    newest = now - timedelta(seconds=capitalcom.CANDLE_TO_SKEW_MARGIN_S)
+    assert req.status == 200 and req.query["to"] == newest.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+@pytest.mark.parametrize(
+    ("now", "end", "to"),
+    [
+        (OPEN + 2 * M5 + timedelta(seconds=30), OPEN + 3 * M5, "2026-11-02T08:10:25"),  # teraz − 5 s
+        (OPEN + 2 * M5 + timedelta(seconds=7, microseconds=900_000), OPEN + 3 * M5, "2026-11-02T08:10:02"),
+        (OPEN + 6 * M5, OPEN + 2 * M5, "2026-11-02T08:10:00"),  # okno dawno minione: koniec okna bez zmian
+        (OPEN + 2 * M5 + timedelta(seconds=5), OPEN + 2 * M5, "2026-11-02T08:10:00"),  # granica marginesu
+    ],
+)
+async def test_candles_to_is_capped_with_a_skew_margin(server, broker, clock, now, end, to):
+    # zegar silnika może się spieszyć względem brokera: `to` najwyżej teraz − margines, więc broker nie dostaje pytania
+    # o swoją przyszłość (zachowanie przy takim pytaniu nieznane, C9)
+    await broker.login()
+    advance_to(clock, now)
+    await broker.candles_5m("DE40", OPEN, end)
+    [req] = server.requests("GET", "/prices/DE40")
+    assert (req.query["to"], req.status) == (to, 200)
+    assert capitalcom.CANDLE_TO_SKEW_MARGIN_S == 5  # stała procedury, nie parametr strategii
+
+
+async def test_candles_read_right_after_the_range_still_gets_its_candles(server, broker, clock):
+    await broker.login()
+    server.set_candles("DE40", "MINUTE_5", [candle(OPEN), candle(OPEN + M5)])
+    advance_to(clock, OPEN + M5 + timedelta(seconds=3))  # okno [08:05, 08:10) po obcięciu do 08:04:58 jest puste
+    assert await broker.candles_5m("DE40", OPEN + M5, OPEN + 2 * M5) == []
+    assert server.count("GET", "/prices/DE40") == 0  # bez zapytania
+    advance_to(clock, OPEN + 2 * M5)  # 08:10:00: `to` = 08:09:55, znaczniki 08:00 i 08:05 (początki świec) mieszczą się
+    got = await broker.candles_5m("DE40", OPEN, OPEN + 2 * M5)
     assert [c.start for c in got] == [OPEN, OPEN + M5]
     [req] = server.requests("GET", "/prices/DE40")
-    assert req.status == 200 and req.query["to"] == now.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+    assert (req.query["to"], req.query["max"]) == ("2026-11-02T08:09:55", "3")
+
+
+@pytest.mark.parametrize("now", [T0, OPEN + 10 * M5, OPEN + 1000 * M5])
+async def test_point_limit_is_checked_on_the_requested_window(server, broker, clock, now):
+    # limit 1000 świec dotyczy żądanego okna [start, end), nie okna obciętego do teraz: wynik nie zależy od zegara
+    await broker.login()
+    advance_to(clock, now)
+    with pytest.raises(ValueError, match="1001 candles, more than 1000"):
+        await broker.candles_5m("DE40", OPEN, OPEN + 999 * M5)
+    assert server.count("GET", "/prices/DE40") == 0
+    await broker.candles_5m("DE40", OPEN, OPEN + 998 * M5)  # 998 slotów + zapas 2 = dokładnie 1000: dozwolone
+    if now == T0:
+        assert server.count("GET", "/prices/DE40") == 0  # okno w przyszłości: nic nie wysłano
+    else:
+        [req] = server.requests("GET", "/prices/DE40")
+        assert int(req.query["max"]) <= 1000
 
 
 async def test_window_entirely_in_the_future_sends_nothing(server, broker, clock):

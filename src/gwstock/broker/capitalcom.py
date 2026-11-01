@@ -101,6 +101,8 @@ RATE_LIMIT_PAUSE_S = 1.0
 """Po HTTP 429 żadne żądanie nie wychodzi przez tyle sekund (kod i `Retry-After` poza logowaniem: C20)."""
 MAX_PRICE_POINTS = 1000
 """Górny limit parametru `max` w `GET /prices` (notatki §2.18); większy zakres to błąd wywołującego."""
+CANDLE_TO_SKEW_MARGIN_S = 5
+"""Margines na rozjazd zegara silnika i brokera (stała procedury): `to` w `GET /prices` najwyżej teraz − 5 s (C9)."""
 
 CANDLE_STAMP_IS_PERIOD_START = True
 """Czy `snapshotTimeUTC` świecy to POCZĄTEK jej okresu (True) czy koniec (False). NIEPOTWIERDZONE (C9).
@@ -831,11 +833,13 @@ class CapitalComBroker(TradingMixin):
         """Zakończone świece 5-minutowe z `start <= c.start < end`, rosnąco (`GET /prices?resolution=MINUTE_5`).
 
         Szukane znaczniki to półotwarte [start + przesunięcie, end + przesunięcie), więc `from` = start + przesunięcie
-        i `to` = end + przesunięcie wystarczają bez względu na to, czy broker traktuje `to` włącznie (C9). `to` jest
-        dodatkowo obcięte do teraz (pełne sekundy): pytanie o przyszłość mogłoby zostać odrzucone, a zakończona świeca
-        ma znacznik ≤ teraz − 5 min (≤ teraz przy znaczniku = koniec okresu; przy wyłącznym `to` świeca o znaczniku
-        równym dokładnie teraz przyjdzie w następnym odczycie). Okno puste po obcięciu → [] bez zapytania. Wynik jest
-        filtrowany lokalnie po `snapshotTimeUTC`; pusta lista jest poprawna (świec jeszcze nie ma).
+        i `to` = end + przesunięcie wystarczają bez względu na to, czy broker traktuje `to` włącznie (C9). Limit
+        `MAX_PRICE_POINTS` jest sprawdzany na ŻĄDANYM oknie (wynik nie zależy od zegara). `to` jest dodatkowo obcięte
+        do teraz − `CANDLE_TO_SKEW_MARGIN_S` (pełne sekundy): pytanie o przyszłość brokera (zegar silnika może się
+        spieszyć) mogłoby zostać odrzucone, a zakończona świeca ma znacznik ≤ teraz − 5 min (≤ teraz przy znaczniku =
+        koniec okresu; wtedy świeca zakończona przed chwilą przyjdzie w odczycie po upływie marginesu). Okno puste po
+        obcięciu → [] bez zapytania; `max` liczony z okna obciętego. Wynik jest filtrowany lokalnie po
+        `snapshotTimeUTC`; pusta lista jest poprawna (świec jeszcze nie ma).
         """
         path = f"/prices/{_check_epic(epic)}"
         start, end = _utc_arg("start", start), _utc_arg("end", end)
@@ -843,12 +847,16 @@ class CapitalComBroker(TradingMixin):
             return []
         shift = _stamp_shift(_FIVE_MINUTES)
         first = (start + shift).replace(microsecond=0)
-        last = min(end + shift, self._clock.now_utc()).replace(microsecond=0)
+        requested = ((end + shift).replace(microsecond=0) - first) // _FIVE_MINUTES + 2
+        if requested > MAX_PRICE_POINTS:
+            raise ValueError(
+                f"candles_5m: the range needs {requested} candles, more than {MAX_PRICE_POINTS} per request"
+            )
+        newest = self._clock.now_utc() - timedelta(seconds=CANDLE_TO_SKEW_MARGIN_S)
+        last = min(end + shift, newest).replace(microsecond=0)
         if last < first:
             return []
         points = (last - first) // _FIVE_MINUTES + 2
-        if points > MAX_PRICE_POINTS:
-            raise ValueError(f"candles_5m: the range needs {points} candles, more than {MAX_PRICE_POINTS} per request")
         params = {"resolution": "MINUTE_5", "from": _api_time(first), "to": _api_time(last), "max": str(points)}
         payload = await self._request("GET", path, params=params)
         candles = self._candles(path, epic, payload, _FIVE_MINUTES, on_grid=True)
