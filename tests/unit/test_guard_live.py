@@ -228,6 +228,7 @@ NOT_CREATION = {
     "echo-to-stderr": 'echo "@N@ missing" >&2',
     "subprocess-rm": "subprocess.run(['rm', '-f', 'data/@N@'])",
     "touch-other-file": "(d / 'x').touch()\nexists = (d / '@N@').exists()",
+    "content-is-not-the-file": "name = (d / '@N@').read_text().strip()\n(d / name).touch()",
 }
 
 
@@ -695,7 +696,8 @@ def test_polish_text_and_unicode_content_are_handled():
 
 def test_the_hook_does_not_depend_on_the_working_directory(tmp_path):
     done = run_hook(write_event("/work/src/gwstock/x.py", "touch data/ARM_LIVE\n"), cwd=tmp_path)
-    assert done.returncode == 2
+    assert done.returncode == 2 and "ZABLOKOWANO" in done.stderr and "line 1" in done.stderr
+    assert run_hook(write_event("/work/src/gwstock/x.py", "x = 1\n"), cwd=tmp_path).returncode == 0
 
 
 def test_running_on_a_terminal_without_input_prints_usage_and_does_not_block():
