@@ -672,12 +672,13 @@ class Executor:
             sent_before = deal_id in self._memory.closes_sent
             if current.state is _P.OPEN:
                 current = self._to_exiting(current, replace(current, state=_P.EXITING), must)
-                recheck = sent_before and not verified  # dziennik mówił OPEN, choć zamknięcie już poszło (zapis zawiódł)
+                recheck = sent_before and not verified  # dziennik mówił OPEN, choć zamknięcie już poszło
             else:
                 recheck = not verified
             if recheck:
                 # EXITING z wcześniejszej próby (przerwanie, odmowa, nieczytelna lista) albo zamknięcie wysłane już
-                # w tym procesie: mogło dojść, więc zanim wyślemy kolejne, broker musi potwierdzić, że pozycja nadal jest
+                # w tym procesie (zapis EXITING zawiódł): mogło dojść, więc zanim wyślemy kolejne, broker musi
+                # potwierdzić, że pozycja nadal jest
                 read_ok, at_broker, error = await self._find_at_broker(deal_id, timeout, must)
                 if not read_ok:
                     self._alert("ERROR", f"FLATTEN_UNVERIFIED {deal_id}: position list unreadable before a retry")

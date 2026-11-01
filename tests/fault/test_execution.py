@@ -627,7 +627,8 @@ def make_reconciler(journal, fake, clock, kill, risk_cfg, executor, mgr):
 
 async def adopted_entry(executor, reconciler, signal, rules, journal, fake, clock, risk_cfg):
     """Wejście przyjęte, odpowiedź zgubiona, lista nieczytelna przez 30 s (UNKNOWN CHECKS_INCOMPLETE, kill miękki
-    ENTRY_UNRESOLVED); uzgadnianie przyjmuje pozycję z danymi brokera. Straże wejścia nie biegły; czyści `fake.calls`."""
+    ENTRY_UNRESOLVED); uzgadnianie przyjmuje pozycję z danymi brokera. Straże wejścia nie biegły; czyści
+    `fake.calls`."""
     fake.fail_next("open_position", BrokerTimeout(), applied=True)
     for _ in range(3):
         fake.fail_next("list_positions", BrokerError("HTTP 502"))
@@ -690,7 +691,9 @@ async def test_guard_adopted_fill_closes_a_slipped_fill_using_the_decision_quote
 
 
 @pytest.mark.parametrize("fill", ["pass", "closed"])
-async def test_guard_adopted_fill_is_idempotent(executor, adopting, signal, rules, journal, fake, clock, risk_cfg, fill):
+async def test_guard_adopted_fill_is_idempotent(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, fill
+):
     if fill == "closed":
         fake.fill_size_factor = D("5")
     await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
@@ -988,9 +991,12 @@ async def test_protection_still_goes_hard_when_the_list_shows_no_or_a_derived_st
     for _ in range(3):
         fake.fail_next("set_stop", BrokerTimeout())  # nic nie ustawione
     if broker_view in ("derived_stop", "other_level"):
-        stop = (STOP, True) if broker_view == "derived_stop" else (STOP - 1, False)
-        fake.on_call("list_positions", lambda: fake.positions.update(
-            {"DEAL-1": replace(fake.positions["DEAL-1"], stop_level=stop[0], stop_derived=stop[1])}), once=True)  # fmt: skip
+        level, derived = (STOP, True) if broker_view == "derived_stop" else (STOP - 1, False)
+
+        def broker_stop() -> None:
+            fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=level, stop_derived=derived)
+
+        fake.on_call("list_positions", broker_stop, once=True)
     elif broker_view == "list_unreadable":
         fake.fail_next("list_positions", BrokerError("HTTP 502"))
     elif broker_view == "budget_spent":  # każda próba czeka 1.75 s: z budżetu 10 s zostaje 0.5 s (< 1 s)
