@@ -502,6 +502,17 @@ async def test_bind_account_needs_overwrite_to_replace_an_existing_binding(unbou
     assert "OVERWRITE" in owner.prompts[1]
 
 
+@pytest.mark.parametrize("content", [{"account_id": "ACC-1", "note": "x"}, {"account_id": "ACC-1", "account": "ACC-0"}])
+async def test_bind_account_treats_a_binding_file_with_extra_keys_as_unreadable(unbound, data_dir, content):
+    # ruling 4 / addendum 7.3: dodatkowe klucze w data/account.json to nie powiązanie (jak w czytniku silnika)
+    (data_dir / "account.json").write_text(json.dumps(content))
+    lines: list[str] = []
+    owner = Owner(data_dir, "2", "OVERWRITE", "CC-1")  # ten sam rachunek, ale plik trzeba jawnie zastąpić
+    assert await cli.bind_account(unbound, owner, data_dir, out=lines.append) == "ACC-1"
+    assert "Currently bound: <unreadable>" in lines and "OVERWRITE" in owner.prompts[1]
+    assert json.loads((data_dir / "account.json").read_text()) == {"account_id": "ACC-1"}
+
+
 async def test_bind_account_rebinding_the_same_account_needs_only_the_confirmation(unbound, data_dir):
     (data_dir / "account.json").write_text(json.dumps({"account_id": "ACC-1"}))
     owner = Owner(data_dir, "2", "CC-1")
@@ -658,6 +669,44 @@ async def test_status_shows_mode_kill_position_orders_heartbeat_decision_and_tra
     assert "kill switch: NONE" in text and "position DE40: OPEN deal DEAL-1 BUY size 0.001" in text
     assert "unresolved orders: 0" in text and "heartbeat: 5 s ago, engine mode live, state MANAGING" in text
     assert "last decision 2026-11-02: SIGNAL" in text and "first candle 2026-11-02T08:00:00+00:00" in text
+    assert "trades today (2026-11-02): 0" in text
+
+
+def corrupt_order_row(path: Path) -> None:
+    """Wiersz zlecenia z nieznanym stanem (np. po ręcznej edycji): `unresolved_orders` rzuca JournalCorruptError."""
+    import sqlite3
+
+    raw = sqlite3.connect(path)
+    raw.execute(
+        "INSERT INTO orders VALUES ('gws-20261102-US500-1-entry', 'US500', 'BUY', '1', '1', 'WAT', NULL, NULL, "
+        "'2026-11-02T08:05:00+00:00', '2026-11-02T08:05:00+00:00', '')"
+    )
+    raw.commit()
+    raw.close()
+
+
+@pytest.mark.parametrize("broken", ["order_row", "kill_state"])
+async def test_status_prints_unreadable_for_a_corrupt_part_and_shows_the_rest(
+    make_engine, broker, clock, data_dir, config_dir, monkeypatch, broken
+):
+    # addendum 7b: jeden uszkodzony wiersz (dowolny instrument) nie może urwać całego `status`
+    monkeypatch.setitem(sys.modules, "gwstock.prereg", None)
+    make_engine.journal_path = data_dir / "journal.sqlite"
+    engine = make_engine(Mode.LIVE)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    engine.kill.soft("STOP_FILE")
+    if broken == "order_row":
+        corrupt_order_row(data_dir / "journal.sqlite")
+    else:
+        corrupt_kill_state(data_dir)
+    lines: list[str] = []
+    assert cli.status(config_dir, data_dir, out=lines.append, now=clock.now_utc()) == 0
+    text = "\n".join(lines)
+    part = "unresolved orders: UNREADABLE (JournalCorruptError" if broken == "order_row" else (
+        "kill switch: UNREADABLE (JournalCorruptError")  # fmt: skip
+    assert part in text and "journal repair" in text
+    assert "position DE40: OPEN deal DEAL-1" in text and "last decision 2026-11-02: SIGNAL" in text
     assert "trades today (2026-11-02): 0" in text
 
 
@@ -867,6 +916,54 @@ def test_clear_kill_refuses_when_nothing_is_engaged_or_a_stop_file_exists(data_d
     lines.clear()
     assert cli.clear_kill(data_dir, "wlasciciel", Typed(), out=lines.append, clock=clock) == 1
     assert any("NONE" in line for line in lines)
+
+
+def test_clear_kill_shows_the_stored_state_when_the_first_read_failed_and_reports_the_merged_level(
+    data_dir, clock, monkeypatch
+):
+    # addendum 7.1: zapisany HARD, pierwszy odczyt stanu zawodzi raz: właściciel nie może zobaczyć „SOFT
+    # (KILL_STATE_UNREADABLE)", wpisać CLEAR i po cichu zdjąć HARD
+    soft_killed_journal(data_dir, clock, level="hard", reason="HARD_STOP_FILE")
+    real = Journal.kill_state
+    calls = {"n": 0}
+
+    def flaky(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise JournalReadError("database is locked")
+        return real(self)
+
+    monkeypatch.setattr(Journal, "kill_state", flaky)
+    lines: list[str] = []
+    assert cli.clear_kill(data_dir, "wlasciciel", Typed("CLEAR"), out=lines.append, clock=clock) == 0
+    [state] = [line for line in lines if line.startswith("kill switch: ")]
+    assert state.startswith("kill switch: HARD (HARD_STOP_FILE, since ")
+    assert "cleared by wlasciciel (was HARD: HARD_STOP_FILE)" in lines[-1]
+
+
+def corrupt_kill_state(data_dir: Path) -> None:
+    import sqlite3
+
+    raw = sqlite3.connect(data_dir / "journal.sqlite")
+    raw.execute("UPDATE kill_state SET level = 7")  # poziom spoza KillLevel: każdy odczyt to JournalCorruptError
+    raw.commit()
+    raw.close()
+
+
+def test_clear_kill_refuses_a_permanently_unreadable_kill_state_and_says_only_a_repair_helps(data_dir, clock):
+    # addendum 7.2: uszkodzony wiersz stanu: clear() odmawia zawsze (fail closed), a CLI mówi dlaczego i co dalej
+    soft_killed_journal(data_dir, clock, level="hard", reason="HARD_STOP_FILE")
+    corrupt_kill_state(data_dir)
+    lines: list[str] = []
+    owner = Typed()
+    assert cli.clear_kill(data_dir, "wlasciciel", owner, out=lines.append, clock=clock) == 1
+    assert owner.prompts == [] and lines[-1].startswith("odmowa: zapisanego stanu kill switcha nie da się odczytać")
+    assert "JournalCorruptError" in lines[-1] and "naprawa dziennika" in lines[-1] and "nic nie zmieniono" in lines[-1]
+    import sqlite3
+
+    raw = sqlite3.connect(data_dir / "journal.sqlite")
+    assert raw.execute("SELECT level FROM kill_state").fetchone() == (7,)  # nic nie nadpisano
+    raw.close()
 
 
 def test_clear_kill_command_refuses_while_the_engine_runs(monkeypatch, tmp_path, capsys):

@@ -185,14 +185,18 @@ class BindAccountError(Exception):
 
 
 def _read_binding(path: Path) -> str | None:
+    """Istniejące powiązanie; `<unreadable>` dla pliku, którego silnik nie przyjmie (zły JSON, brak `account_id`, inne
+    klucze obok niego: jak `config.load_runtime`), więc zmiana wymaga jawnego OVERWRITE."""
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        value = data.get("account_id") if isinstance(data, dict) else None
     except (OSError, ValueError):
         return "<unreadable>"
-    return value if isinstance(value, str) and value else "<unreadable>"
+    if not isinstance(data, dict) or set(data) != {"account_id"}:
+        return "<unreadable>"
+    value = data["account_id"]
+    return value if isinstance(value, str) and value.strip() else "<unreadable>"
 
 
 def _write_binding(path: Path, account_id: str) -> None:
@@ -635,8 +639,9 @@ def _history_latency(journal: Any, deal_id: str, since: datetime) -> float | Non
 
 def status(config_dir: Path, data_dir: Path, out: Callable[[str], None] = print, now: datetime | None = None) -> int:
     """Stan tylko do odczytu: tryb z plików i powód, kill switch, pozycja i zlecenia, tętno, ostatnia decyzja,
-    dzisiejsze transakcje. Niczego nie zapisuje (dziennik otwierany tylko, gdy istnieje)."""
-    from gwstock.calendar import XETRA, ExchangeCalendar
+    dzisiejsze transakcje. Niczego nie zapisuje (dziennik otwierany tylko, gdy istnieje). Część dziennika, której nie
+    da się odczytać (np. uszkodzony wiersz zlecenia dowolnego instrumentu), to linia UNREADABLE, a reszta stanu i tak
+    jest wypisana."""
     from gwstock.journal import Journal
 
     config_dir, data_dir = Path(config_dir), Path(data_dir)
@@ -665,45 +670,77 @@ def status(config_dir: Path, data_dir: Path, out: Callable[[str], None] = print,
     if not path.exists():
         out("journal: none yet")
         return 0
-    journal = Journal.open_readonly(str(path))  # status nigdy nie pisze (sqlite mode=ro)
+    journal = Journal.open_readonly(str(path))  # status nigdy nie pisze (sqlite tylko do odczytu)
     try:
-        ks = journal.kill_state()
-        out(f"kill switch: {ks.level.name}" + (f" ({ks.reason}, since {ks.since.isoformat()})" if ks.since else ""))
-        pos = journal.current_position(epic)
-        if pos is None or pos.state is PositionState.FLAT:
-            out(f"position {epic}: FLAT")
-        else:
-            out(f"position {epic}: {pos.state.value} deal {pos.deal_id} {pos.side.value if pos.side else '?'} size "
-                f"{pos.size} open {pos.open_level} stop {pos.stop_level}")  # fmt: skip
-        orders = journal.unresolved_orders()
-        out(f"unresolved orders: {len(orders)}")
-        for o in orders:
-            out(f"  {o.order_id} {o.state.value} {o.side.value} {o.size} ({o.note})")
-        decisions = [json.loads(e.payload) for e in journal.events("decision")]
-        decisions = [d for d in decisions if d.get("event") == "DECISION"]
-        if decisions:
-            d = decisions[-1]
-            candle = d.get("first_candle") or {}
-            ohlc = " ".join(f"{k[0].upper()} {candle.get(k)}" for k in ("open", "high", "low", "close"))
-            out(f"last decision {d.get('day')}: {d.get('outcome')} {d.get('skip_reason') or ''} mode {d.get('mode')} "
-                f"first candle {candle.get('start')} {ohlc}")  # fmt: skip
-        else:
-            out("last decision: none")
-        sessions = len(journal.trades()) - journal.count_smoke_trades()
-        l1 = (data_dir / L1_PASSED_FILE).exists()
-        out(f"live sessions (trades without smoke): {sessions}; {L1_PASSED_FILE}: {'yes' if l1 else 'no'}")
-        calendar = ExchangeCalendar(XETRA)
-        today = calendar.to_local(now).date()
-        booked = list(zip(journal.trades(), journal.trade_flags(), strict=True))
-        todays = [(t, flags) for t, flags in booked if calendar.to_local(t.exit_ts).date() == today]
-        out(f"trades today ({today}): {len(todays)}")
-        for t, flags in todays:
-            mark = " [ESTIMATED]" if "ESTIMATED" in (flags or "").split() else ""  # szacunek właściciela, nie pomiar
-            out(f"  {t.side.value} {t.size} entry {t.entry_fill} exit {t.exit_fill} net {t.net_pnl} ({t.exit_reason})"
-                + mark)  # fmt: skip
+        parts = (
+            ("kill switch", _status_kill), (f"position {epic}", _status_position),
+            ("unresolved orders", _status_orders), ("last decision", _status_decision),
+            ("live sessions", _status_sessions), ("trades today", _status_trades),
+        )  # fmt: skip
+        for label, part in parts:
+            try:
+                part(journal, epic, data_dir, now, out)
+            except (JournalError, ValueError) as exc:  # uszkodzony wiersz nie urywa reszty stanu
+                out(f"{label}: UNREADABLE ({type(exc).__name__}: {exc}); entries stay blocked while the journal cannot "
+                    "be read, exits are unaffected; only a journal repair or the owner's decision with Claude helps "
+                    "(runbook, section 9)")  # fmt: skip
     finally:
         journal.close()
     return 0
+
+
+def _status_kill(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+    ks = journal.kill_state()
+    out(f"kill switch: {ks.level.name}" + (f" ({ks.reason}, since {ks.since.isoformat()})" if ks.since else ""))
+
+
+def _status_position(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+    pos = journal.current_position(epic)
+    if pos is None or pos.state is PositionState.FLAT:
+        out(f"position {epic}: FLAT")
+    else:
+        out(f"position {epic}: {pos.state.value} deal {pos.deal_id} {pos.side.value if pos.side else '?'} size "
+            f"{pos.size} open {pos.open_level} stop {pos.stop_level}")  # fmt: skip
+
+
+def _status_orders(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+    orders = journal.unresolved_orders()
+    out(f"unresolved orders: {len(orders)}")
+    for o in orders:
+        out(f"  {o.order_id} {o.state.value} {o.side.value} {o.size} ({o.note})")
+
+
+def _status_decision(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+    decisions = [json.loads(e.payload) for e in journal.events("decision")]
+    decisions = [d for d in decisions if d.get("event") == "DECISION"]
+    if not decisions:
+        out("last decision: none")
+        return
+    d = decisions[-1]
+    candle = d.get("first_candle") or {}
+    ohlc = " ".join(f"{k[0].upper()} {candle.get(k)}" for k in ("open", "high", "low", "close"))
+    out(f"last decision {d.get('day')}: {d.get('outcome')} {d.get('skip_reason') or ''} mode {d.get('mode')} "
+        f"first candle {candle.get('start')} {ohlc}")  # fmt: skip
+
+
+def _status_sessions(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+    sessions = len(journal.trades()) - journal.count_smoke_trades()
+    l1 = (data_dir / L1_PASSED_FILE).exists()
+    out(f"live sessions (trades without smoke): {sessions}; {L1_PASSED_FILE}: {'yes' if l1 else 'no'}")
+
+
+def _status_trades(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+    from gwstock.calendar import XETRA, ExchangeCalendar
+
+    calendar = ExchangeCalendar(XETRA)
+    today = calendar.to_local(now).date()
+    booked = list(zip(journal.trades(), journal.trade_flags(), strict=True))
+    todays = [(t, flags) for t, flags in booked if calendar.to_local(t.exit_ts).date() == today]
+    out(f"trades today ({today}): {len(todays)}")
+    for t, flags in todays:
+        mark = " [ESTIMATED]" if "ESTIMATED" in (flags or "").split() else ""  # szacunek właściciela, nie pomiar
+        out(f"  {t.side.value} {t.size} entry {t.entry_fill} exit {t.exit_fill} net {t.net_pnl} ({t.exit_reason})"
+            + mark)  # fmt: skip
 
 
 def health(data_dir: Path, now: datetime | None = None, max_age_s: float = HEALTH_MAX_AGE_S) -> int:
@@ -727,14 +764,16 @@ def clear_kill(
 ) -> int:
     """Zdjęcie kill switcha przez właściciela (silnik zatrzymany: blokada instancji bierze wywołujący).
 
-    Odmowa (1): brak dziennika albo poziom NONE, istniejący `data/STOP` lub `data/HARD_STOP`. Wypisuje poziom,
-    przyczynę i ostatnie alarmy; bez wpisanego `CLEAR` nic nie zmienia (2). `KillSwitch.clear` zapisuje stan NONE
-    i wiersz audytu `kill.audit` (CLEAR, kto). 0: zdjęty.
+    Odmowa (1): brak dziennika albo poziom NONE, istniejący `data/STOP` lub `data/HARD_STOP`, zapisany stan
+    nieczytelny (uszkodzony wiersz: tylko naprawa dziennika; mógł tam być HARD). Wypisuje poziom ZAPISANY w dzienniku
+    (gdy odczyt przy starcie przełącznika zawiódł chwilowo, czyta jeszcze raz, żeby właściciel nie zdjął HARD, widząc
+    zastępczy SOFT KILL_STATE_UNREADABLE), przyczynę i ostatnie alarmy; bez wpisanego `CLEAR` nic nie zmienia (2).
+    `KillSwitch.clear` zapisuje stan NONE i wiersz audytu `kill.audit` (CLEAR, kto). 0: zdjęty.
     """
     from gwstock.clock import SystemClock
     from gwstock.journal import Journal
     from gwstock.notify import FileNotifier
-    from gwstock.risk import KillSwitch
+    from gwstock.risk import KILL_STATE_UNREADABLE, KillSwitch
 
     data_dir = Path(data_dir)
     path = data_dir / JOURNAL_FILE
@@ -744,7 +783,29 @@ def clear_kill(
     clock = clock if clock is not None else SystemClock()
     journal = Journal.open(str(path))
     try:
-        kill = KillSwitch(journal, clock, data_dir, FileNotifier(data_dir / ALERTS_FILE, clock))
+        notifier = FileNotifier(data_dir / ALERTS_FILE, clock)
+        kill = KillSwitch(journal, clock, data_dir, notifier)
+        try:
+            stored = journal.kill_state()
+            if kill.reason() == KILL_STATE_UNREADABLE and (stored.level, stored.reason) != (
+                KillLevel.SOFT, KILL_STATE_UNREADABLE
+            ):  # fmt: skip
+                # odczyt przy starcie zawiódł, a teraz działa: pokazujemy (i zdejmujemy) ZAPISANY stan, np. HARD,
+                # a nie zastępczy SOFT, który by go po ciemku przykrył
+                kill = KillSwitch(journal, clock, data_dir, notifier)
+                stored = journal.kill_state()
+        except JournalError as exc:
+            out(f"odmowa: zapisanego stanu kill switcha nie da się odczytać ({type(exc).__name__}: {exc}); "
+                "clear-kill go nie zdejmie po ciemku (mógł tam być HARD), a silnik zostaje bez nowych wejść (wyjścia "
+                "działają); jeśli ponowne uruchomienie clear-kill da to samo, wyjście daje tylko naprawa dziennika: "
+                "zapytaj Claude; nic nie zmieniono")  # fmt: skip
+            return 1
+        if kill.reason() == KILL_STATE_UNREADABLE and (stored.level, stored.reason) != (
+            KillLevel.SOFT, KILL_STATE_UNREADABLE
+        ):  # fmt: skip
+            out("odmowa: odczyt stanu kill switcha zawodzi z przerwami, więc pokazany stan może nie być zapisanym; "
+                "uruchom clear-kill ponownie; nic nie zmieniono")  # fmt: skip
+            return 1
         level, reason = kill.level(), kill.reason()
         if level is KillLevel.NONE:
             out("kill switch: NONE; nothing to clear")
@@ -754,7 +815,7 @@ def clear_kill(
             out(f"refused: data/{present[0]} exists; remove it first, otherwise the engine engages the kill switch "
                 "again at once")  # fmt: skip
             return 1
-        since = journal.kill_state().since
+        since = stored.since
         out(f"kill switch: {level.name} ({reason}" + (f", since {since.isoformat()})" if since else ")"))
         out("last alerts:")
         for line in _tail(data_dir / ALERTS_FILE, 10):
