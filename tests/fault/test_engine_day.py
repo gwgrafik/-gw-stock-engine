@@ -699,6 +699,29 @@ async def test_reconcile_once_runs_no_fill_guard_after_a_skipped_pass_or_a_shutd
 
 
 
+async def test_downgrade_keeps_the_executor_memory_of_sent_closes(engine, broker, clock, monkeypatch):
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    assert position(engine).state is P.OPEN
+    engine.kill.hard("HARD_STOP_FILE")
+    real_upsert = engine.journal.upsert_position
+    monkeypatch.setattr(engine.journal, "upsert_position", lambda *_a: (_ for _ in ()).throw(JournalWriteError("full")))
+    broker.fail_next("close_position", BrokerTimeout(), applied=False)  # zamknięcie wysłane, wynik nieznany
+    for _ in range(5):
+        broker.fail_next("list_positions", BrokerError("HTTP 502"))
+    await engine.executor.emergency_flatten()
+    assert broker.calls.count("close_position") == 1 and position(engine).state is P.OPEN  # EXITING nie zapisane
+    old = engine.executor
+    engine._downgrade("ARM_LIVE removed by the owner")  # nowy wykonawca (dry_run) w tym samym procesie
+    assert engine.executor is not old and engine.executor.live is False
+    assert engine.reconciler.booker is engine.executor
+    monkeypatch.setattr(engine.journal, "upsert_position", real_upsert)
+    broker.calls.clear()
+    await engine.executor.flatten(position(engine), "FORCED")
+    assert broker.calls[:2] == ["list_positions", "close_position"]  # najpierw lista, nigdy wysyłka na ślepo
+    assert broker.calls.count("close_position") == 1 and position(engine) == PositionRecord("DE40", P.FLAT)
+
+
 async def test_startup_restores_loss_limit_kills_from_the_journal(make_engine, broker, clock):
     engine = make_engine(Mode.LIVE)
     yesterday_exit = datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc)  # piątek

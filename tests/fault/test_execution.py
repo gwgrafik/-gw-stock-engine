@@ -1734,6 +1734,62 @@ async def test_the_emergency_close_is_sent_even_when_the_exiting_write_fails(
     assert alerts(notifier, "JOURNAL_WRITE_FAILED") and kill.level() is KillLevel.HARD
 
 
+@pytest.mark.parametrize("after_close", ["unreadable", "listed"])
+async def test_emergency_flatten_never_resends_a_close_without_a_list_read_when_the_exiting_write_failed(
+    executor, signal, rules, journal, fake, kill, monkeypatch, after_close
+):
+    await entered(executor, signal, rules, fake)
+    kill.hard("HARD_STOP_FILE")
+    switchable(monkeypatch, journal, "upsert_position", JournalWriteError("disk full"))  # EXITING przepada
+    if after_close == "unreadable":
+        fake.fail_next("close_position", BrokerTimeout(), applied=True)  # zamknięte, odpowiedź zgubiona
+        fake.fail_next("list_positions", BrokerError("HTTP 502"))  # próba 1: nie wiadomo, czy zamknięto
+    else:
+        fake.fail_next("close_position", BrokerTimeout(), applied=False)  # lista po nim pokazuje pozycję
+    await executor.emergency_flatten()
+    if after_close == "unreadable":
+        # dziennik nadal mówi OPEN, ale zamknięcie już poszło: próba 2 zaczyna od listy (pozycji nie ma), nie od wysyłki
+        assert fake.calls[:3] == ["close_position", "list_positions", "list_positions"]
+        assert fake.calls.count("close_position") == 1
+    else:  # lista sprzed sekundy potwierdziła pozycję: próba 2 zamyka bez kolejnego odczytu
+        assert fake.calls[:3] == ["close_position", "list_positions", "close_position"]
+    assert "DEAL-1" not in fake.positions and len(journal.trades()) == 1
+
+
+@pytest.mark.parametrize("next_tick", ["emergency", "flatten"])
+async def test_a_close_sent_on_an_earlier_tick_is_never_resent_blind(
+    executor, signal, rules, journal, fake, kill, monkeypatch, next_tick
+):
+    await entered(executor, signal, rules, fake)
+    kill.hard("HARD_STOP_FILE")
+    failing = switchable(monkeypatch, journal, "upsert_position", JournalWriteError("disk full"))
+    fake.fail_next("close_position", BrokerTimeout(), applied=False)  # nie zamknięte, odpowiedź zgubiona
+    for _ in range(5):
+        fake.fail_next("list_positions", BrokerError("HTTP 502"))  # ten takt nic nie potwierdzi
+    await executor.emergency_flatten()
+    assert fake.calls.count("close_position") == 1 and position(journal).state is P.OPEN  # EXITING nie zapisane
+    failing["on"] = False  # dysk wrócił; następny takt
+    fake.calls.clear()
+    if next_tick == "emergency":
+        await executor.emergency_flatten()
+    else:
+        await executor.flatten(position(journal), "FORCED")
+    # zamknięcie wysłane wcześniej w tym procesie: najpierw lista (pozycja nadal jest), dopiero potem zamknięcie
+    assert fake.calls[:2] == ["list_positions", "close_position"] and fake.calls.count("close_position") == 1
+    assert position(journal) == PositionRecord("DE40", P.FLAT) and len(journal.trades()) == 1
+
+
+async def test_a_close_refused_by_a_closed_market_is_not_remembered_as_sent(executor, signal, rules, journal, fake):
+    await entered(executor, signal, rules, fake)
+    fake.set_market_closed(True)
+    assert await executor.flatten(position(journal), "FORCED") is None  # EXITING: następna próba i tak zacznie od listy
+    fake.set_market_closed(False)
+    journal.upsert_position(replace(position(journal), state=P.OPEN))  # np. naprawa właściciela; zamknięcie nie poszło
+    fake.calls.clear()
+    await executor.flatten(position(journal), "FORCED")
+    assert fake.calls[:1] == ["close_position"]  # zamknięty rynek to odmowa, nie niejasność: bez zbędnej listy
+
+
 async def test_a_booking_journal_failure_never_aborts_the_emergency_flatten(
     executor, signal, rules, journal, fake, kill, notifier, monkeypatch
 ):

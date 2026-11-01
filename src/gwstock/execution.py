@@ -24,7 +24,9 @@ Niezmienniki (prawdziwe pieniądze):
 - spłaszczenie (`flatten`): OPEN → EXITING (BLOCKED, ENTERING, FLAT: odmowa ze zdarzeniem), jedno zamknięcie; po
   timeoucie lub odmowie NAJPIERW lista pozycji, nigdy druga wysyłka na ślepo: zamknięcie idzie do brokera tylko przy
   przejściu do EXITING albo gdy lista pozycji właśnie potwierdziła, że pozycja nadal jest (ponowienie na pozycji
-  EXITING zaczyna się od listy); zamknięty rynek: EXITING, stop u brokera zostaje, alarm. Zwykłe spłaszczenie zapisuje
+  EXITING zaczyna się od listy; deal, którego zamknięcie poszło już w tym procesie, także przy dzienniku OPEN po
+  nieudanym zapisie EXITING: pamięć wyjść `ExitMemory`, przekazywana wykonawcy odbudowanemu przy zejściu do dry_run);
+  zamknięty rynek: EXITING, stop u brokera zostaje, alarm. Zwykłe spłaszczenie zapisuje
   EXITING PRZED zamknięciem (spec §8: po restarcie nie wysyłamy na ślepo), a jego błąd dziennika propaguje się;
 - nigdy FLAT bez zaksięgowania: zamknięcie z historii (do `SETTLE_ATTEMPTS` prób) → `book` → FLAT; gdy historia go nie
   pokazuje, pozycja zostaje EXITING i księguje ją później uzgadnianie (`Reconciler(booker=executor)`);
@@ -62,7 +64,7 @@ import asyncio
 import json
 import math
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -180,6 +182,18 @@ class _NoContext(Exception):
     """Brak kontekstu wejścia dla pozycji (obca lub przyjęta bez naszego zapisu): rekord zdegradowany."""
 
 
+@dataclass
+class ExitMemory:
+    """Pamięć wyjść TEGO procesu (nie przeżywa restartu; silnik przekazuje ją wykonawcy odbudowanemu przy zejściu do
+    dry_run). Uzupełnia dziennik, gdy jego zapis „wg możliwości" zawiódł.
+
+    `closes_sent`: deale, dla których `close_position` poszło do brokera (sukces albo niejasny błąd; odmowa przy
+    zamkniętym rynku się nie liczy): kolejna próba zawsze zaczyna od listy pozycji, nawet gdy dziennik nadal mówi OPEN.
+    """
+
+    closes_sent: set[str] = field(default_factory=set)
+
+
 async def _with_timeout(call: Awaitable[T], timeout: float) -> T:
     """Wywołanie brokera z limitem czasu; przekroczenie to `TimeoutError` (niejasność, nie porażka)."""
     return await asyncio.wait_for(call, timeout)
@@ -189,7 +203,8 @@ class Executor:
     """Wykonuje wejście, wyjście i spłaszczenie oraz księguje zamknięcia (patrz docstring modułu).
 
     `live=True` (dokładnie `True`) uzbraja wysyłkę zleceń; domyślnie wykonawca pracuje jak `dry_run`. Jeden wywołujący
-    naraz (silnik szereguje wykonawcę i uzgadnianie jedną blokadą).
+    naraz (silnik szereguje wykonawcę i uzgadnianie jedną blokadą). `memory`: pamięć wyjść poprzedniego wykonawcy tego
+    samego procesu (silnik przy zejściu do dry_run); domyślnie pusta.
     """
 
     def __init__(
@@ -206,6 +221,8 @@ class Executor:
         calendar: ExchangeCalendar,
         notifier: Notifier,
         live: bool = False,
+        *,
+        memory: ExitMemory | None = None,
     ) -> None:
         if not risk.submit_timeout_s > 0:
             raise ValueError(f"submit_timeout_s must be positive, got {risk.submit_timeout_s!r}")
@@ -223,11 +240,17 @@ class Executor:
         self._live = live is True
         self._epic = strat.instrument
         self._timeout = risk.submit_timeout_s
+        self._memory = memory if memory is not None else ExitMemory()
 
     @property
     def live(self) -> bool:
         """Czy wykonawca wysyła zlecenia (tylko przy `live=True` w konstruktorze)."""
         return self._live
+
+    @property
+    def memory(self) -> ExitMemory:
+        """Pamięć wyjść tego procesu (do przekazania wykonawcy odbudowanemu przez silnik)."""
+        return self._memory
 
     # --- wejście ----------------------------------------------------------------------------------------
 
@@ -536,9 +559,9 @@ class Executor:
         awaryjne spłaszczenie). `reason` (np. FORCED, MANUAL, EMERGENCY) trafia do zdarzeń i do `exit_intent`.
         None: rynek zamknięty, zamknięcie niepotwierdzone, pozycja nadal otwarta albo zamknięcie czeka na historię
         (pozycja EXITING; ponowić przy następnym takcie albo zaksięguje uzgadnianie). Ponowienie na pozycji EXITING
-        najpierw czyta listę pozycji: zniknęła → księgowanie bez zamknięcia, jest → zamknięcie, nieczytelna → nic nie
-        wysyłamy. Błąd zapisu obowiązkowego (EXITING, surowe odpowiedzi, księga) propaguje się; kill switch nigdy nie
-        blokuje wyjścia.
+        (albo OPEN, gdy zamknięcie tego deala poszło już w tym procesie) najpierw czyta listę pozycji: zniknęła →
+        księgowanie bez zamknięcia, jest → zamknięcie, nieczytelna → nic nie wysyłamy. Błąd zapisu obowiązkowego
+        (EXITING, surowe odpowiedzi, księga) propaguje się; kill switch nigdy nie blokuje wyjścia.
         """
         failures: list[str] = []
         try:
@@ -601,25 +624,34 @@ class Executor:
                 "BLOCKED_EMERGENCY_FLATTEN", best_effort=must, deal_id=deal_id, journal=current, broker=at_broker
             )
             current = self._to_exiting(current, _from_broker(_P.EXITING, at_broker), must)
-        elif current.state is _P.OPEN:
-            current = self._to_exiting(current, replace(current, state=_P.EXITING), must)
-        elif not verified:
-            # EXITING z wcześniejszej próby (przerwanie, odmowa, nieczytelna lista): wcześniejsze zamknięcie mogło
-            # dojść, więc zanim wyślemy kolejne, broker musi potwierdzić, że pozycja nadal jest
-            read_ok, at_broker, error = await self._find_at_broker(deal_id, timeout, must)
-            if not read_ok:
-                self._alert("ERROR", f"FLATTEN_UNVERIFIED {deal_id}: position list unreadable before a retry")
-                self._event(
-                    "FLATTEN_UNVERIFIED", best_effort=must, deal_id=deal_id, flatten_reason=reason, error=error,
-                    stage="before_retry",
-                )  # fmt: skip
-                return None, OUTCOME_UNVERIFIED
-            if at_broker is None:
-                return await self._settle(current, reason, timeout, must)
+        else:
+            sent_before = deal_id in self._memory.closes_sent
+            if current.state is _P.OPEN:
+                current = self._to_exiting(current, replace(current, state=_P.EXITING), must)
+                recheck = sent_before and not verified  # dziennik mówił OPEN, choć zamknięcie już poszło (zapis zawiódł)
+            else:
+                recheck = not verified
+            if recheck:
+                # EXITING z wcześniejszej próby (przerwanie, odmowa, nieczytelna lista) albo zamknięcie wysłane już
+                # w tym procesie: mogło dojść, więc zanim wyślemy kolejne, broker musi potwierdzić, że pozycja nadal jest
+                read_ok, at_broker, error = await self._find_at_broker(deal_id, timeout, must)
+                if not read_ok:
+                    self._alert("ERROR", f"FLATTEN_UNVERIFIED {deal_id}: position list unreadable before a retry")
+                    self._event(
+                        "FLATTEN_UNVERIFIED", best_effort=must, deal_id=deal_id, flatten_reason=reason, error=error,
+                        stage="before_retry",
+                    )  # fmt: skip
+                    return None, OUTCOME_UNVERIFIED
+                if at_broker is None:
+                    return await self._settle(current, reason, timeout, must)
 
+        sent_before = deal_id in self._memory.closes_sent
+        self._memory.closes_sent.add(deal_id)  # przed wysyłką: także anulowanie w trakcie to niejasność
         try:
             await _with_timeout(self._broker.close_position(deal_id), timeout)
         except MarketClosed as exc:
+            if not sent_before:  # odmowa zamkniętego rynku: to zamknięcie na pewno nie doszło
+                self._memory.closes_sent.discard(deal_id)
             self._raw_error(SOURCE_CLOSE, exc, best_effort=must, deal_id=deal_id, flatten_reason=reason)
             self._alert(
                 "WARN", f"FLATTEN_BLOCKED_MARKET_CLOSED {deal_id}: the stop at the broker stays, retry after reopening"

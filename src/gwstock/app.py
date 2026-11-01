@@ -59,7 +59,7 @@ from gwstock.calendar import ExchangeCalendar
 from gwstock.clock import Clock
 from gwstock.config import CostConfig, RiskConfig, RuntimeConfig, StrategyConfig, load_runtime
 from gwstock.costs import CostModel
-from gwstock.execution import KILL_CHECK_FAILED, Executor
+from gwstock.execution import KILL_CHECK_FAILED, Executor, ExitMemory
 from gwstock.journal import Journal, JournalError, JournalWriteError, PositionRecord
 from gwstock.notify import FileNotifier, Notifier
 from gwstock.orders.manager import OrderManager
@@ -446,10 +446,10 @@ class Engine:
 
     # --- budowa części ---
 
-    def _build_executor(self) -> Executor:
+    def _build_executor(self, memory: ExitMemory | None = None) -> Executor:
         return Executor(
             self.manager, self.broker, self.journal, self.gate, self.kill, self._cost_model, self.clock, self.strat,
-            self.risk, self.calendar, self.alerts, live=self._mode is Mode.LIVE,
+            self.risk, self.calendar, self.alerts, live=self._mode is Mode.LIVE, memory=memory,
         )  # fmt: skip
 
     def _build_reconciler(self) -> Reconciler:
@@ -459,11 +459,12 @@ class Engine:
         )  # fmt: skip
 
     def _downgrade(self, reason: str) -> None:
-        """live → dry_run do końca procesu (nigdy z powrotem); alarm i zdarzenie."""
+        """live → dry_run do końca procesu (nigdy z powrotem); alarm i zdarzenie. Nowy wykonawca dostaje pamięć wyjść
+        poprzedniego (wysłane zamknięcia tego procesu: nigdy druga wysyłka na ślepo)."""
         if self._mode is Mode.DRY_RUN:
             return
         self._mode = Mode.DRY_RUN
-        self.executor = self._build_executor()
+        self.executor = self._build_executor(self.executor.memory)
         if self._own_reconciler:
             self.reconciler = self._build_reconciler()
         self.watchdog.set_status(mode=self._mode.value)
