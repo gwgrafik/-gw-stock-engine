@@ -84,6 +84,9 @@ SMOKE_CANDLE_LOOKBACK_MIN = 30
 SMOKE_HOLD_MAX_S = 600  # `smoke --hold`: najdłużej 10 minut z otwartą pozycją próby
 SMOKE_HOLD_COUNTDOWN_S = 15
 SMOKE_HOLD_TICK_S = 5
+SMOKE_CLOSE_WAIT_SUBMITS = 3  # zamknięcie pozycji próby po przerwaniu: czekamy najwyżej 3 × submit_timeout_s
+ADOPTED_AFTER_UNKNOWN = "ADOPTED_AFTER_UNKNOWN"  # notatka menedżera: wejście przyjęte z listy/potwierdzenia po UNKNOWN
+ADOPTED_WARNING = "WARN [2]"
 CLEAR_WORD = "CLEAR"
 RESET_WORD = "RESET"
 NO_DEAL_ID_WORD = "NO-DEAL-ID"
@@ -357,6 +360,11 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print, hold_s: int 
                  "app and start the engine, whose startup reconciliation adopts or blocks it before anything else")
         return 1
     deal_id = rec.deal_id
+    adopted = ADOPTED_AFTER_UNKNOWN in rec.note.split()
+    if adopted:  # nie FAIL: wejście jest nasze i zabezpieczone, ale właściciel musi obejrzeć odpowiedź potwierdzenia
+        out(f"{ADOPTED_WARNING}: wejście przyjęte przez uzgadnianie, nie przez potwierdzenie — sprawdź w "
+            f"dzienniku/aplikacji (notatka zlecenia: {rec.note}); surowa odpowiedź potwierdzenia jest w dzienniku "
+            "(broker.confirm); runbook, punkt 5")  # fmt: skip
     position = journal.current_position(epic)
     at_broker = await _find_position(engine, deal_id)
     derived = at_broker.stop_derived if at_broker is not None else None
@@ -375,13 +383,13 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print, hold_s: int 
     if hold_s > 0 and visible and position is not None and position.state is PositionState.OPEN:
         try:
             await _hold(engine, deal_id, hold_s, info)
+            position = journal.current_position(epic)  # stan po wstrzymaniu (np. wybicie stopem w jego trakcie)
         except GeneratorExit:  # zamykana korutyna nie może już czekać
             raise
         except BaseException as exc:  # anulowanie, Ctrl-C, sygnał, błąd: pozycja próby nie może zostać bez słowa
             info(3, f"hold interrupted ({type(exc).__name__}); closing the probe position now")
             await _close_after_interrupt(engine, deal_id, out)
             raise
-        position = journal.current_position(epic)  # stan po wstrzymaniu (np. wybicie stopem w jego trakcie)
 
     # [4] spłaszczenie wykonawcą (DELETE po dealId)
     closed_at = clock.now_utc()
@@ -440,7 +448,8 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print, hold_s: int 
          if latency is not None else "history latency: not measured (no closed_since read showed the closure)")
 
     passed = all(results)
-    out(f"{'PASS' if passed else 'FAIL'} smoke: {sum(results)}/{len(results)} checks passed")
+    note = f" ({ADOPTED_WARNING}: entry adopted after UNKNOWN, read it above)" if adopted else ""
+    out(f"{'PASS' if passed else 'FAIL'} smoke: {sum(results)}/{len(results)} checks passed{note}")
     return 0 if passed else 1
 
 
@@ -494,8 +503,9 @@ async def _still_at_broker(engine: Engine, deal_id: str | None) -> bool | None:
 
 
 async def _close_after_interrupt(engine: Engine, deal_id: str | None, out: Callable[[str], None]) -> None:
-    """Po przerwaniu wstrzymania: zamknięcie pozycji próby osłonięte przed kolejnym anulowaniem; gdy się nie udało,
-    głośna linia, co zostało u brokera i co zrobić.
+    """Po przerwaniu wstrzymania: zamknięcie pozycji próby osłonięte przed kolejnym anulowaniem (biegnie jako osobne
+    zadanie, a kolejne przerwania nie kończą czekania na nie, najwyżej `SMOKE_CLOSE_WAIT_SUBMITS` × submit_timeout_s);
+    dopiero potem linia wyniku, a gdy się nie udało, głośna linia, co zostało u brokera i co zrobić.
 
     Najpierw procedura awaryjna wykonawcy (dziennik wg możliwości); jeśli broker nadal pokazuje deal (na przykład
     dziennik leży), jedno bezpośrednie zamknięcie po dealId: to nasza pozycja próby, a zamknięcie bez dziennika
@@ -513,10 +523,23 @@ async def _close_after_interrupt(engine: Engine, deal_id: str | None, out: Calla
             except Exception as exc:
                 _LOG.warning("smoke direct close failed: %s: %s", type(exc).__name__, exc)
 
-    try:
-        await asyncio.shield(attempt())
-    except BaseException as exc:
-        _LOG.warning("smoke close after an interrupt was itself interrupted: %s", type(exc).__name__)
+    task = asyncio.ensure_future(attempt())
+    loop = asyncio.get_running_loop()
+    wait_s = SMOKE_CLOSE_WAIT_SUBMITS * engine.risk.submit_timeout_s
+    deadline = loop.time() + wait_s
+    while not task.done():  # kolejne przerwania nie kończą czekania: wynik dopiero po zamknięciu (albo po limicie)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            _LOG.warning("smoke close after an interrupt still running after %s s; reporting now", wait_s)
+            break
+        try:
+            await asyncio.wait_for(asyncio.shield(task), remaining)
+        except asyncio.TimeoutError:
+            _LOG.warning("smoke close after an interrupt still running after %s s; reporting now", wait_s)
+            break
+        except BaseException as exc:  # np. drugie Ctrl-C: zamknięcie biegnie dalej, czekamy na nie
+            _LOG.warning("smoke close after an interrupt was itself interrupted: %s; still waiting for the close",
+                         type(exc).__name__)  # fmt: skip
     if await _still_at_broker(engine, deal_id) is not False:
         out(f"FAIL [4] LOUD: deal {deal_id} {LEFT_OPEN_HINT}")
     else:
@@ -525,20 +548,34 @@ async def _close_after_interrupt(engine: Engine, deal_id: str | None, out: Calla
 
 @contextlib.contextmanager
 def _stop_on_signals(engine: Engine):
-    """SIGTERM/SIGINT ustawiają flagę zatrzymania silnika (wstrzymanie `smoke` ją sprawdza) zamiast przerywać proces."""
+    """Pierwszy SIGTERM/SIGINT ustawia flagę zatrzymania silnika (wstrzymanie `smoke` ją sprawdza) zamiast przerywać
+    proces i od razu przywraca poprzednią obsługę obu sygnałów: drugi sygnał działa zwykle (zawieszoną próbę da się
+    zatrzymać)."""
     loop = asyncio.get_running_loop()
-    installed = []
+    previous: dict[signal.Signals, Any] = {}
+
+    def restore() -> None:
+        for sig, handler in list(previous.items()):
+            loop.remove_signal_handler(sig)
+            if handler is not None:
+                signal.signal(sig, handler)
+            del previous[sig]
+
+    def first_signal() -> None:
+        engine.request_shutdown()
+        restore()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
+        handler = signal.getsignal(sig)
         try:
-            loop.add_signal_handler(sig, engine.request_shutdown)
-            installed.append(sig)
+            loop.add_signal_handler(sig, first_signal)
         except (NotImplementedError, RuntimeError, ValueError):  # np. nie w głównym wątku: zostaje domyślna obsługa
-            pass
+            continue
+        previous[sig] = handler
     try:
         yield
     finally:
-        for sig in installed:
-            loop.remove_signal_handler(sig)
+        restore()
 
 
 async def _second_close_check(

@@ -794,6 +794,8 @@ Linie `PASS [n]`, `FAIL [n]` i `INFO [n]`, a na końcu wynik `PASS smoke: 7/7 ch
 
 Jeśli w kroku [2] jest `INFO ... the API did not show the stop ...`, broker nie pokazał stopu w liście pozycji i silnik zapisał stop **wyliczony z naszego żądania**. Wtedy stop musisz zobaczyć w aplikacji sam (poniżej): bez tego nie uzbrajaj.
 
+Jeśli przed krokiem [2] jest linia `WARN [2]: wejście przyjęte przez uzgadnianie, nie przez potwierdzenie ...` (a wynik końcowy ma dopisek `WARN [2]`), to nie jest porażka próby, ale potwierdzenie brokera nie dało czystego wypełnienia (np. inna wielkość w potwierdzeniu niż na liście pozycji) i wejście przyjęto z listy pozycji. Przeczytaj notatkę zlecenia z tej linii i pokaż Claude surową odpowiedź potwierdzenia z dziennika (kształt odpowiedzi brokera); jeśli przy następnej próbie `smoke` linia się powtórzy, zatrzymaj się i nie uzbrajaj, dopóki Claude tego nie wyjaśni.
+
 ### Co sprawdzasz w aplikacji Capital.com
 
 Dzięki `--hold` pozycja jest otwarta około 90 sekund:

@@ -543,6 +543,26 @@ async def test_smoke_opens_minimum_size_with_stop_and_closes_immediately(engine,
     assert engine.kill.level() is KillLevel.NONE
 
 
+async def test_smoke_shows_prominently_an_entry_adopted_after_unknown_without_failing(engine, broker, smoke_clock):
+    # potwierdzenie milczy dwa razy: menedżer przyjmuje wejście z listy pozycji (ADOPTED_AFTER_UNKNOWN VIA=positions),
+    # tak samo jak przy fałszywej niezgodności wielkości w potwierdzeniu; właściciel musi to zobaczyć
+    for _ in range(2):
+        broker.fail_next("confirm", BrokerTimeout())
+    lines: list[str] = []
+    assert await cli.smoke(engine, out=lines.append) == 0, lines
+    note = engine.journal.get_order("gws-20261102-DE40-1-smoke").note
+    assert "ADOPTED_AFTER_UNKNOWN VIA=positions" in note
+    [warning] = [line for line in lines if line.startswith("WARN [2]")]
+    assert "wejście przyjęte przez uzgadnianie, nie przez potwierdzenie" in warning and note in warning
+    assert lines[-1].startswith("PASS smoke:") and "WARN [2]" in lines[-1]
+
+
+async def test_smoke_without_an_adopted_entry_prints_no_adoption_warning(engine, broker, smoke_clock):
+    lines: list[str] = []
+    assert await cli.smoke(engine, out=lines.append) == 0
+    assert not any(line.startswith("WARN") for line in lines) and "WARN" not in lines[-1]
+
+
 async def test_smoke_flags_a_derived_stop_for_manual_verification(engine, broker, smoke_clock):
     def mark_derived():
         for deal_id, pos in list(broker.positions.items()):
@@ -1589,6 +1609,69 @@ async def test_smoke_hold_journal_error_still_closes_the_position_at_the_broker(
         await cli.smoke(engine, out=lines.append, hold_s=300)
     assert broker.positions == {}  # zamknięte u brokera mimo dziennika; uzgadnianie silnika zaksięguje je później
     assert any("hold interrupted (JournalReadError)" in line for line in lines)
+
+
+async def test_smoke_journal_read_failure_right_after_the_hold_still_closes_the_probe_position(
+    engine, broker, smoke_clock, monkeypatch
+):
+    # h2: odczyt dziennika tuż po wstrzymaniu (stan po nim) zawodzi: pozycja próby nie może zostać otwarta bez słowa
+    journal = engine.journal
+    real_position, real_hold = journal.current_position, cli._hold
+    after_hold = {"v": False}
+
+    async def hold(*args, **kwargs):
+        await real_hold(*args, **kwargs)
+        after_hold["v"] = True
+
+    def position(epic):
+        if after_hold["v"]:
+            raise JournalReadError("database is locked")
+        return real_position(epic)
+
+    monkeypatch.setattr(cli, "_hold", hold)
+    monkeypatch.setattr(journal, "current_position", position)
+    lines: list[str] = []
+    with pytest.raises(JournalReadError):
+        await cli.smoke(engine, out=lines.append, hold_s=30)
+    assert broker.positions == {} and "close_position" in broker.calls
+    assert any("hold interrupted (JournalReadError)" in line for line in lines)
+
+
+async def test_smoke_close_after_interrupt_survives_a_second_cancellation_and_waits_for_the_close(
+    engine, broker, smoke_clock, monkeypatch
+):
+    # h4: drugie Ctrl-C w trakcie zamykania pozycji próby: czekamy na zamknięcie, zanim wypiszemy wynik
+    outer = asyncio.current_task()
+    at_time(broker, smoke_clock, smoke_clock.now_utc() + timedelta(seconds=20), interrupt(asyncio.CancelledError()))
+    real_close = broker.close_position
+
+    async def slow_close(deal_id):
+        outer.cancel()  # drugie przerwanie, gdy zamknięcie jest w drodze
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await real_close(deal_id)
+
+    monkeypatch.setattr(broker, "close_position", slow_close)
+    lines: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        await cli.smoke(engine, out=lines.append, hold_s=300)
+    assert broker.positions == {}
+    assert any("closed after the interrupt" in line for line in lines) and not any(LEFT_OPEN in line for line in lines)
+    assert outer.uncancel() == 0  # jedno przerwanie zgłoszone, jedno połknięte w oczekiwaniu na zamknięcie
+
+
+async def test_smoke_first_signal_restores_the_default_handlers(engine):
+    # h5: pierwszy sygnał ustawia flagę zatrzymania, a drugi ma już zwykłą obsługę (zawieszona próba da się zatrzymać)
+    import signal
+
+    before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    with cli._stop_on_signals(engine):
+        assert all(signal.getsignal(sig) is not before[sig] for sig in before)  # obsługa pętli zdarzeń
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.05)
+        assert engine.shutdown_requested
+        assert {sig: signal.getsignal(sig) for sig in before} == before  # już po pierwszym sygnale
+    assert {sig: signal.getsignal(sig) for sig in before} == before
 
 
 async def test_smoke_installs_stop_handlers_for_sigterm_and_sigint(engine):
