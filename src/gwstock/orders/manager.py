@@ -19,6 +19,11 @@ Niezmienniki (prawdziwe pieniądze):
 - `in_flight` jest prawdziwe od przejścia ochrony do końca `submit_entry` / `resolve_unknown` (zawsze gaszone
   w `finally`): uzgadnianie pomija wtedy swój przebieg, więc zlecenie w toku ma jednego piszącego.
 
+Odrzucenie: odrzucony POST (`open_position`) to REJECTED od razu (nic nie powstało). Odrzucenie odroczone (POST przyjęty,
+REJECTED dopiero w `confirm`) to REJECTED tylko po udanym odczycie listy pozycji bez dopasowania; nasza pozycja na
+liście → UNKNOWN REJECTED_BUT_LISTED i pozycja BLOCKED, nieczytelna lista → UNKNOWN
+`CAUSE=confirm:BrokerRejected_UNVERIFIED` z pozycją ENTERING (rozstrzyga uzgadnianie).
+
 Rozstrzyganie UNKNOWN: tylko zlecenie UNKNOWN z pozycją ENTERING (BLOCKED to decyzja uzgadniania lub właściciela,
 OPEN to pozycja już przejęta). Do `UNKNOWN_CHECKS` rund co `UNKNOWN_CHECK_INTERVAL_S` (zegar silnika); w rundzie,
 gdy znamy referencję, najpierw `confirm`, potem zawsze `list_positions`. Dopasowanie: `match_entry_positions`
@@ -72,6 +77,9 @@ SOURCE_CONFIRM = "broker.confirm"
 SOURCE_POSITIONS = "broker.list_positions"
 SOURCE_CLOSED = "broker.closed_since"
 SOURCE_EVENT = "order.event"
+
+CHECK_REJECTED_CONFIRM = "rejected_confirm"  # pole `check` surowego odczytu listy po odrzuceniu w potwierdzeniu
+CAUSE_REJECTION_UNVERIFIED = "CAUSE=confirm:BrokerRejected_UNVERIFIED"
 
 T = TypeVar("T")
 
@@ -167,7 +175,7 @@ class OrderManager:
             snapshot = await self._call(self._broker.confirm(ref))
         except BrokerRejected as exc:  # odrzucenie odroczone: POST przyjęty, dealStatus REJECTED
             self._record_error(SOURCE_CONFIRM, order, exc, deal_reference=ref)
-            return self._reject(order, exc.reason, deal_reference=ref)
+            return await self._deferred_rejection(order, exc, ref)
         except Exception as exc:
             self._record_error(SOURCE_CONFIRM, order, exc, deal_reference=ref)
             return await self._unknown(order, f"CAUSE=confirm:{type(exc).__name__}", deal_reference=ref)
@@ -179,6 +187,26 @@ class OrderManager:
         # Bez porównania opened_at z created_at: to odpowiedź na naszą świeżą referencję, a odchyłka zegara
         # brokera nie może zamienić wykonania w UNKNOWN.
         return self._confirm(order, snapshot, "", deal_reference=ref)
+
+    async def _deferred_rejection(self, order: OrderRecord, rejection: BrokerRejected, ref: str) -> OrderRecord:
+        """Odrzucenie w potwierdzeniu po przyjętym POST (także `MarketClosedRejection`): REJECTED dopiero po jednym
+        udanym odczycie listy pozycji (surowa odpowiedź najpierw) bez naszej pozycji.
+
+        Dopasowanie `match_entry_positions` → BLOCKED REJECTED_BUT_LISTED (sprzeczne dowody: decyduje uzgadnianie lub
+        właściciel); nieudany odczyt → UNKNOWN `CAUSE=confirm:BrokerRejected_UNVERIFIED` z pozycją ENTERING (bez rund
+        menedżera: rozstrzyga uzgadnianie). Odrzucenie samego POST (`open_position`) zostaje REJECTED bez odczytu.
+        """
+        try:
+            positions = await self._call(self._broker.list_positions())
+        except Exception as exc:
+            self._record_error(SOURCE_POSITIONS, order, exc, check=CHECK_REJECTED_CONFIRM)
+            self._event(order, "REJECTION_UNVERIFIED", reason=rejection.reason, error=type(exc).__name__)
+            return self._transition(order, OrderState.UNKNOWN, note=CAUSE_REJECTION_UNVERIFIED, deal_reference=ref)
+        self._record(SOURCE_POSITIONS, order, check=CHECK_REJECTED_CONFIRM, response=positions)
+        matches = match_entry_positions(order, positions)
+        if matches:
+            return self._block(order, "REJECTED_BUT_LISTED", deal_reference=ref, deal_ids=[p.deal_id for p in matches])
+        return self._reject(order, rejection.reason, deal_reference=ref)
 
     # --- rozstrzyganie UNKNOWN ------------------------------------------------------------------
 

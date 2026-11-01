@@ -14,6 +14,7 @@ from decimal import Decimal
 import pytest
 
 import gwstock.orders.manager as manager_module
+from gwstock.broker.capitalcom_trading import MarketClosedRejection
 from gwstock.journal import JournalWriteError, OrderRecord, PositionRecord
 from gwstock.orders.fsm import check_order_transition, check_position_transition
 from gwstock.orders.manager import HISTORY_MARGIN, EntryBlocked, OrderManager, match_entry_positions
@@ -437,11 +438,57 @@ async def test_deferred_rejection_on_confirm_is_terminal_and_logged(journal, fak
     rec = await mgr.submit_entry(req)
     assert rec.state == OrderState.REJECTED and rec.note == "INSUFFICIENT_FUNDS" and rec.deal_reference == "REF-1"
     assert position(journal).state == PositionState.FLAT
-    assert fake.calls == ["open_position", "confirm"]
+    assert fake.calls == ["open_position", "confirm", "list_positions"]  # REJECTED dopiero po pustej liście
     [ack] = payloads(journal, "broker.open_position")
     [raw] = payloads(journal, "broker.confirm")
+    [listed] = payloads(journal, "broker.list_positions")
     assert ack["response"] == {"deal_reference": "REF-1"}
     assert raw["error"] == "BrokerRejected" and raw["reason"] == "INSUFFICIENT_FUNDS"
+    assert listed["response"] == [] and listed["check"] == "rejected_confirm"
+
+
+@pytest.mark.parametrize(
+    "exc", [BrokerRejected("INSUFFICIENT_FUNDS"), MarketClosedRejection("error.market.closed")],
+    ids=["rejected", "market_closed_rejection"],
+)
+async def test_a_rejected_confirm_with_our_position_listed_blocks_instead_of_rejecting(
+    journal, fake, mgr, req, monkeypatch, exc
+):
+    # broker przyjął POST i otworzył pozycję, a potwierdzenie mówi REJECTED: dowody sprzeczne, nie zgadujemy
+    fake.fail_next("confirm", exc)
+    log = spy_writes(journal, monkeypatch)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.UNKNOWN and rec.note == "REJECTED_BUT_LISTED" and rec.deal_reference == "REF-1"
+    assert position(journal) == PositionRecord("DE40", PositionState.BLOCKED)
+    assert fake.calls == ["open_position", "confirm", "list_positions"] and list(fake.positions) == ["DEAL-1"]
+    [event] = payloads(journal, "order.event")
+    assert event["event"] == "REJECTED_BUT_LISTED" and event["deal_ids"] == ["DEAL-1"]
+    raw = ["broker.open_position", "broker.confirm", "broker.list_positions", "order.event"]
+    assert log[2:] == [("position", PositionState.BLOCKED, raw), ("order", OrderState.UNKNOWN, raw)]
+
+
+async def test_a_rejected_confirm_with_an_unreadable_position_list_stays_unknown(
+    journal, fake, mgr, req, reconciler, clock, kill_sink
+):
+    fake.reject_next_entry("INSUFFICIENT_FUNDS")
+    fake.fail_next("list_positions", BrokerTimeout())
+    rec = await mgr.submit_entry(req)
+    assert rec.state == OrderState.UNKNOWN and rec.note == "CAUSE=confirm:BrokerRejected_UNVERIFIED"
+    assert rec.deal_reference == "REF-1"
+    assert position(journal).state == PositionState.ENTERING  # nieudany odczyt nie jest dowodem braku pozycji
+    assert fake.calls == ["open_position", "confirm", "list_positions"]  # bez ponownej wysyłki, bez rund menedżera
+    [error] = payloads(journal, "broker.list_positions")
+    assert error["error"] == "BrokerTimeout" and error["check"] == "rejected_confirm"
+    [event] = payloads(journal, "order.event")
+    assert event["event"] == "REJECTION_UNVERIFIED" and event["reason"] == "INSUFFICIENT_FUNDS"
+
+    for _ in range(3):  # rozstrzyga uzgadnianie: trzy puste odczyty w 30 s i czysta historia
+        clock.advance(15)
+        await reconciler.run_once()
+    final = order(journal, req)
+    assert final.state == OrderState.NOT_PLACED
+    assert final.note == "NOT_FOUND_BY_RECONCILER READS=3 CAUSE=confirm:BrokerRejected_UNVERIFIED"
+    assert position(journal).state == PositionState.FLAT and fake.calls.count("open_position") == 1
 
 
 async def test_market_closed_is_rejected_and_position_stays_flat(journal, fake, mgr, req):
@@ -518,6 +565,7 @@ async def test_positions_are_journaled_before_adoption(journal, fake, mgr, req, 
 
 
 CHECKED = ["broker.open_position"] + ["broker.list_positions"] * 3 + ["broker.closed_since"]
+REJECTION_CHECKED = ["broker.open_position", "broker.confirm", "broker.list_positions"]
 
 
 @pytest.mark.parametrize(
@@ -526,8 +574,8 @@ CHECKED = ["broker.open_position"] + ["broker.list_positions"] * 3 + ["broker.cl
         (
             lambda fake: fake.reject_next_entry("INSUFFICIENT_FUNDS"),
             [
-                ("position", PositionState.FLAT, ["broker.open_position", "broker.confirm"]),
-                ("order", OrderState.REJECTED, ["broker.open_position", "broker.confirm"]),
+                ("position", PositionState.FLAT, REJECTION_CHECKED),
+                ("order", OrderState.REJECTED, REJECTION_CHECKED),
             ],
         ),
         (
