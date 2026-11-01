@@ -407,6 +407,19 @@ async def test_only_credential_rejections_of_post_session_are_broker_auth_errors
 
 
 @pytest.mark.parametrize(
+    ("json_body", "text"),
+    [(None, "<html><body>403 Forbidden</body></html>"), (None, ""), ({"message": "blocked"}, None)],
+    ids=["html-page", "empty", "json-without-errorCode"],
+)
+async def test_a_403_without_a_broker_error_code_is_not_a_credential_rejection(server, broker, json_body, text):
+    # strona brzegowa / WAF (403 bez errorCode Capital.com) to awaria przejściowa: bez blokady logowań po 3 razach
+    server.fail_next("/session", 403, json_body, text=text, method="POST")
+    with pytest.raises(BrokerError) as info:
+        await broker.login()
+    assert not isinstance(info.value, BrokerAuthError) and not isinstance(info.value, SessionExpired)
+
+
+@pytest.mark.parametrize(
     ("canned", "match"),
     [
         ({"status": 200, "json": {"currentAccountId": "ACC-FUNDED", "accounts": []}}, "CST"),

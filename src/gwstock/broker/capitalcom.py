@@ -120,7 +120,7 @@ _ONE_DAY = timedelta(days=1)
 _SECRET_MIN_LEN = 4  # krótszych wartości nie da się sensownie wyciąć z komunikatu (zniszczyłoby tekst)
 _MAX_ERROR_CODE_LEN = 200
 # Odrzucenie danych logowania przez `POST /session` (notatki §2.4: 401 error.invalid.details, 400 error.null.api.key);
-# 401/403 z dowolnym kodem też. Tylko to jest `BrokerAuthError` (blokada dalszych logowań w silniku).
+# także każde 401 oraz 403 z errorCode brokera. Tylko to jest `BrokerAuthError` (blokada dalszych logowań w silniku).
 _CREDENTIAL_ERROR_CODES = frozenset({"error.invalid.details", "error.null.api.key"})
 _MAX_RAW_ERROR_CODE_LEN = 4096  # tylko ogranicza pracę; przycięcie do komunikatu dopiero po usunięciu sekretów
 
@@ -500,7 +500,9 @@ class CapitalComBroker(TradingMixin):
         resp = await self._send(where, "POST", "/session", {"X-CAP-API-KEY": self._creds.api_key}, body=body)
         if resp.status != 200:
             error = self._status_error(where, resp)
-            if resp.status in (401, 403) or _error_code(resp.body) in _CREDENTIAL_ERROR_CODES:
+            code = _error_code(resp.body)
+            # 403 bez errorCode Capital.com to strona brzegowa/WAF (przejściowa), nie odrzucenie danych logowania
+            if resp.status == 401 or (resp.status == 403 and code is not None) or code in _CREDENTIAL_ERROR_CODES:
                 raise self._error(BrokerAuthError, str(error))  # dane logowania odrzucone: nie ponawiać w kółko
             raise error
         tokens = self._tokens_from(resp)

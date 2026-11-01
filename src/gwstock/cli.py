@@ -83,7 +83,11 @@ SMOKE_HOLD_COUNTDOWN_S = 15
 SMOKE_HOLD_TICK_S = 5
 CLEAR_WORD = "CLEAR"
 RESET_WORD = "RESET"
+NO_DEAL_ID_WORD = "NO-DEAL-ID"
 SOURCE_OWNER_RESET = "owner.reset"
+LEFT_OPEN_HINT = (
+    "left open with its stop; start the engine (it reconciles and flattens at 17:25) or close it in the Capital.com app"
+)
 
 
 # --- tryb ---------------------------------------------------------------------------------------------------
@@ -355,7 +359,15 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print, hold_s: int 
     visible = at_broker is not None and at_broker.stop_level is not None
     step(3, visible, "position visible in list_positions with a stop")
     if hold_s > 0 and visible and position is not None and position.state is PositionState.OPEN:
-        await _hold(engine, deal_id, hold_s, info)
+        try:
+            await _hold(engine, deal_id, hold_s, info)
+        except GeneratorExit:  # zamykana korutyna nie może już czekać
+            raise
+        except BaseException as exc:  # anulowanie, Ctrl-C, sygnał, błąd: pozycja próby nie może zostać bez słowa
+            info(3, f"hold interrupted ({type(exc).__name__}); closing the probe position now")
+            await _close_after_interrupt(engine, deal_id, out)
+            raise
+        position = journal.current_position(epic)  # stan po wstrzymaniu (np. wybicie stopem w jego trakcie)
 
     # [4] spłaszczenie wykonawcą (DELETE po dealId)
     closed_at = clock.now_utc()
@@ -371,7 +383,10 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print, hold_s: int 
         if current is not None and current.state is PositionState.EXITING:
             await engine.executor.flatten(current, "SMOKE")
     current = journal.current_position(epic)
-    step(4, current is None or current.state is PositionState.FLAT, "flatten through the executor (DELETE by dealId)")
+    flat = current is None or current.state is PositionState.FLAT
+    step(4, flat, "flatten through the executor (DELETE by dealId)")
+    if not flat and await _still_at_broker(engine, deal_id) is not False:
+        out(f"FAIL [4] LOUD: deal {deal_id} {LEFT_OPEN_HINT}")
 
     # [5] pozycja znikła i transakcja zaksięgowana
     gone = await _find_position(engine, deal_id) is None
@@ -447,10 +462,69 @@ async def _hold(engine: Engine, deal_id: str | None, hold_s: int, info: Callable
             doubt = doubt or f"journal position is {position.state.value if position else 'missing'}"
         if engine.kill.level() is not KillLevel.NONE:
             doubt = doubt or f"kill switch {engine.kill.level().name} ({engine.kill.reason()})"
+        if engine.shutdown_requested:  # SIGTERM/SIGINT w trakcie wstrzymania: zamknąć teraz, nie po czasie
+            doubt = doubt or "stop requested (signal)"
         if doubt is not None:
             info(3, f"hold stopped: {doubt}; flattening at once")
             return
         await clock.sleep(min(SMOKE_HOLD_TICK_S, remaining))
+
+
+async def _still_at_broker(engine: Engine, deal_id: str | None) -> bool | None:
+    """Czy broker nadal pokazuje deal (None: lista nieczytelna, czyli nie wiadomo)."""
+    try:
+        positions = await engine.probe(engine.raw_broker.list_positions)
+    except BaseException:  # także kolejne anulowanie: nie wiemy
+        return None
+    return any(p.deal_id == deal_id for p in positions)
+
+
+async def _close_after_interrupt(engine: Engine, deal_id: str | None, out: Callable[[str], None]) -> None:
+    """Po przerwaniu wstrzymania: zamknięcie pozycji próby osłonięte przed kolejnym anulowaniem; gdy się nie udało,
+    głośna linia, co zostało u brokera i co zrobić.
+
+    Najpierw procedura awaryjna wykonawcy (dziennik wg możliwości); jeśli broker nadal pokazuje deal (na przykład
+    dziennik leży), jedno bezpośrednie zamknięcie po dealId: to nasza pozycja próby, a zamknięcie bez dziennika
+    uzgadnianie silnika zaksięguje później z historii. Bez czytelnej listy pozycji nic nie wysyłamy na ślepo.
+    """
+
+    async def attempt() -> None:
+        try:
+            await engine.executor.emergency_flatten()
+        except Exception as exc:
+            _LOG.warning("smoke emergency close via the executor failed: %s: %s", type(exc).__name__, exc)
+        if await _still_at_broker(engine, deal_id):
+            try:
+                await engine.probe(engine.raw_broker.close_position, deal_id)
+            except Exception as exc:
+                _LOG.warning("smoke direct close failed: %s: %s", type(exc).__name__, exc)
+
+    try:
+        await asyncio.shield(attempt())
+    except BaseException as exc:
+        _LOG.warning("smoke close after an interrupt was itself interrupted: %s", type(exc).__name__)
+    if await _still_at_broker(engine, deal_id) is not False:
+        out(f"FAIL [4] LOUD: deal {deal_id} {LEFT_OPEN_HINT}")
+    else:
+        out(f"INFO [4] deal {deal_id} closed after the interrupt; the engine's reconciliation books it if needed")
+
+
+@contextlib.contextmanager
+def _stop_on_signals(engine: Engine):
+    """SIGTERM/SIGINT ustawiają flagę zatrzymania silnika (wstrzymanie `smoke` ją sprawdza) zamiast przerywać proces."""
+    loop = asyncio.get_running_loop()
+    installed = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, engine.request_shutdown)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):  # np. nie w głównym wątku: zostaje domyślna obsługa
+            pass
+    try:
+        yield
+    finally:
+        for sig in installed:
+            loop.remove_signal_handler(sig)
 
 
 async def _second_close_check(
@@ -651,8 +725,13 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     Odmowa (1): pozycja już FLAT; nierozstrzygnięte zlecenie w dzienniku (rozstrzyga uzgadnianie silnika); pozycja
     OPEN/EXITING (silnik sam ją uzgadnia i księguje: reset mógłby pominąć zaksięgowanie prawdziwego zamknięcia);
     brak powiązanego rachunku, sesja na innym rachunku, broker nieczytelny; broker pokazuje pozycję albo zlecenie
-    oczekujące na instrumencie. Bez wpisanego `RESET` nic nie zmienia (2). Zdarzenie audytowe `owner.reset` (kto,
-    poprzedni stan) przed zapisem FLAT przez automat stanów. 0: wyczyszczone.
+    oczekujące na instrumencie; historia zamknięć nieczytelna (każdy błąd); zamknięcie deal_id JEST w historii (jedno):
+    wtedy księguje je uzgadnianie silnika, a reset by je zgubił na zawsze (bez deal_id w dzienniku nikt go już nie
+    znajdzie). Potwierdzenie (inaczej 2, nic nie zmienione): przy deal_id bez zamknięcia w historii (albo historii
+    niejednoznacznej) właściciel wpisuje DEAL ID jako jawne przyjęcie, że transakcja nie zostanie zaksięgowana; przy
+    BLOCKED z polami pozycji, ale bez deal_id, wpisuje `NO-DEAL-ID`; w pozostałych stanach `RESET`. Zdarzenie audytowe
+    `owner.reset` (kto, poprzedni stan, niezaksięgowany deal, wynik historii, potwierdzenie) przed zapisem FLAT przez
+    automat stanów. Wyjście nie zawiera identyfikatorów rachunków. 0: wyczyszczone.
     """
     journal, epic = engine.journal, engine.strat.instrument
     position = journal.current_position(epic)
@@ -694,27 +773,71 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     if orders:
         out(f"refused: a working order on {epic} exists at the broker ({', '.join(orders)}); cancel it in the app")
         return 1
-    out(f"journal position {epic}: {position.state.value} deal {position.deal_id} "
-        f"{position.side.value if position.side else '?'} size {position.size} open {position.open_level} stop "
-        f"{position.stop_level}")  # fmt: skip
+    deal_id = position.deal_id
+    history = "NOT_APPLICABLE"
+    if deal_id is not None:
+        history = await _reset_history_check(engine, position, out)
+        if history is None:
+            return 1
+    out(f"journal position {epic}: {position.state.value} deal {deal_id} side "
+        f"{position.side.value if position.side else '?'} size {position.size} open level {position.open_level} "
+        f"stop {position.stop_level} opened at {position.opened_at.isoformat() if position.opened_at else '?'}")
     out(f"broker: no position and no working order on {epic} on the bound account")
-    if position.deal_id and not journal.has_trade(position.deal_id):
-        out(f"WARNING: deal {position.deal_id} is not booked in the ledger, so its result is NOT in the loss limits; "
-            "check the Capital.com activity")  # fmt: skip
-    if ask(f"Type {RESET_WORD} to set the journal position FLAT: ").strip() != RESET_WORD:
+    has_fields = position.side is not None or position.size is not None or position.open_level is not None
+    if deal_id is not None:
+        if not journal.has_trade(deal_id):
+            out(f"WARNING: deal {deal_id} is not booked in the ledger and its closure is not bookable from the broker "
+                f"history ({history}): its result will NOT be in the loss limits; check the Capital.com activity")
+        word, prompt = deal_id, f"Type the deal id {deal_id} to accept that it stays unbooked and set FLAT: "
+    elif position.state is PositionState.BLOCKED and has_fields:
+        out("WARNING: the journal position has position fields but no deal id: it cannot be matched with the broker "
+            "history or booked; check the Capital.com activity")  # fmt: skip
+        word, prompt = NO_DEAL_ID_WORD, f"Type {NO_DEAL_ID_WORD} to accept it and set the journal position FLAT: "
+    else:
+        word, prompt = RESET_WORD, f"Type {RESET_WORD} to set the journal position FLAT: "
+    typed = ask(prompt).strip()
+    if typed != word:
         out("aborted: nothing changed")
         return 2
     now = engine.clock.now_utc()
     journal.append_raw(
         SOURCE_OWNER_RESET,
-        dump({"event": "OWNER_RESET", "by": by.strip(), "previous": position, "account_id": bound,
-              "broker_positions": [], "working_orders": []}),  # fmt: skip
+        dump({"event": "OWNER_RESET", "by": by.strip(), "previous": position, "unbooked_deal": deal_id,
+              "history": history, "acknowledged": typed, "broker_positions": [], "working_orders": []}),  # fmt: skip
         now,
     )
     check_position_transition(position.state, PositionState.FLAT)
     journal.upsert_position(PositionRecord(epic, PositionState.FLAT))
     out(f"position {epic} set FLAT by {by.strip()} (was {position.state.value}); start the engine")
     return 0
+
+
+async def _reset_history_check(engine: Engine, position: PositionRecord, out: Callable[[str], None]) -> str | None:
+    """Historia zamknięć deal_id pozycji BLOCKED (od otwarcia − HISTORY_MARGIN, pełna albo wyjątek).
+
+    None: odmowa (już wypisana): zamknięcie do zaksięgowania przez silnik albo historia nieczytelna. Inaczej wynik
+    do audytu: `NO_CLOSURE`, `AMBIGUOUS_<n>_CLOSURES`, `START_UNKNOWN` (bez czasu otwarcia nie da się jej sprawdzić).
+    """
+    from gwstock.orders.manager import HISTORY_MARGIN
+
+    deal_id, epic = position.deal_id, position.epic
+    if position.opened_at is None:
+        out(f"note: the open time of deal {deal_id} is unknown, so its closure cannot be looked up in the history")
+        return "START_UNKNOWN"
+    try:
+        closures = await engine.probe(engine.raw_broker.closed_since, position.opened_at - HISTORY_MARGIN)
+    except Exception as exc:
+        out(f"refused: the broker history cannot be read ({type(exc).__name__}: {exc}); nothing changed, try again "
+            "later")  # fmt: skip
+        return None
+    found = [c for c in closures if c.deal_id == deal_id and c.epic == epic]
+    if len(found) == 1:
+        c = found[0]
+        out(f"refused: the closure of deal {deal_id} is in the broker history ({c.reason} at {c.exit_level}, "
+            f"{c.ts.isoformat()}): the engine books it; start the engine and let its reconciliation book it, then "
+            "run reset-position again only if the position is still BLOCKED")  # fmt: skip
+        return None
+    return f"AMBIGUOUS_{len(found)}_CLOSURES" if found else "NO_CLOSURE"
 
 
 # --- main ------------------------------------------------------------------------------------------------------
@@ -833,8 +956,12 @@ def _engine_stopped(paths: Paths):
 
 
 async def _smoke_engine(paths: Paths, hold_s: int = 0) -> int:
+    async def run(engine: Engine) -> int:
+        with _stop_on_signals(engine):  # Ctrl-C/SIGTERM w trakcie wstrzymania: zamknięcie zamiast porzucenia pozycji
+            return await smoke(engine, hold_s=hold_s)
+
     with _engine_stopped(paths) as lock:  # nigdy obok działającego silnika: blokada najpierw
-        return await _with_engine(paths, lambda engine: smoke(engine, hold_s=hold_s), lock=lock)
+        return await _with_engine(paths, run, lock=lock)
 
 
 async def _reset_engine(paths: Paths, by: str) -> int:

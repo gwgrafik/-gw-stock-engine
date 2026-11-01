@@ -8,6 +8,7 @@ Ten plik zawiera nazwy plików uzbrojenia wyłącznie jako wzorce wyszukiwania w
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 import stat
@@ -25,7 +26,7 @@ import gwstock.cli as cli
 from gwstock.app import EngineMisconfigured, Mode
 from gwstock.broker.fake import FakeBroker
 from gwstock.config import RuntimeConfig, load_runtime
-from gwstock.journal import Journal, JournalError, JournalWriteError, OrderRecord
+from gwstock.journal import Journal, JournalError, JournalReadError, JournalWriteError, OrderRecord
 from gwstock.types import (
     AccountInfo,
     BrokerError,
@@ -870,23 +871,80 @@ async def blocked_position(engine, broker, clock):
     engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=P.BLOCKED))
 
 
-async def test_reset_position_sets_a_blocked_position_flat_after_checks_and_confirmation(engine, broker, clock):
-    await blocked_position(engine, broker, clock)
+async def test_reset_position_without_a_closure_in_history_needs_the_deal_id_typed(engine, broker, clock):
+    await blocked_position(engine, broker, clock)  # pozycji nie ma u brokera, zamknięcia nie ma w historii
     lines: list[str] = []
-    owner = Typed("RESET")
+    owner = Typed("DEAL-1")
     assert await cli.reset_position(engine, "wlasciciel", owner, out=lines.append) == 0
     assert engine.journal.current_position("DE40").state is P.FLAT
     [audit] = payloads(engine.journal, "owner.reset")
-    assert audit["by"] == "wlasciciel" and audit["previous"]["state"] == "BLOCKED" and audit["previous"]["deal_id"]
-    assert "list_positions" in broker.calls and "list_working_orders" in broker.calls
-    assert any("not booked" in line for line in lines)  # zamknięcie poza silnikiem: wynik NIE jest w księdze
+    assert audit["by"] == "wlasciciel" and audit["previous"]["state"] == "BLOCKED"
+    assert audit["unbooked_deal"] == "DEAL-1" and audit["history"] == "NO_CLOSURE" and audit["acknowledged"] == "DEAL-1"
+    assert "list_positions" in broker.calls and "list_working_orders" in broker.calls and "closed_since" in broker.calls
+    text = "\n".join(lines)
+    assert "not booked" in text and "side BUY" in text and "size 0.001" in text and "opened at" in text
+    assert "ACC-" not in text  # bez identyfikatorów rachunków w wyjściu
+    assert "DEAL-1" in owner.prompts[0]
 
 
-async def test_reset_position_without_the_exact_confirmation_changes_nothing(engine, broker, clock):
+@pytest.mark.parametrize("answer", ["RESET", "deal-1", "DEAL-2", ""])
+async def test_reset_position_without_the_exact_deal_id_changes_nothing(engine, broker, clock, answer):
     await blocked_position(engine, broker, clock)
-    assert await cli.reset_position(engine, "wlasciciel", Typed("reset"), out=lambda _: None) == 2
+    assert await cli.reset_position(engine, "wlasciciel", Typed(answer), out=lambda _: None) == 2
     assert engine.journal.current_position("DE40").state is P.BLOCKED
     assert payloads(engine.journal, "owner.reset") == []
+
+
+async def test_reset_position_refuses_when_the_closure_is_bookable_from_history(engine, broker, clock):
+    # sonda R3: pozycja BLOCKED, a broker ma jej zamknięcie w historii: reset zgubiłby księgowanie na zawsze
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    broker.trigger_stop("DEAL-1", MID + 1 - 30)  # zamknięcie stopem zapisane w historii brokera
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=P.BLOCKED))
+    clock.advance(3 * 3600)  # właściciel resetuje kilka godzin później: historia od otwarcia, nie od teraz
+    lines: list[str] = []
+    owner = Typed()
+    assert await cli.reset_position(engine, "wlasciciel", owner, out=lines.append) == 1
+    assert owner.prompts == [] and payloads(engine.journal, "owner.reset") == []
+    assert engine.journal.current_position("DE40").state is P.BLOCKED and engine.journal.trades() == []
+    assert any("start the engine" in line and "book" in line for line in lines)
+    result = await engine.reconcile_once()  # kontrola: uzgadnianie silnika rzeczywiście je księguje
+    assert result is not None and len(engine.journal.trades()) == 1
+
+
+async def test_reset_position_refuses_when_the_history_cannot_be_read(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    broker.fail_next("closed_since", BrokerError("GET /history/activity: HISTORY_RANGE_TOO_LARGE"))
+    lines: list[str] = []
+    owner = Typed()
+    assert await cli.reset_position(engine, "wlasciciel", owner, out=lines.append) == 1
+    assert owner.prompts == [] and any("history" in line and "HISTORY_RANGE_TOO_LARGE" in line for line in lines)
+    assert engine.journal.current_position("DE40").state is P.BLOCKED
+
+
+async def test_reset_position_with_an_ambiguous_history_still_needs_the_deal_id(engine, broker, clock):
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    broker.trigger_stop("DEAL-1", MID + 1 - 30)
+    broker._closed.append(replace(broker._closed[-1], exit_level=MID))  # dwa zamknięcia tego samego deal_id
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=P.BLOCKED))
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed("DEAL-1"), out=lines.append) == 0
+    [audit] = payloads(engine.journal, "owner.reset")
+    assert audit["history"] == "AMBIGUOUS_2_CLOSURES" and audit["unbooked_deal"] == "DEAL-1"
+
+
+async def test_reset_position_without_a_deal_id_needs_the_no_deal_id_acknowledgement(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), deal_id=None))
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed("RESET"), out=lines.append) == 2
+    assert engine.journal.current_position("DE40").state is P.BLOCKED
+    assert any("no deal id" in line.lower() for line in lines)
+    assert await cli.reset_position(engine, "wlasciciel", Typed("NO-DEAL-ID"), out=lambda _: None) == 0
+    [audit] = payloads(engine.journal, "owner.reset")
+    assert audit["unbooked_deal"] is None and audit["acknowledged"] == "NO-DEAL-ID"
+    assert engine.journal.current_position("DE40").state is P.FLAT
 
 
 async def test_reset_position_refuses_while_the_broker_shows_a_position(engine, broker, clock):
@@ -973,6 +1031,103 @@ async def test_smoke_hold_flattens_at_once_when_in_doubt(engine, broker, smoke_c
     await cli.smoke(engine, out=lines.append, hold_s=300)
     assert (closes[0] - start).total_seconds() < 60  # wątpliwość (kill switch): bez czekania do końca
     assert any("hold stopped" in line for line in lines)
+
+
+LEFT_OPEN = "left open with its stop; start the engine (it reconciles and flattens at 17:25) or close it"
+
+
+def interrupt(exc):
+    def raise_it():
+        raise exc
+
+    return raise_it
+
+
+@pytest.mark.parametrize("exc", [asyncio.CancelledError, KeyboardInterrupt], ids=["cancelled", "keyboard"])
+async def test_smoke_hold_interrupted_still_closes_the_probe_position(engine, broker, smoke_clock, exc):
+    # sonda H1: anulowanie (SIGINT pod asyncio.run) w trakcie wstrzymania zostawiało pozycję otwartą bez słowa
+    at_time(broker, smoke_clock, smoke_clock.now_utc() + timedelta(seconds=20), interrupt(exc()))
+    lines: list[str] = []
+    with pytest.raises(exc):
+        await cli.smoke(engine, out=lines.append, hold_s=300)
+    assert broker.positions == {} and "close_position" in broker.calls  # zamknięcie spróbowane i udane
+    assert any("hold interrupted" in line for line in lines) and not any(LEFT_OPEN in line for line in lines)
+
+
+async def test_smoke_hold_interrupted_and_unable_to_close_says_so_loudly(engine, broker, smoke_clock):
+    def cancel_with_a_closed_market():
+        broker.set_market_closed(True)
+        raise asyncio.CancelledError()
+
+    at_time(broker, smoke_clock, smoke_clock.now_utc() + timedelta(seconds=20), cancel_with_a_closed_market)
+    lines: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        await cli.smoke(engine, out=lines.append, hold_s=300)
+    assert "DEAL-1" in broker.positions  # stop u brokera nadal chroni
+    assert any("deal DEAL-1 " + LEFT_OPEN in line for line in lines)
+
+
+async def test_smoke_hold_stop_flag_from_a_signal_ends_the_hold_and_flattens(engine, broker, smoke_clock):
+    at_time(broker, smoke_clock, smoke_clock.now_utc() + timedelta(seconds=20), engine.request_shutdown)
+    closes = calls_at(broker, smoke_clock, "close_position")
+    start = smoke_clock.now_utc()
+    lines: list[str] = []
+    await cli.smoke(engine, out=lines.append, hold_s=300)
+    assert (closes[0] - start).total_seconds() < 60 and broker.positions == {}
+    assert any("hold stopped: stop requested" in line for line in lines)
+
+
+async def test_smoke_hold_journal_error_still_closes_the_position_at_the_broker(
+    engine, broker, smoke_clock, monkeypatch
+):
+    # sonda H2: błąd dziennika w trakcie wstrzymania; zamknięcie nie może od niego zależeć
+    journal = engine.journal
+    real = journal.current_position
+    broken_from = smoke_clock.now_utc() + timedelta(seconds=20)
+
+    def flaky(epic):
+        if smoke_clock.now_utc() >= broken_from:
+            raise JournalReadError("database is locked")
+        return real(epic)
+
+    monkeypatch.setattr(journal, "current_position", flaky)
+    lines: list[str] = []
+    with pytest.raises(JournalReadError):
+        await cli.smoke(engine, out=lines.append, hold_s=300)
+    assert broker.positions == {}  # zamknięte u brokera mimo dziennika; uzgadnianie silnika zaksięguje je później
+    assert any("hold interrupted (JournalReadError)" in line for line in lines)
+
+
+async def test_smoke_installs_stop_handlers_for_sigterm_and_sigint(engine):
+    import os
+    import signal
+
+    with cli._stop_on_signals(engine):
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.05)  # handler pętli zdarzeń, nie domyślne zakończenie procesu
+    assert engine.shutdown_requested
+
+
+async def test_the_smoke_command_runs_the_probe_with_the_stop_handlers_installed(engine, monkeypatch, tmp_path):
+    import os
+    import signal
+
+    async def fake_with_engine(paths, action, *, lock=None):
+        return await action(engine)
+
+    async def fake_smoke(eng, out=print, hold_s=0):
+        installed = signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN, None)
+        if not installed:  # bez obsługi sygnał zakończyłby proces testów: tylko zgłaszamy brak
+            return 1
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.05)
+        return 0 if eng.shutdown_requested and hold_s == 30 else 1
+
+    monkeypatch.setattr(cli, "_with_engine", fake_with_engine)
+    monkeypatch.setattr(cli, "smoke", fake_smoke)
+    paths = cli.Paths(tmp_path / "c", tmp_path / "d", tmp_path / "k.json")
+    (tmp_path / "d").mkdir()
+    assert await cli._smoke_engine(paths, 30) == 0
 
 
 @pytest.mark.parametrize("value", ["-1", "601", "x"])
