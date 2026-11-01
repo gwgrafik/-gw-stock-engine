@@ -16,6 +16,11 @@ import pytest
 from gwstock import prereg
 
 REPO = Path(__file__).resolve().parents[2]
+# Obraz testowy (Dockerfile, cel test) ustawia GW_TEST_IMAGE=1 i nie zawiera docs/ ani .gitattributes. Tylko wtedy pomijamy
+# testy dokumentów; bez znacznika brak tych plików ma wywalać testy głośno.
+needs_repo_docs = pytest.mark.skipif(
+    os.environ.get("GW_TEST_IMAGE") == "1", reason="obraz testowy (GW_TEST_IMAGE=1) nie zawiera docs/ ani .gitattributes"
+)
 NOW = datetime(2026, 11, 2, 7, 0, tzinfo=timezone.utc)
 CONFIG_NAMES = ("strategy_v1.toml", "risk_v1.toml", "costs_v1.toml")
 
@@ -542,6 +547,7 @@ def test_python_dash_m_gwstock_prereg_runs(tmp_path, config_dir):
 # --- .gitattributes ----------------------------------------------------------------------------------------------
 
 
+@needs_repo_docs
 def test_gitattributes_pins_line_endings_of_the_frozen_config_files():
     # odcisk liczy SUROWE bajty, więc CRLF (np. z autocrlf) zmieniłby go bez zmiany treści
     path = REPO / ".gitattributes"
@@ -553,6 +559,7 @@ def test_gitattributes_pins_line_endings_of_the_frozen_config_files():
         assert b"\r" not in raw and not raw.startswith(b"\xef\xbb\xbf")
 
 
+@needs_repo_docs
 def test_preregistration_document_matches_what_the_tools_do():
     text = (REPO / "docs" / "preregistration" / "v1.md").read_text(encoding="utf-8")
     prefix = "docker compose -f docker/compose.yml"
@@ -569,6 +576,7 @@ OLD_WORDING = "spread i poślizg stopów zmierzone i porównane z modelem"
 SAMPLES_CLAUSE = "próbki kosztu to transakcje wejścia ORAZ próby smoke dowolnej wielkości"
 
 
+@needs_repo_docs
 def test_cost_wording_is_aligned_in_spec_preregistration_and_runbook():
     spec = (REPO / "docs/superpowers/specs/2026-10-31-engine-design-v2.md").read_text(encoding="utf-8")
     prereg_doc = (REPO / "docs/preregistration/v1.md").read_text(encoding="utf-8")
@@ -582,6 +590,7 @@ def test_cost_wording_is_aligned_in_spec_preregistration_and_runbook():
     assert "eksport CSV" in runbook.split(SAMPLES_CLAUSE)[1][:200]
 
 
+@needs_repo_docs
 def test_preregistration_document_states_the_known_limits_of_the_l1_numbers():
     text = (REPO / "docs" / "preregistration" / "v1.md").read_text(encoding="utf-8")
     assert "cztery liczby" not in text  # są pięć: cztery warunki bramki i liczba próbek kosztu

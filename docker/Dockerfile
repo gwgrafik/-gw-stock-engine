@@ -34,6 +34,10 @@ RUN groupadd --gid 10001 gw \
 # ---------------------------------------------------------------------------------------------------------------------
 FROM base AS test
 
+# Znacznik obrazu testowego: testy czytające docs/, .gitattributes, scripts/ lub .github/ pomijają się TYLKO przy nim
+# (bez znacznika brak tych plików ma głośno wywalać testy, a nie po cichu je wyłączać).
+ENV GW_TEST_IMAGE=1
+
 COPY requirements.lock requirements-dev.lock /app/
 RUN pip install -r requirements-dev.lock
 
