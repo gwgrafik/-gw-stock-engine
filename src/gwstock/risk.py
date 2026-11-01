@@ -653,6 +653,9 @@ class KillSwitch:
         except Exception:
             return  # dziennik nadal leży; alarm o tym już poszedł
         self._unsynced = False
+        # Przy nieznanym stanie zapis dochodzi tu tylko dla HARD, który niczego nie obniżył: dziennik ma teraz nasz
+        # stan, więc niepewność się skończyła (bez dalszych wolnych odczytów i bez mylącego "restored" później).
+        self._state_unknown = False
         self._audit("PERSISTED", self._level, self._reason, self._level, self._reason, ts)
         self._alert(
             "INFO",

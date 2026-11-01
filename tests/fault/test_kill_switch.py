@@ -594,6 +594,37 @@ def test_hard_written_while_the_state_is_unreadable_is_persisted_and_ends_the_un
     assert state["calls"] == calls  # niepewność skończona: odczytu nie ponawiamy
 
 
+def test_persisting_hard_after_an_unknown_start_clears_the_unknown_flag(
+    journal, clock, data_dir, notifier, monkeypatch
+):
+    real_state = journal.kill_state
+    reads = flaky_kill_state(monkeypatch, journal)
+    real_set = journal.set_kill
+    write = {"down": True}
+
+    def set_kill(level, reason, ts):
+        if write["down"]:
+            raise JournalWriteError("disk full")
+        return real_set(level, reason, ts)
+
+    monkeypatch.setattr(journal, "set_kill", set_kill)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    ks.hard("y")  # zapis zawodzi: HARD tylko w pamięci
+    write["down"] = False
+    ks.scan_files()  # ponowienie zapisuje HARD, choć odczyt nadal leży
+    assert (real_state().level, real_state().reason) == (KillLevel.HARD, "y")
+    assert notifier.alerts[-1][0] == "INFO"
+    calls = reads["calls"]
+    ks.soft("z")
+    ks.scan_files()
+    assert reads["calls"] == calls  # zapisany HARD kończy niepewność: wolnego odczytu już nie ponawiamy
+    reads["down"] = False
+    alerts = len(notifier.alerts)
+    ks.scan_files()
+    assert len(notifier.alerts) == alerts  # i żadnego mylącego "restored from the journal" po powrocie odczytu
+    assert not any(a["event"] == "RECOVERED" for a in audit(journal))
+
+
 @pytest.mark.parametrize("via", ["hard", "hard_stop_file"])
 def test_hard_is_in_memory_before_a_slow_read_of_an_unknown_stored_state(
     journal, clock, data_dir, notifier, monkeypatch, via
