@@ -28,11 +28,9 @@ from gwstock.types import (
     BrokerRejected,
     BrokerTimeout,
     Candle,
-    EntryRequest,
     InstrumentRules,
     Quote,
     SessionExpired,
-    Side,
 )
 from tests.unit.fake_capital_server import TEST_API_KEY, TEST_IDENTIFIER, TEST_PASSWORD, candle, stamp
 
@@ -146,24 +144,6 @@ async def test_constructor_validates_credentials_and_timeout(capital_credentials
 async def test_capabilities_and_broker_protocol(capital_broker):
     assert capital_broker.capabilities == Capabilities("atomic", None, 600, "positions", True)
     assert isinstance(capital_broker, Broker)
-
-
-@pytest.mark.parametrize(
-    "call",
-    [
-        lambda b: b.open_position(EntryRequest("gws-x", "DE40", Side.BUY, Decimal("0.001"), Decimal("30"))),
-        lambda b: b.confirm("o_ref"),
-        lambda b: b.list_positions(),
-        lambda b: b.close_position("DEAL-1"),
-        lambda b: b.set_stop("DEAL-1", Decimal("25750.0")),
-        lambda b: b.closed_since(T0),
-        lambda b: b.list_working_orders(),
-    ],
-)
-async def test_part_two_methods_are_explicit_stubs(capital_broker, fake_capital_server, call):
-    with pytest.raises(NotImplementedError, match="Task 13 part 2"):
-        await call(capital_broker)
-    assert fake_capital_server.log == []
 
 
 # --- dane logowania ----------------------------------------------------------------------

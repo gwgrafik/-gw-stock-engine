@@ -20,11 +20,14 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from gwstock.types import AccountInfo, InstrumentRules, Quote
+from gwstock.types import AccountInfo, InstrumentRules, Quote, Side, WorkingOrder
 
 _ENUM = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
 _UTC_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?")  # bez strefy (notatki §1.3)
 _FIELD = re.compile(r"[A-Za-z]+\.[A-Za-z_]+")
+# identyfikator brokera, który trafia do ścieżki URL (dealId, dealReference): bez `/`, `?`, `#`, spacji, `.`/`..`
+_IDENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
+_MAX_RAW_REASON_LEN = 4096
 
 
 class ParseError(ValueError):
@@ -146,6 +149,59 @@ def optional_text(d: dict[str, Any], key: str, where: str) -> str | None:
     if not isinstance(value, str):
         raise ParseError(f"{path(where, key)}: expected a string, got {type(value).__name__}")
     return value
+
+
+def positive(d: dict[str, Any], key: str, where: str) -> Decimal:
+    value = dec(d, key, where)
+    if value <= 0:
+        raise ParseError(f"{path(where, key)}: expected a positive number")
+    return value
+
+
+def ident(d: dict[str, Any], key: str, where: str) -> str:
+    """Identyfikator brokera (dealId, dealReference) bezpieczny jako segment ścieżki URL."""
+    value = text(d, key, where)
+    if not _IDENT.fullmatch(value):
+        raise ParseError(f"{path(where, key)}: expected an identifier of letters, digits, '.', '_' or '-'")
+    return value
+
+
+def side_of(d: dict[str, Any], key: str, where: str) -> Side:
+    value = get(d, key, where)
+    if value == "BUY":
+        return Side.BUY
+    if value == "SELL":
+        return Side.SELL
+    raise ParseError(f"{path(where, key)}: expected BUY or SELL, got {shown(value)}")
+
+
+def check_ident(name: str, value: object) -> str:
+    """Argument wywołania (deal_id, deal_reference) przed wstawieniem do ścieżki URL; zły → TypeError/ValueError."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name}: expected a string, got {type(value).__name__}")
+    if not _IDENT.fullmatch(value):
+        raise ValueError(f"{name}: expected letters, digits, '.', '_' or '-' (no '/', '?', '#', spaces), got {value!r:.40}")
+    return value
+
+
+def clean_reason(value: Any) -> str | None:
+    """Powód brokera do komunikatu: tylko znaki drukowalne; nie-napis albo pusty → None.
+
+    Bez przycinania do długości komunikatu: adapter najpierw usuwa sekrety, dopiero potem przycina (inaczej cięcie
+    w połowie sekretu zostawiłoby jego początek). Górna granica `_MAX_RAW_REASON_LEN` tylko ogranicza pracę.
+    """
+    if not isinstance(value, str):
+        return None
+    value = "".join(ch for ch in value[:_MAX_RAW_REASON_LEN] if ch.isprintable()).strip()
+    return value or None
+
+
+def is_market_closed_code(code: str) -> bool:
+    """Czy `errorCode` odmowy mówi o zamkniętym rynku. Kod jest NIEUDOKUMENTOWANY (notatki §1.4, C14b): rozpoznajemy
+    każdy kod, który zawiera słowa "market" i "closed" (wielkość liter bez znaczenia). Pomyłka tylko zmienia klasę
+    odmowy (`MarketClosed` zamiast `BrokerRejected`): w obu przypadkach nic nie zostało wykonane."""
+    lowered = code.lower()
+    return "market" in lowered and "closed" in lowered
 
 
 def build(cls: type, where: str, *args: Any) -> Any:
@@ -374,3 +430,148 @@ def parse_bars(payload: Any) -> list[Bar]:
         _require(low <= h, path(where, "highPrice"), "highPrice >= lowPrice")
         bars.append(Bar(moment, o, h, low, c))
     return bars
+
+
+# --- część handlowa: referencje, potwierdzenia, pozycje, zlecenia oczekujące -------------------------------
+
+
+def parse_reference(payload: Any) -> str:
+    """`{"dealReference": "..."}` z `POST /positions`, `PUT`/`DELETE /positions/{dealId}` (notatki §2.10, §2.13, §2.14)."""
+    return ident(obj(payload, ""), "dealReference", "")
+
+
+def parse_deal_status(payload: Any, reference: str) -> tuple[str, str | None]:
+    """(`dealStatus`, `reason`) z `GET /confirms/{ref}` (§2.15); potwierdzenie innej referencji → `ParseError`.
+
+    Referencja jest sprawdzana PRZED statusem, więc cudze potwierdzenie nigdy nie staje się odrzuceniem naszego.
+    `dealStatus` musi być napisem; jego wartość ocenia wywołujący (tylko ACCEPTED i REJECTED mają znaczenie).
+    """
+    root = obj(payload, "")
+    echoed = root.get("dealReference")
+    if echoed is not None and echoed != reference:
+        raise ParseError("dealReference: the confirmation is for another reference")
+    status = text(root, "dealStatus", "")
+    return status, clean_reason(root.get("reason"))
+
+
+@dataclass(frozen=True)
+class Opening:
+    """Potwierdzenie otwarcia (ACCEPTED): `order_id` = główne `dealId` (zlecenie), `deal_id` = pozycja (C2)."""
+
+    order_id: str | None
+    deal_id: str
+    epic: str
+    side: Side
+    size: Decimal
+    level: Decimal
+
+
+def parse_opening(payload: Any) -> Opening:
+    """Id pozycji = jedyny wpis `affectedDeals` ze statusem `OPENED` (notatki §2.15, C2); inaczej `ParseError`.
+
+    Brak wpisu `OPENED` (np. `AMENDED` przy agregacji z inną pozycją, C15) albo kilka takich wpisów: nie wiadomo,
+    którą pozycję utworzyło zlecenie, więc adapter nie zgaduje.
+    """
+    root = obj(payload, "")
+    affected = items(get(root, "affectedDeals", ""), "affectedDeals")
+    opened = []
+    for i, item in enumerate(affected):
+        where = path("affectedDeals", i)
+        deal = obj(item, where)
+        if deal.get("status") == "OPENED":
+            opened.append(ident(deal, "dealId", where))
+    if len(opened) != 1:
+        raise ParseError(f"affectedDeals: expected exactly one OPENED deal, found {len(opened)}")
+    order_id = root.get("dealId")
+    return Opening(
+        order_id=order_id if isinstance(order_id, str) and order_id else None,
+        deal_id=opened[0],
+        epic=text(root, "epic", ""),
+        side=side_of(root, "direction", ""),
+        size=positive(root, "size", ""),
+        level=positive(root, "level", ""),
+    )
+
+
+@dataclass(frozen=True)
+class PositionRow:
+    """Element `GET /positions` / `GET /positions/{dealId}` (§2.11). `stop_reported`: klucz stopu był w odpowiedzi."""
+
+    deal_id: str
+    working_order_id: str | None
+    epic: str
+    side: Side
+    size: Decimal
+    level: Decimal
+    opened_at: datetime
+    stop_reported: bool
+    stop_level: Decimal | None
+
+
+def parse_position(item: Any, where: str = "") -> PositionRow:
+    """`{position, market}` → `PositionRow`; czas WYŁĄCZNIE z `createdDateUTC` (`createdDate` jest lokalny).
+
+    Stop (C5, C24): klucz `stopLevel` obecny → jego wartość (jawny `null` → brak stopu); inaczej klucz
+    `stopDistance` obecny → `level ∓ stopDistance` (BUY minus, SELL plus; `null` → brak stopu); żadnego klucza →
+    `stop_reported=False` i adapter sięga do własnego zapisu.
+    """
+    entry = obj(item, where)
+    pos_where, market_where = path(where, "position"), path(where, "market")
+    position = obj(get(entry, "position", where), pos_where)
+    market = obj(get(entry, "market", where), market_where)
+    side = side_of(position, "direction", pos_where)
+    level = positive(position, "level", pos_where)
+    reported, stop = True, None
+    if "stopLevel" in position:
+        if position["stopLevel"] is not None:
+            stop = positive(position, "stopLevel", pos_where)
+    elif "stopDistance" in position:
+        if position["stopDistance"] is not None:
+            distance = positive(position, "stopDistance", pos_where)
+            stop = level - distance if side is Side.BUY else level + distance
+    else:
+        reported = False
+    return PositionRow(
+        deal_id=ident(position, "dealId", pos_where),
+        working_order_id=optional_text(position, "workingOrderId", pos_where),
+        epic=text(market, "epic", market_where),
+        side=side,
+        size=positive(position, "size", pos_where),
+        level=level,
+        opened_at=utc_stamp(position, "createdDateUTC", pos_where),
+        stop_reported=reported,
+        stop_level=stop,
+    )
+
+
+def parse_positions(payload: Any) -> list[PositionRow]:
+    """`GET /positions` → wiersze w kolejności brokera; powtórzony `dealId` → `ParseError`."""
+    rows: list[PositionRow] = []
+    for i, item in enumerate(items(get(obj(payload, ""), "positions", ""), "positions")):
+        row = parse_position(item, path("positions", i))
+        if any(r.deal_id == row.deal_id for r in rows):
+            raise ParseError(f"positions[{i}].position.dealId: duplicate deal id")
+        rows.append(row)
+    return rows
+
+
+def parse_working_orders(payload: Any) -> list[WorkingOrder]:
+    """`GET /workingorders` → `WorkingOrder(dealId, epic, direction, orderSize, orderLevel)` z `workingOrderData`."""
+    orders: list[WorkingOrder] = []
+    for i, item in enumerate(items(get(obj(payload, ""), "workingOrders", ""), "workingOrders")):
+        where = path(path("workingOrders", i), "workingOrderData")
+        data = obj(get(obj(item, path("workingOrders", i)), "workingOrderData", path("workingOrders", i)), where)
+        order_id = text(data, "dealId", where)
+        if any(o.order_id == order_id for o in orders):
+            raise ParseError(f"{where}.dealId: duplicate order id")
+        order = build(
+            WorkingOrder,
+            where,
+            order_id,
+            text(data, "epic", where),
+            side_of(data, "direction", where),
+            positive(data, "orderSize", where),
+            positive(data, "orderLevel", where),
+        )
+        orders.append(order)
+    return orders

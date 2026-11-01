@@ -16,7 +16,7 @@ Dokument nie zawiera kluczy, haseł, tokenów, numerów rachunków ani sald. Wsz
 Status każdej pozycji, dokładnie jeden z dwóch napisów:
 
 - `udokumentowane` oznacza, że oficjalna dokumentacja [S1] wprost podaje to, o co pytamy (ścieżkę, nagłówek, pole, wartość).
-- `do potwierdzenia w dry_run lub w odczytach live` oznacza, że dokumentacja milczy, podaje tylko przykład, z którego da się coś wywnioskować, albo informacja pochodzi z [S3]. Adapter ma wtedy zachować ostrożność, a wartość rozstrzyga `dry_run` (odczyty), próba `smoke` (pierwsza transakcja na wielkości minimalnej) lub Zadanie 18. Lista takich pozycji z numerami C1 do C26 jest w sekcji 6.
+- `do potwierdzenia w dry_run lub w odczytach live` oznacza, że dokumentacja milczy, podaje tylko przykład, z którego da się coś wywnioskować, albo informacja pochodzi z [S3]. Adapter ma wtedy zachować ostrożność, a wartość rozstrzyga `dry_run` (odczyty), próba `smoke` (pierwsza transakcja na wielkości minimalnej) lub Zadanie 18. Lista takich pozycji z numerami C1 do C29 jest w sekcji 6.
 
 Czego nie udało się przeczytać: repozytorium z kolekcją Postman (<https://github.com/capital-com-sv/capital-api-postman>) zwróciło w moim środowisku 403, więc nie było źródłem. Wszystkie ścieżki, nagłówki i przykłady poniżej pochodzą ze specyfikacji [S1].
 
@@ -119,10 +119,11 @@ Trzy kolumny opisowe i jedna kolumna statusu. "Kształt" dotyczy ścieżki, meto
 | `GET /prices/{epic}` (świece dzienne) | opisany w [S1] | otwarte: C9 | do potwierdzenia w dry_run lub w odczytach live | 2.18 |
 | `GET /history/activity` (cena i przyczyna zamknięcia) | opisany w [S1] | otwarte: C7, C7b | do potwierdzenia w dry_run lub w odczytach live | 2.19 |
 | `GET /history/transactions` | opisany w [S1] | otwarte: C8 | do potwierdzenia w dry_run lub w odczytach live | 2.20 |
+| `GET /workingorders` (tylko odczyt) | opisany w [S1] | opisane w [S1] | udokumentowane | 2.22 |
 | WebSocket: połączenie, `marketData.*`, `OHLCMarketData.*`, `ping` | opisany w [S1] | otwarte: C21 | do potwierdzenia w dry_run lub w odczytach live | 2.21 |
 | Godziny otwarcia DE40 (`instrument.openingHours`) | struktura opisana w [S1] | otwarte: C12 | do potwierdzenia w dry_run lub w odczytach live | 2.16.3 |
 
-Operacje `workingorders`, `marketnavigation`, `clientsentiment`, `watchlists`, `accounts/topUp` istnieją w API, ale v1 ich nie używa (spec §6: zlecenia oczekujące poza zakresem; `topUp` działa tylko na koncie demo). Nie opisuję ich dalej.
+Operacje `marketnavigation`, `clientsentiment`, `watchlists`, `accounts/topUp` oraz zapis zleceń oczekujących (`POST /workingorders`, `PUT`/`DELETE /workingorders/{dealId}`) istnieją w API, ale v1 ich nie używa (spec §6: zlecenia oczekujące poza zakresem; `topUp` działa tylko na koncie demo). Nie opisuję ich dalej. Wyjątek: `GET /workingorders` (sekcja 2.22) jest czytane, bo spec §7 wymaga wykrycia obcego zlecenia oczekującego na naszym instrumencie.
 
 ### 2.1 `GET /api/v1/time`
 
@@ -459,7 +460,7 @@ Wnioski do potwierdzenia (wszystkie z przykładów i z [S3], nie ze zdania dokum
 
 - **Identyfikator pozycji.** W przykładzie `dealId` potwierdzenia (kończy się na `...43`) różni się od `affectedDeals[0].dealId` (`...45`), a przykład pozycji ma `workingOrderId` `...5c` i `dealId` `...5e`, a więc ta sama relacja "zlecenie, pozycja = zlecenie + 2". Wniosek: `dealId` pozycji (do `GET`/`PUT`/`DELETE /positions/{dealId}`) to `affectedDeals[i].dealId` ze statusem `OPENED`, nie główne `dealId` potwierdzenia, a `position.workingOrderId` jest równe `dealId` potwierdzenia (to identyfikator zlecenia, nie jego referencja `o_...`). C2, `do potwierdzenia w dry_run lub w odczytach live`. Adapter zapisuje w dzienniku oba identyfikatory i do `OpenPosition.deal_id` bierze `affectedDeals`. **Główna kontrola krzyżowa:** odczyt `GET /positions/{kandydat}` i sprawdzenie, że `position.workingOrderId == confirm.dealId`. Heurystyka zapasowa (gdy tego pola brak albo kandydatów jest kilku): dopasowanie po `list_positions()` według kierunku, wielkości i czasu otwarcia.
 - **Wartości `status` i `dealStatus`.** [S1] pokazuje tylko `status: "OPEN"` i `dealStatus: "ACCEPTED"`. Odrzucenie to według [S3] `dealStatus: "REJECTED"` z polem `reason` (tekst). Pełna lista wartości: C4, `do potwierdzenia w dry_run lub w odczytach live`.
-- **Wyścig.** Potwierdzenie tuż po `POST` może jeszcze zwrócić 404 `error.not-found.dealReference` (konektor [S3] ponawia do 6 razy z odstępem 150 ms razy numer próby). Adapter: do 3 prób w ciągu kilku sekund, potem stan `UNKNOWN` i uzgadnianie przez listę pozycji (spec §6). C1, `do potwierdzenia w dry_run lub w odczytach live`.
+- **Wyścig.** Potwierdzenie tuż po `POST` może jeszcze zwrócić 404 `error.not-found.dealReference` (konektor [S3] ponawia do 6 razy z odstępem 150 ms razy numer próby). Adapter (Zadanie 13) nie ponawia: dokładnie ten kształt 404 daje `confirm(ref) = None`, a menedżer zleceń przechodzi do `UNKNOWN` i rozstrzyga ponownym `confirm` i listą pozycji (spec §6). Każde inne 404, 4xx lub 5xx to `BrokerError`, nigdy `None` ani odrzucenie. C1, `do potwierdzenia w dry_run lub w odczytach live`.
 - **Zamknięcie.** Potwierdzenie zamknięcia pobieramy dla `dealReference` zwróconego w treści odpowiedzi `DELETE`: pola nieopisane (C3).
 
 Status operacji: `do potwierdzenia w dry_run lub w odczytach live` (C1, C2, C3, C4).
@@ -684,10 +685,15 @@ Odpowiedź (z `detailed=true`, `dealId` filtrowane; kształt z przykładu [S1], 
 
 Dlaczego tylko "przypuszczalnie": dokumentacja wymienia wartości `SL` i `TP` w wyliczeniu `source`, ale **nie mówi wprost**, że zadziałanie stopu daje `source: "SL"`. Jedyny przykład pełnego cyklu (otwarcie `USER`, zamknięcie `CLOSE_OUT`, odrzucona edycja `SYSTEM`) nie pokazuje stopu. Reguła mapowania dla Zadań 4 i 8 (`ClosedDeal.reason`):
 
-- `source == "SL"` → `"STOP"`.
-- `source == "USER"` → ręczne lub nasze polecenie zamknięcia (rozróżniamy po tym, czy mamy lokalnie pozycję w `EXITING`: wtedy `"FORCED"`, inaczej `"MANUAL"`).
-- `source` inne (`CLOSE_OUT`, `TP`, `DEALER`, `SYSTEM`) → rozbieżność nierozpoznana: zapisujemy surowy wpis, księgujemy cenę z `details.level` jako zamknięcie o nieznanej przyczynie, alarm i `BLOCKED` zgodnie z spec §7.
-- Dodatkowa weryfikacja stopu: jeśli `details.level` jest w pobliżu lokalnie zapisanego poziomu stopu (±spread), to zamknięcie przez stop jest wiarygodne nawet gdy `source` nie jest `SL`.
+- `source == "SL"` lub `"TP"` → `"STOP"` (v1 nie ustawia take profit).
+- `source == "USER"` → `"MANUAL"` (polecenie użytkownika w aplikacji albo nasze `DELETE` przez API; czy zamknięcie było nasze, rozstrzyga silnik po stanie `EXITING`, nie adapter).
+- `source` `CLOSE_OUT`, `DEALER`, `SYSTEM` → `"FORCED"`.
+- `source` spoza wyliczenia → `"FORCED"` (nigdy `"STOP"`) i licznik `unknown_close_sources` adaptera, na którym alarmuje Watchdog (Zadanie 14).
+- Dodatkowa weryfikacja stopu (dla silnika, nie adaptera): jeśli `details.level` jest w pobliżu lokalnie zapisanego poziomu stopu (±spread), to zamknięcie przez stop jest wiarygodne nawet gdy `source` nie jest `SL`.
+
+**Jak adapter odróżnia otwarcie od zamknięcia (C7d).** Wiersz otwarcia i wiersz zamknięcia mają ten sam typ `POSITION`, status `ACCEPTED` i ten sam `dealId`; różni je tylko `details.direction` (zamknięcie ma kierunek przeciwny do pozycji, a źródło otwarcia przez API to `USER`). Adapter zna stronę pozycji z własnej pamięci (nasze potwierdzenia, ostatnia lista pozycji), z wiersza zamknięcia systemowego (źródło inne niż `USER`: jego kierunek jest przeciwny do pozycji) albo z pary wierszy `USER`, w której najwcześniejszy jako jedyny ma swój kierunek (to otwarcie). Gdy to nie wystarcza, czyta świeżą listę pozycji; jeśli deal nadal jest nierozstrzygnięty, `closed_since` rzuca `BrokerError("HISTORY_AMBIGUOUS…")` zamiast zgadywać (np. samotny wiersz `USER` deala, którego nie ma na liście: może to być zamknięcie starszej pozycji albo otwarcie, którego zamknięcie jeszcze nie trafiło do historii). Sprzeczne wiersze → `HISTORY_INCONSISTENT`.
+
+**Kompletność (C27).** `closed_since(since)` zwraca wszystkie zamknięcia od `since` albo rzuca: zakres dłuższy niż 14 dni → `HISTORY_RANGE_TOO_LARGE` przed zapytaniem; okna `from`/`to` po najwyżej 1 dobie, sąsiednie zachodzą o 1 s (włączność granic nieopisana), `from` = `since` w dół do pełnej sekundy, `to` ostatniego okna = teraz w górę do pełnej sekundy (adapter czeka do tej chwili, więc `to` nigdy nie jest w przyszłości); zawsze `detailed=true`, bez `filter` (C7b) i bez `dealId`; odpowiedź z co najmniej 20 wierszami może być obcięta (limit nieudokumentowany), więc okno jest dzielone na połowy, a gdy się nie da (okno < 4 s) albo potrzeba ponad 64 zapytań → `HISTORY_TRUNCATED`; wiersz z `dateUTC` spoza zapytanego okna znaczy, że filtr nie zadziałał tak, jak zakładamy → `BrokerError`; nieudane okno → wyjątek (nigdy pominięte); identyczne wiersze (np. z nakładki okien) liczą się raz, a różne zamknięcia tego samego `dealId` (zamknięcia częściowe) zostają osobno. Liczą się tylko wiersze `POSITION`/`ACCEPTED`; `REJECTED`, `MODIFY_REJECT`, `CANCEL_REJECT` są pomijane, typy `WORKING_ORDER`, `EDIT_STOP_AND_LIMIT`, `SWAP`, `SYSTEM` też, a każdy inny status wiersza `POSITION` albo typ spoza wyliczenia → `BrokerError` (C7c). `ClosedDeal.epic` ← `activities[].epic` (ten sam identyfikator co `EntryRequest.epic`, np. `DE40`; nigdy `details.marketName`).
 
 Uwagi praktyczne:
 
@@ -770,6 +776,37 @@ Otwarte przed użyciem strumienia (spec pytanie 8): `t` jako początek świecy w
 
 Status operacji: `do potwierdzenia w dry_run lub w odczytach live` (C21).
 
+### 2.22 `GET /api/v1/workingorders` (zlecenia oczekujące, tylko odczyt)
+
+Źródło: oficjalna specyfikacja [S1] <https://open-api.capital.com/>, grupa "Trading > Orders", operacja "All working orders" (odczyt specyfikacji OpenAPI wbudowanej w stronę, 2026-10-31). Nagłówki: `CST`, `X-SECURITY-TOKEN`; bez parametrów. Cytat [S1]: "Returns all open working orders for the active account".
+
+```jsonc
+// 200 (kształt z przykładu [S1]; wartości poglądowe)
+{ "workingOrders": [
+  { "workingOrderData": {
+      "dealId": "<ORDER_ID>",                    // identyfikator zlecenia oczekującego
+      "direction": "BUY",
+      "epic": "<EPIC>",
+      "orderSize": 1,
+      "leverage": 10,
+      "orderLevel": 20,                          // poziom zlecenia
+      "timeInForce": "GOOD_TILL_DATE",           // albo "GOOD_TILL_CANCELLED"
+      "goodTillDate": "...", "goodTillDateUTC": "2022-06-09T01:01:00.000",  // tylko przy GOOD_TILL_DATE
+      "createdDate": "...", "createdDateUTC": "2022-04-06T09:48:28.114",
+      "guaranteedStop": true,
+      "orderType": "LIMIT",
+      "stopDistance": -3, "profitDistance": 3,   // tak w przykładzie (odległość stopu ujemna)
+      "trailingStop": false,
+      "currencyCode": "USD" },
+    "marketData": { "instrumentName": "<nazwa>", "epic": "<EPIC>", "marketStatus": "TRADEABLE",
+                    "bid": <number>, "offer": <number>, "updateTimeUTC": "...", ... } }   // jak `market` w 2.11
+] }
+```
+
+Mapowanie na `WorkingOrder(order_id, epic, side, size, level)` (spec §7: obce zlecenie oczekujące na naszym instrumencie): `order_id` ← `workingOrderData.dealId`, `epic` ← `workingOrderData.epic`, `side` ← `workingOrderData.direction`, `size` ← `workingOrderData.orderSize`, `level` ← `workingOrderData.orderLevel`; kolejność jak w odpowiedzi. Brak pola, zły typ, liczba jako napis, wartość niedodatnia albo powtórzony `dealId` → `BrokerError` (nigdy lista niepełna). Kształt pustej odpowiedzi nie jest pokazany; spodziewane `{"workingOrders": []}` (jak C5b). v1 nie składa ani nie anuluje zleceń oczekujących (anulowanie obcego zlecenia to decyzja właściciela).
+
+Status operacji: `udokumentowane`.
+
 ## 3. Skąd wziąć które pole (ściąga dla Zadań 4, 8, 13)
 
 | Potrzebne | Operacja i pole | Status |
@@ -809,6 +846,8 @@ Status operacji: `do potwierdzenia w dry_run lub w odczytach live` (C21).
 | lista rachunków (pola) | `GET /accounts` → `accounts[].{accountId, currency, status, balance.*}` | udokumentowane |
 | `equity`, `margin_used` | `equity` = `balance.balance`; `margin_used` = `balance.balance − balance.available` (równanie `balance` = `deposit` + `profitLoss` z przykładu [S1]) | do potwierdzenia w dry_run lub w odczytach live (C17) |
 | tryb konta | `GET /accounts/preferences` → `hedgingMode` | udokumentowane |
+| zlecenia oczekujące | `GET /workingorders` → `workingOrders[].workingOrderData.{dealId, epic, direction, orderSize, orderLevel}` | udokumentowane |
+| zamknięcie a otwarcie w historii | kierunek `details.direction` względem strony pozycji (sekcja 2.19) | do potwierdzenia w dry_run lub w odczytach live (C7d) |
 
 ## 4. Sekwencje dla adaptera (Zadanie 13) i uzgadniania (Zadanie 8)
 
@@ -818,9 +857,9 @@ Status operacji: `do potwierdzenia w dry_run lub w odczytach live` (C21).
 
 **Notowanie i świece.** `GET /markets/{epic}` co ok. 5 s (notowanie, status rynku); `GET /prices/DE40?resolution=MINUTE_5&from&to` dla zakresu otwarcia i zapasowych odczytów; `GET /prices/DE40?resolution=DAY&max=30` raz przed otwarciem (ATR14).
 
-**Wejście.** `INTENT` w dzienniku → `POST /positions` (ze `stopDistance`, odstęp ≥ 0,1 s od poprzedniego zlecenia) → `dealReference` w dzienniku → `GET /confirms/{dealReference}` (do 3 prób, krótkie odstępy) → przy `ACCEPTED`: `dealId` pozycji z `affectedDeals` → `GET /positions/{dealId}`: kontrola krzyżowa `position.workingOrderId == confirm.dealId` (C2) i kontrola stopu. Kontrola stopu: jeśli `stopLevel` jest w odpowiedzi, ma być zgodny z oczekiwanym (BUY `level − stopDistance`, SELL `level + stopDistance`); jeśli klucz jest obecny i `null`, `PUT /positions/{dealId}` z `stopLevel`, a gdy zawiedzie, kill switch twardy; jeśli klucza w ogóle nie ma, stop jest wyliczony z własnego żądania i oznaczony `derived` (C24). Timeout `POST` = `UNKNOWN` → `GET /positions` do 3 razy w 30 s (spec §6).
+**Wejście.** `INTENT` w dzienniku → `POST /positions` (ze `stopDistance`, odstęp ≥ 0,1 s od poprzedniego zlecenia) → `dealReference` w dzienniku → `GET /confirms/{dealReference}` (jedna próba na wywołanie `confirm`; ponawia menedżer zleceń w `UNKNOWN`) → przy `ACCEPTED`: `dealId` pozycji z `affectedDeals` → `GET /positions/{dealId}`: kontrola krzyżowa `position.workingOrderId == confirm.dealId` (C2) i kontrola stopu. Kontrola stopu: jeśli `stopLevel` jest w odpowiedzi, ma być zgodny z oczekiwanym (BUY `level − stopDistance`, SELL `level + stopDistance`); jeśli klucz jest obecny i `null`, `PUT /positions/{dealId}` z `stopLevel`, a gdy zawiedzie, kill switch twardy; jeśli klucza w ogóle nie ma, stop jest wyliczony z własnego żądania i oznaczony `derived` (C24). Timeout `POST` = `UNKNOWN` → `GET /positions` do 3 razy w 30 s (spec §6).
 
-**Wyjście.** `DELETE /positions/{dealId}` → `GET /confirms/{dealReference}` z referencją z treści odpowiedzi (nie budować `p_<dealId>` ręcznie) → kontrola listy pozycji; timeout lub odmowa → uzgadnianie, nie ponawianie na ślepo.
+**Wyjście.** Wyłącznie `DELETE /positions/{dealId}` (nigdy przeciwne zlecenie rynkowe) → `GET /confirms/{dealReference}` z referencją z treści odpowiedzi (nie budować `p_<dealId>` ręcznie) → kontrola listy pozycji; `dealStatus` `ACCEPTED` → zamknięte, `REJECTED` → `BrokerRejected(reason)`, każdy inny wynik potwierdzenia (404, błąd, timeout, brak referencji) → `BrokerTimeout("close outcome unknown")`; `DELETE` na nieistniejący deal (404 `error.not-found.dealId`) → `BrokerRejected("POSITION_NOT_FOUND")` (C29); timeout lub odmowa → uzgadnianie, nie ponawianie na ślepo.
 
 **Uzgadnianie co 10 s.** `GET /positions` → porównanie z dziennikiem (tabela spec §7). Pozycja lokalna zniknęła: `GET /history/activity?from=<początek dnia sesji UTC>&to=<teraz>&detailed=true&dealId=<dealId>` → wpis zamykający daje `details.level` i `source`; brak wpisu = `BLOCKED` i alarm.
 
@@ -831,8 +870,9 @@ Status operacji: `do potwierdzenia w dry_run lub w odczytach live` (C21).
 | `Quote(epic, bid, ask, ts)` | `bid` ← `snapshot.bid`; `ask` ← `snapshot.offer`; `ts` ← chwila zegara silnika, w której krotka (`bid`, `offer`, `updateTime`) ostatnio się zmieniła (sekcja 2.16.2; C10) |
 | `Candle(epic, start, open, high, low, close)` | `start` ← `snapshotTimeUTC` (UTC); OHLC ← `(bid + ask) / 2` z `openPrice` itd. |
 | `InstrumentRules(...)` | sekcja 2.16.1 |
-| `OpenPosition(deal_id, epic, side, size, open_level, stop_level, opened_at)` | `deal_id` ← `position.dealId`; `side` ← `position.direction`; `size` ← `position.size`; `open_level` ← `position.level`; `stop_level` ← `position.stopLevel` gdy klucz jest w odpowiedzi (C5), a gdy klucza nie ma, wartość `derived` z własnego żądania (C24); `None` tylko dla jawnego `null`; `opened_at` ← `position.createdDateUTC` |
-| `ClosedDeal(deal_id, epic, exit_level, reason, ts)` | `exit_level` ← `details.level`; `reason` wg reguły z 2.19; `ts` ← `dateUTC` (C7) |
+| `OpenPosition(deal_id, epic, side, size, open_level, stop_level, opened_at, stop_derived)` | `deal_id` ← `position.dealId`; `epic` ← `market.epic`; `side` ← `position.direction`; `size` ← `position.size`; `open_level` ← `position.level`; `stop_level` ← `position.stopLevel` gdy klucz jest w odpowiedzi (C5), inaczej `level ∓ position.stopDistance` gdy ten klucz jest, a gdy kluczy stopu nie ma wcale, wartość z zapisu adaptera (poziom wykonania ∓ wysłane `stopDistance` albo poziom z potwierdzonego `set_stop`) i `stop_derived=True` (C24); `None` dla jawnego `null` albo gdy adapter nie ma zapisu (np. po restarcie); `opened_at` ← `position.createdDateUTC`. Migawka `confirm`: `deal_id` ← `affectedDeals[]` `OPENED`, `open_level`/`size`/`side`/`epic` ← potwierdzenie, `opened_at` i stop ← `GET /positions/{dealId}` (pozycja już zamknięta: `opened_at` ← `dateUTC` wiersza otwarcia w historii, C28) |
+| `ClosedDeal(deal_id, epic, exit_level, reason, ts)` | `deal_id` ← `activities[].dealId`; `epic` ← `activities[].epic`; `exit_level` ← `details.level`; `reason` wg reguły z 2.19; `ts` ← `dateUTC` (C7, C7c, C7d, C27) |
+| `WorkingOrder(order_id, epic, side, size, level)` | `workingOrderData.{dealId, epic, direction, orderSize, orderLevel}` (sekcja 2.22) |
 | `AccountInfo(...)` | `equity` ← `balance.balance`; `available` ← `balance.available`; `margin_used` ← `balance.balance − balance.available` (sekcja 2.8; C17) |
 | `EntryAck(deal_reference)` | `POST /positions` → `dealReference` |
 | `Capabilities` | `stop_attach="atomic"` (stop w treści `POST /positions`), `idempotency_key=None`, `keepalive_s=600` (sesja 10 minut; ping wcześniej), `reconcile="positions"`, `is_cfd=True` |
@@ -850,35 +890,38 @@ Status operacji: `do potwierdzenia w dry_run lub w odczytach live` (C21).
 
 ## 6. Lista pozycji do potwierdzenia (dla `dry_run`, próby `smoke`, Zadania 18)
 
-Kolumna "Gdzie": **odczyt** = da się rozstrzygnąć odczytem bez zleceń (`dry_run`, odczyty live); **smoke** = wymaga pierwszej transakcji na wielkości minimalnej (Zadanie 18) po zgodzie właściciela. Wszystkie pozycje mają status `do potwierdzenia w dry_run lub w odczytach live`. Warianty z literą (C5b, C5c, C5d, C7b, C11b, C16b, C16c, C19b) należą do pozycji nadrzędnej o tym samym numerze.
+Kolumna "Gdzie": **odczyt** = da się rozstrzygnąć odczytem bez zleceń (`dry_run`, odczyty live); **smoke** = wymaga pierwszej transakcji na wielkości minimalnej (Zadanie 18) po zgodzie właściciela. Wszystkie pozycje mają status `do potwierdzenia w dry_run lub w odczytach live`. Warianty z literą (C2b, C5b, C5c, C5d, C7b, C7c, C7d, C11b, C14b, C16b, C16c, C19b) należą do pozycji nadrzędnej o tym samym numerze. Pozycje rozstrzygnięte odczytem live z 2026-10-31 (`docs/ops/capitalcom-live-probe-2026-10-31.md`) są oznaczone **rozstrzygnięte** w kolumnie „Co sprawdzić”; ich część nadal otwarta jest wymieniona osobno.
 
 | ID | Co sprawdzić | Gdzie | Spec |
 |---|---|---|---|
-| C1 | Czy `GET /confirms/{ref}` tuż po `POST` zwraca 404 i ile prób trzeba | smoke | pyt. 7 |
-| C2 | Który identyfikator z potwierdzenia jest `dealId` pozycji (`affectedDeals[].dealId` kontra `dealId`) oraz czy `position.workingOrderId == confirm.dealId` | smoke | pyt. 7 |
-| C3 | Struktura potwierdzenia zamknięcia (`DELETE`): `status`, `level`, wynik | smoke | pyt. 7 |
+| C1 | Czy `GET /confirms/{ref}` tuż po `POST` zwraca 404 i ile prób trzeba. Adapter: dokładnie 404 `error.not-found.dealReference` → `confirm` = None (bez ponawiania w adapterze; ponawia menedżer zleceń w `UNKNOWN`), każde inne 404 → `BrokerError`. Weryfikacja: smoke, surowa odpowiedź pierwszego `confirm` w dzienniku | smoke | pyt. 7 |
+| C2 | Który identyfikator z potwierdzenia jest `dealId` pozycji (`affectedDeals[].dealId` kontra `dealId`) oraz czy `position.workingOrderId == confirm.dealId`. Adapter: id pozycji = JEDYNY wpis `affectedDeals` ze statusem `OPENED` (żaden, np. `AMENDED` przy agregacji, albo kilka → `BrokerError`); `GET /positions/{id}` musi zgadzać się epikiem, kierunkiem i (gdy oba są) `workingOrderId == confirm.dealId`, inaczej `BrokerError`. C2b: czy po zamknięciu pozycji potwierdzenie otwarcia nadal ma ten wpis `OPENED` (jeśli nie, `confirm` po restarcie dla zamkniętej pozycji da `BrokerError`: bezpiecznie, ale z blokadą). Weryfikacja: smoke, `GET /confirms/{o_ref}` przed i po zamknięciu pozycji | smoke | pyt. 7 |
+| C3 | Struktura potwierdzenia zamknięcia (`DELETE`): `status`, `level`, wynik. Adapter czyta z niego wyłącznie `dealStatus` (i `reason` przy `REJECTED`). Uwaga: `PUT` i `DELETE` zwracają tę samą referencję `p_<dealId>` [S1], więc potwierdzenie odczytane tuż po `DELETE` mogłoby w teorii pokazać jeszcze wynik wcześniejszego `PUT`; fałszywy sukces wychwytuje silnik (po zamknięciu szuka zamknięcia w historii i kontroluje listę pozycji). Weryfikacja: smoke, surowe potwierdzenia `PUT` i `DELETE` w dzienniku | smoke | pyt. 7 |
 | C4 | Pełna lista `status`/`dealStatus` i wartości `reason` przy odrzuceniu | smoke | pyt. 7 |
 | C5 | Pola stopu w `GET /positions` (`stopLevel`, `stopDistance`, `profitLevel`, `trailingStop`): czy klucze są w ogóle zwracane i czy brak stopu to jawny `null`; kształt pustej listy; 404 po zamknięciu; skutek `PUT` (C5b, C5c, C5d) | smoke | pyt. 7 |
 | C6 | Czy `stopDistance` liczy się od notowania, czy od ceny wykonania; zgodność `stopLevel` z `level − stopDistance` (BUY) i `level + stopDistance` (SELL) | smoke | pyt. 7 |
-| C7 | Aktywność po zamknięciu przez stop: `source` (`SL`?), `details.level`, opóźnienie wpisu, składnia `filter` | smoke (stop), odczyt (kształt) | pyt. 7 |
+| C7 | Aktywność po zamknięciu przez stop: `source` (`SL`?), `details.level`, opóźnienie wpisu, składnia `filter`. Adapter: `SL`/`TP` → STOP, `USER` → MANUAL, `CLOSE_OUT`/`DEALER`/`SYSTEM` → FORCED, inne → FORCED i licznik `unknown_close_sources`; `filter` nieużywany (C7b). C7c: tylko `POSITION`/`ACCEPTED` to transakcje; `REJECTED`/`MODIFY_REJECT`/`CANCEL_REJECT` pomijane; inny status wiersza `POSITION` albo typ spoza wyliczenia → `BrokerError`. C7d: otwarcie i zamknięcie różni tylko kierunek; deal bez rozpoznanej strony → `HISTORY_AMBIGUOUS` (sekcja 2.19). Weryfikacja: smoke, surowa historia (`detailed=true`) po wejściu, po zamknięciu przez API i po wybiciu stopu: wiersz otwarcia `USER` w kierunku pozycji, zamknięcie w kierunku przeciwnym, źródło stopu `SL`; zmierzyć opóźnienie wpisu (menedżer czyta historię w T0 + 30 s) | smoke (stop), odczyt (kształt) | pyt. 7 |
 | C8 | Historia transakcji: znaczenie `size`, `reference`, brak ceny i `dealId`, zakres czasu, pola `openLevel`/`closeLevel`/`pnl` | smoke | pyt. 7 |
-| C9 | Świece: znacznik = początek świecy, wyłączność `to`, świeca trwająca w odpowiedzi, granica doby świec dziennych DE40, `max` bez `from`/`to`, opóźnienie świecy | odczyt | pyt. 8, 12 |
-| C10 | Obecność `snapshot.updateTimeUTC`, jednostka `delayTime`, częstotliwość odświeżania notowania | odczyt | pyt. 8 |
+| C9 | **Rozstrzygnięte** (odczyt 2026-10-31): pola świecy `snapshotTime` (lokalny, CET), `snapshotTimeUTC`, `openPrice`/`closePrice`/`highPrice`/`lowPrice` jako `{bid, ask}`, `lastTradedVolume`. Otwarte: znacznik = początek świecy (stała adaptera `CANDLE_STAMP_IS_PERIOD_START = True`, czytana wyłącznie w `_stamp_shift`; bramka L0: w `dry_run` właściciel porównuje zapisany początek UTC i OHLC świecy 09:00 Berlin z wykresem 5-minutowym w aplikacji), wyłączność `to`, świeca trwająca w odpowiedzi, czy przyjmowane jest `to` równe teraz, granica doby świec dziennych DE40, `max` bez `from`/`to`, opóźnienie świecy | odczyt | pyt. 8, 12 |
+| C10 | **Rozstrzygnięte** (odczyt 2026-10-31): `snapshot` w `GET /markets/DE40` NIE ma `updateTimeUTC`, a `updateTime` jest lokalny (CET, bez strefy); adapter liczy świeżość zmianą krotki. Otwarte: jednostka `delayTime`, częstotliwość odświeżania notowania | odczyt | pyt. 8 |
 | C11 | Wartości `marketStatus` i `marketModes`; zachowanie `POST` przy `CLOSED` (kod błędu); C11b zamknięcie przy `CLOSED` | odczyt (status), smoke (błąd) | pyt. 7 |
-| C12 | Wartości `instrument.openingHours` dla `DE40` i pole `zone` | odczyt | Zadanie 1 |
+| C12 | **Rozstrzygnięte** (odczyt 2026-10-31): `zone` = `UTC`; DE40 pon–czw 00:00–21:00 i 21:05–24:00, pt 00:00–21:00, sob zamknięte, nd 22:00–24:00 (rynek prawie całą dobę, więc `marketStatus` nie wyznacza sesji XETRA) | odczyt | Zadanie 1 |
 | C13 | Kod i status HTTP przy wygasłej sesji | odczyt (odczekać ponad 10 min) | §13 |
-| C14 | Kody błędów `POST /positions`: za mała wielkość, zły krok, brak środków, zbyt mały stop, rynek zamknięty; semantyka liczby po dwukropku | smoke | pyt. 7 |
-| C15 | Tryb `hedgingMode` i skutek drugiego wejścia na tym samym instrumencie | smoke | pyt. 4 |
+| C14 | Kody błędów `POST /positions`: za mała wielkość, zły krok, brak środków, zbyt mały stop, rynek zamknięty; semantyka liczby po dwukropku. Adapter: każde 4xx z `errorCode` na `POST`/`PUT`/`DELETE` → `BrokerRejected(errorCode)` (nigdy ponowione). C14b: kod przy zamkniętym rynku jest nieudokumentowany; adapter zamienia na `MarketClosed` każdy kod zawierający słowa `market` i `closed` (pomyłka zmienia tylko klasę odmowy: w obu przypadkach nic nie wykonano). Weryfikacja: pierwszy realny kod odmowy w dzienniku (smoke tylko za zgodą właściciela, np. w przerwie 21:00–21:05 UTC) | smoke | pyt. 7 |
+| C15 | Tryb `hedgingMode` i skutek drugiego wejścia na tym samym instrumencie. Adapter: potwierdzenie bez wpisu `OPENED` (np. `AMENDED`, gdy zlecenie dołączyło do istniejącej pozycji) → `BrokerError`, nie zgadywana pozycja | smoke | pyt. 4 |
 | C16 | Wartość punktu (`size` × `lotSize` w EUR) z porównania `upl`; C16b zależność dźwigni od depozytu 5%; C16c krok `minStepDistance` | smoke | pyt. 3 |
 | C17 | Znaczenie `balance`, `deposit`, `profitLoss`, `available`: czy `balance` = `deposit` + `profitLoss` i czy `margin_used = balance − available` | odczyt | Zadanie 4 |
 | C18 | Czy `CST`/`X-SECURITY-TOKEN` zmieniają się po `PUT /session` lub w odpowiedziach `ping` | odczyt | §13 |
-| C19 | Strefa pól lokalnych (`date`, `createdDate`, `snapshotTime`); C19b `Content-Type` odpowiedzi `POST /session` | odczyt | pyt. 8 |
+| C19 | Strefa pól lokalnych (`date`, `createdDate`, `snapshotTime`); **rozstrzygnięte** (odczyt 2026-10-31): `snapshotTime` i `snapshot.updateTime` to CET (UTC + 1 h zimą). Adapter nie czyta żadnego pola lokalnego (także `date` potwierdzenia i historii). C19b `Content-Type` odpowiedzi `POST /session` | odczyt | pyt. 8 |
 | C20 | Nagłówek `Retry-After` i kod błędu przy 429 poza logowaniem | odczyt (ostrożnie) | §13 |
 | C21 | Strumień WebSocket: znacznik `t`, `priceType`, opóźnienie względem REST | odczyt (po wdrożeniu strumienia) | pyt. 8 |
 | C22 | Czy `DELETE /positions/{dealId}` zamyka pozycję w całości i nie przyjmuje wielkości | smoke | pyt. 7 |
 | C23 | Czy `GET /markets?epics=DE40` zwraca `marketDetails[]` z `snapshot` tym samym co `GET /markets/{epic}` (w tym `updateTimeUTC`) i czy `GET /markets?searchTerm=` zwraca `updateTimeUTC` dla DE40 | odczyt | pyt. 8 |
-| C24 | Stop `derived`: gdy `GET /positions` nie zwraca kluczy stopu, czy stop wyliczony z własnego żądania zgadza się ze stopem widocznym w aplikacji Capital.com (weryfikacja wzrokowa przez właściciela) | smoke | pyt. 7 |
+| C24 | Stop `derived`: gdy `GET /positions` nie zwraca kluczy stopu, czy stop wyliczony z własnego żądania zgadza się ze stopem widocznym w aplikacji Capital.com (weryfikacja wzrokowa przez właściciela). Adapter: klucz `stopLevel` obecny → wartość brokera (`null` → brak stopu); sam `stopDistance` → `level ∓ stopDistance`; kluczy brak → zapis adaptera (poziom wykonania z potwierdzenia ∓ wysłane `stopDistance`, po udanym `set_stop` jego poziom) z `stop_derived=True`; brak zapisu (restart, utracona odpowiedź `POST`) → `None` (silnik ustawi stop). Pamięć ograniczona do 256 wpisów na tablicę | smoke | pyt. 7 |
 | C25 | Wartość `instrument.marginFactor` i `marginFactorUnit` dla `DE40` (odczyt [S4] podaje "depozyt 5%") | odczyt | pyt. 3 |
 | C26 | Godzina naliczenia finansowania nocnego DE40 w polu `overnightFee.swapChargeTimestamp` (strona rynku podaje 21:00 UTC) | odczyt | §4 |
+| C27 | Granice `GET /history/activity`: czy `to` równe teraz jest przyjmowane, czy granice `from`/`to` są włączne, czy istnieje nieudokumentowany limit liczby wierszy (adapter: ≥ 20 wierszy w odpowiedzi → podział okna, stała `ACTIVITY_SUSPECT_ROWS`), czy filtr działa po `dateUTC` (wiersz spoza okna → `BrokerError`). Weryfikacja: `dry_run` (odczyt bez zleceń: okno dobowe kończące się teraz zwraca `{"activities": []}` bez błędu; test `integration_live_readonly` `test_closed_since_two_days_does_not_raise`), po smoke: liczba wierszy z okna dobowego równa sumie z jego połówek | odczyt, smoke | pyt. 7 |
+| C28 | Migawka `confirm` pozycji już zamkniętej: `opened_at` z `dateUTC` jedynego wiersza otwarcia tego `dealId` w ostatniej dobie historii (pozycja otwarta: z `createdDateUTC`); czy oba czasy są równe co do milisekundy. Weryfikacja: smoke, porównać `createdDateUTC` pozycji z `dateUTC` jej wiersza otwarcia | smoke | pyt. 7 |
+| C29 | Drugie zamknięcie: `DELETE /positions/{dealId}` na deal już zamknięty to czyste 404 `error.not-found.dealId` bez skutku (adapter: `BrokerRejected("POSITION_NOT_FOUND")`), a zamknięcie zawsze idzie przez `DELETE` po `dealId` (nigdy przeciwne zlecenie). Założenie wykonawcy (Zadanie 12: awaryjne spłaszczenie może wysłać drugie zamknięcie). Weryfikacja: smoke za zgodą właściciela: po zamknięciu jeszcze raz `DELETE` tego `dealId`, potem lista pozycji pusta i brak nowej pozycji w aplikacji | smoke | Zadanie 12 |
 
 Sugestia dla Zadania 18: pierwszy `dry_run` zapisuje do dziennika surowe odpowiedzi `GET /markets/DE40`, `GET /prices/DE40` (5 minut i dzień) i `GET /accounts/preferences` (bez zapisywania sald w repo), co zamyka C9 do C12, C17, C19, C23, C25 i C26 bez żadnego zlecenia.

@@ -27,8 +27,12 @@ Zasady:
 - HTTP 429 nie jest ponawiany automatycznie ani razu: `BrokerError` i wstrzymanie wszystkich żądań na
   `RATE_LIMIT_PAUSE_S` (spec §13 „przy limitach wstrzymuje zapytania”); o ponowieniu decyduje silnik;
 - błędy: przekroczenie czasu → `BrokerTimeout`, błąd połączenia → `BrokerError`, 5xx i 429 → `BrokerError` ze
-  statusem, 4xx z `errorCode` na POST/PUT/DELETE → `BrokerRejected(errorCode)`, inne 4xx (w tym każde 4xx na GET)
-  → `BrokerError`; przekierowania nie są wykonywane (nagłówki z tokenami nie mogą trafić pod inny adres);
+  statusem, 4xx z `errorCode` na POST/PUT/DELETE → `BrokerRejected(errorCode)` (kod nazywający zamknięty rynek →
+  `MarketClosed`, C14b), inne 4xx (w tym każde 4xx na GET) → `BrokerError`; wyjątek: 404 z dokładnie wskazanym
+  `errorCode` (`_request(..., not_found=...)`) wraca jako None, np. nieznana referencja potwierdzenia; przekierowania
+  nie są wykonywane (nagłówki z tokenami nie mogą trafić pod inny adres);
+- część handlowa (wejście, potwierdzenie, pozycje, stop, zamknięcie, historia, zlecenia oczekujące) jest w
+  `capitalcom_trading.TradingMixin`, a czysta logika historii w `capitalcom_history` (oba bez adresu hosta);
 - komunikaty wyjątków zawierają wyłącznie metodę, ścieżkę bez zapytania, status HTTP i `errorCode` brokera (lub
   nazwę pola przy złym kształcie odpowiedzi), nigdy danych logowania, tokenów, nagłówków ani treści żądań;
   dodatkowo każdy komunikat jest czyszczony ze znanych sekretów, a wyjątki adaptera nie mają łańcucha
@@ -58,6 +62,7 @@ from gwstock.broker.capitalcom_parse import (
     ParseError,
     build,
     dumps,
+    is_market_closed_code,
     loads,
     parse_accounts,
     parse_bars,
@@ -66,6 +71,7 @@ from gwstock.broker.capitalcom_parse import (
     parse_session_account,
     parse_snapshot,
 )
+from gwstock.broker.capitalcom_trading import TradingMixin
 from gwstock.clock import Clock
 from gwstock.types import (
     AccountInfo,
@@ -73,14 +79,10 @@ from gwstock.types import (
     BrokerRejected,
     BrokerTimeout,
     Candle,
-    ClosedDeal,
-    EntryAck,
-    EntryRequest,
     InstrumentRules,
-    OpenPosition,
+    MarketClosed,
     Quote,
     SessionExpired,
-    WorkingOrder,
 )
 
 LIVE_BASE_URL = "https://api-capital.backend-capital.com"
@@ -111,12 +113,12 @@ start = znacznik − okres świecy (5 minut albo 1 dzień), a okno zapytania prz
 
 SECRET_KEYS = ("api_key", "identifier", "api_password")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-_PART_TWO = "Task 13 part 2"
 _EPIC = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
 _FIVE_MINUTES = timedelta(minutes=5)
 _ONE_DAY = timedelta(days=1)
 _SECRET_MIN_LEN = 4  # krótszych wartości nie da się sensownie wyciąć z komunikatu (zniszczyłoby tekst)
 _MAX_ERROR_CODE_LEN = 200
+_MAX_RAW_ERROR_CODE_LEN = 4096  # tylko ogranicza pracę; przycięcie do komunikatu dopiero po usunięciu sekretów
 
 
 def api_root(base_url: str) -> str:
@@ -339,7 +341,7 @@ def _valid_token(value: str | None) -> bool:
 
 
 def _error_code(body: bytes) -> str | None:
-    """`errorCode` z treści błędu `{"errorCode": "..."}`; tylko znaki drukowalne, przycięty."""
+    """`errorCode` z treści błędu `{"errorCode": "..."}`; tylko znaki drukowalne (przycina `_status_error`)."""
     try:
         payload = loads(body)
     except ParseError:
@@ -347,7 +349,7 @@ def _error_code(body: bytes) -> str | None:
     code = payload.get("errorCode") if isinstance(payload, dict) else None
     if not isinstance(code, str):
         return None
-    code = "".join(ch for ch in code if ch.isprintable()).strip()[:_MAX_ERROR_CODE_LEN]
+    code = "".join(ch for ch in code[:_MAX_RAW_ERROR_CODE_LEN] if ch.isprintable()).strip()
     return code or None
 
 
@@ -400,8 +402,13 @@ def _assemble_candles(
     return [by_start[s] for s in sorted(by_start) if s + period <= now]
 
 
-class CapitalComBroker:
-    """Adapter `Broker` dla Capital.com (część 1 z 2: sesja, rachunki, dane rynkowe; patrz docstring modułu)."""
+class CapitalComBroker(TradingMixin):
+    """Adapter `Broker` dla Capital.com: sesja, rachunki i dane rynkowe tutaj (patrz docstring modułu), wejście,
+    potwierdzenie, pozycje, stop, zamknięcie, historia i zlecenia oczekujące w `capitalcom_trading.TradingMixin`.
+
+    `unknown_close_sources` (publiczny licznik): zamknięcia z historii o nieznanym źródle (zgłoszone jako "FORCED");
+    Watchdog (T14) alarmuje, gdy rośnie.
+    """
 
     capabilities = Capabilities(
         stop_attach="atomic", idempotency_key=None, keepalive_s=600, reconcile="positions", is_cfd=True
@@ -442,6 +449,7 @@ class CapitalComBroker:
         self._seen_tokens: deque[str] = deque(maxlen=64)  # do czyszczenia komunikatów także ze starych tokenów
         # świeżość notowań: epic → (ostatnio obserwowana krotka, chwila jej ostatniej zmiany na zegarze silnika)
         self._quote_marks: dict[str, tuple[tuple, datetime]] = {}
+        self._init_trading()
 
     # --- sesja ---------------------------------------------------------------------------------
 
@@ -607,11 +615,13 @@ class CapitalComBroker:
         params: dict[str, str] | None = None,
         body: dict[str, Any] | None = None,
         order: bool = False,
-    ) -> dict[str, Any]:
+        not_found: str | None = None,
+    ) -> dict[str, Any] | None:
         """Żądanie z tokenami sesji; zwraca obiekt JSON odpowiedzi 2xx albo rzuca wyjątek z `gwstock.types`.
 
         401 → jedno wspólne ponowne logowanie i jedna powtórka; drugie 401 → `SessionExpired` i porzucenie sesji.
-        Nigdy więcej prób.
+        Nigdy więcej prób. `not_found`: HTTP 404 z DOKŁADNIE tym `errorCode` (np. `error.not-found.dealId`) zwraca
+        None zamiast wyjątku; każde inne 404 to nadal wyjątek. Bez `not_found` wynik nigdy nie jest None.
         """
         where = f"{method} {path}"
         resp, used = await self._send_authed(method, path, params, body, order)
@@ -627,6 +637,8 @@ class CapitalComBroker:
         self._adopt_tokens(resp, used)
         if 200 <= resp.status < 300:
             return self._decode(where, resp)
+        if not_found is not None and resp.status == 404 and _error_code(resp.body) == not_found:
+            return None
         raise self._status_error(where, resp, rejectable=method != "GET")
 
     async def _send_authed(
@@ -726,6 +738,8 @@ class CapitalComBroker:
 
     def _status_error(self, where: str, resp: _Response, *, rejectable: bool = False) -> BrokerError:
         code = _error_code(resp.body)
+        if code is not None:  # najpierw bez sekretów, potem przycięty: cięcie nigdy nie zostawia połowy sekretu
+            code = self._scrub(code)[:_MAX_ERROR_CODE_LEN]
         if resp.status == 429:
             self._general.pause_until(self._clock.now_utc() + timedelta(seconds=RATE_LIMIT_PAUSE_S))
             return self._error(
@@ -734,39 +748,22 @@ class CapitalComBroker:
                 f"{RATE_LIMIT_PAUSE_S:g} s)",
             )
         if rejectable and 400 <= resp.status < 500 and code:
+            if is_market_closed_code(code):  # kod nieudokumentowany (C14b): nic nie wykonano, rynek zamknięty
+                return self._error(MarketClosed, f"{where}: HTTP {resp.status} {code}")
             return self._error(BrokerRejected, code)
         return self._error(BrokerError, f"{where}: HTTP {resp.status}{_with_code(code)}")
 
     def _error(self, cls: type[BrokerError], message: str) -> BrokerError:
         """Jedyna droga tworzenia wyjątków brokera: komunikat bez znanych sekretów."""
+        return cls(self._scrub(message))
+
+    def _scrub(self, message: str) -> str:
+        """Tekst bez znanych sekretów (klucz, identyfikator, hasło, ostatnie tokeny); przycinać dopiero potem."""
         secrets = [self._creds.api_key, self._creds.identifier, self._creds.api_password, *self._seen_tokens]
         for secret in sorted(set(secrets), key=len, reverse=True):
             if len(secret) >= _SECRET_MIN_LEN:
                 message = message.replace(secret, "<redacted>")
-        return cls(message)
-
-    # --- część 2 (Zadanie 13b) --------------------------------------------------------------------
-
-    async def open_position(self, req: EntryRequest) -> EntryAck:
-        raise NotImplementedError(_PART_TWO)
-
-    async def confirm(self, deal_reference: str) -> OpenPosition | None:
-        raise NotImplementedError(_PART_TWO)
-
-    async def list_positions(self) -> list[OpenPosition]:
-        raise NotImplementedError(_PART_TWO)
-
-    async def close_position(self, deal_id: str) -> None:
-        raise NotImplementedError(_PART_TWO)
-
-    async def set_stop(self, deal_id: str, stop_level) -> None:
-        raise NotImplementedError(_PART_TWO)
-
-    async def closed_since(self, since: datetime) -> list[ClosedDeal]:
-        raise NotImplementedError(_PART_TWO)
-
-    async def list_working_orders(self) -> list[WorkingOrder]:
-        raise NotImplementedError(_PART_TWO)
+        return message
 
     # --- dane rynkowe -------------------------------------------------------------------------------
 
