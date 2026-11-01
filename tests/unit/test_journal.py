@@ -311,22 +311,39 @@ def test_update_order_write_failure_is_wrapped_and_changes_nothing(journal):
     assert journal.get_order("gws-20261102-DE40-1-entry").state is OrderState.INTENT
 
 
-def test_unresolved_orders_are_intent_submitting_and_unknown_only(journal):
-    states = [
-        OrderState.INTENT,
-        OrderState.SUBMITTING,
-        OrderState.UNKNOWN,
-        OrderState.CONFIRMED,
-        OrderState.REJECTED,
-        OrderState.NOT_PLACED,
-        OrderState.WORKING,
-        OrderState.CANCELED,
-    ]
+TERMINAL_ORDER_STATES = {
+    OrderState.CONFIRMED, OrderState.REJECTED, OrderState.NOT_PLACED, OrderState.CANCELED, OrderState.EXPIRED,
+}
+
+
+def test_terminal_order_states_are_exactly_the_states_without_exits_in_the_fsm():
+    from gwstock.orders.fsm import ALLOWED_ORDER_TRANSITIONS
+
+    assert {s for s, exits in ALLOWED_ORDER_TRANSITIONS.items() if not exits} == TERMINAL_ORDER_STATES
+
+
+def test_unresolved_orders_includes_working_partial_and_canceling(journal):
+    # każdy stan poza końcowymi (także rozszerzone, nieużywane w v1) blokuje podwójne wejście
+    states = [OrderState.CONFIRMED, *OrderState]  # pierwszy wiersz końcowy: kolejność wstawienia, nie stanów
     for i, st in enumerate(states, start=1):
         journal.insert_order(make_order(f"gws-20261102-DE40-{i}-entry", state=st))
     unresolved = journal.unresolved_orders()
-    assert [o.state for o in unresolved] == [OrderState.INTENT, OrderState.SUBMITTING, OrderState.UNKNOWN]
-    assert [o.order_id for o in unresolved] == [f"gws-20261102-DE40-{i}-entry" for i in (1, 2, 3)]
+    assert [o.state for o in unresolved] == [
+        OrderState.INTENT, OrderState.SUBMITTING, OrderState.UNKNOWN,
+        OrderState.WORKING, OrderState.PARTIAL, OrderState.CANCELING,
+    ]  # fmt: skip
+    assert [o.order_id for o in unresolved] == [
+        f"gws-20261102-DE40-{i}-entry" for i, st in enumerate(states, start=1) if st not in TERMINAL_ORDER_STATES
+    ]
+
+
+@pytest.mark.parametrize("bad", ["WAT", "confirmed", "CONFIRMED ", ""])
+def test_unresolved_orders_with_an_unknown_state_raises_corrupt(journal, bad):
+    journal.insert_order(make_order("gws-20261102-DE40-1-entry", state=OrderState.CONFIRMED))
+    journal.insert_order(make_order("gws-20261102-DE40-2-entry", state=OrderState.CONFIRMED))
+    journal._conn.execute("UPDATE orders SET state = ? WHERE order_id = 'gws-20261102-DE40-2-entry'", (bad,))
+    with pytest.raises(JournalCorruptError):
+        journal.unresolved_orders()  # nieczytelny stan nie znika z ochrony przed podwójnym wejściem
 
 
 def test_unresolved_orders_empty_when_everything_is_settled(journal):
@@ -708,9 +725,8 @@ def test_corrupt_stored_order_raises_journal_corrupt_error(journal, column, bad)
     journal._conn.execute(f"UPDATE orders SET {column} = ?", (bad,))
     with pytest.raises(JournalCorruptError):
         journal.get_order("gws-20261102-DE40-1-entry")
-    if column != "state":  # wiersz z nieznanym stanem nie pasuje do filtru unresolved_orders
-        with pytest.raises(JournalCorruptError):
-            journal.unresolved_orders()
+    with pytest.raises(JournalCorruptError):
+        journal.unresolved_orders()
 
 
 def test_corrupt_pnl_text_raises_journal_corrupt_error_and_blocks_further_booking(journal):

@@ -310,6 +310,11 @@ _TRADE_INSERT = (
     f"INSERT INTO trades (deal_id, exit_day, {_TRADE_COLS}) VALUES ({', '.join('?' * 21)}) "
     "ON CONFLICT(deal_id) DO NOTHING"
 )  # konflikt tylko na deal_id jest pomijany; naruszenie NOT NULL itp. nadal jest błędem
+# Stany końcowe zlecenia (bez wyjść w automacie stanów `gwstock.orders.fsm`; zgodność pilnuje test): reszta, także
+# stan nieznany, jest nierozstrzygnięta.
+_TERMINAL_ORDER_STATES = (
+    OrderState.CONFIRMED, OrderState.REJECTED, OrderState.NOT_PLACED, OrderState.CANCELED, OrderState.EXPIRED,
+)
 _DAY_PREFIX = "gws-{:%Y%m%d}-"  # prefiks identyfikatora z `make_client_id` (dzień handlowy, bez znajomości stref)
 _ENTRY_SUFFIX = "-entry"  # rola wejścia strategii (ostatni segment identyfikatora)
 _SMOKE_SUFFIX = "-smoke"  # rola próby akceptacyjnej L0
@@ -702,15 +707,18 @@ class Journal:
         return None if row is None else _decode("order", _order_from_row, row)
 
     def unresolved_orders(self) -> list[OrderRecord]:
-        """Zlecenia wymagające uzgodnienia po restarcie: INTENT, SUBMITTING i UNKNOWN (w kolejności wstawienia).
+        """Każde zlecenie w stanie innym niż końcowy (w kolejności wstawienia): ochrona przed podwójnym wejściem i
+        uzgadnianie po restarcie. W v1 to INTENT, SUBMITTING i UNKNOWN; rozszerzone WORKING, PARTIAL i CANCELING też.
 
         INTENT też: wiersz INTENT, który nie przeszedł dalej, oznacza przerwanie między zapisem a wysyłką,
-        więc nie wiadomo, czy zlecenie doszło do brokera.
+        więc nie wiadomo, czy zlecenie doszło do brokera. Wiersz z nieznanym stanem to `JournalCorruptError`
+        (wywołujący blokują wejście), nigdy cicho pominięte zlecenie.
         """
-        states = (OrderState.INTENT.value, OrderState.SUBMITTING.value, OrderState.UNKNOWN.value)
+        states = tuple(s.value for s in _TERMINAL_ORDER_STATES)
         rows = self._read(
             lambda c: c.execute(
-                f"SELECT {_ORDER_COLS} FROM orders WHERE state IN (?, ?, ?) ORDER BY rowid", states
+                f"SELECT {_ORDER_COLS} FROM orders WHERE state NOT IN ({', '.join('?' * len(states))}) ORDER BY rowid",
+                states,
             ).fetchall()
         )
         return [_decode("order", _order_from_row, r) for r in rows]
