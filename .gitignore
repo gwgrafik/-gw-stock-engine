@@ -10,7 +10,11 @@ __pycache__/
 .venv/
 venv*/
 
-# bazy, logi, sekrety
+# bazy, logi, sekrety (te same wzorce co w .dockerignore: plik z kluczem nie może trafić do publicznego repozytorium)
 *.sqlite*
 *.log
 .env
+.env.*
+**/capitalcom*.json
+*.pem
+*.key
