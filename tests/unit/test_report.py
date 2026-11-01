@@ -84,6 +84,12 @@ def smoke_times(day: date) -> dict:
     return dict(signal_ts=at(day, 7, 0), submit_ts=at(day, 7, 0, 1), confirm_ts=at(day, 7, 0, 2), exit_ts=at(day, 7, 1))
 
 
+def later_times(day: date, hour: int) -> dict:
+    """Inne czasy niż domyślne (drugie wejście tego samego dnia), żeby kontekst pasował do właściwej transakcji."""
+    return dict(signal_ts=at(day, hour, 5), submit_ts=at(day, hour, 5, 1), confirm_ts=at(day, hour, 5, 2),
+                exit_ts=at(day, hour, 40))  # fmt: skip
+
+
 def five_clean_sessions(journal: Journal) -> None:
     for seq, day in enumerate((D1, D2, D3, D4, D5), start=1):
         book_session(journal, day, seq=1)
@@ -217,7 +223,7 @@ def test_trades_summary_groups_by_local_exit_day_and_of_nothing_is_zero():
 
 
 def test_gate_l1_is_a_frozen_validated_dataclass():
-    gate = GateL1(5, 0, 0, Decimal("1"))
+    gate = GateL1(5, 0, 0, Decimal("1"), cost_samples=5)
     with pytest.raises(dataclasses.FrozenInstanceError):
         gate.unhandled_rejections = 1  # type: ignore[misc]
     zero = Decimal(0)
@@ -226,17 +232,32 @@ def test_gate_l1_is_a_frozen_validated_dataclass():
     for args in bad:
         with pytest.raises((TypeError, ValueError)):
             GateL1(*args)
+    for samples in (-1, True, 2.0, "3", None):
+        with pytest.raises((TypeError, ValueError)):
+            GateL1(5, 0, 0, zero, cost_samples=samples)  # type: ignore[arg-type]
+    assert GateL1(5, 0, 0, zero).cost_samples == 0  # bez podanych próbek: brak pomiaru
 
 
-def test_gate_l1_needs_five_sessions_and_three_clean_conditions():
-    assert GateL1(5, 0, 0, Decimal("1.4")).passed(5) is True
-    assert GateL1(6, 0, 0, Decimal("0")).passed(5) is True
-    assert GateL1(4, 0, 0, Decimal("1")).passed(5) is False  # 4 sesje
-    assert GateL1(5, 1, 0, Decimal("1")).passed(5) is False  # rozbieżność > 60 s
-    assert GateL1(5, 0, 1, Decimal("1")).passed(5) is False  # nieobsłużone odrzucenie
-    assert GateL1(5, 0, 0, Decimal("2.0001")).passed(5) is False  # koszty > 2x model
-    assert GateL1(5, 0, 0, Decimal("2")).passed(5) is True  # dokładnie 2x: jeszcze bez przeglądu
-    assert GateL1(5, 0, 0, Decimal("Infinity")).passed(5) is False
+def test_gate_l1_needs_five_sessions_three_clean_conditions_and_cost_samples():
+    assert GateL1(5, 0, 0, Decimal("1.4"), cost_samples=5).passed(5) is True
+    assert GateL1(6, 0, 0, Decimal("0"), cost_samples=6).passed(5) is True
+    assert GateL1(4, 0, 0, Decimal("1"), cost_samples=5).passed(5) is False  # 4 sesje
+    assert GateL1(5, 1, 0, Decimal("1"), cost_samples=5).passed(5) is False  # rozbieżność > 60 s
+    assert GateL1(5, 0, 1, Decimal("1"), cost_samples=5).passed(5) is False  # nieobsłużone odrzucenie
+    assert GateL1(5, 0, 0, Decimal("2.0001"), cost_samples=5).passed(5) is False  # koszty > 2x model
+    assert GateL1(5, 0, 0, Decimal("2"), cost_samples=5).passed(5) is True  # dokładnie 2x: jeszcze bez przeglądu
+    assert GateL1(5, 0, 0, Decimal("Infinity"), cost_samples=5).passed(5) is False
+
+
+def test_gate_l1_never_passes_without_enough_usable_cost_samples():
+    # zero dowodów to nie dowód: 0 próbek nie przechodzi, nawet gdy stosunek wynosi 0
+    assert GateL1(5, 0, 0, Decimal("0")).passed(5) is False
+    assert GateL1(5, 0, 0, Decimal("0"), cost_samples=0).passed(5) is False
+    assert GateL1(1, 0, 0, Decimal("0"), cost_samples=0).passed(1) is False
+    # mniej próbek niż wymaganych sesji też nie przechodzi
+    assert GateL1(5, 0, 0, Decimal("0.5"), cost_samples=4).passed(5) is False
+    assert GateL1(5, 0, 0, Decimal("0.5"), cost_samples=5).passed(5) is True
+    assert GateL1(5, 0, 0, Decimal("0.5"), cost_samples=9).passed(5) is True
 
 
 def test_gate_l1_required_sessions_must_be_a_positive_integer():
@@ -244,17 +265,19 @@ def test_gate_l1_required_sessions_must_be_a_positive_integer():
     for bad in (0, -1, True, 5.0, "5"):
         with pytest.raises((TypeError, ValueError)):
             gate.passed(bad)  # type: ignore[arg-type]
-    assert GateL1(1, 0, 0, Decimal("0")).passed(1) is True
+    assert GateL1(1, 0, 0, Decimal("0"), cost_samples=1).passed(1) is True
 
 
 def test_gate_l1_reasons_name_every_failed_condition():
-    assert GateL1(5, 0, 0, Decimal("1")).reasons(5) == []
-    reasons = GateL1(4, 2, 1, Decimal("2.5")).reasons(5)
-    assert len(reasons) == 4
+    assert GateL1(5, 0, 0, Decimal("1"), cost_samples=5).reasons(5) == []
+    reasons = GateL1(4, 2, 1, Decimal("2.5"), cost_samples=3).reasons(5)
+    assert len(reasons) == 5
     assert "4 z 5" in reasons[0] and "brakuje 1" in reasons[0]
     assert "2" in reasons[1] and "60 s" in reasons[1]
     assert "nieobsłużone" in reasons[2]
-    assert "2.5" in reasons[3]
+    assert reasons[3] == "brak pomiaru kosztów: użytecznych próbek 3 z 5"
+    assert "2.5" in reasons[4]
+    assert GateL1(5, 0, 0, Decimal("0")).reasons(5) == ["brak pomiaru kosztów: użytecznych próbek 0 z 5"]
 
 
 # --- gate_l1_status na dzienniku --------------------------------------------------------------------------
@@ -315,7 +338,8 @@ def test_smoke_context_on_the_neighbouring_day_is_still_found(journal):
     client_id = make_client_id(D3, "DE40", 1, "smoke")
     journal.insert_order(OrderRecord(client_id, "DE40", Side.BUY, trade.size, Decimal("30"), OrderState.CONFIRMED,
                                      "r", "D", trade.signal_ts, trade.confirm_ts))  # fmt: skip
-    journal.set_meta(f"entry_ctx:{client_id}", dump({"signal_ts": trade.signal_ts, "submit_ts": trade.submit_ts}))
+    context = {"signal_ts": trade.signal_ts, "submit_ts": trade.submit_ts, "value_per_point": Decimal("1")}
+    journal.set_meta(f"entry_ctx:{client_id}", dump(context))
     journal.record_trade(trade, "D", D3)
     assert gates.trade_roles(journal, [trade]) == ["smoke"]
 
@@ -405,63 +429,95 @@ def test_resolved_and_rejected_orders_are_not_unhandled(journal):
     assert gate_l1_status(journal, costs=COSTS).unhandled_rejections == 0
 
 
-def test_cost_ratio_is_the_unrounded_points_ratio_and_ignores_size_ledger_rounding_and_stop_extra(journal):
-    # A: BUY, bid 100 / ask 102 (spread 2), wypełnienie 102.5 (poślizg 0.5), FORCED: zmierzone 2.5, model 2 + 0.5 = 2.5
-    # B: BUY, bid 200 / ask 201 (spread 1), wypełnienie 202 (poślizg 1.0), STOP: zmierzone 1 + 1.0 = 2.0,
-    #    model 1 + 0.5 = 1.5 (dodatkowy poślizg stopu nie jest mierzony, więc nie wchodzi też do modelu)
-    # wielkości i zaokrąglone koszty księgi (tu 0.00) nie mają wpływu: 4.5 / 4.0 = 1.125
+def test_cost_verdict_is_the_adverse_entry_slippage_over_the_model(journal):
+    # A: BUY, bid 100 / ask 102, wypełnienie 102.5 -> poślizg 0.5; B: BUY, bid 200 / ask 201, wypełnienie 202 -> 1.0
+    # werdykt = (0.5 + 1.0) / (2 * 0.5) = 1.5; wielkość, wartość punktu, zaokrąglenia księgi i STOP nie mają wpływu
     book_session(journal, D1, size=Decimal("1"), decision_bid=Decimal("100"), decision_ask=Decimal("102"),
                  entry_fill=Decimal("102.5"), exit_reason="FORCED")  # fmt: skip
     book_session(journal, D2, size=Decimal("2"), decision_bid=Decimal("200"), decision_ask=Decimal("201"),
                  entry_fill=Decimal("202"), exit_reason="STOP")  # fmt: skip
-    status = gate_l1_status(journal, costs=COSTS)
-    assert status.cost_deviation_ratio == Decimal("1.125")
+    details = gates.l1_details(journal, costs=COSTS)
+    assert details.gate.cost_deviation_ratio == Decimal("1.5")
+    assert details.gate.cost_samples == details.points.trades == 2
+    # informacyjnie: spread + poślizg wejścia kontra spread + model: (2.5 + 2.0) / (3 + 1.0)
+    assert details.points.combined_ratio == Decimal("4.5") / Decimal("4")
 
 
-def test_cost_ratio_on_the_sell_side_and_with_price_improvement(journal):
-    # SELL: poślizg = bid - wypełnienie; 100 / 102, wypełnienie 99.5 -> 0.5; model 2.5, zmierzone 2.5
+def test_the_spread_is_not_netted_into_the_verdict(journal):
+    # spread 20 pkt i poślizg 3.0: łączny stosunek (20 + 3) / (20 + 0.5) = 1.12 by przeszedł, werdykt 3.0 / 0.5 = 6
+    book_session(journal, D1, decision_bid=Decimal("100"), decision_ask=Decimal("120"), entry_fill=Decimal("123"))
+    details = gates.l1_details(journal, costs=COSTS)
+    assert details.gate.cost_deviation_ratio == Decimal("6")
+    assert details.points.combined_ratio == Decimal("23") / Decimal("20.5")
+
+
+def test_price_improvement_does_not_offset_adverse_slippage(journal):
+    # SELL: poślizg = bid - wypełnienie; 100 / 102, wypełnienie 99.5 -> 0.5 niekorzystny
     book_session(journal, D1, side=Side.SELL, decision_bid=Decimal("100"), decision_ask=Decimal("102"),
                  entry_fill=Decimal("99.5"))  # fmt: skip
     assert gate_l1_status(journal, costs=COSTS).cost_deviation_ratio == Decimal("1")
-    # poprawa ceny (SELL po 101.5 przy bid 100 -> poślizg -1.5): zmierzone 2 - 1.5 = 0.5, model 2.5
+    # SELL po 101.5 przy bid 100 -> poprawa 1.5: liczona jako 0, nie odejmuje się od pierwszego
     book_session(journal, D2, side=Side.SELL, decision_bid=Decimal("100"), decision_ask=Decimal("102"),
                  entry_fill=Decimal("101.5"))  # fmt: skip
-    assert gate_l1_status(journal, costs=COSTS).cost_deviation_ratio == Decimal("0.6")  # (2.5 + 0.5) / (2.5 + 2.5)
+    details = gates.l1_details(journal, costs=COSTS)
+    assert details.gate.cost_deviation_ratio == Decimal("0.5")  # 0.5 / (2 * 0.5)
+    assert details.points.combined_ratio == Decimal("0.6")  # informacyjnie, ze znakiem: (2.5 + 0.5) / (4 + 1.0)
 
 
 def test_cost_ratio_boundary_two_passes_above_two_fails(journal):
-    # 5 sesji: spread 2, poślizg 3.0 -> zmierzone 5.0, model 2.5 -> dokładnie 2: bramka przechodzi
+    # 5 sesji z poślizgiem 1.0 (wypełnienie 103 przy ask 102): 5.0 / (5 * 0.5) = 2 -> przechodzi
     for day in (D1, D2, D3, D4, D5):
         book_session(journal, day, decision_bid=Decimal("100"), decision_ask=Decimal("102"),
-                     entry_fill=Decimal("105"))  # fmt: skip
+                     entry_fill=Decimal("103"))  # fmt: skip
     at_limit = gate_l1_status(journal, costs=COSTS)
     assert at_limit.cost_deviation_ratio == Decimal("2") and at_limit.passed(5) is True
-    # szósta sesja z poślizgiem 3.1 przesuwa sumę: (25 + 5.1) / (12.5 + 2.5) = 30.1 / 15 > 2
-    book_session(journal, D6, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("105.1"))
+    # szósta z poślizgiem 1.1: 6.1 / 3.0 > 2
+    book_session(journal, D6, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("103.1"))
     above = gate_l1_status(journal, costs=COSTS)
-    assert above.cost_deviation_ratio == Decimal("30.1") / Decimal("15") and above.passed(5) is False
+    assert above.cost_deviation_ratio == Decimal("6.1") / Decimal("3") and above.passed(5) is False
 
 
 def test_cost_ratio_edge_cases(journal):
     details = gates.l1_details(journal, costs=COSTS)
     assert details.gate.cost_deviation_ratio == Decimal("0") and details.points.trades == 0
-    # wiersz zdegradowany (notowanie = poziom otwarcia, spread 0) nie jest pomiarem kosztu
+    # wiersz zdegradowany (notowanie = poziom otwarcia, spread 0) nie jest próbką kosztu
     book_session(journal, D1, decision_bid=Decimal("100"), decision_ask=Decimal("100"), entry_fill=Decimal("100"))
     details = gates.l1_details(journal, costs=COSTS)
-    assert details.gate.cost_deviation_ratio == Decimal("0") and details.points.trades == 0
-    # zerowy model poślizgu nie dzieli przez zero: model = sam spread
+    assert details.gate.cost_deviation_ratio == Decimal("0") and details.gate.cost_samples == 0
+    # zerowy model poślizgu: niekorzystny poślizg wobec modelu 0 to nieskończoność, brak poślizgu to 0
     zero = CostConfig(Decimal("0"), Decimal("0"), Decimal("0"), False)
-    book_session(journal, D2, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("103"))
-    assert gate_l1_status(journal, costs=zero).cost_deviation_ratio == Decimal("1.5")  # 3 / 2
-    # ujemna suma (wypełnienie dużo lepsze niż notowanie) nie daje ujemnego stosunku
-    book_session(journal, D3, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("80"))
+    book_session(journal, D2, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("102"))
     assert gate_l1_status(journal, costs=zero).cost_deviation_ratio == Decimal("0")
+    book_session(journal, D3, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("103"))
+    assert gate_l1_status(journal, costs=zero).cost_deviation_ratio == Decimal("Infinity")
+
+
+def test_a_gate_with_no_usable_cost_sample_does_not_pass(journal):
+    for day in (D1, D2, D3, D4, D5):  # pięć sesji, ale każda z notowaniem zdegradowanym (bid = ask)
+        book_session(journal, day, decision_bid=Decimal("100"), decision_ask=Decimal("100"), entry_fill=Decimal("100"))
+    status = gate_l1_status(journal, costs=COSTS)
+    assert status.sessions_at_min_size == 5 and status.cost_samples == 0 and status.cost_deviation_ratio == 0
+    assert status.passed(5) is False
+    assert status.reasons(5) == ["brak pomiaru kosztów: użytecznych próbek 0 z 5"]
+
+
+def test_fewer_usable_cost_samples_than_required_sessions_do_not_pass(journal):
+    for day in (D1, D2, D3, D4):
+        book_session(journal, day)
+    book_session(journal, D5, decision_bid=Decimal("100"), decision_ask=Decimal("100"), entry_fill=Decimal("100"))
+    status = gate_l1_status(journal, costs=COSTS)
+    assert status.sessions_at_min_size == 5 and status.cost_samples == 4
+    assert status.passed(5) is False
+    assert status.reasons(5) == ["brak pomiaru kosztów: użytecznych próbek 4 z 5"]
+    book_session(journal, D6)  # szósta sesja z pomiarem: pięć próbek
+    assert gate_l1_status(journal, costs=COSTS).passed(5) is True
 
 
 def test_smoke_trades_take_part_in_the_cost_measurement(journal):
     book_session(journal, D1, role="smoke", decision_bid=Decimal("100"), decision_ask=Decimal("102"),
-                 entry_fill=Decimal("105.1"))  # fmt: skip
-    assert gate_l1_status(journal, costs=COSTS).cost_deviation_ratio == Decimal("5.1") / Decimal("2.5")  # 2.04
+                 entry_fill=Decimal("103.1"))  # fmt: skip
+    status = gate_l1_status(journal, costs=COSTS)
+    assert status.cost_deviation_ratio == Decimal("1.1") / Decimal("0.5") and status.cost_samples == 1
 
 
 def test_costs_default_to_the_configuration_directory(journal, monkeypatch):
@@ -471,17 +527,31 @@ def test_costs_default_to_the_configuration_directory(journal, monkeypatch):
 
 
 def test_measured_points_use_decision_quotes_and_fills():
-    buy = make_trade(D1, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("102.5"))
+    buy = make_trade(D1, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("102.5"),
+                     exit_reason="STOP")  # fmt: skip
     sell = make_trade(D2, side=Side.SELL, decision_bid=Decimal("200"), decision_ask=Decimal("201"),
                       entry_fill=Decimal("199"))  # fmt: skip
     degraded = make_trade(D3, decision_bid=Decimal("300"), decision_ask=Decimal("300"), entry_fill=Decimal("300"))
     points = gates.cost_points([buy, sell, degraded], COSTS)
-    assert points.trades == 2  # wiersz zdegradowany (spread 0) nie zaniża średnich
-    assert points.spread == Decimal("1.5")  # (2 + 1) / 2
-    assert points.entry_slippage == Decimal("0.75")  # (0.5 + 1.0) / 2
-    assert points.ratio == Decimal("4.5") / Decimal("4")  # zmierzone 2.5 + 2.0, model 2.5 + 1.5
+    assert points.trades == 2  # wiersz zdegradowany (spread 0) nie jest próbką
+    assert (points.spread, points.spread_max) == (Decimal("1.5"), Decimal("2"))  # (2 + 1) / 2
+    assert (points.entry_slippage, points.entry_slippage_max) == (Decimal("0.75"), Decimal("1.0"))  # (0.5 + 1.0) / 2
+    assert points.ratio == Decimal("1.5")  # 1.5 / (2 * 0.5)
+    assert points.combined_ratio == Decimal("4.5") / Decimal("4")  # (2.5 + 2.0) / (3 + 1.0)
+    assert points.stop_exits == 1  # liczone po wszystkich transakcjach: nie są mierzone
     empty = gates.cost_points([], COSTS)
     assert (empty.trades, empty.spread, empty.entry_slippage, empty.ratio) == (0, None, None, Decimal("0"))
+    assert (empty.spread_max, empty.entry_slippage_max, empty.combined_ratio, empty.stop_exits) == (
+        None, None, Decimal("0"), 0)  # fmt: skip
+
+
+def test_cost_points_can_exclude_trades_and_report_a_price_improvement_as_zero_slippage():
+    better = make_trade(D1, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("101"))
+    worse = make_trade(D2, decision_bid=Decimal("100"), decision_ask=Decimal("102"), entry_fill=Decimal("104"))
+    points = gates.cost_points([better, worse], COSTS, include=[True, False])
+    assert points.trades == 1 and points.entry_slippage == 0 and points.entry_slippage_max == 0
+    assert points.ratio == Decimal("0")
+    assert gates.cost_points([better, worse], COSTS).ratio == Decimal("2") / Decimal("1")  # (0 + 2) / (2 * 0.5)
 
 
 def test_eur_ratio_uses_the_value_per_point_stored_in_the_entry_context(journal):
@@ -492,7 +562,7 @@ def test_eur_ratio_uses_the_value_per_point_stored_in_the_entry_context(journal)
     book_session(journal, D2, size=Decimal("2"), decision_bid=Decimal("200"), decision_ask=Decimal("201"),
                  spread_cost=Decimal("3.00"), slippage_penalty=Decimal("3.00"), exit_reason="STOP")  # fmt: skip
     details = gates.l1_details(journal, costs=COSTS)
-    assert details.eur_ratio == Decimal("1.4") and details.default_vpp_trades == 0  # 10.5 / 7.5
+    assert details.eur_ratio == Decimal("1.4") and details.excluded_trades == 0  # 10.5 / 7.5
 
 
 def test_eur_ratio_with_a_different_value_per_point_in_the_context(journal):
@@ -501,34 +571,48 @@ def test_eur_ratio_with_a_different_value_per_point_in_the_context(journal):
     book_session(journal, D2, vpp="2", size=Decimal("2"), decision_bid=Decimal("200"), decision_ask=Decimal("201"),
                  spread_cost=Decimal("3.00"), slippage_penalty=Decimal("3.00"), exit_reason="STOP")  # fmt: skip
     details = gates.l1_details(journal, costs=COSTS)
-    assert details.eur_ratio == Decimal("0.7") and details.default_vpp_trades == 0  # 10.5 / 15
+    assert details.eur_ratio == Decimal("0.7") and details.excluded_trades == 0  # 10.5 / 15
 
 
-def test_eur_ratio_falls_back_to_one_only_for_trades_without_a_context(journal):
+def test_trades_without_a_usable_context_are_excluded_everywhere_and_counted(journal):
     book_session(journal, D1, vpp="2", size=Decimal("1"), decision_bid=Decimal("100"), decision_ask=Decimal("102"),
                  spread_cost=Decimal("4.00"), slippage_penalty=Decimal("0.50"), exit_reason="FORCED")  # fmt: skip
     book_session(journal, D2, ctx=False, size=Decimal("2"), decision_bid=Decimal("200"), decision_ask=Decimal("201"),
-                 spread_cost=Decimal("3.00"), slippage_penalty=Decimal("3.00"), exit_reason="STOP")  # fmt: skip
+                 entry_fill=Decimal("260"), spread_cost=Decimal("3.00"), slippage_penalty=Decimal("3.00"))  # fmt: skip
     book_session(journal, D3, vpp=None, size=Decimal("1"), decision_bid=Decimal("100"), decision_ask=Decimal("102"),
-                 spread_cost=Decimal("0.00"), slippage_penalty=Decimal("0.00"))  # fmt: skip
+                 entry_fill=Decimal("190"), spread_cost=Decimal("9.00"))  # fmt: skip
     details = gates.l1_details(journal, costs=COSTS)
-    # A: (2 + 0.5) * 1 * 2 = 5; B (bez kontekstu, wartość punktu 1): 5.0; C (kontekst bez pola, 1): 2.5; księga 10.5
-    assert details.eur_ratio == Decimal("10.5") / Decimal("12.5")
-    assert details.default_vpp_trades == 2
-    again = gates.l1_details(journal, costs=COSTS, value_per_point=Decimal("2"))  # zapasowa wartość punktu
-    assert again.eur_ratio == Decimal("10.5") / Decimal("20")  # A 5 + B 10 + C 5
+    assert details.roles == ("entry", "unknown", "invalid")
+    assert details.excluded_trades == 2
+    assert details.eur_ratio == Decimal("4.5") / Decimal("5")  # tylko A: (2 + 0.5) * 1 * 2 = 5; ani B, ani C
+    assert details.points.trades == 1 and details.gate.cost_samples == 1  # B i C (ogromny poślizg) poza próbką
+    assert details.gate.sessions_at_min_size == 1
 
 
-@pytest.mark.parametrize("bad", ["0", "-2", "abc", "NaN", "Infinity", ""])
-def test_an_unusable_value_per_point_in_the_context_means_the_fallback(journal, bad):
+@pytest.mark.parametrize(
+    "bad",
+    ["0", "-2", "abc", "NaN", "Infinity", "-Infinity", "", "1001", "1E+999999", "1e999999999999999999999",
+     1, 1.0, True, None, [1], {"a": 1}, float("inf")],
+)  # fmt: skip
+def test_a_corrupted_or_absurd_value_per_point_makes_the_trade_unusable(journal, bad):
     trade = book_session(journal, D1, vpp=None)
     client_id = make_client_id(D1, "DE40", 1, "entry")
     context = {"client_id": client_id, "signal_ts": trade.signal_ts.isoformat(), "value_per_point": bad,
                "submit_ts": trade.submit_ts.isoformat()}  # fmt: skip
     journal.set_meta(f"entry_ctx:{client_id}", json.dumps(context))
     details = gates.l1_details(journal, costs=COSTS)
-    assert details.roles == ("entry",)  # rola nadal rozpoznana
-    assert details.default_vpp_trades == 1
+    assert details.roles == ("invalid",)  # nie wejście, nie smoke
+    assert details.excluded_trades == 1
+    assert details.gate.sessions_at_min_size == 0 and details.gate.cost_samples == 0
+    assert details.eur_ratio == Decimal("0")  # żadnej liczby z uszkodzonego rekordu
+
+
+@pytest.mark.parametrize("good", ["1", "2.5", "1000", "0.0001"])
+def test_a_sane_value_per_point_is_accepted(journal, good):
+    book_session(journal, D1, vpp=good)
+    details = gates.l1_details(journal, costs=COSTS)
+    assert details.roles == ("entry",) and details.excluded_trades == 0
+    assert gates.MAX_VALUE_PER_POINT == Decimal("1000")  # 1000 x domyślna wartość punktu
 
 
 def test_incident_dates_are_local_days_of_the_counted_incidents(journal):
@@ -679,25 +763,36 @@ INSTRUCTION = "Aby dopuścić wielkość według reguł utwórz plik data/L1_PAS
 VERDICT_TAIL = "(cały dziennik; ocena wyjaśnień należy do właściciela)"
 
 
+RATIO_LABEL = "  koszty zmierzone / model (poślizg wejścia w punktach, bez zaokrągleń): "
+COMBINED_LABEL = "    informacyjnie, nie wpływa na werdykt: spread + poślizg wejścia / model (spread + poślizg): "
+STOPS_LINE = "    zamknięcia stopem: 0 (spread i poślizg przy wyjściu stopem nie są mierzone)"
+SPREAD_LINE = "    spread w chwili decyzji: średni 2.00 pkt, największy 2.00 pkt"
+
+
 def test_report_l1_block_not_yet_with_four_sessions(journal, capsys, config_env, jpath):
     for day in (D1, D2, D3, D4):
         book_session(journal, day)
     _, out, _ = run(["--journal", jpath], capsys)
     lines = out.splitlines()
     start = lines.index(f"Bramka L1 (spec §11): NOT YET {VERDICT_TAIL}")
-    assert lines[start : start + 11] == [
+    assert lines[start : start + 15] == [
         f"Bramka L1 (spec §11): NOT YET {VERDICT_TAIL}",
         "  sesje na wielkości minimalnej: 4 z 5 (brakuje 1)",
         "  rozbieżności pozycja/broker starsze niż 60 s: 0 (wymagane 0)",
         "  nieobsłużone odrzucenia: 0 (wymagane 0)",
-        "  koszty zmierzone / model (w punktach, bez zaokrągleń): 0.80 (najwyżej 2; transakcji w pomiarze: 4)",
-        "    średni spread w chwili decyzji: 2.00 pkt",
-        "    średni poślizg wejścia względem notowania decyzji: 0.00 pkt (model: 0.5 pkt)",
+        RATIO_LABEL + "0.00 (najwyżej 2; próbki pomiaru: 4 z 5)",
+        "    średni niekorzystny poślizg wejścia: 0.00 pkt (model: 0.5 pkt; poprawa ceny liczona jako 0)",
+        "    największy niekorzystny poślizg wejścia: 0.00 pkt",
+        SPREAD_LINE,
+        STOPS_LINE,
+        "    informacyjnie, nie wpływa na werdykt: spread + poślizg wejścia / model (spread + poślizg): 0.80",
         "  koszty w EUR (informacyjnie): ratio 0.00",
         CAVEAT,
+        "  uwaga: dowody są skąpe: pomiar kosztów z 4 transakcji przy wymaganych 5; to za mało, by oceniać koszty",
         "  powód: za mało sesji na wielkości minimalnej: 4 z 5 (brakuje 1)",
-        "",
+        "  powód: brak pomiaru kosztów: użytecznych próbek 4 z 5",
     ]
+    assert lines[start + 15] == ""
     assert INSTRUCTION not in out
 
 
@@ -706,14 +801,17 @@ def test_report_l1_block_passes_with_five_clean_sessions_and_prints_the_instruct
     _, out, _ = run(["--journal", jpath], capsys)
     lines = out.splitlines()
     start = lines.index(f"Bramka L1 (spec §11): PASS {VERDICT_TAIL}")
-    assert lines[start : start + 10] == [
+    assert lines[start : start + 13] == [
         f"Bramka L1 (spec §11): PASS {VERDICT_TAIL}",
         "  sesje na wielkości minimalnej: 5 z 5 (brakuje 0)",
         "  rozbieżności pozycja/broker starsze niż 60 s: 0 (wymagane 0)",
         "  nieobsłużone odrzucenia: 0 (wymagane 0)",
-        "  koszty zmierzone / model (w punktach, bez zaokrągleń): 0.80 (najwyżej 2; transakcji w pomiarze: 5)",
-        "    średni spread w chwili decyzji: 2.00 pkt",
-        "    średni poślizg wejścia względem notowania decyzji: 0.00 pkt (model: 0.5 pkt)",
+        RATIO_LABEL + "0.00 (najwyżej 2; próbki pomiaru: 5 z 5)",
+        "    średni niekorzystny poślizg wejścia: 0.00 pkt (model: 0.5 pkt; poprawa ceny liczona jako 0)",
+        "    największy niekorzystny poślizg wejścia: 0.00 pkt",
+        SPREAD_LINE,
+        STOPS_LINE,
+        "    informacyjnie, nie wpływa na werdykt: spread + poślizg wejścia / model (spread + poślizg): 0.80",
         "  koszty w EUR (informacyjnie): ratio 0.00",
         CAVEAT,
         INSTRUCTION,
@@ -721,21 +819,33 @@ def test_report_l1_block_passes_with_five_clean_sessions_and_prints_the_instruct
     # zastrzeżenie o zaokrągleniu stoi w bloku bramki NAD instrukcją o pliku data/L1_PASSED
     assert lines.index(CAVEAT) < lines.index(INSTRUCTION)
     assert not any(line.startswith("  powód:") for line in lines)
+    assert not any("dowody są skąpe" in line for line in lines)  # pięć próbek przy pięciu wymaganych
 
 
-def test_report_gate_verdict_comes_from_points_not_from_the_rounded_euro_ratio(journal, capsys, config_env, jpath):
-    # księga w EUR pokazuje 0.00 (zaokrąglenie do 0,01 przy wielkości 0,001), a wypełnienia są 3.1 pkt gorsze
+def test_report_gate_verdict_is_entry_slippage_not_the_spread_and_not_the_rounded_euro_ratio(
+    journal, capsys, config_env, jpath
+):
+    # wypełnienia 1.1 pkt gorsze od ask (model 0.5): 1.1 / 0.5 = 2.2; księga w EUR pokazuje 0.00
     for day in (D1, D2, D3, D4, D5):
         book_session(journal, day, decision_bid=Decimal("100"), decision_ask=Decimal("102"),
-                     entry_fill=Decimal("105.1"))  # fmt: skip
+                     entry_fill=Decimal("103.1"))  # fmt: skip
     _, out, _ = run(["--journal", jpath], capsys)
     lines = out.splitlines()
     assert f"Bramka L1 (spec §11): NOT YET {VERDICT_TAIL}" in lines
-    ratio_line = "  koszty zmierzone / model (w punktach, bez zaokrągleń): 2.04 (najwyżej 2; transakcji w pomiarze: 5)"
-    assert ratio_line in lines
+    assert RATIO_LABEL + "2.20 (najwyżej 2; próbki pomiaru: 5 z 5)" in lines
+    assert "    średni niekorzystny poślizg wejścia: 1.10 pkt (model: 0.5 pkt; poprawa ceny liczona jako 0)" in lines
+    assert "    największy niekorzystny poślizg wejścia: 1.10 pkt" in lines
+    assert f"{COMBINED_LABEL}1.24" in lines
     assert "  koszty w EUR (informacyjnie): ratio 0.00" in lines
-    assert "  powód: koszty zmierzone / model: 2.04 > 2 (przegląd kosztów)" in lines
+    assert "  powód: koszty zmierzone / model: 2.20 > 2 (przegląd kosztów)" in lines
     assert INSTRUCTION not in lines
+
+
+def test_report_shows_the_number_of_stop_exits_as_unmeasured(journal, capsys, config_env, jpath):
+    five_clean_sessions(journal)
+    book_session(journal, D6, exit_reason="STOP")
+    _, out, _ = run(["--journal", jpath], capsys)
+    assert "    zamknięcia stopem: 1 (spread i poślizg przy wyjściu stopem nie są mierzone)" in out.splitlines()
 
 
 @pytest.mark.parametrize(
@@ -768,19 +878,53 @@ def test_report_explains_what_the_unhandled_rejections_count_includes(journal, c
     assert lines[lines.index("  nieobsłużone odrzucenia: 1 (wymagane 0; dni: 2026-11-06)") + 1] == note
 
 
-def test_report_prints_the_assumed_value_per_point_for_trades_without_a_context(journal, capsys, config_env, jpath):
-    for day in (D1, D2, D3, D4):
-        book_session(journal, day)
-    book_session(journal, D5, ctx=False)
+EXCLUDED = "  wykluczone z pomiaru kosztów i z liczby sesji (brak kontekstu wejścia albo uszkodzona wartość punktu): "
+
+
+def test_report_counts_exactly_the_excluded_trades(journal, capsys, config_env, jpath):
+    five_clean_sessions(journal)
+    book_session(journal, D1, seq=2, ctx=False, **later_times(D1, 10))  # bez kontekstu
+    book_session(journal, D2, seq=2, ctx=False, **later_times(D2, 10))  # bez kontekstu
+    book_session(journal, D3, seq=2, vpp="0", **later_times(D3, 10))  # kontekst z uszkodzoną wartością punktu
     _, out, _ = run(["--journal", jpath], capsys)
     lines = out.splitlines()
-    assert "  wartość punktu = 1 dla 1 transakcji bez kontekstu (koszty w EUR)" in lines
+    assert EXCLUDED + "3" in lines
+    assert sum(1 for line in lines if line.startswith("  wykluczone z pomiaru")) == 1
+    assert "  sesje na wielkości minimalnej: 5 z 5 (brakuje 0)" in lines  # wykluczone nie są sesjami
+    assert RATIO_LABEL + "0.00 (najwyżej 2; próbki pomiaru: 5 z 5)" in lines  # ani próbkami kosztów
+    assert not any("wartość punktu = 1" in line for line in lines)  # żadnego cichego zapasowego 1
 
 
-def test_report_omits_the_value_per_point_assumption_when_every_trade_has_a_context(journal, capsys, config_env, jpath):
+def test_report_omits_the_excluded_line_when_every_trade_has_a_context(journal, capsys, config_env, jpath):
     five_clean_sessions(journal)
     _, out, _ = run(["--journal", jpath], capsys)
-    assert "wartość punktu = 1" not in out
+    assert "wykluczone z pomiaru" not in out
+
+
+def test_report_survives_corrupted_value_per_point_in_the_entry_context(journal, capsys, config_env, jpath):
+    five_clean_sessions(journal)
+    trade = book_session(journal, D6, vpp=None)
+    client_id = make_client_id(D6, "DE40", 1, "entry")
+    for index, bad in enumerate(["1E+999999", "-1", "NaN", "9" * 400, 1e400, True]):
+        context = {"client_id": client_id, "signal_ts": trade.signal_ts.isoformat(), "value_per_point": bad,
+                   "submit_ts": trade.submit_ts.isoformat()}  # fmt: skip
+        journal.set_meta(f"entry_ctx:{client_id}", json.dumps(context))
+        code, out, err = run(["--journal", jpath], capsys)
+        assert code == 0 and err == "", (index, bad)
+        assert EXCLUDED + "1" in out.splitlines()
+        assert "Bramka L1 (spec §11): PASS" in out  # pięć czystych sesji; uszkodzony wiersz tylko wykluczony
+
+
+def test_report_says_plainly_that_the_evidence_is_thin_only_below_the_required_n(journal, capsys, config_env, jpath):
+    thin = "  uwaga: dowody są skąpe: pomiar kosztów z {} transakcji przy wymaganych 5; to za mało, by oceniać koszty"
+    for day in (D1, D2):
+        book_session(journal, day)
+    _, out, _ = run(["--journal", jpath], capsys)
+    assert thin.format(2) in out.splitlines()
+    for day in (D3, D4, D5):
+        book_session(journal, day)
+    _, out, _ = run(["--journal", jpath], capsys)
+    assert "dowody są skąpe" not in out
 
 
 def test_report_on_an_empty_journal(journal, capsys, config_env, jpath):
@@ -790,7 +934,8 @@ def test_report_on_an_empty_journal(journal, capsys, config_env, jpath):
     assert "Dziennik jest pusty: brak transakcji i zapisów dnia." in lines
     assert f"Bramka L1 (spec §11): NOT YET {VERDICT_TAIL}" in lines
     assert "  sesje na wielkości minimalnej: 0 z 5 (brakuje 5)" in lines
-    assert "  koszty zmierzone / model (w punktach, bez zaokrągleń): brak danych (najwyżej 2)" in lines
+    assert RATIO_LABEL + "brak danych (najwyżej 2; próbki pomiaru: 0 z 5)" in lines
+    assert "  powód: brak pomiaru kosztów: użytecznych próbek 0 z 5" in lines
     assert lines[-1] == STATEMENT
     assert "Dzień: " not in out
 
@@ -953,6 +1098,14 @@ def test_format_ratio_rounds_half_up_to_two_places_and_names_infinity():
     assert gates.format_ratio(Decimal("2.005")) == "2.01"
     assert gates.format_ratio(Decimal("0")) == "0.00"
     assert gates.format_ratio(Decimal("Infinity")) == "inf"
+    assert gates.format_ratio(Decimal("-0.001")) == "0.00"  # nigdy "-0.00"
+
+
+@pytest.mark.parametrize("value", ["-0.001", "-0", "-0.0", "-0.004", "0", "0.001"])
+def test_points_are_never_printed_as_negative_zero(value):
+    assert report_cli._points(Decimal(value)) == "0.00"
+    assert report_cli._points(Decimal("-0.006")) == "-0.01"  # prawdziwa wartość ujemna zostaje
+    assert report_cli._points(Decimal("1.234")) == "1.23" and report_cli._points(None) == "-"
 
 
 def test_report_shows_an_infinite_euro_ratio_as_information_only(journal, capsys, config_env, jpath, monkeypatch):
@@ -962,7 +1115,7 @@ def test_report_shows_an_infinite_euro_ratio_as_information_only(journal, capsys
     _, out, _ = run(["--journal", jpath], capsys)
     lines = out.splitlines()
     assert "  koszty w EUR (informacyjnie): ratio inf" in lines  # koszt w księdze bez modelu (EUR)
-    assert "  koszty zmierzone / model (w punktach, bez zaokrągleń): brak danych (najwyżej 2)" in lines
+    assert RATIO_LABEL + "brak danych (najwyżej 2; próbki pomiaru: 0 z 5)" in lines
 
 
 def test_report_cannot_write_to_the_journal(journal, jpath):
@@ -1037,3 +1190,14 @@ def test_report_negative_zero_is_printed_as_zero(journal, capsys, config_env, jp
     lines = out.splitlines()
     assert "Opłaty: 0.00" in lines and "Finansowanie: 0.00" in lines
     assert "-0.00" not in out
+
+
+def test_an_arithmetic_error_while_building_the_report_is_exit_1_not_a_traceback(
+    journal, capsys, config_env, jpath, monkeypatch
+):
+    def exploding(*args, **kwargs):
+        raise ArithmeticError("value out of range")
+
+    monkeypatch.setattr(gates, "l1_details", exploding)
+    code, out, err = run(["--journal", jpath], capsys)
+    assert code == 1 and out == "" and "value out of range" in err

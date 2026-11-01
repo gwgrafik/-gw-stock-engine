@@ -47,6 +47,10 @@ L1_EUR_CAVEAT = (
     "  uwaga: koszty w EUR są zaokrąglane do 0,01 € przy wielkości 0,001, więc ratio w EUR jest zgrubne; "
     "poślizg stopu przy wyjściu NIE jest mierzony"
 )
+L1_RATIO_LABEL = "  koszty zmierzone / model (poślizg wejścia w punktach, bez zaokrągleń): "
+L1_EXCLUDED_LABEL = (
+    "  wykluczone z pomiaru kosztów i z liczby sesji (brak kontekstu wejścia albo uszkodzona wartość punktu): "
+)
 L1_REJECTION_NOTE = (
     "    liczy ENTRY_UNRESOLVED także po późniejszym rozstrzygnięciu zlecenia oraz zlecenia INTENT/SUBMITTING, "
     "gdy raport powstaje w trakcie wejścia"
@@ -285,29 +289,37 @@ def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[st
     ]
     if gate.unhandled_rejections:
         lines.append(L1_REJECTION_NOTE)
-    label = "  koszty zmierzone / model (w punktach, bez zaokrągleń): "
+    verdict = f"{format_ratio(gate.cost_deviation_ratio)}" if points.trades else "brak danych"
+    limit = gates.COST_DEVIATION_LIMIT
+    lines.append(f"{L1_RATIO_LABEL}{verdict} (najwyżej {limit}; próbki pomiaru: {points.trades} z {required})")
     if points.trades:
         lines += [
-            f"{label}{format_ratio(gate.cost_deviation_ratio)} "
-            f"(najwyżej {gates.COST_DEVIATION_LIMIT}; transakcji w pomiarze: {points.trades})",
-            f"    średni spread w chwili decyzji: {_points(points.spread)} pkt",
-            f"    średni poślizg wejścia względem notowania decyzji: {_points(points.entry_slippage)} pkt "
-            f"(model: {costs.entry_slippage_points} pkt)",
+            f"    średni niekorzystny poślizg wejścia: {_points(points.entry_slippage)} pkt "
+            f"(model: {costs.entry_slippage_points} pkt; poprawa ceny liczona jako 0)",
+            f"    największy niekorzystny poślizg wejścia: {_points(points.entry_slippage_max)} pkt",
+            f"    spread w chwili decyzji: średni {_points(points.spread)} pkt, "
+            f"największy {_points(points.spread_max)} pkt",
         ]
-    else:
-        lines.append(f"{label}brak danych (najwyżej {gates.COST_DEVIATION_LIMIT})")
-    lines.append(f"  koszty w EUR (informacyjnie): ratio {format_ratio(details.eur_ratio)}")
-    if details.default_vpp_trades:
+    lines.append(
+        f"    zamknięcia stopem: {points.stop_exits} (spread i poślizg przy wyjściu stopem nie są mierzone)"
+    )
+    if points.trades:
         lines.append(
-            f"  wartość punktu = {details.fallback_value_per_point} dla {details.default_vpp_trades} "
-            "transakcji bez kontekstu (koszty w EUR)"
+            "    informacyjnie, nie wpływa na werdykt: spread + poślizg wejścia / model (spread + poślizg): "
+            f"{format_ratio(points.combined_ratio)}"
         )
+    lines.append(f"  koszty w EUR (informacyjnie): ratio {format_ratio(details.eur_ratio)}")
     lines.append(L1_EUR_CAVEAT)
-    smoke, unknown = details.roles.count(gates.ROLE_SMOKE), details.roles.count(gates.ROLE_UNKNOWN)
+    if details.excluded_trades:
+        lines.append(f"{L1_EXCLUDED_LABEL}{details.excluded_trades}")
+    smoke = details.roles.count(gates.ROLE_SMOKE)
     if smoke:
         lines.append(f"  próby smoke (poza liczbą sesji): {smoke}")
-    if unknown:
-        lines.append(f"  transakcje bez kontekstu wejścia (poza liczbą sesji): {unknown}")
+    if points.trades < required:
+        lines.append(
+            f"  uwaga: dowody są skąpe: pomiar kosztów z {points.trades} transakcji przy wymaganych {required}; "
+            "to za mało, by oceniać koszty"
+        )
     lines += [f"  powód: {reason}" for reason in reasons]
     if not reasons:
         lines.append(L1_INSTRUCTION)
@@ -316,7 +328,11 @@ def _gate_lines(details: L1Details, required: int, costs: CostConfig) -> list[st
 
 
 def _points(value: Decimal | None) -> str:
-    return format(value.quantize(Decimal("0.01")), "f") if value is not None else "-"
+    """Punkty do wydruku z dwoma miejscami; nigdy `-0.00` (zero po zaokrągleniu jest bez znaku)."""
+    if value is None:
+        return "-"
+    rounded = value.quantize(Decimal("0.01"))
+    return format(abs(rounded) if rounded.is_zero() else rounded, "f")
 
 
 # --- polecenie --------------------------------------------------------------------------------------------------
@@ -401,7 +417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             lines, csv_error = _report(args, journal_path, journal, strat.fixed_min_size_sessions, costs)
         finally:
             journal.close()
-    except (ReportError, JournalError, sqlite3.Error) as exc:
+    except (ReportError, JournalError, sqlite3.Error, ArithmeticError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print("\n".join(lines))

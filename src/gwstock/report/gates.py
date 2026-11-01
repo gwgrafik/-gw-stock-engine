@@ -26,26 +26,36 @@ Definicje czterech liczb (`gate_l1_status`, szczegóły i daty incydentów w `l1
   Uwaga: wiersz ENTRY_UNRESOLVED liczy się NAWET wtedy, gdy zlecenie rozstrzygnięto później (ślad incydentu zostaje,
   a kod nie ocenia wyjaśnień), a zlecenie INTENT/SUBMITTING liczy się, gdy raport powstaje w trakcie wejścia.
   Zlecenie ZAKOŃCZONE (CONFIRMED, REJECTED, NOT_PLACED) bez wiersza ENTRY_UNRESOLVED nie jest nieobsłużone.
-- `cost_deviation_ratio` (WERDYKT bramki, w PUNKTACH, bez zaokrągleń): Σ(zmierzony koszt) / Σ(koszt z modelu) po
-  wszystkich transakcjach z użytecznym notowaniem decyzji (także smoke: to prawdziwe wypełnienia), gdzie dla
-  transakcji zmierzony koszt = spread w chwili decyzji (ask − bid) + poślizg wejścia z wypełnienia (BUY: wypełnienie −
-  ask, SELL: bid − wypełnienie; ujemny przy poprawie ceny), a koszt z modelu = ten sam spread + `entry_slippage_points`
-  z `costs_v1.toml`. Wielkość i wartość punktu się skracają. Wynik jest ograniczony od dołu zerem. Brak użytecznych
-  transakcji: 0 (to brak danych, nie dowód). Poślizg stopu przy wyjściu NIE jest mierzony (księga nie zna poziomu
-  stopu brokera, a jego pochodzenie jest niepotwierdzone), więc dodatkowy poślizg STOP nie wchodzi ani do licznika,
-  ani do mianownika.
+- `cost_deviation_ratio` (WERDYKT bramki, w PUNKTACH, bez zaokrągleń): Σ(niekorzystny poślizg wejścia) /
+  (n × `entry_slippage_points` z `costs_v1.toml`), gdzie n to liczba PRÓBEK KOSZTU, a poślizg wejścia z wypełnienia
+  to BUY: wypełnienie − ask, SELL: bid − wypełnienie, z poprawą ceny liczoną jako 0 (nie odejmuje się od innych
+  transakcji). Spread NIE wchodzi do werdyktu (jest zarazem pomiarem i wejściem modelu, więc rozcieńczałby
+  rozbieżność). Przy modelu 0,5 pkt i progu 2× przegląd wypada, gdy średni niekorzystny poślizg przekracza 1,0 pkt.
+  Model 0 przy poślizgu > 0: nieskończoność. Próbka kosztu: transakcja o roli `entry` lub `smoke` z użytecznym
+  notowaniem decyzji (ask > bid). Poślizg i spread przy wyjściu STOP NIE są mierzone (księga nie zna poziomu stopu
+  brokera, a jego pochodzenie jest niepotwierdzone); `CostPoints.stop_exits` tylko je liczy.
+- `cost_samples` (piąte pole `GateL1`): liczba próbek kosztu. Bramka NIE przechodzi, gdy próbek jest mniej niż
+  wymaganych sesji (`brak pomiaru kosztów`): zero dowodów to nie dowód.
 
-Koszt w EUR (`l1_details().eur_ratio`) to tylko INFORMACJA: Σ(`spread_cost` + `slippage_penalty`) księgi / Σ modelu
-w EUR, z wartością punktu z `entry_ctx` danej transakcji (zapasowo 1 dla transakcji bez kontekstu, o czym raport
-informuje). Księga zaokrągla każdy składnik do 0,01 €, a przy wielkości 0,001 koszt modelu to ok. 0,0025 € na
-transakcję, więc ten stosunek jest zgrubny (wiersz to 0,00 albo 0,01); `slippage_penalty` jest liczony z konfiguracji,
-nie z pomiaru, a `spread_cost` to maksimum z kosztu zrealizowanego i modelu połówek spreadu.
+Transakcje WYKLUCZONE z sesji, z próbek kosztu i z kosztu w EUR (`L1Details.excluded_trades`, raport drukuje ich
+liczbę):
+rola `unknown` (brak kontekstu wejścia, np. wiersz COST_FALLBACK) i rola `invalid` (kontekst jest, ale wartość punktu
+jest uszkodzona: brak, nie napis, nie liczba, nie skończona, ≤ 0 albo > `MAX_VALUE_PER_POINT` = 1000 × domyślna wartość
+punktu 1 dla DE40; w konfiguracji nie ma limitu wartości punktu). Uszkodzony zapis nie daje więc żadnej liczby.
+
+Informacyjnie (nie wpływa na werdykt): średni i największy spread decyzji, największy poślizg wejścia, liczba wyjść
+STOP, łączny stosunek (spread + poślizg wejścia) / (spread + model) (`CostPoints.combined_ratio`) oraz koszt w EUR
+(`l1_details().eur_ratio`): Σ(`spread_cost` + `slippage_penalty`) księgi / Σ modelu w EUR z wartością punktu
+z `entry_ctx` danej transakcji. Księga zaokrągla każdy składnik do 0,01 €, a przy wielkości 0,001 koszt modelu to
+ok. 0,0025 € na transakcję, więc ten stosunek jest zgrubny (wiersz to 0,00 albo 0,01); `slippage_penalty` jest liczony
+z konfiguracji, nie z pomiaru, a `spread_cost` to maksimum z kosztu zrealizowanego i modelu połówek spreadu.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Context, Decimal, Inexact, InvalidOperation, Overflow
@@ -60,7 +70,7 @@ from gwstock.types import Side
 
 __all__ = [
     "GateL1", "L1Details", "CostPoints", "TradeContext", "gate_l1_status", "l1_details", "trade_contexts",
-    "trade_roles", "cost_points", "format_ratio", "read_events", "COST_DEVIATION_LIMIT",
+    "trade_roles", "cost_points", "format_ratio", "read_events", "COST_DEVIATION_LIMIT", "MAX_VALUE_PER_POINT",
 ]  # fmt: skip
 
 # Nazwy zgodne ze stałymi silnika (pilnuje ich test `test_literals_match_the_engine_constants`); nie importujemy
@@ -75,14 +85,17 @@ SOURCE_ENGINE = "engine"
 META_ENTRY_CTX = "entry_ctx:{}"
 ROLE_ENTRY = "entry"
 ROLE_SMOKE = "smoke"
-ROLE_UNKNOWN = "unknown"
+ROLE_UNKNOWN = "unknown"  # brak kontekstu wejścia
+ROLE_INVALID = "invalid"  # kontekst jest, ale wartość punktu jest uszkodzona
+COST_ROLES = (ROLE_ENTRY, ROLE_SMOKE)  # role, których transakcje są próbkami kosztu
 ENTRY_UNRESOLVED = "ENTRY_UNRESOLVED"
 ENTRY_EXCEPTION = "ENTRY_EXCEPTION"
 MISMATCH_TIMEOUT = "MISMATCH_TIMEOUT"
 ENGAGE_EVENTS = ("ENGAGE", "ESCALATE", "REASON")  # wiersze `kill.audit` oznaczające włączenie przyczyny
 
 COST_DEVIATION_LIMIT = Decimal("2")  # spec §11: rozbieżność większa niż 2× model uruchamia przegląd
-DEFAULT_VALUE_PER_POINT = Decimal("1")  # zapasowa wartość punktu (DE40: 1 € za punkt przy wielkości 1)
+DEFAULT_VALUE_PER_POINT = Decimal("1")  # domyślna wartość punktu instrumentu (DE40: 1 € za punkt przy wielkości 1)
+MAX_VALUE_PER_POINT = 1000 * DEFAULT_VALUE_PER_POINT  # powyżej tego wartość punktu z kontekstu jest uszkodzona
 ENV_CONFIG_DIR = "GW_CONFIG_DIR"
 DEFAULT_CONFIG_DIR = "config"
 
@@ -113,20 +126,23 @@ def format_ratio(ratio: Decimal) -> str:
     """Stosunek kosztów do wyświetlenia: dwa miejsca po przecinku (ROUND_HALF_UP), nieskończoność jako `inf`."""
     if ratio.is_infinite():
         return "inf"
-    return format(ratio.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP), "f")
+    text = ratio.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP)
+    return format(abs(text) if text.is_zero() else text, "f")  # nigdy "-0.00"
 
 
 @dataclass(frozen=True)
 class GateL1:
-    """Cztery liczby bramki L1 (patrz docstring modułu); `passed` sprawdza je wobec wymaganej liczby sesji."""
+    """Cztery liczby bramki L1 (patrz docstring modułu) i liczba próbek kosztu; `passed` sprawdza je wobec wymaganej
+    liczby sesji. `cost_samples` bez podania to 0, czyli brak pomiaru kosztów (bramka nie przechodzi)."""
 
     sessions_at_min_size: int
     unreconciled_over_60s: int
     unhandled_rejections: int
     cost_deviation_ratio: Decimal
+    cost_samples: int = 0
 
     def __post_init__(self) -> None:
-        for name in ("sessions_at_min_size", "unreconciled_over_60s", "unhandled_rejections"):
+        for name in ("sessions_at_min_size", "unreconciled_over_60s", "unhandled_rejections", "cost_samples"):
             _check_count(name, getattr(self, name))
         ratio = self.cost_deviation_ratio
         if not isinstance(ratio, Decimal):
@@ -137,12 +153,14 @@ class GateL1:
             raise ValueError(f"GateL1.cost_deviation_ratio: must not be negative, got {ratio}")
 
     def passed(self, required_sessions: int) -> bool:
-        """Cztery warunki (spec §11): sesje ≥ wymagane, zero rozbieżności, zero odrzuceń, koszty ≤ 2× model."""
+        """Warunki (spec §11): sesje ≥ wymagane, zero rozbieżności, zero odrzuceń, pomiar kosztów z co najmniej tylu
+        próbek co wymagane sesje i koszty ≤ 2× model."""
         _check_required(required_sessions)
         return (
             self.sessions_at_min_size >= required_sessions
             and self.unreconciled_over_60s == 0
             and self.unhandled_rejections == 0
+            and self.cost_samples >= required_sessions
             and self.cost_deviation_ratio <= COST_DEVIATION_LIMIT
         )
 
@@ -160,6 +178,8 @@ class GateL1:
             reasons.append(f"rozbieżności pozycja/broker starsze niż 60 s: {self.unreconciled_over_60s} (wymagane 0)")
         if self.unhandled_rejections:
             reasons.append(f"nieobsłużone odrzucenia: {self.unhandled_rejections} (wymagane 0)")
+        if self.cost_samples < required_sessions:
+            reasons.append(f"brak pomiaru kosztów: użytecznych próbek {self.cost_samples} z {required_sessions}")
         if self.cost_deviation_ratio > COST_DEVIATION_LIMIT:
             reasons.append(
                 f"koszty zmierzone / model: {format_ratio(self.cost_deviation_ratio)} > {COST_DEVIATION_LIMIT} "
@@ -232,24 +252,34 @@ def _rejection_days(journal: Journal) -> list[date]:
 
 @dataclass(frozen=True)
 class TradeContext:
-    """Rola transakcji (`entry`, `smoke`, `unknown`) i wartość punktu z kontekstu wejścia (None: brak)."""
+    """Rola transakcji (`entry`, `smoke`, `unknown`, `invalid`) i wartość punktu z kontekstu wejścia (None: brak)."""
 
     role: str
     value_per_point: Decimal | None
+
+
+def _usable_value_per_point(value: object) -> Decimal | None:
+    """Wartość punktu z kontekstu albo None, gdy jest uszkodzona.
+
+    Silnik zapisuje ją jako napis (`Decimal` przez `dump`), więc tylko napis jest przyjmowany (bez float, bool, null,
+    list). Skończona, > 0 i ≤ `MAX_VALUE_PER_POINT`; nic nie rzuca.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        number = Decimal(value)
+    except (ArithmeticError, ValueError):
+        return None
+    return number if number.is_finite() and 0 < number <= MAX_VALUE_PER_POINT else None
 
 
 def _parse_context(text: str) -> tuple[datetime, datetime, Decimal | None] | None:
     try:
         ctx = json.loads(text)
         signal_ts, submit_ts = datetime.fromisoformat(ctx["signal_ts"]), datetime.fromisoformat(ctx["submit_ts"])
-    except (ValueError, TypeError, KeyError):
+        vpp = _usable_value_per_point(ctx.get("value_per_point"))
+    except (ValueError, TypeError, KeyError, AttributeError):
         return None
-    vpp = None
-    try:
-        value = Decimal(ctx["value_per_point"])
-        vpp = value if value.is_finite() and value > 0 else None
-    except (ArithmeticError, ValueError, TypeError, KeyError):
-        pass
     return signal_ts, submit_ts, vpp
 
 
@@ -258,8 +288,8 @@ def trade_contexts(journal: Journal, trades: list[TradeRecord]) -> list[TradeCon
 
     Dla dnia sygnału i dni sąsiednich (nazwa zlecenia nosi dzień handlowy, a czas UTC może wypaść w innym dniu)
     przegląda zlecenia `gws-{dzień}-{instrument}-{seq}-{entry|smoke}`, czyta ich `entry_ctx` i dopasowuje transakcję
-    po `signal_ts` i `submit_ts`. Bez dopasowania: rola `unknown`, wartość punktu None. Tylko publiczne metody
-    dziennika.
+    po `signal_ts` i `submit_ts`. Bez dopasowania: rola `unknown`; z dopasowaniem, ale z uszkodzoną wartością punktu:
+    rola `invalid`. W obu przypadkach wartość punktu to None. Tylko publiczne metody dziennika.
     """
     index: dict[tuple[datetime, datetime], TradeContext] = {}
     scanned: set[tuple[str, date]] = set()
@@ -278,7 +308,9 @@ def trade_contexts(journal: Journal, trades: list[TradeRecord]) -> list[TradeCon
                     text = journal.get_meta(META_ENTRY_CTX.format(client_id))
                     parsed = None if text is None else _parse_context(text)
                     if parsed is not None:
-                        index.setdefault(parsed[:2], TradeContext(role, parsed[2]))
+                        signal_ts, submit_ts, vpp = parsed
+                        usable_role = role if vpp is not None else ROLE_INVALID
+                        index.setdefault((signal_ts, submit_ts), TradeContext(usable_role, vpp))
     unknown = TradeContext(ROLE_UNKNOWN, None)
     return [index.get((trade.signal_ts, trade.submit_ts), unknown) for trade in trades]
 
@@ -295,14 +327,22 @@ def trade_roles(journal: Journal, trades: list[TradeRecord]) -> list[str]:
 class CostPoints:
     """Pomiar kosztu w punktach, bez zaokrągleń księgi.
 
-    `trades`: liczba transakcji z użytecznym notowaniem (ask > bid); `spread`: średni spread decyzji;
-    `entry_slippage`: średni poślizg wejścia względem notowania decyzji; `ratio`: Σ zmierzonego / Σ modelu (> 0 lub 0).
+    `trades`: liczba próbek (z użytecznym notowaniem: ask > bid); `spread`, `spread_max`: średni i największy spread
+    decyzji;
+    `entry_slippage`, `entry_slippage_max`: średni i największy NIEKORZYSTNY poślizg wejścia (poprawa ceny jako 0);
+    `ratio`: WERDYKT, Σ niekorzystnego poślizgu / (n × `entry_slippage_points`); `combined_ratio`: informacyjnie,
+    Σ(spread + poślizg ze znakiem) / Σ(spread + model), nie mniej niż 0; `stop_exits`: liczba wyjść STOP wśród
+    WSZYSTKICH podanych transakcji (ich spread i poślizg nie są mierzone).
     """
 
     trades: int
     spread: Decimal | None
+    spread_max: Decimal | None
     entry_slippage: Decimal | None
+    entry_slippage_max: Decimal | None
     ratio: Decimal
+    combined_ratio: Decimal
+    stop_exits: int
 
 
 def _entry_slippage(trade: TradeRecord) -> Decimal:
@@ -312,46 +352,50 @@ def _entry_slippage(trade: TradeRecord) -> Decimal:
     return _EXACT.subtract(trade.decision_bid, trade.entry_fill)
 
 
-def cost_points(trades: list[TradeRecord], costs: CostConfig) -> CostPoints:
+def cost_points(trades: list[TradeRecord], costs: CostConfig, include: Sequence[bool] | None = None) -> CostPoints:
     """Pomiar w punktach (werdykt kosztów bramki L1; definicja w docstringu modułu).
 
-    Transakcje o spreadzie 0 (zdegradowane wiersze, gdzie notowanie = poziom otwarcia) są pomijane. Średnie to iloraz
-    o precyzji 28 cyfr; sumy są dokładne.
+    `include`: maska transakcji branych pod uwagę (domyślnie wszystkie). Transakcje o spreadzie 0 (zdegradowane wiersze,
+    gdzie notowanie = poziom otwarcia) nie są próbkami. Sumy są dokładne; średnie to iloraz o precyzji 28 cyfr.
     """
-    usable = [t for t in trades if t.decision_ask > t.decision_bid]
+    stop_exits = sum(1 for t in trades if t.exit_reason == "STOP")
+    chosen = trades if include is None else [t for t, keep in zip(trades, include) if keep]
+    usable = [t for t in chosen if t.decision_ask > t.decision_bid]
     if not usable:
-        return CostPoints(0, None, None, Decimal(0))
+        return CostPoints(0, None, None, None, None, Decimal(0), Decimal(0), stop_exits)
     spreads = [_EXACT.subtract(t.decision_ask, t.decision_bid) for t in usable]
     slips = [_entry_slippage(t) for t in usable]
-    measured = exact_sum([*spreads, *slips])
-    modelled = exact_sum([*spreads, *([costs.entry_slippage_points] * len(usable))])  # spread > 0, więc model > 0
+    adverse = [max(slip, Decimal(0)) for slip in slips]
     count = Decimal(len(usable))
-    ratio = max(_RATIO.divide(measured, modelled), Decimal(0))
+    model = costs.entry_slippage_points
+    modelled = _EXACT.multiply(count, model)
+    if modelled > 0:
+        ratio = _RATIO.divide(exact_sum(adverse), modelled)
+    else:
+        ratio = Decimal(0) if exact_sum(adverse) == 0 else Decimal("Infinity")
+    combined_modelled = exact_sum([*spreads, *([model] * len(usable))])  # spread > 0, więc model > 0
+    combined = max(_RATIO.divide(exact_sum([*spreads, *slips]), combined_modelled), Decimal(0))
     return CostPoints(
-        len(usable), _RATIO.divide(exact_sum(spreads), count), _RATIO.divide(exact_sum(slips), count), ratio
-    )
+        len(usable), _RATIO.divide(exact_sum(spreads), count), max(spreads),
+        _RATIO.divide(exact_sum(adverse), count), max(adverse), ratio, combined, stop_exits,
+    )  # fmt: skip
 
 
-def _eur_ratio(
-    trades: list[TradeRecord], contexts: list[TradeContext], costs: CostConfig, fallback_vpp: Decimal
-) -> tuple[Decimal, int]:
-    """Informacyjny stosunek kosztów w EUR i liczba transakcji, dla których przyjęto zapasową wartość punktu."""
-    measured = exact_sum(_EXACT.add(t.spread_cost, t.slippage_penalty) for t in trades)
-    defaulted = 0
+def _eur_ratio(trades: list[TradeRecord], contexts: list[TradeContext], costs: CostConfig) -> Decimal:
+    """Informacyjny stosunek kosztów w EUR po transakcjach z użytecznym kontekstem (role `entry` i `smoke`)."""
+    chosen = [(t, c) for t, c in zip(trades, contexts) if c.role in COST_ROLES and c.value_per_point is not None]
+    measured = exact_sum(_EXACT.add(t.spread_cost, t.slippage_penalty) for t, _ in chosen)
     modelled_parts = []
-    for trade, context in zip(trades, contexts):
-        vpp = context.value_per_point
-        if vpp is None:
-            vpp, defaulted = fallback_vpp, defaulted + 1
+    for trade, context in chosen:
         slippage_points = costs.entry_slippage_points
         if trade.exit_reason == "STOP":
             slippage_points = _EXACT.add(slippage_points, costs.stop_exit_extra_slippage_points)
         points = _EXACT.add(_EXACT.subtract(trade.decision_ask, trade.decision_bid), slippage_points)
-        modelled_parts.append(_EXACT.multiply(points, _EXACT.multiply(trade.size, vpp)))
+        modelled_parts.append(_EXACT.multiply(points, _EXACT.multiply(trade.size, context.value_per_point)))
     modelled = exact_sum(modelled_parts)
     if modelled <= 0:
-        return (Decimal(0) if measured <= 0 else Decimal("Infinity")), defaulted
-    return _RATIO.divide(measured, modelled), defaulted
+        return Decimal(0) if measured <= 0 else Decimal("Infinity")
+    return _RATIO.divide(measured, modelled)
 
 
 # --- status ---------------------------------------------------------------------------------------------------------
@@ -361,19 +405,23 @@ def _eur_ratio(
 class L1Details:
     """Status L1 z danymi pomocniczymi dla raportu.
 
-    `gate`: cztery liczby werdyktu; `roles`: rola każdej transakcji księgi; `points`: pomiar w punktach (werdykt
-    kosztów); `eur_ratio`: koszty w EUR (informacja); `default_vpp_trades`: ile transakcji w `eur_ratio` ma zapasową
-    wartość punktu; `mismatch_days`, `rejection_days`: dni lokalne policzonych incydentów (po jednym na incydent).
+    `gate`: liczby werdyktu (z liczbą próbek kosztu); `roles`: rola każdej transakcji księgi; `points`: pomiar
+    w punktach; `eur_ratio`: koszty w EUR (informacja); `mismatch_days`, `rejection_days`: dni lokalne policzonych
+    incydentów (po jednym na incydent).
     """
 
     gate: GateL1
     roles: tuple[str, ...]
     points: CostPoints
     eur_ratio: Decimal
-    default_vpp_trades: int
-    fallback_value_per_point: Decimal
     mismatch_days: tuple[date, ...]
     rejection_days: tuple[date, ...]
+
+    @property
+    def excluded_trades(self) -> int:
+        """Liczba transakcji wykluczonych z sesji i z pomiaru kosztów: bez kontekstu (`unknown`) albo z uszkodzonym
+        kontekstem (`invalid`)."""
+        return sum(1 for role in self.roles if role not in COST_ROLES)
 
 
 def _default_costs() -> CostConfig:
@@ -385,20 +433,16 @@ def l1_details(
     *,
     min_size: Decimal | None = None,
     costs: CostConfig | None = None,
-    value_per_point: Decimal = DEFAULT_VALUE_PER_POINT,
     trades: list[TradeRecord] | None = None,
 ) -> L1Details:
     """Status bramki L1 z danymi pomocniczymi (definicje w docstringu modułu).
 
     `min_size`: wielkość minimalna sesji (domyślnie najmniejsza wśród wejść strategii). `costs`: stawki modelu
-    (domyślnie `costs_v1.toml` z `GW_CONFIG_DIR` albo `config/`). `value_per_point`: wartość punktu zapasowa, tylko dla
-    transakcji bez kontekstu wejścia i tylko w informacyjnym koszcie w EUR (DE40: 1). `trades`: księga już odczytana
-    przez wywołującego (domyślnie `journal.trades()`).
+    (domyślnie `costs_v1.toml` z `GW_CONFIG_DIR` albo `config/`). `trades`: księga już odczytana przez wywołującego
+    (domyślnie `journal.trades()`).
     """
     if min_size is not None and (not isinstance(min_size, Decimal) or min_size <= 0):
         raise ValueError(f"min_size: expected a positive Decimal, got {min_size!r}")
-    if not isinstance(value_per_point, Decimal) or value_per_point <= 0:
-        raise ValueError(f"value_per_point: expected a positive Decimal, got {value_per_point!r}")
     costs = costs if costs is not None else _default_costs()
     trades = journal.trades() if trades is None else trades
     contexts = trade_contexts(journal, trades)
@@ -406,20 +450,17 @@ def l1_details(
     floor = min_size if min_size is not None else min((t.size for t in entries), default=None)
     sessions = len({trade_day(t) for t in entries if t.size == floor})
     mismatches, rejections = _mismatch_days(journal), _rejection_days(journal)
-    points = cost_points(trades, costs)
-    eur_ratio, defaulted = _eur_ratio(trades, contexts, costs, value_per_point)
+    points = cost_points(trades, costs, [context.role in COST_ROLES for context in contexts])
     return L1Details(
-        gate=GateL1(sessions, len(mismatches), len(rejections), points.ratio),
+        gate=GateL1(sessions, len(mismatches), len(rejections), points.ratio, cost_samples=points.trades),
         roles=tuple(context.role for context in contexts),
         points=points,
-        eur_ratio=eur_ratio,
-        default_vpp_trades=defaulted,
-        fallback_value_per_point=value_per_point,
+        eur_ratio=_eur_ratio(trades, contexts, costs),
         mismatch_days=tuple(mismatches),
         rejection_days=tuple(rejections),
     )
 
 
 def gate_l1_status(journal: Journal, *, min_size: Decimal | None = None, costs: CostConfig | None = None) -> GateL1:
-    """Cztery liczby bramki L1 z dziennika (definicje w docstringu modułu); szczegóły: `l1_details`."""
+    """Liczby bramki L1 z dziennika (definicje w docstringu modułu); szczegóły: `l1_details`."""
     return l1_details(journal, min_size=min_size, costs=costs).gate
