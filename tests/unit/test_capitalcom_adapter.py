@@ -424,6 +424,29 @@ async def test_a_403_without_a_broker_error_code_is_not_a_credential_rejection(s
 
 
 @pytest.mark.parametrize(
+    "code",
+    [
+        "error.too-many.requests",
+        "error.service.unavailable",
+        "error.maintenance",
+        "error.too-many.login.attempts",  # każdy kod z "too-many"
+        "error.temporarily.unavailable",  # każdy kod z "unavailable"
+        "ERROR.SERVICE.UNAVAILABLE",  # wielkość liter bez znaczenia
+    ],
+)
+async def test_login_403_with_a_transient_error_code_is_not_a_credential_rejection(server, broker, code):
+    # przeciążenie, limit albo przerwa techniczna podane jako 403 z errorCode: zwykły BrokerError (ponawiany z
+    # odstępem), nie odrzucenie danych logowania, więc bez blokady logowań, która mogłaby wstrzymać wyjścia
+    server.fail_next("/session", 403, {"errorCode": code}, method="POST")
+    with pytest.raises(BrokerError) as info:
+        await broker.login()
+    assert type(info.value) is BrokerError
+    assert str(info.value) == f"login: POST /session: HTTP 403 {code}"
+    await broker.login()  # następna próba przechodzi normalnie
+    assert server.count("POST", "/session") == 2
+
+
+@pytest.mark.parametrize(
     ("canned", "match"),
     [
         ({"status": 200, "json": {"currentAccountId": "ACC-FUNDED", "accounts": []}}, "CST"),

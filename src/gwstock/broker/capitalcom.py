@@ -120,8 +120,13 @@ _ONE_DAY = timedelta(days=1)
 _SECRET_MIN_LEN = 4  # krótszych wartości nie da się sensownie wyciąć z komunikatu (zniszczyłoby tekst)
 _MAX_ERROR_CODE_LEN = 200
 # Odrzucenie danych logowania przez `POST /session` (notatki §2.4: 401 error.invalid.details, 400 error.null.api.key);
-# także każde 401 oraz 403 z errorCode brokera. Tylko to jest `BrokerAuthError` (blokada dalszych logowań w silniku).
+# także każde 401 oraz 403 z errorCode brokera, chyba że kod jest przejściowy (`_is_transient_code`). Tylko to jest
+# `BrokerAuthError` (blokada dalszych logowań w silniku).
 _CREDENTIAL_ERROR_CODES = frozenset({"error.invalid.details", "error.null.api.key"})
+# Kody przeciążenia, limitu i przerwy technicznej: na 403 to awaria przejściowa (ponawiana z odstępem), nie odrzucenie
+# danych logowania; dodatkowo każdy kod zawierający jedno z `_TRANSIENT_CODE_PARTS` (wielkość liter bez znaczenia).
+_TRANSIENT_ERROR_CODES = frozenset({"error.too-many.requests", "error.service.unavailable", "error.maintenance"})
+_TRANSIENT_CODE_PARTS = ("too-many", "unavailable")
 _MAX_RAW_ERROR_CODE_LEN = 4096  # tylko ogranicza pracę; przycięcie do komunikatu dopiero po usunięciu sekretów
 
 
@@ -361,6 +366,12 @@ def _with_code(code: str | None) -> str:
     return f" {code}" if code else ""
 
 
+def _is_transient_code(code: str) -> bool:
+    """Czy `errorCode` mówi o przeciążeniu, limicie albo przerwie technicznej (nie o danych logowania)."""
+    lowered = code.lower()
+    return lowered in _TRANSIENT_ERROR_CODES or any(part in lowered for part in _TRANSIENT_CODE_PARTS)
+
+
 def _check_epic(epic: object) -> str:
     """Epic trafia do ścieżki URL, więc tylko bezpieczne znaki (bez `/`, `?`, `#` i ścieżek `.`/`..`)."""
     if not isinstance(epic, str):
@@ -501,8 +512,10 @@ class CapitalComBroker(TradingMixin):
         if resp.status != 200:
             error = self._status_error(where, resp)
             code = _error_code(resp.body)
-            # 403 bez errorCode Capital.com to strona brzegowa/WAF (przejściowa), nie odrzucenie danych logowania
-            if resp.status == 401 or (resp.status == 403 and code is not None) or code in _CREDENTIAL_ERROR_CODES:
+            # 403 bez errorCode Capital.com to strona brzegowa/WAF (przejściowa), a 403 z kodem przeciążenia, limitu
+            # albo przerwy technicznej też jest przejściowe: żadne z nich nie jest odrzuceniem danych logowania
+            credential_403 = resp.status == 403 and code is not None and not _is_transient_code(code)
+            if resp.status == 401 or credential_403 or code in _CREDENTIAL_ERROR_CODES:
                 raise self._error(BrokerAuthError, str(error))  # dane logowania odrzucone: nie ponawiać w kółko
             raise error
         tokens = self._tokens_from(resp)
