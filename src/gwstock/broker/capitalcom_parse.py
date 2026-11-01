@@ -456,7 +456,11 @@ def parse_deal_status(payload: Any, reference: str) -> tuple[str, str | None]:
 
 @dataclass(frozen=True)
 class Opening:
-    """Potwierdzenie otwarcia (ACCEPTED): `order_id` = główne `dealId` (zlecenie), `deal_id` = pozycja (C2)."""
+    """Potwierdzenie otwarcia (ACCEPTED): `order_id` = główne `dealId` (zlecenie), `deal_id` = pozycja (C2).
+
+    `stop_reported`: potwierdzenie ma klucz `stopLevel` (pole znane z [S3]); `stop_level` to jego wartość (None dla
+    jawnego `null`).
+    """
 
     order_id: str | None
     deal_id: str
@@ -464,6 +468,17 @@ class Opening:
     side: Side
     size: Decimal
     level: Decimal
+    stop_reported: bool = False
+    stop_level: Decimal | None = None
+
+
+def _stop_key(root: dict[str, Any], where: str) -> tuple[bool, Decimal | None]:
+    """(czy klucz `stopLevel` jest, jego wartość albo None dla `null`); wartość inna niż liczba dodatnia → błąd."""
+    if "stopLevel" not in root:
+        return False, None
+    if root["stopLevel"] is None:
+        return True, None
+    return True, positive(root, "stopLevel", where)
 
 
 def parse_opening(payload: Any) -> Opening:
@@ -483,6 +498,7 @@ def parse_opening(payload: Any) -> Opening:
     if len(opened) != 1:
         raise ParseError(f"affectedDeals: expected exactly one OPENED deal, found {len(opened)}")
     order_id = root.get("dealId")
+    stop_reported, stop_level = _stop_key(root, "")
     return Opening(
         order_id=order_id if isinstance(order_id, str) and order_id else None,
         deal_id=opened[0],
@@ -490,7 +506,35 @@ def parse_opening(payload: Any) -> Opening:
         side=side_of(root, "direction", ""),
         size=positive(root, "size", ""),
         level=positive(root, "level", ""),
+        stop_reported=stop_reported,
+        stop_level=stop_level,
     )
+
+
+def _our_statuses(root: dict[str, Any], deal_id: str) -> list[Any]:
+    affected = items(get(root, "affectedDeals", ""), "affectedDeals")
+    return [d.get("status") for d in affected if isinstance(d, dict) and d.get("dealId") == deal_id]
+
+
+def check_closure(payload: Any, deal_id: str) -> None:
+    """Potwierdzenie `DELETE` musi przypisać ZAMKNIĘCIE naszemu dealId (C3): `status` OPEN, brak naszego dealId w
+    `affectedDeals` albo wyłącznie `AMENDED`/`OPENED` przy nim → `ParseError` (np. nieaktualne potwierdzenie `PUT`
+    pod wspólną referencją `p_<dealId>`)."""
+    root = obj(payload, "")
+    if root.get("status") == "OPEN":
+        raise ParseError("status: OPEN, the confirmation does not report a closure")
+    statuses = _our_statuses(root, deal_id)
+    if not any(isinstance(s, str) and s not in ("AMENDED", "OPENED") for s in statuses):
+        raise ParseError("affectedDeals: no closure of this deal in the confirmation")
+
+
+def check_amendment(payload: Any, deal_id: str) -> tuple[bool, Decimal | None]:
+    """Potwierdzenie `PUT` musi mieć nasz dealId jako `AMENDED` w `affectedDeals`; zwraca klucz `stopLevel` (jak
+    `Opening`), który wywołujący porównuje z żądanym poziomem."""
+    root = obj(payload, "")
+    if "AMENDED" not in _our_statuses(root, deal_id):
+        raise ParseError("affectedDeals: this deal is not reported as AMENDED")
+    return _stop_key(root, "")
 
 
 @dataclass(frozen=True)

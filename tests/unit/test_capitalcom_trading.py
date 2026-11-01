@@ -769,7 +769,11 @@ async def test_set_stop_puts_the_level_and_confirms_by_the_returned_reference(se
     _, pos = await open_confirmed(broker)
     mark = since_mark(server)
     await broker.set_stop(pos.deal_id, Decimal("25742.3"))
-    assert seq(server, mark) == [f"PUT /positions/{pos.deal_id}", f"GET /confirms/p_{pos.deal_id}"]
+    assert seq(server, mark) == [
+        f"PUT /positions/{pos.deal_id}",
+        f"GET /confirms/p_{pos.deal_id}",
+        f"GET /positions/{pos.deal_id}",  # kontrola: stop pozycji (gdy broker go pokazuje) równy żądanemu
+    ]
     assert server.log[mark].raw == '{"stopLevel":25742.3}'
     assert only_position(server).stop_level == Decimal("25742.3")
     [moved] = await broker.list_positions()
@@ -872,7 +876,11 @@ async def test_close_is_delete_by_deal_id_then_confirm_by_the_returned_reference
     _, pos = await open_confirmed(broker)
     mark = since_mark(server)
     assert await broker.close_position(pos.deal_id) is None
-    assert seq(server, mark) == [f"DELETE /positions/{pos.deal_id}", f"GET /confirms/p_{pos.deal_id}"]
+    assert seq(server, mark) == [
+        f"DELETE /positions/{pos.deal_id}",
+        f"GET /confirms/p_{pos.deal_id}",
+        f"GET /positions/{pos.deal_id}",  # kontrola: pozycji już nie ma (404)
+    ]
     delete = server.log[mark]
     assert delete.raw is None and delete.query == {}  # bez treści i bez wielkości: zamknięcie w całości (C22)
     assert server.positions == {} and server.count("POST", "/positions") == 1  # nigdy przeciwne zlecenie
@@ -1503,8 +1511,11 @@ async def test_exception_messages_on_trading_paths_never_contain_secrets(server,
             for secret in secrets:
                 assert secret not in text, f"secret leaked into {type(e).__name__}"
     assert info.value.__cause__ is None and info.value.__context__ is None
+    # dziennik dostępu SERWERA testowego (`aiohttp.access`) zapisuje wiersz żądania, w którym adapter odsyła brokerowi
+    # jego własny dealId (tu celowo równy tokenowi); to nie jest wyjście adaptera, więc go pomijamy
+    adapter_logs = "\n".join(r.getMessage() for r in caplog.records if r.name != "aiohttp.access")
     for secret in secrets:
-        assert secret not in caplog.text
+        assert secret not in adapter_logs
 
 
 async def test_trading_values_contain_no_float(server, broker):
@@ -1574,3 +1585,418 @@ async def test_confirm_of_a_closed_position_with_two_opening_rows_is_a_broker_er
     restarted = await restart(make_broker, clock)
     with pytest.raises(BrokerError, match="appears 2 times"):
         await restarted.confirm(ref)
+
+
+# --- runda poprawek 1 -----------------------------------------------------------------------------------------
+# (1) potwierdzenie `p_<dealId>` jest wspólne dla PUT i DELETE: sukces tylko z przypisaniem do NASZEGO deala i kontrolą
+
+
+async def test_close_with_a_stale_put_confirm_is_an_unknown_outcome(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    # DELETE przyjęty do realizacji, ale bez skutku: ta sama referencja, potwierdzenie nadal pokazuje PUT
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="DELETE")
+    mark = since_mark(server)
+    with pytest.raises(BrokerTimeout, match="close outcome unknown"):
+        await broker.close_position(pos.deal_id)
+    assert pos.deal_id in server.positions
+    assert seq(server, mark) == [f"DELETE /positions/{pos.deal_id}", f"GET /confirms/p_{pos.deal_id}"]
+
+
+def close_confirm(deal_id: str, **changes) -> dict:
+    body = {
+        "status": "CLOSED",
+        "dealStatus": "ACCEPTED",
+        "epic": "DE40",
+        "dealReference": f"p_{deal_id}",
+        "dealId": deal_id,
+        "affectedDeals": [{"dealId": deal_id, "status": "FULLY_CLOSED"}],
+        "level": BID,
+        "size": Decimal("0.001"),
+        "direction": "SELL",
+    }
+    body.update(changes)
+    return body
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "OPEN"},
+        {"affectedDeals": []},
+        {"affectedDeals": [{"dealId": "OTHER-DEAL", "status": "FULLY_CLOSED"}]},
+        {"affectedDeals": [{"dealId": "{deal}", "status": "AMENDED"}]},
+        {"affectedDeals": [{"dealId": "{deal}", "status": "OPENED"}]},
+        {"affectedDeals": None},
+    ],
+)
+async def test_close_confirm_must_attribute_the_closure_to_our_deal(server, broker, changes):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    if "affectedDeals" in changes and changes["affectedDeals"]:
+        changes = {"affectedDeals": [{**d, "dealId": d["dealId"].replace("{deal}", pos.deal_id)} for d in changes["affectedDeals"]]}
+    server.fail_next(f"/confirms/p_{pos.deal_id}", 200, close_confirm(pos.deal_id, **changes))
+    with pytest.raises(BrokerTimeout, match="close outcome unknown"):
+        await broker.close_position(pos.deal_id)
+
+
+async def test_accepted_close_with_the_position_still_listed_is_an_unknown_outcome(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="DELETE")
+    server.fail_next(f"/confirms/p_{pos.deal_id}", 200, close_confirm(pos.deal_id))
+    with pytest.raises(BrokerTimeout, match="close outcome unknown") as info:
+        await broker.close_position(pos.deal_id)
+    assert "still open" in str(info.value) and pos.deal_id in server.positions
+
+
+@pytest.mark.parametrize(
+    "failure", [(500, {"errorCode": "error.internal"}), (404, {}), (404, {"errorCode": "error.other"}), "timeout"]
+)
+async def test_close_verification_that_fails_is_an_unknown_outcome(server, make_broker, failure):
+    broker = make_broker(request_timeout_s=0.2)
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    if failure == "timeout":
+        server.delay_next(f"/positions/{pos.deal_id}", 2.0, method="GET")
+    else:
+        server.fail_next(f"/positions/{pos.deal_id}", *failure, method="GET")
+    with pytest.raises(BrokerTimeout, match="close outcome unknown") as info:
+        await broker.close_position(pos.deal_id)
+    assert info.value.__context__ is None and info.value.__cause__ is None
+
+
+async def test_set_stop_with_a_stale_confirm_reporting_the_old_stop_is_not_success(server, broker):
+    server.confirm_stop_keys = True  # potwierdzenie niesie `stopLevel` ([S3])
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="PUT")
+    with pytest.raises(BrokerError) as info:
+        await broker.set_stop(pos.deal_id, Decimal("25732.3"))
+    assert type(info.value) is BrokerError and "stopLevel" in str(info.value)
+    [listed] = await broker.list_positions()
+    assert listed.stop_level == Decimal("25742.3")  # zapis bez zmian
+
+
+async def test_set_stop_with_a_stale_confirm_is_caught_by_the_position_read(server, broker):
+    server.position_stop_keys = "present"
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="PUT")
+    with pytest.raises(BrokerError) as info:
+        await broker.set_stop(pos.deal_id, Decimal("25732.3"))
+    assert type(info.value) is BrokerError and "differs from the requested" in str(info.value)
+
+
+async def test_set_stop_with_nothing_reported_is_accepted_and_remembered(server, broker):
+    """Pozostałe ryzyko (C3): bez `stopLevel` w potwierdzeniu i w pozycji nieaktualnego potwierdzenia nie widać."""
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="PUT")
+    await broker.set_stop(pos.deal_id, Decimal("25732.3"))
+    [listed] = await broker.list_positions()
+    assert (listed.stop_level, listed.stop_derived) == (Decimal("25732.3"), True)
+
+
+@pytest.mark.parametrize(
+    "affected",
+    [[], [{"dealId": "OTHER-DEAL", "status": "AMENDED"}], [{"dealId": "{deal}", "status": "FULLY_CLOSED"}], None],
+)
+async def test_set_stop_confirm_must_name_our_deal_as_amended(server, broker, affected):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    ref = f"p_{pos.deal_id}"
+    if affected:
+        affected = [{**d, "dealId": d["dealId"].replace("{deal}", pos.deal_id)} for d in affected]
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "status": "OPEN",
+                                               "affectedDeals": affected})  # fmt: skip
+    with pytest.raises(BrokerTimeout, match="stop outcome unknown"):
+        await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    [listed] = await broker.list_positions()
+    assert listed.stop_level == pos.stop_level
+
+
+@pytest.mark.parametrize(
+    ("reported", "error"),
+    [(Decimal("25742.3"), None), (Decimal("25700.0"), BrokerError), (None, BrokerError)],
+)
+async def test_set_stop_checks_the_stop_the_position_reports(server, broker, reported, error):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    item = server._position_item(only_position(server))
+    item["position"]["stopLevel"] = reported
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")  # odczyt kontrolny po PUT
+    if error is None:
+        await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    else:
+        with pytest.raises(error) as info:
+            await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+        assert type(info.value) is BrokerError
+
+
+@pytest.mark.parametrize(
+    ("failure", "error"),
+    [
+        ((404, {"errorCode": "error.not-found.dealId"}), BrokerRejected),
+        ((500, {"errorCode": "error.internal"}), BrokerTimeout),
+        ("timeout", BrokerTimeout),
+    ],
+)
+async def test_set_stop_verification_failures(server, make_broker, failure, error):
+    broker = make_broker(request_timeout_s=0.2)
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    if failure == "timeout":
+        server.delay_next(f"/positions/{pos.deal_id}", 2.0, method="GET")
+    else:
+        server.fail_next(f"/positions/{pos.deal_id}", *failure, method="GET")
+    with pytest.raises(error) as info:
+        await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    if error is BrokerRejected:
+        assert info.value.reason == "POSITION_NOT_FOUND"
+    else:
+        assert "stop outcome unknown" in str(info.value)
+
+
+async def test_set_stop_confirm_carrying_a_different_stop_level_is_a_broker_error(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "stopLevel": BID - 50,
+                                               "affectedDeals": [{"dealId": pos.deal_id, "status": "AMENDED"}]})  # fmt: skip
+    with pytest.raises(BrokerError) as info:
+        await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    assert type(info.value) is BrokerError and "stopLevel" in str(info.value)
+
+
+# (2) historia: deal z samotnym wierszem USER w zakresie → wyszukanie jego otwarcia wstecz (filtr dealId, okna ≤ 1 doba)
+
+
+async def test_foreign_deal_closed_while_the_engine_was_down_is_found_by_a_deal_lookback(server, broker, make_broker, clock):
+    # obca pozycja otwarta 3 h przed `since`, zamknięta przez właściciela po `since`, gdy silnik nie działał
+    server.add_activity(activity("F-1", T0 - timedelta(hours=3), source="USER", direction="BUY", epic="US100"))
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL", epic="US100",
+                                 level="28000.0"))  # fmt: skip
+    # nasza pozycja: otwarta po `since`, wybita stopem
+    server.add_activity(activity("OUR-1", T0 - timedelta(minutes=39), source="USER", direction="BUY"))
+    server.add_activity(activity("OUR-1", T0 - timedelta(minutes=10), source="SL", direction="SELL", level="25700.0"))
+    restarted = await restart(make_broker, clock)
+    since = T0 - timedelta(minutes=40)
+    for _ in range(3):  # za każdym razem, nie tylko raz
+        closed = await restarted.closed_since(since)
+        assert closed == [
+            ClosedDeal("F-1", "US100", Decimal("28000.0"), "MANUAL", T0 - timedelta(minutes=20)),
+            ClosedDeal("OUR-1", "DE40", Decimal("25700.0"), "STOP", T0 - timedelta(minutes=10)),
+        ]
+        clock.advance(60)
+    lookbacks = [r for r in server.requests("GET", "/history/activity") if r.query.get("dealId") == "F-1"]
+    assert lookbacks and all(parse_api(r.query["to"]) - parse_api(r.query["from"]) <= DAY for r in lookbacks)
+    assert all(r.query["detailed"] == "true" for r in lookbacks)
+
+
+async def test_deal_lookback_goes_back_day_by_day_within_the_cap(server, broker):
+    server.add_activity(activity("F-1", T0 - timedelta(days=5), source="USER", direction="BUY"))
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL", level="25001.0"))
+    await broker.login()
+    closed = await broker.closed_since(T0 - timedelta(hours=1))
+    assert [(c.deal_id, c.reason, c.exit_level) for c in closed] == [("F-1", "MANUAL", Decimal("25001.0"))]
+    lookbacks = [(r.query["from"], r.query["to"]) for r in server.requests("GET", "/history/activity")
+                 if r.query.get("dealId") == "F-1"]  # fmt: skip
+    assert lookbacks[0] == ("2026-11-01T06:30:00", "2026-11-02T06:30:00")  # najpierw doba tuż przed `since`
+    assert len(lookbacks) == 5  # dzień po dniu wstecz, aż do otwarcia sprzed 5 dni
+    assert all(parse_api(t) - parse_api(f) <= DAY for f, t in lookbacks)
+
+
+async def test_deal_lookback_that_exhausts_the_request_budget_raises(server, broker, monkeypatch):
+    monkeypatch.setattr(capitalcom_history, "MAX_HISTORY_REQUESTS", 4)
+    server.add_activity(activity("F-1", T0 - timedelta(days=5), source="USER", direction="BUY"))
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL"))
+    server.add_activity(activity("D-2", T0 - timedelta(minutes=10), source="SL", direction="SELL"))
+    await broker.login()
+    with pytest.raises(BrokerError, match="^HISTORY_TRUNCATED"):
+        await broker.closed_since(T0 - timedelta(hours=1))
+    assert len(server.requests("GET", "/history/activity")) == 4
+
+
+async def test_deal_lookback_stops_at_the_fourteen_day_cap(server, broker):
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL"))
+    await broker.login()
+    with pytest.raises(BrokerError, match="^HISTORY_AMBIGUOUS"):
+        await broker.closed_since(T0 - timedelta(hours=1))
+    lookbacks = [r for r in server.requests("GET", "/history/activity") if r.query.get("dealId") == "F-1"]
+    earliest = min(parse_api(r.query["from"]) for r in lookbacks)
+    assert earliest >= T0 - timedelta(days=14) - timedelta(seconds=1) and len(lookbacks) == 14
+
+
+# (3) stop wyliczony nie może udawać ochrony
+
+
+async def test_once_stop_keys_were_seen_a_position_without_them_has_no_stop(server, broker):
+    server.position_stop_keys = "when-set"  # API pokazuje klucz tylko przy pozycji ze stopem
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    assert (pos.stop_level, pos.stop_derived) == (OFFER - 30, False)
+    await broker.set_stop(pos.deal_id, Decimal("25742.3"))  # adapter ma teraz własny zapis stopu
+    only_position(server).stop_level = None  # właściciel usunął stop w aplikacji: klucz znika z odpowiedzi
+    [listed] = await broker.list_positions()
+    assert (listed.stop_level, listed.stop_derived) == (None, False)  # nie nasz zapis, który udawałby ochronę
+
+
+async def test_stop_keys_seen_in_a_list_also_disable_derivation_for_other_positions(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)  # klucze nieobecne: stop wyliczony
+    item = server._position_item(only_position(server))
+    other = position_item(position__dealId="D-2", position__stopLevel=Decimal("25700.0"))
+    server.fail_next("/positions", 200, {"positions": [item, other]}, method="GET")
+    first = await broker.list_positions()
+    assert [(p.deal_id, p.stop_level, p.stop_derived) for p in first] == [
+        (pos.deal_id, None, False),  # w tej samej odpowiedzi klucze widać przy innej pozycji
+        ("D-2", Decimal("25700.0"), False),
+    ]
+    [again] = await broker.list_positions()
+    assert (again.stop_level, again.stop_derived) == (None, False)
+
+
+@pytest.mark.parametrize(
+    ("confirm_stop", "expected"),
+    [("match", None), ("other", BrokerError), ("null", BrokerError)],
+)
+async def test_confirm_stop_level_is_cross_checked_against_our_derived_stop(server, broker, confirm_stop, expected):
+    await broker.login()
+    ack = await broker.open_position(entry())
+    payload = dict(server.confirms[ack.deal_reference])
+    payload["stopLevel"] = {"match": OFFER - 30, "other": OFFER - 25, "null": None}[confirm_stop]
+    server.fail_next(f"/confirms/{ack.deal_reference}", 200, payload)
+    if expected is None:
+        pos = await broker.confirm(ack.deal_reference)
+        assert (pos.stop_level, pos.stop_derived) == (OFFER - 30, True)
+    else:
+        with pytest.raises(expected) as info:
+            await broker.confirm(ack.deal_reference)
+        assert type(info.value) is BrokerError and "stopLevel" in str(info.value)
+
+
+async def test_confirm_stop_level_without_our_record_is_the_reported_stop(server, broker, make_broker, clock):
+    server.confirm_stop_keys = True
+    await broker.login()
+    ref, pos = await open_confirmed(broker)
+    restarted = await restart(make_broker, clock)
+    snapshot = await restarted.confirm(ref)
+    assert (snapshot.stop_level, snapshot.stop_derived) == (OFFER - 30, False)
+
+
+class TestCapitalComContractWithStopKeys(TestCapitalComContract):
+    """Kontrakt także wtedy, gdy broker pokazuje klucze stopu: asercje stopu porównują wartość brokera, nie nasz zapis."""
+
+    @pytest.fixture
+    def broker(self, capital_broker, fake_capital_server):
+        fake_capital_server.position_stop_keys = "present"
+        fake_capital_server.confirm_stop_keys = True
+        return capital_broker
+
+
+async def test_stop_keys_mode_reports_the_brokers_stop_not_ours(server, broker):
+    server.position_stop_keys = "present"
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    only_position(server).stop_level = Decimal("25600.0")  # broker ma inny stop niż nasze wyliczenie
+    [listed] = await broker.list_positions()
+    assert (listed.stop_level, listed.stop_derived) == (Decimal("25600.0"), False)
+
+
+# poprawki drobne
+
+
+async def test_overflowing_fill_level_is_a_broker_error(server, broker):
+    await broker.login()
+    ack = await broker.open_position(entry())
+    payload = dict(server.confirms[ack.deal_reference])
+    payload["level"] = Decimal("1E+1000000")
+    server.fail_next(f"/confirms/{ack.deal_reference}", 200, payload)
+    with pytest.raises(BrokerError) as info:
+        await broker.confirm(ack.deal_reference)
+    assert type(info.value) is BrokerError and "out of range" in str(info.value)
+
+
+async def test_unknown_close_source_is_counted_once_per_closure(server, broker):
+    server.add_activity(activity("D-1", T0 - timedelta(minutes=10), source="USER", direction="BUY"))
+    server.add_activity(activity("D-1", T0 - timedelta(minutes=5), source="NEW_SOURCE", direction="SELL"))
+    await broker.login()
+    for _ in range(3):
+        await broker.closed_since(T0 - timedelta(hours=1))
+    assert broker.unknown_close_sources == 1
+    server.add_activity(activity("D-2", T0 - timedelta(minutes=4), source="NEW_SOURCE", direction="SELL"))
+    await broker.closed_since(T0 - timedelta(hours=1))
+    assert broker.unknown_close_sources == 2
+
+
+async def test_market_closed_reason_on_an_opening_confirm_is_both_rejected_and_market_closed(server, broker):
+    await broker.login()
+    server.reject_next_order("error.market.closed")
+    ack = await broker.open_position(entry())
+    with pytest.raises(MarketClosed) as info:
+        await broker.confirm(ack.deal_reference)
+    # nadal odrzucenie: menedżer zleceń kończy wejście jako REJECTED (nie UNKNOWN)
+    assert isinstance(info.value, BrokerRejected) and info.value.reason == "error.market.closed"
+
+
+async def test_market_closed_reason_on_a_close_confirm_is_market_closed(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": ref}, method="DELETE")  # odmowa: bez skutku
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "REJECTED", "reason": "MARKET_CLOSED", "dealReference": ref})
+    with pytest.raises(MarketClosed) as info:
+        await broker.close_position(pos.deal_id)
+    assert isinstance(info.value, BrokerRejected) and pos.deal_id in server.positions
+
+
+def deal_row(deal: str, minutes: int, source: str, side: Side, level: str = "25000") -> capitalcom_history.DealRow:
+    ts = T0 + timedelta(minutes=minutes)
+    return capitalcom_history.DealRow(deal, "DE40", ts, source, side, Decimal(level), (deal, ts, source, side))
+
+
+def test_a_row_of_the_inferred_side_after_the_supposed_closure_is_inconsistent():
+    # otwarcie przez API z innym źródłem niż USER (gdyby C7 było błędne), zamknięcie USER, strona nieznana
+    rows = [deal_row("D", 0, "DEALER", Side.BUY, "25782.3"), deal_row("D", 5, "USER", Side.SELL, "25800")]
+    found = capitalcom_history.classify(rows, {})
+    assert found.closures == [] and found.conflicting == {"D"}
+
+
+async def test_non_user_opening_after_restart_is_inconsistent_not_booked(server, broker):
+    server.add_activity(activity("D", T0 - timedelta(minutes=30), source="DEALER", direction="BUY", level="25782.3"))
+    server.add_activity(activity("D", T0 - timedelta(minutes=25), source="USER", direction="SELL", level="25800.0"))
+    await broker.login()
+    with pytest.raises(BrokerError, match="^HISTORY_INCONSISTENT"):
+        await broker.closed_since(T0 - timedelta(hours=1))
+
+
+async def test_close_with_a_non_accepted_status_is_unknown_even_when_attributed(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    server.fail_next(f"/confirms/p_{pos.deal_id}", 200, close_confirm(pos.deal_id, dealStatus="PENDING"))
+    with pytest.raises(BrokerTimeout, match="unexpected dealStatus"):
+        await broker.close_position(pos.deal_id)  # DELETE wykonany, ale status potwierdzenia nie mówi „przyjęte”
+
+
+async def test_set_stop_with_a_non_accepted_status_is_unknown_even_when_attributed(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "PENDING", "dealReference": ref,
+                                               "affectedDeals": [{"dealId": pos.deal_id, "status": "AMENDED"}]})  # fmt: skip
+    with pytest.raises(BrokerTimeout, match="unexpected dealStatus"):
+        await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+
+
+async def test_confirm_after_stop_keys_were_seen_reports_a_missing_key_as_no_stop(server, broker):
+    await broker.login()
+    foreign = position_item(position__dealId="D-9", position__stopLevel=Decimal("25700.0"))
+    server.fail_next("/positions", 200, {"positions": [foreign]}, method="GET")
+    await broker.list_positions()  # broker pokazał już klucze stopu (przy innej pozycji)
+    _, pos = await open_confirmed(broker)  # nasza pozycja bez klucza: według brokera bez stopu
+    assert (pos.stop_level, pos.stop_derived) == (None, False)

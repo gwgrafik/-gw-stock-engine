@@ -16,8 +16,12 @@ Zasady (kompletność albo wyjątek, nigdy lista częściowa):
 - wiersz otwarcia i wiersz zamknięcia różni tylko kierunek `details.direction` (zamknięcie ma kierunek przeciwny do
   pozycji), więc `classify` musi znać stronę pozycji: z pamięci adaptera (nasze wejścia, ostatnia lista pozycji), z
   wiersza zamknięcia systemowego (źródło inne niż `USER`: kierunek przeciwny do pozycji) albo z pary wierszy
-  `USER` (najwcześniejszy jest otwarciem, jeśli jako jedyny ma swój kierunek); bez tego deal jest „nierozstrzygnięty”
-  i adapter zgłasza wyjątek (`HISTORY_AMBIGUOUS`) zamiast zgadywać (C7d);
+  `USER` (najwcześniejszy jest otwarciem, jeśli jako jedyny ma swój kierunek); bez tego deal jest „nierozstrzygnięty”:
+  adapter czyta świeżą listę pozycji, potem historię tego deala wstecz od `since` (`lookback_windows`, filtr
+  `dealId`), a gdy i to nie pomoże, zgłasza wyjątek (`HISTORY_AMBIGUOUS`) zamiast zgadywać (C7d);
+- wiersz w kierunku pozycji PO rzekomym zamknięciu (np. otwarcie przez API ze źródłem innym niż `USER`, z którego
+  wywnioskowano by odwrotną stronę) → deal sprzeczny (`HISTORY_INCONSISTENT`), nigdy otwarcie zaksięgowane jako
+  wyjście;
 - przyczyna: `SL`/`TP` → "STOP", `USER` → "MANUAL", `CLOSE_OUT`/`DEALER`/`SYSTEM` → "FORCED", źródło nieznane →
   "FORCED" (nigdy "STOP") i licznik alarmowy adaptera (C7);
 - identyczne wiersze (np. z nakładki okien) liczą się raz; różne zamknięcia jednego dealId zostają (częściowe
@@ -56,7 +60,7 @@ WINDOW_OVERLAP = timedelta(seconds=1)
 ACTIVITY_SUSPECT_ROWS = 20
 """Tyle wierszy w jednej odpowiedzi to możliwe obcięcie (limit nieudokumentowany, C27): okno jest dzielone."""
 MAX_HISTORY_REQUESTS = 64
-"""Górny limit zapytań jednego odczytu historii; więcej → wyjątek zamiast listy częściowej."""
+"""Górny limit zapytań jednego odczytu historii (okna, podziały i wyszukiwanie wstecz razem); więcej → wyjątek."""
 _MIN_SPLIT = timedelta(seconds=4)
 
 POSITION = "POSITION"
@@ -96,6 +100,19 @@ def history_windows(since: datetime, now: datetime) -> list[tuple[datetime, date
         if stop >= end:
             return windows
         start = stop - WINDOW_OVERLAP
+
+
+def lookback_windows(since: datetime, cap: datetime) -> list[tuple[datetime, datetime]]:
+    """Okna WSTECZ od `since` do `cap` (najnowsze najpierw), każde ≤ 1 doba, sąsiednie zachodzą o 1 s."""
+    floor_cap, end = floor_second(cap), ceil_second(since)
+    windows: list[tuple[datetime, datetime]] = []
+    while end > floor_cap:
+        start = max(end - WINDOW_MAX, floor_cap)
+        windows.append((start, end))
+        if start <= floor_cap:
+            break
+        end = start + WINDOW_OVERLAP
+    return windows
 
 
 def split_window(start: datetime, end: datetime) -> list[tuple[datetime, datetime]] | None:
@@ -195,6 +212,12 @@ def classify(rows: list[DealRow], sides: Mapping[str, Side]) -> Classification:
         elif side in system:
             result.conflicting.add(deal_id)
             continue
-        result.closures.extend(r for r in deal_rows if r.direction is not side)
+        closures = [r for r in deal_rows if r.direction is not side]
+        if closures and any(r.direction is side and r.ts > closures[0].ts for r in deal_rows):
+            # wiersz strony pozycji PO rzekomym zamknięciu: wnioskowana strona (np. z wiersza systemowego, gdy
+            # otwarcie przez API nie ma źródła USER) albo wiersz jest błędny; nie księgujemy otwarcia jako wyjścia
+            result.conflicting.add(deal_id)
+            continue
+        result.closures.extend(closures)
     result.closures.sort(key=lambda r: (r.ts, r.deal_id))
     return result

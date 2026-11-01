@@ -19,14 +19,21 @@ Zasady:
   zmienia się po zamknięciu pozycji;
 - stop pozycji: klucze `stopLevel`/`stopDistance` w odpowiedzi → wartość brokera (jawny `null` → brak stopu);
   kluczy brak (jak w oficjalnych przykładach) → zapis adaptera: poziom wykonania ∓ wysłane `stopDistance` (BUY
-  minus, SELL plus) albo poziom z potwierdzonego `set_stop`, `stop_derived=True`; brak zapisu (np. po restarcie) →
-  None (C5, C24);
+  minus, SELL plus; sprawdzony ze `stopLevel` potwierdzenia, jeśli je ma) albo poziom z potwierdzonego `set_stop`,
+  `stop_derived=True`; brak zapisu (np. po restarcie) → None (C5, C24); gdy JAKAKOLWIEK odpowiedź z pozycją
+  pokazała już klucze stopu, brak klucza znaczy brak stopu (None), a zapis adaptera nie jest już używany;
 - `close_position`: ZAWSZE `DELETE /positions/{dealId}` (nigdy przeciwne zlecenie), potem `GET /confirms` z
-  referencją z odpowiedzi: ACCEPTED → None, REJECTED → `BrokerRejected(reason)`, cokolwiek innego (404, błąd,
-  timeout, dziwny status, brak referencji) → `BrokerTimeout("close outcome unknown")`; 404 `error.not-found.dealId`
-  na `DELETE` → `BrokerRejected("POSITION_NOT_FOUND")`; `set_stop` tak samo (`PUT` ze `stopLevel`);
+  referencją z odpowiedzi i `GET /positions/{dealId}`: sukces tylko przy ACCEPTED, które przypisuje zamknięcie
+  naszemu dealId (`PUT` i `DELETE` dzielą referencję `p_<dealId>`, C3), i 404 pozycji; REJECTED →
+  `BrokerRejected(reason)`; cokolwiek innego → `BrokerTimeout("close outcome unknown")`; 404
+  `error.not-found.dealId` na `DELETE` → `BrokerRejected("POSITION_NOT_FOUND")`;
+- `set_stop`: `PUT` ze `stopLevel`, potwierdzenie z naszym dealId jako `AMENDED` (inaczej `BrokerTimeout`), jego
+  `stopLevel` i stop pozycji (jeśli broker je pokazuje) równe żądanemu (inaczej `BrokerError`);
+- powód odrzucenia w potwierdzeniu nazywający zamknięty rynek → `MarketClosedRejection` (jednocześnie
+  `BrokerRejected` i `MarketClosed`);
 - `closed_since`: kompletność albo wyjątek (szczegóły w `capitalcom_history`); zakres > 14 dni →
-  `HISTORY_RANGE_TOO_LARGE` przed zapytaniem; okna ≤ 1 doba; obcięte okno dzielone; nieudane okno → wyjątek;
+  `HISTORY_RANGE_TOO_LARGE` przed zapytaniem; okna ≤ 1 doba; obcięte okno dzielone; nieudane okno → wyjątek; deal,
+  którego otwarcia nie ma w zakresie, jest szukany wstecz z filtrem `dealId` (do 14 dni, wspólny limit zapytań);
 - pamięć adaptera (wysłane odległości stopu, stopy deali, strony deali, migawki potwierdzeń) jest ograniczona do
   `RECORD_LIMIT` wpisów na tablicę (najstarsze wypadają).
 """
@@ -45,7 +52,10 @@ from gwstock.broker.capitalcom_parse import (
     Opening,
     ParseError,
     build,
+    check_amendment,
+    check_closure,
     check_ident,
+    is_market_closed_code,
     parse_deal_status,
     parse_opening,
     parse_position,
@@ -61,6 +71,7 @@ from gwstock.types import (
     ClosedDeal,
     EntryAck,
     EntryRequest,
+    MarketClosed,
     OpenPosition,
     Side,
     WorkingOrder,
@@ -75,7 +86,21 @@ _MAX_REASON_LEN = 200
 _MAX_WAIT_FOR_WINDOW_END_S = 1.0  # koniec ostatniego okna historii to „teraz” w górę do pełnej sekundy
 
 
-def _remember(table: OrderedDict, key: str, value: Any) -> None:
+class MarketClosedRejection(BrokerRejected, MarketClosed):
+    """dealStatus REJECTED z powodem nazywającym zamknięty rynek (C14b): dla menedżera zleceń to nadal odrzucenie
+    (`BrokerRejected`: wejście kończy się REJECTED, nie UNKNOWN), dla wykonawcy zamknięty rynek (`MarketClosed`:
+    stop zostaje, ponowienie po otwarciu)."""
+
+
+class _Budget:
+    """Wspólny limit zapytań o historię w jednym wywołaniu (okna, podziały i wyszukiwanie wstecz)."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.left = limit
+
+
+def _remember(table: OrderedDict, key: Any, value: Any) -> None:
     table[key] = value
     table.move_to_end(key)
     while len(table) > RECORD_LIMIT:
@@ -112,6 +137,10 @@ class TradingMixin:
         self._deal_stops: OrderedDict[str, Decimal] = OrderedDict()  # dealId → nasz stop (wyliczony albo z set_stop)
         self._deal_sides: OrderedDict[str, Side] = OrderedDict()  # dealId → strona (potwierdzenie, lista pozycji)
         self._snapshots: OrderedDict[str, OpenPosition] = OrderedDict()  # dealReference → migawka potwierdzenia
+        self._unknown_seen: OrderedDict[tuple, None] = OrderedDict()  # zamknięcia o nieznanym źródle już policzone
+        # czy jakakolwiek odpowiedź z pozycją pokazała klucze stopu: od tej chwili brak klucza = brak stopu, a zapis
+        # adaptera nie może już udawać ochrony (stop_derived=True tylko, dopóki klucze nigdy nie wystąpiły)
+        self._stop_keys_seen = False
 
     # --- wejście i potwierdzenie ---------------------------------------------------------------------
 
@@ -175,27 +204,50 @@ class TradingMixin:
                 raise self._error(
                     BrokerError, f"GET {path}: the position does not match the confirmation ({', '.join(mismatch)})"
                 )
+            self._note_stop_keys([row])
             opened_at, stop_reported, stop = row.opened_at, row.stop_reported, row.stop_level
         else:  # pozycja już zamknięta (stop, ręcznie): czas otwarcia z wiersza otwarcia w historii
             opened_at = await self._opened_at_from_history(opening, where)
-        derived = False
-        if not stop_reported:
-            sent = self._sent_stops.get(reference)
-            if sent is not None and sent[0] is opening.side:
-                stop, derived = _stop_from(opening.level, opening.side, sent[1]), True
+        stop, derived = self._snapshot_stop(reference, opening, where, stop_reported, stop)
         snapshot = self._parse(
             where, build, OpenPosition, "confirm", opening.deal_id, opening.epic, opening.side, opening.size,
             opening.level, stop, opened_at, derived,
         )  # fmt: skip
         _remember(self._deal_sides, opening.deal_id, opening.side)
-        if derived:
+        if not stop_reported and stop is not None:
             _remember(self._deal_stops, opening.deal_id, stop)
         return snapshot
+
+    def _snapshot_stop(
+        self, reference: str, opening: Opening, where: str, position_reported: bool, position_stop: Decimal | None
+    ) -> tuple[Decimal | None, bool]:
+        """(stop migawki, stop_derived). Kolejność: stop pozycji pokazany przez brokera; po raz pierwszy brak klucza,
+        choć broker już kiedyś klucze pokazywał → brak stopu; inaczej nasz zapis (wykonanie ∓ wysłana odległość),
+        sprawdzony z `stopLevel` potwierdzenia, gdy je ma (różnica → `BrokerError`, C6); bez zapisu `stopLevel`
+        potwierdzenia albo None."""
+        if position_reported:
+            return position_stop, False
+        candidate = None
+        sent = self._sent_stops.get(reference)
+        if sent is not None and sent[0] is opening.side:
+            candidate = self._parse(where, _stop_from, opening.level, opening.side, sent[1])
+        if opening.stop_reported and candidate is not None and opening.stop_level != candidate:
+            raise self._error(
+                BrokerError,
+                f"{where}: the confirmation's stopLevel {opening.stop_level} differs from the stop {candidate} derived "
+                "from our request (fill level ∓ stopDistance, C6)",
+            )
+        if self._stop_keys_seen:
+            return (opening.stop_level if opening.stop_reported else None), False
+        if candidate is not None:
+            return candidate, True
+        return (opening.stop_level if opening.stop_reported else None), False
 
     async def _opened_at_from_history(self, opening: Opening, where: str) -> datetime:
         """`dateUTC` jedynego wiersza otwarcia (kierunek pozycji) tego dealId w ostatniej dobie; inaczej wyjątek."""
         end = history.ceil_second(self._clock.now_utc())
-        rows = await self._activity_rows([(end - history.WINDOW_MAX, end)], deal_id=opening.deal_id)
+        budget = _Budget(history.MAX_HISTORY_REQUESTS)
+        rows = await self._activity_rows([(end - history.WINDOW_MAX, end)], budget, deal_id=opening.deal_id)
         opens = [r for r in rows if r.deal_id == opening.deal_id and r.direction is opening.side]
         if len(opens) != 1:
             raise self._error(
@@ -211,10 +263,11 @@ class TradingMixin:
         """Wszystkie pozycje aktywnego rachunku (`GET /positions`), w kolejności brokera; stop wg docstringu modułu."""
         where = "GET /positions"
         rows = self._parse(where, parse_positions, await self._request("GET", "/positions"))
+        self._note_stop_keys(rows)
         result: list[OpenPosition] = []
         for row in rows:
             stop, derived = row.stop_level, False
-            if not row.stop_reported:
+            if not row.stop_reported and not self._stop_keys_seen:
                 stop = self._deal_stops.get(row.deal_id)
                 derived = stop is not None
             position = self._parse(
@@ -226,60 +279,113 @@ class TradingMixin:
             _remember(self._deal_sides, row.deal_id, row.side)
         return result
 
+    def _note_stop_keys(self, rows: list) -> None:
+        if any(row.stop_reported for row in rows):
+            self._stop_keys_seen = True
+
     async def set_stop(self, deal_id: str, stop_level: Decimal) -> None:
-        """`PUT /positions/{dealId}` ze `stopLevel`, potem potwierdzenie; zapis stopu tylko po ACCEPTED."""
+        """`PUT /positions/{dealId}` ze `stopLevel`, potwierdzenie i odczyt kontrolny pozycji; zapis stopu po sukcesie.
+
+        Sukces wymaga (C3): potwierdzenia ACCEPTED z naszym dealId jako `AMENDED` (inaczej wynik nieznany:
+        `BrokerTimeout`), równego `stopLevel` w potwierdzeniu, jeśli je ma, oraz równego stopu pozycji, jeśli
+        broker go pokazuje (różnica → `BrokerError`, nie sukces). Pozycja zniknęła → `BrokerRejected("POSITION_NOT_FOUND")`.
+        """
         deal_id = check_ident("deal_id", deal_id)
         if not isinstance(stop_level, Decimal):
             raise TypeError(f"set_stop: stop_level must be a Decimal, got {type(stop_level).__name__}")
         if not stop_level.is_finite() or stop_level <= 0:
             raise ValueError("set_stop: stop_level must be a positive finite Decimal")
         path = f"/positions/{deal_id}"
+        where = f"PUT {path}"
         payload = await self._request("PUT", path, body={"stopLevel": stop_level}, not_found=NOT_FOUND_DEAL)
         if payload is None:
             raise self._error(BrokerRejected, POSITION_NOT_FOUND)
-        await self._await_outcome(f"PUT {path}", "stop", payload)
+        confirmation, problem = await self._outcome(payload)
+        reported = None
+        if problem is None:
+            reported, problem = _attempt(check_amendment, confirmation, deal_id)
+        if problem is None:
+            present, level = reported
+            if present and level != stop_level:
+                raise self._error(
+                    BrokerError, f"{where}: the confirmation's stopLevel {level} differs from the requested {stop_level}"
+                )
+            reply = None
+            try:
+                reply = await self._request("GET", path, not_found=NOT_FOUND_DEAL)
+            except BrokerError as exc:  # odczyt kontrolny nieudany: wynik nieznany (ponowienie tego samego jest bezpieczne)
+                problem = f"position check failed ({type(exc).__name__}: {exc})"
+            if problem is None:
+                if reply is None:
+                    raise self._error(BrokerRejected, POSITION_NOT_FOUND)
+                row = self._parse(f"GET {path}", parse_position, reply)
+                self._note_stop_keys([row])
+                if row.deal_id != deal_id or (row.stop_reported and row.stop_level != stop_level):
+                    raise self._error(
+                        BrokerError,
+                        f"GET {path}: the position's stop {row.stop_level} differs from the requested {stop_level}",
+                    )
+        if problem is not None:
+            raise self._error(BrokerTimeout, f"{where}: stop outcome unknown ({problem})")
         _remember(self._deal_stops, deal_id, stop_level)
 
     async def close_position(self, deal_id: str) -> None:
-        """Zamknięcie w całości: wyłącznie `DELETE /positions/{dealId}`, wynik z `GET /confirms` (docstring modułu)."""
+        """Zamknięcie w całości: wyłącznie `DELETE /positions/{dealId}`, potem `GET /confirms` i `GET /positions/{id}`.
+
+        Sukces wymaga potwierdzenia ACCEPTED, które przypisuje zamknięcie NASZEMU dealId (C3: `PUT` i `DELETE` dzielą
+        referencję `p_<dealId>`, więc samo ACCEPTED może być nieaktualnym potwierdzeniem `PUT`), i 404 pozycji po nim.
+        Cokolwiek innego → `BrokerTimeout("close outcome unknown")`; REJECTED → `BrokerRejected(reason)`.
+        """
         deal_id = check_ident("deal_id", deal_id)
         path = f"/positions/{deal_id}"
         payload = await self._request("DELETE", path, not_found=NOT_FOUND_DEAL)
-        if payload is None:  # deal już nie istnieje: czyste 404 bez skutku (do potwierdzenia na próbie smoke)
+        if payload is None:  # deal już nie istnieje: czyste 404 bez skutku (do potwierdzenia na próbie smoke, C29)
             raise self._error(BrokerRejected, POSITION_NOT_FOUND)
-        await self._await_outcome(f"DELETE {path}", "close", payload)
+        confirmation, problem = await self._outcome(payload)
+        if problem is None:
+            _, problem = _attempt(check_closure, confirmation, deal_id)
+        if problem is None:
+            try:
+                still = await self._request("GET", path, not_found=NOT_FOUND_DEAL)
+            except BrokerError as exc:
+                problem = f"position check failed ({type(exc).__name__}: {exc})"
+            else:
+                if still is not None:
+                    problem = f"GET {path}: the position is still open after an accepted close"
+        if problem is not None:
+            raise self._error(BrokerTimeout, f"DELETE {path}: close outcome unknown ({problem})")
         self._deal_stops.pop(deal_id, None)
 
-    async def _await_outcome(self, where: str, what: str, payload: Any) -> None:
-        """Wynik `PUT`/`DELETE` z potwierdzenia: ACCEPTED → None; REJECTED → `BrokerRejected`; reszta → `BrokerTimeout`.
+    async def _outcome(self, payload: Any) -> tuple[Any, str | None]:
+        """Potwierdzenie `PUT`/`DELETE` po referencji z odpowiedzi: (treść, None) przy ACCEPTED, (None, problem) gdy
+        wynik nieznany (404, błąd, timeout, wygasła sesja, inny status, brak referencji); REJECTED → wyjątek.
 
-        Wyjątek jest tworzony poza blokiem `except`, więc nie ma łańcucha (`__context__`) z obcymi obiektami.
+        Wyjątki są tworzone poza blokami `except`, więc nie mają łańcucha (`__context__`) z obcymi obiektami.
         """
-        status, reason = None, None
         reference, problem = _attempt(parse_reference, payload)
-        if problem is None:
-            reply = None
-            try:
-                reply = await self._request("GET", f"/confirms/{reference}", not_found=NOT_FOUND_REFERENCE)
-            except BrokerError as exc:  # timeout, błąd, wygasła sesja: wynik operacji nieznany
-                problem = f"{type(exc).__name__}: {exc}"
-            if problem is None and reply is None:
-                problem = f"GET /confirms/{reference}: unknown reference (HTTP 404)"
-            if problem is None:
-                parsed, problem = _attempt(parse_deal_status, reply, reference)
-                if parsed is not None:
-                    status, reason = parsed
+        if problem is not None:
+            return None, f"response without a usable dealReference ({problem})"
+        try:
+            reply = await self._request("GET", f"/confirms/{reference}", not_found=NOT_FOUND_REFERENCE)
+        except BrokerError as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        if reply is None:
+            return None, f"GET /confirms/{reference}: unknown reference (HTTP 404)"
+        parsed, problem = _attempt(parse_deal_status, reply, reference)
+        if problem is not None:
+            return None, problem
+        status, reason = parsed
         if status == "REJECTED":
             raise self._rejection(reason)
-        if status == "ACCEPTED":
-            return
-        if problem is None:
-            problem = f"unexpected dealStatus {shown(status)}"
-        raise self._error(BrokerTimeout, f"{where}: {what} outcome unknown ({problem})")
+        if status != "ACCEPTED":
+            return None, f"unexpected dealStatus {shown(status)}"
+        return reply, None
 
     def _rejection(self, reason: str | None) -> BrokerRejected:
-        """`BrokerRejected` z powodem brokera: najpierw bez sekretów, potem przycięty (nigdy pół sekretu)."""
-        return self._error(BrokerRejected, self._scrub(reason or "REJECTED")[:_MAX_REASON_LEN])
+        """`BrokerRejected` z powodem brokera: najpierw bez sekretów, potem przycięty (nigdy pół sekretu); powód
+        nazywający zamknięty rynek → `MarketClosedRejection` (C14b)."""
+        cls = MarketClosedRejection if reason and is_market_closed_code(reason) else BrokerRejected
+        return self._error(cls, self._scrub(reason or "REJECTED")[:_MAX_REASON_LEN])
 
     # --- historia zamknięć ---------------------------------------------------------------------------
 
@@ -295,10 +401,14 @@ class TradingMixin:
             )
         if since > now:
             return []
-        rows = await self._activity_rows(history.history_windows(since, now))
+        budget = _Budget(history.MAX_HISTORY_REQUESTS)
+        rows = await self._activity_rows(history.history_windows(since, now), budget)
         found = history.classify(rows, self._deal_sides)
         if found.undecided and not found.conflicting:
             await self.list_positions()  # strona otwartych deali z listy brokera (zapisywana w pamięci)
+            found = history.classify(rows, self._deal_sides)
+        if found.undecided and not found.conflicting:  # np. obca pozycja sprzed `since`, zamknięta w zakresie
+            rows = await self._look_back(rows, found.undecided, since, now, budget)
             found = history.classify(rows, self._deal_sides)
         if found.conflicting:
             raise self._error(BrokerError, self._history_problem("HISTORY_INCONSISTENT", found.conflicting,
@@ -307,17 +417,38 @@ class TradingMixin:
             raise self._error(BrokerError, self._history_problem("HISTORY_AMBIGUOUS", found.undecided,
                                                                  "cannot tell the opening from a closing"))  # fmt: skip
         closed: list[ClosedDeal] = []
-        unknown = 0
+        unknown: list[tuple] = []
         for row in found.closures:
             if row.ts < since:
                 continue
             reason, known = history.reason_for(row.source)
-            unknown += not known
+            if not known and row.key not in self._unknown_seen:
+                unknown.append(row.key)
             where = "GET /history/activity"
             closed.append(self._parse(where, build, ClosedDeal, "activity", row.deal_id, row.epic, row.level, reason,
                                       row.ts))  # fmt: skip
-        self.unknown_close_sources += unknown
+        for key in unknown:  # każde zamknięcie liczone raz, nie przy każdym odczycie
+            _remember(self._unknown_seen, key, None)
+        self.unknown_close_sources += len(unknown)
         return closed
+
+    async def _look_back(
+        self, rows: list[DealRow], undecided: set[str], since: datetime, now: datetime, budget: _Budget
+    ) -> list[DealRow]:
+        """Dla każdego nierozstrzygniętego deala: historia z filtrem `dealId` WSTECZ od `since`, okna ≤ 1 doba, do
+        granicy 14 dni od teraz, aż jego wiersze dadzą się rozstrzygnąć (zwykle: wcześniejsze otwarcie o kierunku
+        przeciwnym). Limit zapytań wspólny z oknami głównymi; jego wyczerpanie → `HISTORY_TRUNCATED`."""
+        merged = {row.key: row for row in rows}
+        windows = history.lookback_windows(since, now - history.HISTORY_MAX_RANGE)
+        for deal_id in sorted(undecided):
+            for window in windows:
+                for row in await self._activity_rows([window], budget, deal_id=deal_id):
+                    merged.setdefault(row.key, row)
+                deal_rows = [r for r in merged.values() if r.deal_id == deal_id]
+                verdict = history.classify(deal_rows, self._deal_sides)
+                if deal_id not in verdict.undecided:
+                    break
+        return list(merged.values())
 
     @staticmethod
     def _history_problem(code: str, deals: set[str], what: str) -> str:
@@ -325,20 +456,18 @@ class TradingMixin:
         return f"{code}: {what} for {len(deals)} deal(s) in the history ({shown_ids}); nothing returned"
 
     async def _activity_rows(
-        self, windows: list[tuple[datetime, datetime]], *, deal_id: str | None = None
+        self, windows: list[tuple[datetime, datetime]], budget: _Budget, *, deal_id: str | None = None
     ) -> list[DealRow]:
         """Wiersze `POSITION`/`ACCEPTED` ze wszystkich okien (bez duplikatów); obcięte okno dzielone, błąd → wyjątek."""
         where = "GET /history/activity"
         queue = deque(windows)
         found: dict[tuple, DealRow] = {}
-        sent = 0
         while queue:
             start, end = queue.popleft()
-            if sent >= history.MAX_HISTORY_REQUESTS:
+            if budget.left <= 0:
                 raise self._error(
                     BrokerError,
-                    f"HISTORY_TRUNCATED: more than {history.MAX_HISTORY_REQUESTS} history requests would be needed; "
-                    "nothing returned",
+                    f"HISTORY_TRUNCATED: more than {budget.limit} history requests would be needed; nothing returned",
                 )
             wait = (end - self._clock.now_utc()).total_seconds()
             if wait > 0:  # `to` nigdy w przyszłości (wariant ostrożny): koniec okna to teraz w górę do sekundy
@@ -346,7 +475,7 @@ class TradingMixin:
             params = {"from": history.api_time(start), "to": history.api_time(end), "detailed": "true"}
             if deal_id is not None:
                 params["dealId"] = deal_id
-            sent += 1
+            budget.left -= 1
             payload = await self._request("GET", "/history/activity", params=params)
             count, rows = self._parse(where, history.parse_activity, payload, start, end)
             if count >= history.ACTIVITY_SUSPECT_ROWS:

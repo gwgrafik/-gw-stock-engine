@@ -327,7 +327,10 @@ class FakeCapitalServer:
         self.confirms: dict[str, dict[str, Any]] = {}
         self.activities: list[dict[str, Any]] = []  # kolejność zdarzeń; odpowiedź podaje je od najnowszych
         self.working_orders: list[tuple[str, dict[str, Any]]] = []  # (rachunek, element odpowiedzi)
-        self.position_stop_keys = "absent"  # "absent" | "present" | "null" (klucze stopu w GET /positions)
+        # klucze stopu w GET /positions: "absent" (jak w przykładach [S1]) | "present" | "null" | "when-set" (klucz
+        # tylko przy pozycji, która ma stop: tak mogłoby wyglądać API, które pomija klucz przy braku stopu)
+        self.position_stop_keys = "absent"
+        self.confirm_stop_keys = False  # `stopLevel` w potwierdzeniach (pole znane tylko z [S3], notatki §2.15)
         self.hedging_mode = False
         self.market_closed = False
         self.max_activities: int | None = None
@@ -804,7 +807,7 @@ class FakeCapitalServer:
             "currency": "EUR",
             "guaranteedStop": False,
         }
-        if self.position_stop_keys == "present":
+        if self.position_stop_keys == "present" or (self.position_stop_keys == "when-set" and pos.stop_level):
             position["trailingStop"] = False
             position["stopLevel"] = pos.stop_level
         elif self.position_stop_keys == "null":
@@ -816,7 +819,7 @@ class FakeCapitalServer:
                          affected: str = "OPENED", direction: str | None = None,
                          level: Decimal | None = None) -> dict[str, Any]:  # fmt: skip
         """Potwierdzenie (§2.15; [S1] "Position/Order confirmation"); `date` celowo lokalne (C19)."""
-        return {
+        payload = {
             "date": stamp_ms(self.clock.now_utc() + LOCAL_OFFSET),
             "status": status,
             "dealStatus": deal_status,
@@ -830,6 +833,9 @@ class FakeCapitalServer:
             "guaranteedStop": False,
             "trailingStop": False,
         }
+        if self.confirm_stop_keys and affected in ("OPENED", "AMENDED"):
+            payload["stopLevel"] = pos.stop_level
+        return payload
 
     def _own_position(self, request: web.Request) -> FakePosition | None:
         pos = self.positions.get(request.match_info["deal_id"])
