@@ -45,6 +45,7 @@ APPLICATION_ID = int.from_bytes(b"gwsj", "big")
 _READABLE_PRAGMAS = frozenset({
     "journal_mode", "synchronous", "user_version", "application_id", "busy_timeout", "page_size", "wal_autocheckpoint",
 })
+_SQLITE_INT_MAX = 2**63 - 1  # największa wartość kolumny INTEGER (64 bity ze znakiem)
 
 T = TypeVar("T")
 
@@ -89,6 +90,14 @@ def _check_decimal(value: object, where: str) -> None:
         raise TypeError(f"{where}: expected Decimal, got {type(value).__name__} {value!r}")
     if not value.is_finite():
         raise ValueError(f"{where}: expected a finite Decimal, got {value!r}")
+
+
+def _check_int(value: object, where: str, *, minimum: int) -> None:
+    """Liczba całkowita (nie bool) w zakresie `[minimum, 2**63 - 1]`, czyli taka, którą SQLite zwiąże."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{where}: expected int, got {type(value).__name__} {value!r}")
+    if not minimum <= value <= _SQLITE_INT_MAX:
+        raise ValueError(f"{where}: must be between {minimum} and {_SQLITE_INT_MAX}, got {value}")
 
 
 def _check_day(day: object) -> str:
@@ -209,7 +218,6 @@ _TRADE_DECIMALS = (
     "spread_cost", "slippage_penalty", "financing", "fees", "net_pnl",
 )
 _TRADE_TIMES = ("signal_ts", "submit_ts", "confirm_ts", "exit_ts")
-_SQLITE_INT_MAX = 2**63 - 1  # największa wartość kolumny INTEGER (64 bity ze znakiem)
 
 
 @dataclass(frozen=True)
@@ -690,17 +698,33 @@ class Journal:
 
         return self._write(op)
 
-    def events(self, source: str | None = None) -> list[RawEvent]:
-        """Surowe zdarzenia w kolejności `id` (opcjonalnie tylko z danego źródła)."""
+    def events(
+        self, source: str | None = None, *, after_id: int | None = None, limit: int | None = None
+    ) -> list[RawEvent]:
+        """Surowe zdarzenia w kolejności `id` (opcjonalnie tylko z danego źródła); domyślnie wszystkie.
 
-        def op(conn: sqlite3.Connection) -> list[tuple]:
-            if source is None:
-                return conn.execute("SELECT id, source, payload, ts FROM raw_events ORDER BY id").fetchall()
-            return conn.execute(
-                "SELECT id, source, payload, ts FROM raw_events WHERE source = ? ORDER BY id", (source,)
-            ).fetchall()
-
-        return [_decode("raw event", _event_from_row, r) for r in self._read(op)]
+        `after_id`: tylko zdarzenia o większym `id` (kursor strony: `id` ostatniego zdarzenia poprzedniej strony);
+        `limit`: najwyżej tyle pierwszych zdarzeń (>= 1).
+        """
+        where: list[str] = []
+        params: list[object] = []
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        if after_id is not None:
+            _check_int(after_id, "events.after_id", minimum=0)
+            where.append("id > ?")
+            params.append(after_id)
+        sql = "SELECT id, source, payload, ts FROM raw_events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id"
+        if limit is not None:
+            _check_int(limit, "events.limit", minimum=1)
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._read(lambda c: c.execute(sql, params).fetchall())
+        return [_decode("raw event", _event_from_row, r) for r in rows]
 
     # --- zlecenia ---
 

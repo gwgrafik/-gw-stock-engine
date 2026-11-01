@@ -297,6 +297,38 @@ def test_events_roundtrip_filter_and_order(journal):
     assert journal.events("nonexistent") == []
 
 
+def test_events_after_id_and_limit_page_through_in_id_order(journal):
+    ids = [journal.append_raw(src, f"p{i}", T0) for i, src in enumerate(["broker", "event", "broker", "broker", "event"])]
+    assert [e.id for e in journal.events()] == ids  # domyślnie bez zmian: wszystko
+    assert [e.id for e in journal.events(after_id=ids[1])] == ids[2:]
+    assert [e.id for e in journal.events(limit=2)] == ids[:2]
+    assert [e.id for e in journal.events(after_id=ids[0], limit=2)] == ids[1:3]
+    assert [e.id for e in journal.events("broker", after_id=ids[0])] == [ids[2], ids[3]]
+    assert [e.id for e in journal.events("broker", after_id=ids[2], limit=1)] == [ids[3]]
+    assert [e.id for e in journal.events("event", after_id=0, limit=5)] == [ids[1], ids[4]]
+    assert journal.events(after_id=ids[-1]) == [] and journal.events("nonexistent", limit=1) == []
+    seen, cursor = [], 0  # strony po dwa: każde zdarzenie dokładnie raz
+    while page := journal.events(after_id=cursor, limit=2):
+        seen += [e.id for e in page]
+        cursor = page[-1].id
+    assert seen == ids
+    with pytest.raises(TypeError):
+        journal.events("broker", ids[0])  # after_id i limit tylko z nazwy
+
+
+@pytest.mark.parametrize(
+    "kwargs, error",
+    [({"after_id": -1}, ValueError), ({"after_id": 2**63}, ValueError), ({"after_id": True}, TypeError),
+     ({"after_id": 1.0}, TypeError), ({"after_id": "1"}, TypeError), ({"limit": 0}, ValueError),
+     ({"limit": -1}, ValueError), ({"limit": 2**63}, ValueError), ({"limit": False}, TypeError),
+     ({"limit": "2"}, TypeError)],
+)  # fmt: skip
+def test_events_rejects_a_bad_after_id_or_limit(journal, kwargs, error):
+    journal.append_raw("broker", "x", T0)
+    with pytest.raises(error):
+        journal.events(**kwargs)
+
+
 def test_append_raw_rejects_naive_timestamp_and_empty_source(journal):
     with pytest.raises(ValueError):
         journal.append_raw("broker", "x", datetime(2026, 11, 2, 7, 30))
