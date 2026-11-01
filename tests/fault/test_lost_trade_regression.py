@@ -198,6 +198,87 @@ async def test_blocked_lost_trade_survives_restarts_and_keeps_raising_the_alarm(
     assert fake.calls.count("open_position") == 1
 
 
+class ProcessDied(BaseException):
+    """Śmierć procesu (kill -9) w wybranym miejscu: nie jest `Exception`, więc żadna siatka w kodzie jej nie połknie."""
+
+
+def die_after_history_raw(journal, monkeypatch):
+    real = journal.append_raw
+
+    def append_raw(source, payload, ts):
+        row = real(source, payload, ts)
+        if source == "broker.closed_since":
+            raise ProcessDied("killed right after the raw history record")
+        return row
+
+    monkeypatch.setattr(journal, "append_raw", append_raw)
+
+
+def die_on_position_write(journal, monkeypatch, *, after):
+    real = journal.upsert_position
+
+    def upsert_position(p):
+        if p.state is PositionState.BLOCKED and not after:
+            raise ProcessDied("killed right before the BLOCKED write")
+        real(p)
+        if p.state is PositionState.BLOCKED:
+            raise ProcessDied("killed right after the BLOCKED write, before the order note")
+
+    monkeypatch.setattr(journal, "upsert_position", upsert_position)
+
+
+CRASH_POINTS = {
+    "after_the_history_raw_record": die_after_history_raw,
+    "before_the_block_write": lambda j, mp: die_on_position_write(j, mp, after=False),
+    "after_the_block_write": lambda j, mp: die_on_position_write(j, mp, after=True),
+}
+
+
+@pytest.mark.parametrize("crash", list(CRASH_POINTS))
+async def test_a_crash_after_the_history_read_before_the_block_still_ends_blocked_after_restart(
+    tmp_path, journal, fake, mgr, req, clock, risk_cfg, reopen, monkeypatch, crash
+):
+    # menedżer zapisał surową historię (z zamknięciem DEAL-1), a proces zginął przed (albo w trakcie) zapisu BLOCKED
+    accept_then_stop_before_first_check(fake)
+    CRASH_POINTS[crash](journal, monkeypatch)
+    with pytest.raises(ProcessDied):
+        await mgr.submit_entry(req)
+    assert not mgr.in_flight
+    path = tmp_path / "journal.sqlite"  # plik dziennika z fixture `journal`
+    journal.close()
+
+    # restart: na dysku zlecenie UNKNOWN i pozycja ENTERING (albo już BLOCKED), surowa historia jest, księgi nie ma
+    j1 = reopen(path)
+    [history] = payloads(j1, "broker.closed_since")
+    assert [c["deal_id"] for c in history["response"]] == ["DEAL-1"]
+    assert j1.get_order(req.client_id).state is OrderState.UNKNOWN and j1.trades() == []
+    expected = PositionState.BLOCKED if crash == "after_the_block_write" else PositionState.ENTERING
+    assert j1.current_position("DE40").state is expected
+    written = spy_states(j1, monkeypatch)
+    kills = RecordingKillSink()
+    mgr1 = OrderManager(j1, fake, clock, risk_cfg)
+    reconciler = reconciler_for(j1, fake, clock, kills, risk_cfg, mgr1)
+    for _ in range(3):  # trzy puste odczyty po ≥ 30 s od INTENT, potem historia (zamknięcie na DE40)
+        clock.advance(risk_cfg.reconcile_interval_s)
+        await reconciler.run_once()
+    clock.advance(risk_cfg.mismatch_tolerance_s + 1)
+    assert (await reconciler.run_once()).blocked
+    j1.close()
+
+    # restart 2: transakcja nadal zablokowana do decyzji właściciela, nigdy NOT_PLACED ani FLAT
+    j2 = reopen(path)
+    rec = j2.get_order(req.client_id)
+    assert rec.state is OrderState.UNKNOWN and j2.current_position("DE40") == PositionRecord("DE40", PositionState.BLOCKED)
+    assert j2.trades() == [] and j2.realized_pnl_total() == 0
+    assert OrderState.NOT_PLACED not in written["order"] and PositionState.FLAT not in written["position"]
+    if crash == "after_the_block_write":  # BLOCKED już zapisane: uzgadnianie czeka na właściciela, nie dopisuje kodu
+        assert "MISMATCH_TIMEOUT" in kills.calls
+    else:
+        assert_blocked_lost_trade(j2, req)  # uzgadnianie samo doszło do UNMATCHED_CLOSED_DEAL
+        assert kills.calls[:1] == ["UNMATCHED_CLOSED_DEAL"] and "MISMATCH_TIMEOUT" in kills.calls
+    assert fake.calls.count("open_position") == 1
+
+
 # --- d. wiele przebiegów z pustą listą pozycji nie zdejmuje blokady --------------------------------------
 
 
