@@ -813,19 +813,24 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
 
 
 async def _reset_history_check(engine: Engine, position: PositionRecord, out: Callable[[str], None]) -> str | None:
-    """Historia zamknięć deal_id pozycji BLOCKED (od otwarcia − HISTORY_MARGIN, pełna albo wyjątek).
+    """Historia zamknięć deal_id pozycji BLOCKED (pełna albo wyjątek) od tego samego początku, co uzgadnianie:
+    `reconcile.history_start` (późniejszy z: znacznik ostatniego zaksięgowanego zamknięcia, otwarcie; minus
+    HISTORY_MARGIN).
 
     None: odmowa (już wypisana): zamknięcie do zaksięgowania przez silnik albo historia nieczytelna. Inaczej wynik
-    do audytu: `NO_CLOSURE`, `AMBIGUOUS_<n>_CLOSURES`, `START_UNKNOWN` (bez czasu otwarcia nie da się jej sprawdzić).
+    do audytu: `NO_CLOSURE`, `AMBIGUOUS_<n>_CLOSURES`, `START_UNKNOWN` (bez czasu otwarcia i bez znacznika nie da się
+    jej sprawdzić).
     """
-    from gwstock.orders.manager import HISTORY_MARGIN
+    from gwstock.reconcile import history_start
 
     deal_id, epic = position.deal_id, position.epic
-    if position.opened_at is None:
-        out(f"note: the open time of deal {deal_id} is unknown, so its closure cannot be looked up in the history")
+    start = history_start(engine.journal, position)
+    if start is None:
+        out(f"note: neither the open time of deal {deal_id} nor a booked closure is known, so its closure cannot be "
+            "looked up in the history")  # fmt: skip
         return "START_UNKNOWN"
     try:
-        closures = await engine.probe(engine.raw_broker.closed_since, position.opened_at - HISTORY_MARGIN)
+        closures = await engine.probe(engine.raw_broker.closed_since, start)
     except Exception as exc:
         out(f"refused: the broker history cannot be read ({type(exc).__name__}: {exc}); nothing changed, try again "
             "later")  # fmt: skip

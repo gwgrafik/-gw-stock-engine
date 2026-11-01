@@ -934,6 +934,36 @@ async def test_reset_position_with_an_ambiguous_history_still_needs_the_deal_id(
     assert audit["history"] == "AMBIGUOUS_2_CLOSURES" and audit["unbooked_deal"] == "DEAL-1"
 
 
+async def test_reset_position_with_unknown_open_time_uses_the_closed_marker_and_refuses_a_bookable_closure(
+    engine, broker, clock
+):
+    # h1: czas otwarcia nieznany, ale znacznik ostatniego zaksięgowanego zamknięcia jest: historia od znacznika
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    opened = engine.journal.current_position("DE40").opened_at
+    broker.trigger_stop("DEAL-1", MID + 1 - 30)  # zamknięcie do zaksięgowania przez silnik
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=P.BLOCKED, opened_at=None))
+    engine.journal.set_meta("closed_marker", (opened - timedelta(hours=1)).isoformat())  # poprzednia transakcja
+    lines: list[str] = []
+    owner = Typed("DEAL-1")
+    assert await cli.reset_position(engine, "wlasciciel", owner, out=lines.append) == 1
+    assert owner.prompts == [] and payloads(engine.journal, "owner.reset") == []
+    assert engine.journal.current_position("DE40").state is P.BLOCKED and engine.journal.trades() == []
+    assert any("is in the broker history" in line for line in lines)
+
+
+async def test_reset_position_start_unknown_only_without_open_time_and_marker_needs_the_deal_id(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), opened_at=None))
+    lines: list[str] = []
+    before = broker.calls.count("closed_since")
+    assert await cli.reset_position(engine, "wlasciciel", Typed("DEAL-1"), out=lines.append) == 0
+    [audit] = payloads(engine.journal, "owner.reset")
+    assert audit["history"] == "START_UNKNOWN" and audit["acknowledged"] == "DEAL-1"
+    assert broker.calls.count("closed_since") == before  # bez początku zakresu: żadnego odczytu historii
+    assert any("cannot be looked up" in line for line in lines)
+
+
 async def test_reset_position_without_a_deal_id_needs_the_no_deal_id_acknowledgement(engine, broker, clock):
     await blocked_position(engine, broker, clock)
     engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), deal_id=None))
