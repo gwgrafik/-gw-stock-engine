@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import re
 import stat
@@ -70,6 +71,7 @@ from gwstock.broker.capitalcom_parse import (
     parse_login,
     parse_session_account,
     parse_snapshot,
+    snapshot_anomalies,
 )
 from gwstock.broker.capitalcom_trading import TradingMixin
 from gwstock.clock import Clock
@@ -85,6 +87,8 @@ from gwstock.types import (
     Quote,
     SessionExpired,
 )
+
+_LOG = logging.getLogger(__name__)
 
 LIVE_BASE_URL = "https://api-capital.backend-capital.com"
 API_PREFIX = "/api/v1"
@@ -471,6 +475,7 @@ class CapitalComBroker(TradingMixin):
         self._seen_tokens: deque[str] = deque(maxlen=64)  # do czyszczenia komunikatów także ze starych tokenów
         # świeżość notowań: epic → (ostatnio obserwowana krotka, chwila jej ostatniej zmiany na zegarze silnika)
         self._quote_marks: dict[str, tuple[tuple, datetime]] = {}
+        self._snapshot_warned: set[str] = set()  # epiki, dla których ostrzeżono o delayTime/scalingFactor (C10)
         self._init_trading()
 
     # --- sesja ---------------------------------------------------------------------------------
@@ -808,6 +813,7 @@ class CapitalComBroker(TradingMixin):
         """
         path = f"/markets/{_check_epic(epic)}"
         payload = await self._request("GET", path)
+        self._note_snapshot_anomalies(epic, payload)
         currency = self._login_accounts.get(self._session_account_id) if self._session_account_id else None
         return self._parse(f"GET {path}", parse_instrument_rules, epic, payload, currency)
 
@@ -818,16 +824,35 @@ class CapitalComBroker(TradingMixin):
         `updateTimeUTC` jeśli jest) ostatnio się ZMIENIŁA; pierwszy odczyt epiku → teraz. Czas brokera nie jest
         parsowany (`updateTime` jest lokalny i bez strefy), więc zamrożona migawka starzeje się i uruchamia straż
         ciszy notowań. `marketStatus` nie jest częścią interfejsu v1, więc stan inny niż TRADEABLE nie jest błędem.
+        `delayTime` ≠ 0 albo `scalingFactor` ≠ 1: ostrzeżenie w logu raz na epik, ceny bez zmian (C10).
         """
         path = f"/markets/{_check_epic(epic)}"
         where = f"GET {path}"
-        snapshot = self._parse(where, parse_snapshot, await self._request("GET", path))
+        payload = await self._request("GET", path)
+        self._note_snapshot_anomalies(epic, payload)
+        snapshot = self._parse(where, parse_snapshot, payload)
         now = self._clock.now_utc()
         previous = self._quote_marks.get(epic)
         changed_at = previous[1] if previous is not None and previous[0] == snapshot.marker else now
         quote = self._parse(where, build, Quote, "snapshot", epic, snapshot.bid, snapshot.offer, changed_at)
         self._quote_marks[epic] = (snapshot.marker, changed_at)  # dopiero po udanej budowie notowania
         return quote
+
+    def _note_snapshot_anomalies(self, epic: str, payload: dict[str, Any]) -> None:
+        """Ostrzeżenie (raz na epik, bez zamykania drogi), gdy `snapshot.delayTime` ≠ 0 albo `scalingFactor` ≠ 1:
+        znaczenie pól jest nieopisane (C10), a ceny są używane tak, jak je podał broker."""
+        if epic in self._snapshot_warned:
+            return
+        found = snapshot_anomalies(payload)
+        if found:
+            self._snapshot_warned.add(epic)
+            _LOG.warning(
+                "%s",
+                self._scrub(
+                    f"GET /markets/{epic}: unexpected {', '.join(found)} (expected delayTime 0 and scalingFactor 1; "
+                    "prices are used as reported, C10)"
+                ),
+            )
 
     async def candles_5m(self, epic: str, start: datetime, end: datetime) -> list[Candle]:
         """Zakończone świece 5-minutowe z `start <= c.start < end`, rosnąco (`GET /prices?resolution=MINUTE_5`).

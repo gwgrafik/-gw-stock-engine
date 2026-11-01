@@ -33,7 +33,7 @@ from gwstock.types import (
     Quote,
     SessionExpired,
 )
-from tests.unit.fake_capital_server import TEST_API_KEY, TEST_IDENTIFIER, TEST_PASSWORD, candle, stamp
+from tests.unit.fake_capital_server import TEST_API_KEY, TEST_IDENTIFIER, TEST_PASSWORD, candle, de40_market, stamp
 
 UTC = timezone.utc
 T0 = datetime(2026, 11, 2, 7, 30, tzinfo=UTC)  # = start fixture `clock`
@@ -1032,6 +1032,37 @@ async def test_quote_freshness_is_tracked_per_epic(server, broker, clock):
     us100 = await broker.quote("US100")  # 30,2: pierwszy odczyt US100
     de40_again = await broker.quote("DE40")  # 30,4: DE40 bez zmian
     assert (de40.ts, us100.ts, de40_again.ts) == (at(0.2), at(30.2), at(0.2))
+
+
+async def test_unexpected_delay_or_scaling_is_logged_once(server, broker, caplog):
+    # znaczenie `delayTime` i `scalingFactor` jest nieopisane (C10; live DE40: 0 i 1): inna wartość to ostrzeżenie raz
+    # na epik, bez zamykania drogi (ceny są używane tak, jak je podał broker)
+    caplog.set_level(logging.WARNING, logger="gwstock.broker.capitalcom")
+    server.markets["US100"] = de40_market()
+
+    def warnings() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.name == "gwstock.broker.capitalcom" and r.levelno == logging.WARNING]
+
+    await broker.login()
+    await broker.quote("DE40")
+    await broker.instrument_rules("DE40")
+    assert warnings() == []  # 0 i 1 jak w odczycie live
+    server.markets["DE40"]["snapshot"].update(delayTime=Decimal("15"), scalingFactor=Decimal("10"))
+    quote = await broker.quote("DE40")
+    assert (quote.bid, quote.ask) == (Decimal("25780.3"), Decimal("25782.3"))  # bez zamykania drogi
+    [de40] = warnings()  # już po notowaniu
+    assert "GET /markets/DE40" in de40 and "snapshot.delayTime=15" in de40 and "snapshot.scalingFactor=10" in de40
+    await broker.quote("DE40")
+    await broker.instrument_rules("DE40")
+    assert warnings() == [de40]  # raz na epik
+    server.markets["US100"]["snapshot"].pop("delayTime")  # brak pola to nie anomalia
+    server.markets["US100"]["snapshot"].update(scalingFactor="1")  # napis zamiast liczby: anomalia, treść ukryta
+    await broker.instrument_rules("US100")
+    [_, us100] = warnings()  # już po regułach instrumentu
+    assert "GET /markets/US100" in us100 and "snapshot.scalingFactor=<unexpected value>" in us100
+    assert "snapshot.delayTime" not in us100
+    await broker.quote("US100")
+    assert len(warnings()) == 2
 
 
 @pytest.mark.parametrize(

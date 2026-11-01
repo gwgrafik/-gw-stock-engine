@@ -309,6 +309,32 @@ def parse_snapshot(payload: Any) -> Snapshot:
     return Snapshot(bid, offer, marker)
 
 
+_EXPECTED_SNAPSHOT_FIELDS = (("delayTime", Decimal(0)), ("scalingFactor", Decimal(1)))
+_MAX_SHOWN_NUMBER_LEN = 24
+
+
+def snapshot_anomalies(payload: Any) -> list[str]:
+    """Opisy pól `snapshot.delayTime` ≠ 0 i `snapshot.scalingFactor` ≠ 1 z `GET /markets/{epic}` (np.
+    `snapshot.delayTime=15`); brak pola albo migawki to nie anomalia, a zły kształt nie jest tu błędem.
+
+    Znaczenie obu pól jest nieopisane (C10), w odczycie live DE40 to 0 i 1. Wynik służy tylko ostrzeżeniu: liczba
+    jest pokazana (przycięta), każda inna wartość jako znacznik bez treści (`shown`).
+    """
+    snapshot = payload.get("snapshot") if isinstance(payload, dict) else None
+    if not isinstance(snapshot, dict):
+        return []
+    found = []
+    for key, expected in _EXPECTED_SNAPSHOT_FIELDS:
+        if key not in snapshot:
+            continue
+        value = snapshot[key]
+        if isinstance(value, Decimal) and value == expected:
+            continue
+        text_value = str(value)[:_MAX_SHOWN_NUMBER_LEN] if isinstance(value, Decimal) else shown(value)
+        found.append(f"snapshot.{key}={text_value}")
+    return found
+
+
 def rule(dealing: dict[str, Any], name: str) -> tuple[str, Decimal]:
     """Reguła `dealingRules.<name>` jako (jednostka, wartość) z obiektu `{unit, value}`."""
     where = path("dealingRules", name)
