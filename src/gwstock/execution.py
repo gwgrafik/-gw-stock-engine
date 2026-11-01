@@ -21,11 +21,11 @@ Niezmienniki (prawdziwe pieniądze):
   spłaszczenie (zamknięcie niezależne od dziennika);
 - te same straże dla wypełnienia przyjętego przez uzgadnianie (zgubione potwierdzenie, restart lub awaria dziennika po
   wysyłce): `guard_adopted_fill` po każdym udanym przebiegu uzgadniania (po zabezpieczeniu stopem), dla pozycji OPEN
-  bez znacznika `fill_guarded` (przy HARD nic: zamyka awaryjne spłaszczenie tego taktu); z kontekstem wejścia obie
-  straże, bez niego ryzyko wielkości z odległości stopu
-  pozycji i wartości punktu brokera. Znacznik (nie wynik uzgadniania) jest kluczem idempotencji: zapisany, gdy żadna
-  straż nie zadziałała, albo po spłaszczeniu, które wyprowadziło pozycję z OPEN, więc przerwanie w dowolnym miejscu
-  kończy się ponowieniem straży;
+  bez znacznika `fill_guarded` (przy HARD nic: zamyka awaryjne spłaszczenie tego taktu i dopiero po zamknięciu
+  zostawia ślad straży z kontekstu wejścia, notatka EMERGENCY); z kontekstem wejścia obie straże, bez niego ryzyko
+  wielkości z odległości stopu pozycji i wartości punktu brokera. Znacznik (nie wynik uzgadniania) jest kluczem
+  idempotencji: zapisany, gdy żadna straż nie zadziałała, albo po spłaszczeniu, które wyprowadziło pozycję z OPEN, więc
+  przerwanie w dowolnym miejscu kończy się ponowieniem straży; znacznik o nieznanej wartości niczego nie zamyka (alarm);
 - spłaszczenie (`flatten`): OPEN → EXITING (BLOCKED, ENTERING, FLAT: odmowa ze zdarzeniem), jedno zamknięcie; po
   timeoucie lub odmowie NAJPIERW lista pozycji, nigdy druga wysyłka na ślepo: zamknięcie idzie do brokera tylko przy
   przejściu do EXITING albo gdy lista pozycji właśnie potwierdziła, że pozycja nadal jest (ponowienie na pozycji
@@ -142,6 +142,10 @@ META_EXIT_INTENT = "exit_intent:{}"  # deal_id → przyczyna wyjścia zainicjowa
 META_FILL_GUARDED = "fill_guarded:{}"
 FILL_GUARD_PASS = "PASS"
 FILL_GUARD_NO_CONTEXT_PASS = "NO_CONTEXT_PASS"
+# Przyczyny natychmiastowego spłaszczenia po wypełnieniu: jedyne tokeny znacznika z przyczynami (inny = nieczytelny).
+SLIPPAGE_GUARD = "SLIPPAGE_GUARD"
+SIZE_MISMATCH_RISK = "SIZE_MISMATCH_RISK"
+FILL_GUARD_CAUSES = frozenset({SLIPPAGE_GUARD, SIZE_MISMATCH_RISK})
 
 # Przyczyny kill switcha nadawane przez wykonawcę (JOURNAL_WRITE_FAILED z `gwstock.risk`).
 ENTRY_EXCEPTION = "ENTRY_EXCEPTION"
@@ -219,11 +223,17 @@ class ExitMemory:
     awaryjne spłaszczenie przy nieczytelnym dzienniku zamyka tylko jego (i tylko gdy broker go pokazuje).
     `exit_intents`: deal → przyczyna wyjścia silnika, zapisywana tam, gdzie `exit_intent:<deal>` w dzienniku: wyjście
     silnika jest FORCED także wtedy, gdy zapis zamiaru zawiódł (po restarcie bez zapisu: MANUAL).
+    `alerted_once`: (kod, deal_id) alarmów straży wysłanych już w tym procesie (raz na pozycję, także po odbudowie
+    wykonawcy).
+    `guards_run`: deale, dla których straże wypełnienia zapisały już w tym procesie swoje zdarzenia: ślad straży po
+    awaryjnym spłaszczeniu ich nie powtarza.
     """
 
     closes_sent: set[str] = field(default_factory=set)
     last_own_deal: str | None = None
     exit_intents: dict[str, str] = field(default_factory=dict)
+    alerted_once: set[tuple[str, str]] = field(default_factory=set)
+    guards_run: set[str] = field(default_factory=set)
 
 
 async def _with_timeout(call: Awaitable[T], timeout: float) -> T:
@@ -274,7 +284,6 @@ class Executor:
         self._timeout = risk.submit_timeout_s
         self._memory = memory if memory is not None else ExitMemory()
         self._closes_started = 0  # wywołania `close_position` w tym wykonawcy (czy procedura cokolwiek wysłała)
-        self._alerted_once: set[tuple[str, str]] = set()  # (kod, deal_id): alarmy straży raz na pozycję w procesie
 
     @property
     def live(self) -> bool:
@@ -458,8 +467,14 @@ class Executor:
         Nic nie robi (żadnego wywołania brokera), gdy pozycja w dzienniku nie jest OPEN z deal_id, kill switch jest
         HARD (zamyka awaryjne spłaszczenie tego samego taktu; bez znacznika), pozycja ma znacznik `fill_guarded` bez
         przyczyny (PASS, NO_CONTEXT_PASS), albo na instrumencie jest zlecenie nierozstrzygnięte (najpierw uzgadnianie).
+        Znacznik spoza tej listy i spoza przyczyn (`FILL_GUARD_CAUSES` złączone `+`) jest nieczytelny: jak sprawdzony,
+        nic nie zamykamy, jeden alarm FILL_GUARD_MARKER_UNREADABLE na deal.
         Znacznik z przyczynami przy pozycji znów OPEN (np. BLOCK_CLEARED po chwilowym błędzie listy): ponowne
-        spłaszczenie (FILL_GUARD_REFLATTEN), bez nowych zdarzeń straży. Z kontekstem
+        spłaszczenie (FILL_GUARD_REFLATTEN), bez nowych zdarzeń straży. W nowym procesie (pusta pamięć wyjść) to
+        zamknięcie idzie bez własnego odczytu listy: gwarancję daje wywołujący, `Engine.reconcile_once`, który woła tę
+        metodę tylko po udanym, niepominiętym przebiegu uzgadniania, czyli zaraz po odczycie listy brokera (pozycja OPEN
+        po BLOCK_CLEARED = deal jest u brokera), a zamknięcie po deal_id nie otworzy ekspozycji; po zamknięciu wysłanym
+        już w tym procesie lista idzie najpierw. Z kontekstem
         wejścia: notowanie decyzji, żądana wielkość, odległość stopu i wartość punktu z kontekstu. Bez niego (albo
         z nieczytelnym): tylko ryzyko wielkości z odległości stopu pozycji i wartości punktu brokera; pozycja bez stopu
         czeka na zabezpieczenie, nieczytelne reguły brokera → alarm FILL_GUARD_UNAVAILABLE i ponowienie w następnym
@@ -477,15 +492,26 @@ class Executor:
         marker = self._journal.get_meta(META_FILL_GUARDED.format(deal_id))
         if marker in (FILL_GUARD_PASS, FILL_GUARD_NO_CONTEXT_PASS):
             return False
+        marked = None if marker is None else _marker_causes(marker)
+        if marker is not None and marked is None:
+            # znacznik pisze tylko straż: obca lub uszkodzona wartość to nie dowód przyczyny, więc nic nie zamykamy
+            # (jak po sprawdzeniu), a właściciel dostaje jeden alarm na deal; znacznik zostaje jako ślad
+            self._alert_once(
+                "FILL_GUARD_MARKER_UNREADABLE", deal_id, "ERROR",
+                f"FILL_GUARD_MARKER_UNREADABLE {deal_id}: fill_guarded marker {marker!r} is not a fill guard result; "
+                "treated as checked, nothing closed (the stop at the broker stays); check the journal and the "
+                "position size at the broker",
+            )  # fmt: skip
+            return False
         if any(o.epic == self._epic for o in self._journal.unresolved_orders()):
             return False  # pozycja może jeszcze należeć do zlecenia bez deal_id: kontekst nie byłby pewny
         failures: list[str] = []
         closes_before: int | None = None
         try:
-            if marker is not None:
+            if marked is not None:
                 # straż już zadziałała (znacznik z przyczynami), a pozycja znów jest OPEN (np. EXITING → BLOCKED →
                 # BLOCK_CLEARED po chwilowym błędzie listy): zamykamy jeszcze raz, bez nowych zdarzeń straży
-                causes = marker.split("+")
+                causes = marked
                 self._alert("ERROR", f"FILL_GUARD_REFLATTEN {deal_id}: closed by the fill guard before ({marker}) "
                                      "and OPEN again in the journal; closing again")  # fmt: skip
                 self._event("FILL_GUARD_REFLATTEN", best_effort=failures, deal_id=deal_id, causes=causes)
@@ -572,11 +598,12 @@ class Executor:
         return rules.value_per_point
 
     def _alert_once(self, code: str, deal_id: str, level: str, message: str) -> None:
-        """Alarm straży raz na (kod, pozycja) w tym procesie: ponowienia w każdym przebiegu uzgadniania nie zalewają
-        kanału alarmów (zdarzenia i surowe odpowiedzi w dzienniku zostają za każdym razem)."""
-        if (code, deal_id) in self._alerted_once:
+        """Alarm straży raz na (kod, pozycja) w tym procesie (pamięć wykonawcy, przekazywana przy zejściu do dry_run):
+        ponowienia w każdym przebiegu uzgadniania nie zalewają kanału alarmów (zdarzenia i surowe odpowiedzi w
+        dzienniku zostają za każdym razem)."""
+        if (code, deal_id) in self._memory.alerted_once:
             return
-        self._alerted_once.add((code, deal_id))
+        self._memory.alerted_once.add((code, deal_id))
         self._alert(level, message)
 
     def _mark_fill_guarded(
@@ -616,11 +643,15 @@ class Executor:
         failures: list[str],
         *,
         adopted: bool = False,
+        note: str | None = None,
     ) -> list[str]:
         """Straż poślizgu (spec §5 pkt 7; tylko ze znanym notowaniem decyzji i odległością stopu) i ryzyko faktycznej
         wielkości (zawsze); obie sprawdzane, zdarzenia (wg możliwości) przed zamknięciem. Odległość dla ryzyka: stop
         pozycji, a bez niego `stop_distance` (stop ustawiony przed chwilą w tej odległości). `adopted`: wypełnienie
-        przyjęte przez uzgadnianie. Zwraca przyczyny natychmiastowego spłaszczenia."""
+        przyjęte przez uzgadnianie. `note="EMERGENCY"`: tylko ślad po zamknięciu przez awaryjne spłaszczenie (notatka
+        w zdarzeniach, alarm mówi, że pozycję już zamknięto). Zwraca przyczyny natychmiastowego spłaszczenia."""
+        self._memory.guards_run.add(position.deal_id)  # zdarzenia straży tego deala są (albo zaraz będą) w dzienniku
+        extra = {} if note is None else {"note": note}
         causes: list[str] = []
         if decision_bid is not None and decision_ask is not None and stop_distance is not None:
             if position.side is Side.BUY:
@@ -629,11 +660,11 @@ class Executor:
                 deviation = decision_bid - position.open_level  # SELL sprzedaje po bid: gorzej = niżej
             limit = self._strat.slippage_guard_fraction * stop_distance
             if deviation > limit:
-                causes.append("SLIPPAGE_GUARD")
+                causes.append(SLIPPAGE_GUARD)
                 self._event(
-                    "SLIPPAGE_GUARD", best_effort=failures, deal_id=position.deal_id, side=position.side,
+                    SLIPPAGE_GUARD, best_effort=failures, deal_id=position.deal_id, side=position.side,
                     decision_bid=decision_bid, decision_ask=decision_ask, open_level=position.open_level,
-                    deviation=deviation, limit=limit, adopted=adopted,
+                    deviation=deviation, limit=limit, adopted=adopted, **extra,
                 )  # fmt: skip
         if position.stop_level is not None:
             distance = abs(position.open_level - position.stop_level)
@@ -643,15 +674,22 @@ class Executor:
             raise ValueError(f"fill guard of {position.deal_id}: neither a stop level nor a stop distance")
         risk = position.size * distance * value_per_point
         if risk > self._risk.max_loss_per_trade:
-            causes.append("SIZE_MISMATCH_RISK")
+            causes.append(SIZE_MISMATCH_RISK)
             self._event(
-                "SIZE_MISMATCH_RISK", best_effort=failures, deal_id=position.deal_id, size=position.size,
+                SIZE_MISMATCH_RISK, best_effort=failures, deal_id=position.deal_id, size=position.size,
                 requested=requested_size, distance=distance, risk=risk, limit=self._risk.max_loss_per_trade,
-                adopted=adopted,
+                adopted=adopted, **extra,
             )  # fmt: skip
         if causes:
             where = " (adopted by reconciliation)" if adopted else ""
-            self._alert("ERROR", f"{' + '.join(causes)}: closing {position.deal_id} at once{where}")
+            if note is None:
+                self._alert("ERROR", f"{' + '.join(causes)}: closing {position.deal_id} at once{where}")
+            else:
+                self._alert(
+                    "ERROR",
+                    f"{' + '.join(causes)}: {position.deal_id} was over the limit and has been closed by the emergency "
+                    f"flatten (kill switch HARD) before the fill guard ran{where}",
+                )
         return causes
 
     # --- spłaszczenie -------------------------------------------------------------------------------------
@@ -906,11 +944,14 @@ class Executor:
         próby. Bez FLAT: alarm EMERGENCY_FLATTEN_INCOMPLETE. Nieczytelny dziennik: zamknięcie tylko NASZEGO ostatniego
         deala tego procesu i tylko wtedy, gdy lista brokera go właśnie pokazuje (alarm
         EMERGENCY_FLATTEN_JOURNAL_UNREADABLE; zaksięguje uzgadnianie, gdy dziennik wróci); nieznanego nie zamykamy.
+        Po wysłanym zamknięciu pozycji OPEN, której straż wypełnienia nie sprawdziła (przy HARD nie biegnie): ślad
+        straży z kontekstu wejścia (`_audit_emergency_fill`).
         """
         timeout = max(EMERGENCY_MIN_TIMEOUT_S, self._risk.submit_timeout_s / 2)
         failures: list[str] = []
         outcome, attempts = "", 0
         closes_before = self._closes_started
+        unguarded: PositionRecord | None = None  # zapis OPEN z pierwszego odczytu: kandydat do śladu straży
         try:
             for attempt in range(1, EMERGENCY_ATTEMPTS + 1):
                 if attempt > 1:
@@ -930,6 +971,8 @@ class Executor:
                 if current.state not in _FLATTENABLE | {_P.BLOCKED} or current.deal_id is None:
                     outcome = f"STATE_{current.state.value}"  # BLOCKED bez deal_id (obca) albo ENTERING: nie ruszamy
                     break
+                if unguarded is None and current.state is _P.OPEN:
+                    unguarded = current
                 attempts = attempt
                 # STILL_OPEN: lista sprzed sekundy potwierdziła otwartą pozycję, więc zamknięcie bez kolejnego odczytu
                 _, outcome = await self._flatten(
@@ -958,7 +1001,39 @@ class Executor:
                 outcome=outcome,
             )  # fmt: skip
         finally:
+            if self._closes_started > closes_before:
+                self._audit_emergency_fill(unguarded, failures)
             self._report_journal_failures(failures, "emergency flatten", closes_before=closes_before)
+
+    def _audit_emergency_fill(self, record: PositionRecord | None, failures: list[str]) -> None:
+        """Ślad straży wypełnienia (spec §5 pkt 7) dla pozycji OPEN, którą awaryjne spłaszczenie właśnie zamknęło, zanim
+        straż ją sprawdziła (przy HARD straż nie biegnie; zwykle wypełnienie przyjęte przez uzgadnianie): wartości z
+        kontekstu wejścia, zdarzenia SLIPPAGE_GUARD / SIZE_MISMATCH_RISK i FILL_GUARD_ADOPTED z notatką EMERGENCY,
+        alarm przy przyczynie i znacznik `fill_guarded` jak po straży. Dopiero po zamknięciu (ochrona nie czeka na
+        dziennik), tylko z dziennika (bez wywołań brokera; bez kontekstu nic), raz na deal w procesie (`guards_run`:
+        także nie po straży, która sama przeszła na ścieżkę awaryjną) i bez deala ze znacznikiem. Wg możliwości: nigdy
+        nie rzuca (zamknięcie już poszło)."""
+        if record is None or record.deal_id is None or record.deal_id in self._memory.guards_run:
+            return
+        deal_id = record.deal_id
+        try:
+            if self._journal.get_meta(META_FILL_GUARDED.format(deal_id)) is not None:
+                return  # straż już sprawdziła ten deal (także we wcześniejszym procesie)
+            found = self._guard_context(deal_id, record.epic)
+            if found is None:
+                return  # ryzyko bez kontekstu wymaga reguł brokera, a ścieżka awaryjna ich nie czyta
+            order_id, ctx = found
+            causes = self._guard_values(
+                record, ctx["decision_bid"], ctx["decision_ask"], ctx["stop_distance"], ctx["value_per_point"],
+                ctx["size"], failures, adopted=True, note="EMERGENCY",
+            )  # fmt: skip
+            self._event(
+                "FILL_GUARD_ADOPTED", best_effort=failures, deal_id=deal_id, order_id=order_id, causes=causes,
+                source="entry_ctx", note="EMERGENCY",
+            )  # fmt: skip
+            self._mark_fill_guarded(record, causes, FILL_GUARD_PASS, failures)
+        except Exception:  # odczyt dziennika albo inny błąd śladu: zamknięcie już poszło, ślad przepada
+            return
 
     async def _flatten_without_journal(self, error: JournalError, timeout: float, failures: list[str]) -> str:
         """Jedna próba awaryjna przy nieczytelnym dzienniku: tylko ostatni NASZ deal tego procesu (widziany w dzienniku
@@ -1069,7 +1144,9 @@ class Executor:
         for attempt in range(1, PROTECT_ATTEMPTS + 1):
             if attempt > 1:  # stały rytm od startu procedury: czas oczekiwania na odpowiedź nie przesuwa kolejnej próby
                 due = started + timedelta(seconds=(attempt - 1) * PROTECT_PAUSE_S)
-                wait = (due - self._now()).total_seconds()
+                # najwyżej jedna przerwa: zegar ścienny cofnięty w trakcie procedury (NTP, wznowienie maszyny) nie
+                # może wydłużyć oczekiwania pozycji bez stopu; przesunięty do przodu tylko skraca (budżet → HARD)
+                wait = min((due - self._now()).total_seconds(), PROTECT_PAUSE_S)
                 if wait > 0:
                     await self._clock.sleep(wait)
             try:
@@ -1458,6 +1535,13 @@ def _as_open(rec: PositionRecord) -> OpenPosition:
 
 def _from_broker(state: PositionState, p: OpenPosition) -> PositionRecord:
     return PositionRecord(p.epic, state, p.deal_id, p.side, p.size, p.open_level, p.stop_level, p.opened_at)
+
+
+def _marker_causes(marker: str) -> list[str] | None:
+    """Przyczyny ze znacznika `fill_guarded` (tokeny `FILL_GUARD_CAUSES` złączone `+`); None: wartość nieznana lub
+    uszkodzona (także pusta, z pustym tokenem albo z PASS w środku)."""
+    causes = marker.split("+")
+    return causes if all(cause in FILL_GUARD_CAUSES for cause in causes) else None
 
 
 def _record(

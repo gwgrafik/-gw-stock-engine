@@ -818,6 +818,116 @@ def test_clear_reports_the_stored_hard_after_recovery(journal, clock, data_dir, 
     assert set_kill_calls[-1] == (KillLevel.SOFT, "w")
 
 
+def failing_once(monkeypatch, ks: KillSwitch, name: str) -> None:
+    """Metoda `name` przełącznika rzuca RuntimeError przy pierwszym wywołaniu (np. błąd w środku scalania)."""
+    real = getattr(ks, name)
+    state = {"failed": False}
+
+    def wrapper(*args, **kwargs):
+        if not state["failed"]:
+            state["failed"] = True
+            raise RuntimeError(f"{name} failed once")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ks, name, wrapper)
+
+
+def test_a_failure_in_the_middle_of_the_recovery_merge_never_overwrites_a_stored_hard(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
+):
+    # odczyt wrócił, ale scalanie przerywa wyjątek (tu zegar): stan ma zostać NIEZNANY, a nie "znany" z SOFT w pamięci,
+    # bo najbliższe ponowienie zapisu nadpisałoby wtedy zapisany HARD poziomem SOFT (KILL_STATE_UNREADABLE)
+    journal.set_kill(KillLevel.HARD, "original", clock.now_utc())
+    set_kill_calls.clear()
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    state["down"] = False
+    failing_once(monkeypatch, ks, "_now")
+    ks.scan_files()  # nie rzuca
+    stored = journal.kill_state()
+    assert set_kill_calls == [] and (stored.level, stored.reason) == (KillLevel.HARD, "original")
+    ks.scan_files()  # następna próba scala do końca: zapisany HARD wraca do pamięci
+    assert ks.level() is KillLevel.HARD and ks.reason() == "original" and set_kill_calls == []
+    assert journal.kill_state().level is KillLevel.HARD
+
+
+def test_clear_refuses_when_the_recovery_fails_midway_and_never_clears_a_stored_hard_blind(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls, caplog
+):
+    # to samo w clear(): błąd scalania to odmowa (ValueError, którą obsługuje CLI), nie wyjątek i nie zdjęcie po ciemku
+    journal.set_kill(KillLevel.HARD, "original", clock.now_utc())
+    set_kill_calls.clear()
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    state["down"] = False
+    failing_once(monkeypatch, ks, "_now")
+    alerts_before, audit_before = list(notifier.alerts), audit(journal)
+    with caplog.at_level(logging.ERROR, logger="gwstock.risk"):
+        with pytest.raises(ValueError, match=r"cannot be read; refusing to clear \(it may be HARD\)"):
+            ks.clear("owner")
+    assert "recovery of the stored kill state failed" in caplog.text
+    assert set_kill_calls == [] and journal.kill_state().level is KillLevel.HARD
+    assert notifier.alerts == alerts_before and audit(journal) == audit_before
+    ks.clear("owner")  # ponowienie: scalanie się udaje, zdjęty jest naprawdę HARD
+    assert audit(journal)[-1]["previous_level"] == "HARD" and journal.kill_state().level is KillLevel.NONE
+
+
+def test_clear_refuses_when_the_recovery_raises(journal, clock, data_dir, notifier, monkeypatch, set_kill_calls):
+    flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)  # nieznany stan startowy
+
+    def broken_recovery():
+        raise RuntimeError("bug in recovery")
+
+    monkeypatch.setattr(ks, "_resolve_unknown", broken_recovery)
+    with pytest.raises(ValueError, match="refusing to clear"):  # nie RuntimeError: CLI pokazuje odmowę, nie ślad stosu
+        ks.clear("owner")
+    assert set_kill_calls == [] and ks.level() is KillLevel.SOFT
+
+
+def test_a_hard_whose_write_keeps_failing_keeps_retrying_the_stored_state_read(
+    journal, clock, data_dir, notifier, monkeypatch
+):
+    # HARD przy nieznanym stanie kończy niepewność dopiero UDANYM zapisem; dopóki zapis zawodzi, odczyt jest ponawiany
+    # (zapisany stan może mieć własną przyczynę, która po odzyskaniu odczytu wraca do pamięci)
+    journal.set_kill(KillLevel.HARD, "original", clock.now_utc())
+    reads = flaky_kill_state(monkeypatch, journal)
+    break_method(monkeypatch, journal, "set_kill", JournalWriteError("disk full"))
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    ks.hard("y")  # zapis zawodzi: HARD tylko w pamięci
+    for _ in range(2):
+        calls = reads["calls"]
+        ks.scan_files()  # ponowienie zapisu znów zawodzi
+        assert reads["calls"] == calls + 1
+    reads["down"] = False
+    ks.scan_files()
+    assert ks.level() is KillLevel.HARD and ks.reason() == "original"
+    assert any(a["event"] == "RECOVERED" and a["reason"] == "original" for a in audit(journal))
+
+
+def test_a_soft_raised_while_a_hard_is_in_flight_never_lowers_the_hard_floor(
+    journal, clock, data_dir, notifier, monkeypatch
+):
+    # HARD obowiązuje od pierwszego kroku `hard` (próg w pamięci); soft zgłoszony w trakcie (inny wątek albo, jak tu,
+    # hak wywołany z odczytu dziennika) nie może obniżyć poziomu, który w tej chwili widzi reszta silnika
+    seen: list[KillLevel] = []
+    hook = {"armed": False}
+    switch: list[KillSwitch] = []
+
+    def kill_state():
+        if hook["armed"]:
+            hook["armed"] = False
+            switch[0].soft("NESTED")
+            seen.append(switch[0].level())
+        raise JournalReadError("database is locked")
+
+    monkeypatch.setattr(journal, "kill_state", kill_state)
+    switch.append(KillSwitch(journal, clock, data_dir, notifier))  # nieznany stan: `hard` najpierw ponawia odczyt
+    hook["armed"] = True
+    switch[0].hard("NO_STOP")
+    assert seen == [KillLevel.HARD] and switch[0].level() is KillLevel.HARD
+
+
 def test_concurrent_callers_see_one_transition(kill, notifier, set_kill_calls):
     barrier = threading.Barrier(8)
 

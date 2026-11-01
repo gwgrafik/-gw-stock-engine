@@ -514,8 +514,7 @@ class KillSwitch:
                 self._floor = KillLevel.NONE
             self._reasons.clear()
             self._suppressed.clear()
-            self._unsynced = False
-            self._state_unknown = False
+            self._unsynced = False  # (stan zapisany jest znany: nieznany kończy się odmową powyżej)
             failures = self._audit(
                 "CLEAR", KillLevel.NONE, "", previous_level, previous_reason, ts, requested_by=who
             )
@@ -587,7 +586,8 @@ class KillSwitch:
             stored_level, stored_reason = KillLevel(state.level), str(state.reason)
         except Exception:
             return  # nadal nieczytelny: kolejna próba przy następnym soft/hard/scan_files
-        self._state_unknown = False
+        # Flaga nieznanego stanu spada dopiero PO scaleniu: wyjątek wcześniej (`_recover` go połyka) zostawia stan
+        # nieznany, więc kolejne ponowienie zapisu nie nadpisze zapisanego HARD poziomem z pamięci.
         ts = self._now()
         memory_level, memory_reason = self._level, self._reason
         if stored_level >= memory_level:
@@ -596,6 +596,7 @@ class KillSwitch:
             kept = self._reasons if stored_level == memory_level else set()
             self._level, self._reason, self._reasons = stored_level, stored_reason, {stored_reason} | kept
             self._unsynced = False  # dziennik już ma ten stan
+            self._state_unknown = False
             self._audit("RECOVERED", stored_level, stored_reason, memory_level, memory_reason, ts)
             self._alert(
                 stored_level.name,
@@ -605,6 +606,7 @@ class KillSwitch:
             return
         self._audit("RECOVERED", memory_level, memory_reason, stored_level, stored_reason, ts)
         self._unsynced = True
+        self._state_unknown = False  # zapisany poziom jest niższy od pamięci: wolno go nadpisać
         self._retry_unsynced()  # zapis poziomu z pamięci do dziennika (po sukcesie alarm INFO)
 
     def _apply(self, level: KillLevel, reason: str) -> None:

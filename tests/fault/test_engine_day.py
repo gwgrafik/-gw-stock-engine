@@ -678,6 +678,10 @@ async def test_reconcile_once_attaches_the_stop_before_the_fill_guard_closes_an_
 
 
 async def test_hard_with_a_full_disk_still_closes_an_adopted_oversize_fill_in_the_same_tick(make_engine, broker, clock):
+    # Test silnika dla m3: przy HARD straż wypełnienia nic nie wysyła z `reconcile_once` (wraca, zanim cokolwiek mogłoby
+    # rzucić), a nadwypełnienie zamyka gałąź HARD tego samego taktu, także przy pełnym dysku. Tego, że wyjątek straży
+    # nie przerywa taktu (opakowanie `_safe` w `reconcile_once`), pilnuje test_a_failing_fill_guard_never_stops_the_
+    # management_tick: tu straż przy HARD nie rzuca, więc ta asercja byłaby pusta.
     broker.fill_size_factor = D("40")  # 0.040 × 30 × 1 = 1.20 > 1.00
     first = make_engine(Mode.LIVE)
     broker.on_call("confirm", die, once=True)
@@ -695,10 +699,16 @@ async def test_hard_with_a_full_disk_still_closes_an_adopted_oversize_fill_in_th
 
     second.journal.upsert_position = upsert
     broker.calls.clear()
-    result = await second.reconcile_once()  # straż nie przerywa taktu (i nie wysyła przy HARD)
-    assert result is not None and "close_position" not in broker.calls
+    seen = payloads(second.journal, "event")
+    result = await second.reconcile_once()
+    assert result is not None and not result.skipped  # przebieg udany, więc straż została zawołana
+    assert broker.calls == ["list_positions", "list_working_orders"]  # tylko odczyty uzgadniania: straż nic nie wysyła
+    assert payloads(second.journal, "event") == seen and second.journal.get_meta("fill_guarded:DEAL-1") is None
     await second.executor.emergency_flatten()  # gałąź HARD tego samego taktu
     assert broker.calls.count("close_position") == 1 and "DEAL-1" not in broker.positions
+    # ślad straży po zamknięciu (księga pokaże wielkość 0.040): z kontekstu wejścia, z notatką EMERGENCY
+    [risk] = [p for p in payloads(second.journal, "event") if p["event"] == "SIZE_MISMATCH_RISK"]
+    assert risk["note"] == "EMERGENCY" and risk["size"] == "0.040"
 
 
 async def test_a_failing_fill_guard_never_stops_the_management_tick(engine, broker, clock, data_dir, notifier):

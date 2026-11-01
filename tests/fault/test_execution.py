@@ -792,6 +792,21 @@ async def test_fill_guard_alerts_are_once_per_position_not_once_per_process(exec
     ]  # fmt: skip
 
 
+async def test_fill_guard_alerts_stay_once_per_position_after_the_executor_is_rebuilt(
+    build, executor, journal, fake, notifier
+):
+    # zejście live → dry_run odbudowuje wykonawcę z pamięcią poprzedniego (Engine._downgrade): alarm straży raz na
+    # pozycję w PROCESIE, nie raz na obiekt wykonawcy
+    journal.upsert_position(NO_CTX_POSITION)
+    fake.positions["DEAL-9"] = OpenPosition("DEAL-9", "DE40", Side.BUY, D("0.010"), D("25700"), D("25670"), T_ENTRY)
+    fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
+    assert await executor.guard_adopted_fill() is False
+    rebuilt = build(live=False, memory=executor.memory)
+    fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
+    assert await rebuilt.guard_adopted_fill() is False
+    assert fake.calls == ["instrument_rules"] * 2 and len(alerts(notifier, "FILL_GUARD_UNAVAILABLE DEAL-9")) == 1
+
+
 async def test_a_guarded_deal_that_is_open_again_is_closed_again_without_new_guard_events(
     executor, adopting, signal, rules, journal, fake, clock, risk_cfg, notifier, monkeypatch
 ):
@@ -827,6 +842,42 @@ async def test_a_guarded_deal_that_is_open_again_is_closed_again_without_new_gua
     assert [lvl for lvl, _ in alerts(notifier, "FILL_GUARD_REFLATTEN DEAL-1")] == ["ERROR"]
 
 
+@pytest.mark.parametrize("marker", ["SIZE_MISMATCH_RISK", "SLIPPAGE_GUARD", "SLIPPAGE_GUARD+SIZE_MISMATCH_RISK"])
+async def test_a_fill_guard_marker_with_known_causes_closes_a_deal_that_is_open_again(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, marker
+):
+    fake.fill_size_factor = D("5")
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    journal.set_meta("fill_guarded:DEAL-1", marker)  # zostawiony przez straż (np. wcześniejszy proces)
+    assert await executor.guard_adopted_fill() is True
+    assert fake.calls.count("close_position") == 1 and position(journal) == PositionRecord("DE40", P.FLAT)
+    [again] = events(journal, "FILL_GUARD_REFLATTEN")
+    assert again["causes"] == marker.split("+") and events(journal, "FILL_GUARD_ADOPTED") == []
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["OWNER_OK", "", "size_mismatch_risk", "SIZE_MISMATCH_RISK+", "PASS+SLIPPAGE_GUARD", "NO_CONTEXT"],
+    ids=["foreign", "empty", "lowercase", "trailing_plus", "pass_and_cause", "truncated_pass"],
+)
+async def test_an_unreadable_fill_guard_marker_never_closes_and_alerts_once(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, notifier, marker
+):
+    # znacznik pisze tylko straż: PASS, NO_CONTEXT_PASS albo przyczyny SLIPPAGE_GUARD / SIZE_MISMATCH_RISK złączone `+`;
+    # inna wartość to uszkodzony dziennik: nie zamykamy na jej podstawie (stop u brokera zostaje), jeden alarm na deal
+    fake.fill_size_factor = D("5")  # ponad limit: prawdziwy znacznik z przyczyną zamknąłby pozycję
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    journal.set_meta("fill_guarded:DEAL-1", marker)
+    seen = len(journal.events())
+    for _ in range(3):  # kolejne przebiegi uzgadniania
+        assert await executor.guard_adopted_fill() is False
+    assert fake.calls == [] and position(journal).state is P.OPEN and "DEAL-1" in fake.positions
+    assert len(journal.events()) == seen and journal.get_meta("fill_guarded:DEAL-1") == marker  # dowód zostaje
+    [(level, message)] = alerts(notifier, "FILL_GUARD_MARKER_UNREADABLE DEAL-1")
+    assert level == "ERROR" and repr(marker) in message and "nothing closed" in message
+    assert alerts(notifier, "FILL_GUARD_REFLATTEN") == []
+
+
 async def test_guard_adopted_fill_leaves_the_exit_to_the_emergency_flatten_while_hard(
     executor, adopting, signal, rules, journal, fake, clock, risk_cfg, kill
 ):
@@ -838,6 +889,65 @@ async def test_guard_adopted_fill_leaves_the_exit_to_the_emergency_flatten_while
     assert fake.calls == [] and len(journal.events()) == seen and journal.get_meta("fill_guarded:DEAL-1") is None
     await executor.emergency_flatten()
     assert fake.calls.count("close_position") == 1 and position(journal) == PositionRecord("DE40", P.FLAT)
+
+
+@pytest.mark.parametrize("journal_state", ["exiting_written", "exiting_write_fails"])
+async def test_an_oversize_fill_closed_by_the_emergency_flatten_under_hard_leaves_the_guard_audit_once(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, kill, notifier, monkeypatch, journal_state
+):
+    # przy HARD straż nie biegnie (zamyka awaryjne spłaszczenie tego taktu); żeby księga z nadwymiarową wielkością
+    # miała wyjaśnienie, awaryjne spłaszczenie PO zamknięciu zostawia ślad straży z kontekstu wejścia (notatka
+    # EMERGENCY): bez wywołań brokera, raz na deal, także gdy pozycja w dzienniku została OPEN (pełny dysk)
+    fake.fill_size_factor = D("5")  # 0.035 × 30 × 1 = 1.05 > 1.00
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    kill.hard("HARD_STOP_FILE")
+    assert await executor.guard_adopted_fill() is False
+    if journal_state == "exiting_write_fails":
+        failing_exiting_write(journal, monkeypatch)
+    await executor.emergency_flatten()
+    await executor.emergency_flatten()  # następny takt z HARD
+    assert fake.calls.count("close_position") == 1 and "DEAL-1" not in fake.positions
+    assert "instrument_rules" not in fake.calls and len(journal.trades()) == 1
+    [risk] = events(journal, "SIZE_MISMATCH_RISK")
+    assert risk["note"] == "EMERGENCY" and risk["adopted"] is True and D(risk["risk"]) == D("1.05")
+    [guard] = events(journal, "FILL_GUARD_ADOPTED")
+    assert guard == {
+        "event": "FILL_GUARD_ADOPTED", "deal_id": "DEAL-1", "order_id": CID, "causes": ["SIZE_MISMATCH_RISK"],
+        "source": "entry_ctx", "note": "EMERGENCY",
+    }  # fmt: skip
+    [close] = [e.id for e in journal.events("broker.close_position")]
+    assert close < min(e.id for e in journal.events("event") if "SIZE_MISMATCH_RISK" in e.payload)  # po zamknięciu
+    [(level, message)] = alerts(notifier, "SIZE_MISMATCH_RISK:")
+    assert level == "ERROR" and "DEAL-1" in message and "emergency flatten" in message
+    if journal_state == "exiting_written":
+        assert position(journal) == PositionRecord("DE40", P.FLAT)
+        assert journal.get_meta("fill_guarded:DEAL-1") == "SIZE_MISMATCH_RISK"  # jak po spłaszczeniu przez straż
+    else:
+        assert position(journal).state is P.OPEN and journal.get_meta("fill_guarded:DEAL-1") is None
+
+
+@pytest.mark.parametrize("fill", ["within_the_limit", "without_entry_context"])
+async def test_the_emergency_flatten_audit_says_pass_within_the_limit_and_needs_the_entry_context(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, kill, notifier, fill
+):
+    if fill == "within_the_limit":
+        await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    else:  # bez kontekstu ryzyko wielkości wymagałoby reguł brokera: awaryjne spłaszczenie ich nie czyta
+        oversize = replace(NO_CTX_POSITION, size=D("0.040"))
+        journal.upsert_position(oversize)
+        fake.positions["DEAL-9"] = OpenPosition("DEAL-9", "DE40", Side.BUY, D("0.040"), D("25700"), D("25670"),
+                                                T_ENTRY)  # fmt: skip
+    kill.hard("HARD_STOP_FILE")
+    await executor.emergency_flatten()
+    assert fake.calls.count("close_position") == 1 and position(journal) == PositionRecord("DE40", P.FLAT)
+    assert events(journal, "SIZE_MISMATCH_RISK") == [] and alerts(notifier, "SIZE_MISMATCH_RISK") == []
+    if fill == "within_the_limit":
+        [guard] = events(journal, "FILL_GUARD_ADOPTED")
+        assert guard["causes"] == [] and guard["note"] == "EMERGENCY"
+        assert journal.get_meta("fill_guarded:DEAL-1") == "PASS" and "instrument_rules" not in fake.calls
+    else:  # (reguły czyta tylko księgowanie rekordu zdegradowanego, raz)
+        assert events(journal, "FILL_GUARD_ADOPTED") == [] and journal.get_meta("fill_guarded:DEAL-9") is None
+        assert fake.calls.count("instrument_rules") == 1
 
 
 @pytest.mark.parametrize("corrupt", ["bad_json", "wrong_client", "missing_field", "float_value", "zero_vpp"])
@@ -1104,6 +1214,32 @@ async def test_protection_confirms_a_stop_by_a_list_read_when_every_set_stop_tim
     assert limits == [execution.PROTECT_CALL_TIMEOUT_S] * 4
     assert kill.level() is KillLevel.NONE and "close_position" not in fake.calls
     assert events(journal, "STOP_ATTACHED")[0]["verified_by"] == "list"
+
+
+async def test_a_backward_wall_clock_step_never_stretches_the_wait_between_stop_attempts(
+    executor, signal, rules, journal, fake, kill, clock, monkeypatch
+):
+    # zegar ścienny cofa się o godzinę (NTP, wznowienie maszyny wirtualnej) w trakcie pierwszej próby: rytm liczony od
+    # startu procedury nie może zamienić 3 s przerwy w ponad godzinę pozycji bez stopu, bez HARD i z zatrzymanym taktem
+    await entered(executor, signal, rules, fake)
+    fake.positions["DEAL-1"] = replace(fake.positions["DEAL-1"], stop_level=None)
+    for _ in range(3):
+        fake.fail_next("set_stop", BrokerTimeout())  # nic nie ustawione
+    sleeps = []
+    real_sleep, real_now = clock.sleep, clock.now_utc
+    step = {"by": timedelta(0)}
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(clock, "sleep", sleep)
+    monkeypatch.setattr(clock, "now_utc", lambda: real_now() + step["by"])
+    fake.on_call("set_stop", lambda: step.update(by=timedelta(hours=-1)), once=True)
+    assert await executor.protect_unprotected(fake.positions["DEAL-1"]) is False
+    assert sleeps[:2] == [execution.PROTECT_PAUSE_S] * 2  # nie 3603 i 3601 s
+    assert fake.calls[:4] == ["set_stop"] * 3 + ["list_positions"] and fake.calls.count("close_position") == 1
+    assert kill.level() is KillLevel.HARD and kill.reason() == "UNPROTECTED_POSITION"
 
 
 @pytest.mark.parametrize("broker_view", ["no_stop", "derived_stop", "other_level", "list_unreadable", "budget_spent"])
@@ -2177,6 +2313,14 @@ async def test_a_guard_close_the_journal_cannot_record_escalates_to_hard_and_the
 ):
     # ruling m5: ryzyko ponad limit nie czeka na dziennik; zwykłe spłaszczenie nie wyśle zamknięcia bez zapisu EXITING,
     # więc straż przechodzi na ścieżkę awaryjną (zamknięcie niezależne od dziennika) z kill switchem HARD
+    runs = []
+    real_emergency = executor.emergency_flatten
+
+    async def counted_emergency():
+        runs.append("emergency_flatten")
+        await real_emergency()
+
+    monkeypatch.setattr(executor, "emergency_flatten", counted_emergency)
     if path == "on_time_entry":
         fake.fill_slippage = D("10")
         failing_exiting_write(journal, monkeypatch)
@@ -2191,6 +2335,11 @@ async def test_a_guard_close_the_journal_cannot_record_escalates_to_hard_and_the
     [(level, message)] = alerts(notifier, "GUARD_EXIT_UNPERSISTED: DEAL-1")  # (kill switch alarmuje osobno)
     assert level == "ERROR" and "emergency flatten" in message
     assert fake.calls.count("close_position") == 1 and "DEAL-1" not in fake.positions
+    # dokładnie jedno awaryjne spłaszczenie: drugie nie wysłałoby zamknięcia (lista najpierw), ale czytałoby listę i
+    # historię jeszcze raz i zostawiło drugi ślad FLATTENED
+    assert len(runs) == 1 and "list_positions" not in fake.calls
+    guard_events = [e for e in events(journal) if e["event"] in ("SLIPPAGE_GUARD", "SIZE_MISMATCH_RISK")]
+    assert len(guard_events) == 1 and "note" not in guard_events[0]  # ślad straży już jest: awaryjne go nie powtarza
     assert len(journal.trades()) == 1 and position(journal).state is P.OPEN  # EXITING/FLAT dogoni uzgadnianie
     assert journal.get_meta("fill_guarded:DEAL-1") is None
     assert alerts(notifier, "the close was sent to the broker regardless")
