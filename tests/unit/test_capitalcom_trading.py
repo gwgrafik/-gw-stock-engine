@@ -2000,3 +2000,101 @@ async def test_confirm_after_stop_keys_were_seen_reports_a_missing_key_as_no_sto
     await broker.list_positions()  # broker pokazał już klucze stopu (przy innej pozycji)
     _, pos = await open_confirmed(broker)  # nasza pozycja bez klucza: według brokera bez stopu
     assert (pos.stop_level, pos.stop_derived) == (None, False)
+
+
+# --- runda poprawek 2 -----------------------------------------------------------------------------------------
+
+
+async def seen_stop_keys(server, broker) -> None:
+    """Broker pokazał już klucze stopu (przy obcej pozycji): od tej chwili brak klucza znaczy brak stopu."""
+    foreign = position_item(position__dealId="D-9", position__stopLevel=Decimal("25700.0"))
+    server.fail_next("/positions", 200, {"positions": [foreign]}, method="GET")
+    await broker.list_positions()
+
+
+async def test_set_stop_without_the_stop_key_after_keys_were_seen_is_an_unknown_outcome(server, broker):
+    server.position_stop_keys = "when-set"
+    await broker.login()
+    _, pos = await open_confirmed(broker)  # klucze widoczne: pozycja pokazuje swój stop
+    await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    only_position(server).stop_level = None  # właściciel usunął stop: klucz znika
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="PUT")  # bez skutku
+    with pytest.raises(BrokerTimeout, match="stop outcome unknown") as info:
+        await broker.set_stop(pos.deal_id, Decimal("25732.3"))
+    assert info.value.__context__ is None and info.value.__cause__ is None
+    assert broker._deal_stops[pos.deal_id] == Decimal("25742.3")  # nic nie zapisano z nieudanej próby
+    assert only_position(server).stop_level is None
+
+
+async def test_confirm_stop_level_does_not_mask_a_missing_position_stop_after_keys_were_seen(server, broker):
+    server.position_stop_keys = "when-set"
+    server.confirm_stop_keys = True
+    await broker.login()
+    await seen_stop_keys(server, broker)
+    ack = await broker.open_position(entry())
+    only_position(server).stop_level = None  # pozycja bez stopu (w trybie when-set: bez klucza)
+    snapshot = await broker.confirm(ack.deal_reference)
+    assert (snapshot.stop_level, snapshot.stop_derived) == (None, False)  # wykonawca zabezpieczy pozycję
+
+
+@pytest.mark.parametrize("keys_seen", [False, True])
+async def test_confirm_of_a_position_closed_before_the_read_keeps_the_derived_stop(server, broker, keys_seen):
+    await broker.login()
+    if keys_seen:
+        await seen_stop_keys(server, broker)
+    ack = await broker.open_position(entry())
+    [deal_id] = list(server.positions)
+    server.trigger_stop(deal_id, "25752.3")  # wybita stopem przed naszym odczytem
+    snapshot = await broker.confirm(ack.deal_reference)
+    # pozycji już nie ma: reguła „brak klucza = brak stopu” nie ma tu zastosowania (nie ma czego chronić)
+    assert (snapshot.stop_level, snapshot.stop_derived) == (OFFER - 30, True)
+
+
+@pytest.mark.parametrize("keys_seen", [False, True])
+async def test_set_stop_accepts_a_reply_with_only_stop_distance(server, broker, keys_seen):
+    await broker.login()
+    if keys_seen:
+        await seen_stop_keys(server, broker)
+    _, pos = await open_confirmed(broker)
+    item = server._position_item(only_position(server))
+    item["position"]["stopDistance"] = BID - Decimal("25742.3")  # odległość od notowania, nie od wykonania (C6)
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")
+    await broker.set_stop(pos.deal_id, Decimal("25742.3"))  # porównujemy tylko zgłoszony `stopLevel`
+    assert only_position(server).stop_level == Decimal("25742.3")
+
+
+async def test_set_stop_with_a_null_stop_distance_is_a_broker_error(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    item = server._position_item(only_position(server))
+    item["position"]["stopDistance"] = None  # broker mówi: brak stopu
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")
+    with pytest.raises(BrokerError) as info:
+        await broker.set_stop(pos.deal_id, Decimal("25742.3"))
+    assert type(info.value) is BrokerError
+
+
+async def test_a_lookback_reply_with_another_deal_means_the_filter_was_not_honoured(server, broker):
+    since = T0 - timedelta(hours=1)
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL", level="25001.0"))
+    rows = [
+        activity("X-9", since - timedelta(hours=2), source="USER", direction="SELL"),
+        activity("F-1", since - timedelta(hours=3), source="USER", direction="BUY"),
+    ]
+    server.fail_request("/history/activity", 2, 200, {"activities": rows}, method="GET")  # drugie żądanie = wstecz
+    await broker.login()
+    with pytest.raises(BrokerError) as info:
+        await broker.closed_since(since)
+    assert type(info.value) is BrokerError and "filter not honoured" in str(info.value)
+    assert server.requests("GET", "/history/activity")[1].query["dealId"] == "F-1"
+
+
+async def test_a_lookback_row_without_a_deal_id_is_rejected_too(server, broker):
+    since = T0 - timedelta(hours=1)
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL"))
+    row = activity("F-1", since - timedelta(hours=3), source="SYSTEM", type="SWAP")
+    del row["dealId"]
+    server.fail_request("/history/activity", 2, 200, {"activities": [row]}, method="GET")
+    await broker.login()
+    with pytest.raises(BrokerError, match="filter not honoured"):
+        await broker.closed_since(since)

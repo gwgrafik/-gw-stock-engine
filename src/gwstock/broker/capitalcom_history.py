@@ -136,12 +136,15 @@ class DealRow:
     key: tuple = field(repr=False)  # tożsamość zdarzenia (identyczne wiersze to jedno zdarzenie)
 
 
-def parse_activity(payload: Any, start: datetime, end: datetime) -> tuple[int, list[DealRow]]:
+def parse_activity(
+    payload: Any, start: datetime, end: datetime, only_deal: str | None = None
+) -> tuple[int, list[DealRow]]:
     """(liczba wszystkich wierszy odpowiedzi, wiersze `POSITION`/`ACCEPTED`); zły kształt → `ParseError`.
 
     Każdy wiersz (każdego typu) musi mieć `dateUTC` w zapytanym oknie [start, end + 1 s): wiersz spoza niego znaczy,
     że broker nie zastosował filtra tak, jak zakładamy (np. zignorował zakres albo filtruje po czasie lokalnym), a
-    wtedy lista mogłaby być niepełna bez śladu.
+    wtedy lista mogłaby być niepełna bez śladu. Z `only_deal` (zapytanie z filtrem `dealId`) każdy wiersz musi mieć
+    dokładnie ten `dealId`; inny albo brak → `ParseError` (filtr nie zadziałał).
     """
     rows = items(get(obj(payload, ""), "activities", ""), "activities")
     deals: list[DealRow] = []
@@ -151,6 +154,8 @@ def parse_activity(payload: Any, start: datetime, end: datetime) -> tuple[int, l
         ts = utc_stamp(row, "dateUTC", where)
         if not start <= ts < end + WINDOW_OVERLAP:
             raise ParseError(f"{where}.dateUTC: outside the requested window")
+        if only_deal is not None and row.get("dealId") != only_deal:
+            raise ParseError(f"{where}.dealId: another deal in a dealId-filtered answer (filter not honoured)")
         kind, status = text(row, "type", where), text(row, "status", where)
         if kind != POSITION:
             if kind not in _IGNORED_TYPES:

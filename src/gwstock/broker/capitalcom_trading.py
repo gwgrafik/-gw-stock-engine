@@ -28,7 +28,9 @@ Zasady:
   `BrokerRejected(reason)`; cokolwiek innego → `BrokerTimeout("close outcome unknown")`; 404
   `error.not-found.dealId` na `DELETE` → `BrokerRejected("POSITION_NOT_FOUND")`;
 - `set_stop`: `PUT` ze `stopLevel`, potwierdzenie z naszym dealId jako `AMENDED` (inaczej `BrokerTimeout`), jego
-  `stopLevel` i stop pozycji (jeśli broker je pokazuje) równe żądanemu (inaczej `BrokerError`);
+  `stopLevel` i `stopLevel` pozycji (jeśli broker je podaje; sam `stopDistance` nie jest porównywany, C6) równe
+  żądanemu (inaczej `BrokerError`); broker pokazywał już klucze stopu, a pozycja po `PUT` nie ma żadnego →
+  `BrokerTimeout` bez zapisu;
 - powód odrzucenia w potwierdzeniu nazywający zamknięty rynek → `MarketClosedRejection` (jednocześnie
   `BrokerRejected` i `MarketClosed`);
 - `closed_since`: kompletność albo wyjątek (szczegóły w `capitalcom_history`); zakres > 14 dni →
@@ -208,7 +210,7 @@ class TradingMixin:
             opened_at, stop_reported, stop = row.opened_at, row.stop_reported, row.stop_level
         else:  # pozycja już zamknięta (stop, ręcznie): czas otwarcia z wiersza otwarcia w historii
             opened_at = await self._opened_at_from_history(opening, where)
-        stop, derived = self._snapshot_stop(reference, opening, where, stop_reported, stop)
+        stop, derived = self._snapshot_stop(reference, opening, where, reply is not None, stop_reported, stop)
         snapshot = self._parse(
             where, build, OpenPosition, "confirm", opening.deal_id, opening.epic, opening.side, opening.size,
             opening.level, stop, opened_at, derived,
@@ -219,12 +221,20 @@ class TradingMixin:
         return snapshot
 
     def _snapshot_stop(
-        self, reference: str, opening: Opening, where: str, position_reported: bool, position_stop: Decimal | None
+        self,
+        reference: str,
+        opening: Opening,
+        where: str,
+        position_read: bool,
+        position_reported: bool,
+        position_stop: Decimal | None,
     ) -> tuple[Decimal | None, bool]:
-        """(stop migawki, stop_derived). Kolejność: stop pozycji pokazany przez brokera; po raz pierwszy brak klucza,
-        choć broker już kiedyś klucze pokazywał → brak stopu; inaczej nasz zapis (wykonanie ∓ wysłana odległość),
-        sprawdzony z `stopLevel` potwierdzenia, gdy je ma (różnica → `BrokerError`, C6); bez zapisu `stopLevel`
-        potwierdzenia albo None."""
+        """(stop migawki, stop_derived). Kolejność: stop pokazany przez brokera w odczycie pozycji; odczyt pozycji BEZ
+        klucza, choć broker już kiedyś klucze pokazywał → brak stopu (także gdy potwierdzenie ma `stopLevel`: liczy się
+        stan pozycji, wykonawca ją zabezpieczy); inaczej nasz zapis (wykonanie ∓ wysłana odległość, `stop_derived`),
+        sprawdzony ze `stopLevel` potwierdzenia, gdy je ma (różnica → `BrokerError`, C6); bez zapisu `stopLevel`
+        potwierdzenia albo None. Pozycji już nie ma (zamknięta przed odczytem): reguła kluczy nie ma zastosowania,
+        bo nie ma czego chronić, więc migawka niesie wyliczony stop (oznaczony)."""
         if position_reported:
             return position_stop, False
         candidate = None
@@ -237,8 +247,8 @@ class TradingMixin:
                 f"{where}: the confirmation's stopLevel {opening.stop_level} differs from the stop {candidate} derived "
                 "from our request (fill level ∓ stopDistance, C6)",
             )
-        if self._stop_keys_seen:
-            return (opening.stop_level if opening.stop_reported else None), False
+        if position_read and self._stop_keys_seen:
+            return None, False
         if candidate is not None:
             return candidate, True
         return (opening.stop_level if opening.stop_reported else None), False
@@ -287,8 +297,11 @@ class TradingMixin:
         """`PUT /positions/{dealId}` ze `stopLevel`, potwierdzenie i odczyt kontrolny pozycji; zapis stopu po sukcesie.
 
         Sukces wymaga (C3): potwierdzenia ACCEPTED z naszym dealId jako `AMENDED` (inaczej wynik nieznany:
-        `BrokerTimeout`), równego `stopLevel` w potwierdzeniu, jeśli je ma, oraz równego stopu pozycji, jeśli
-        broker go pokazuje (różnica → `BrokerError`, nie sukces). Pozycja zniknęła → `BrokerRejected("POSITION_NOT_FOUND")`.
+        `BrokerTimeout`), równego `stopLevel` w potwierdzeniu, jeśli je ma, oraz równego `stopLevel` pozycji, jeśli
+        broker go podaje (różnica albo `null` → `BrokerError`, nie sukces; sam `stopDistance` nie jest porównywany,
+        bo jego punkt odniesienia jest niepotwierdzony, C6). Gdy broker pokazywał już klucze stopu, a pozycja po `PUT`
+        nie ma żadnego: wynik nieznany (`BrokerTimeout`), nic nie jest zapisywane. Pozycja zniknęła →
+        `BrokerRejected("POSITION_NOT_FOUND")`.
         """
         deal_id = check_ident("deal_id", deal_id)
         if not isinstance(stop_level, Decimal):
@@ -320,11 +333,16 @@ class TradingMixin:
                     raise self._error(BrokerRejected, POSITION_NOT_FOUND)
                 row = self._parse(f"GET {path}", parse_position, reply)
                 self._note_stop_keys([row])
-                if row.deal_id != deal_id or (row.stop_reported and row.stop_level != stop_level):
+                # porównujemy tylko `stopLevel` podany wprost; sam `stopDistance` nie mówi, od czego liczono (C6),
+                # ale `null` znaczy brak stopu
+                no_stop = row.stop_reported and row.stop_level is None
+                if row.deal_id != deal_id or no_stop or (row.stop_level_reported and row.stop_level != stop_level):
                     raise self._error(
                         BrokerError,
                         f"GET {path}: the position's stop {row.stop_level} differs from the requested {stop_level}",
                     )
+                if self._stop_keys_seen and not row.stop_reported:  # broker pokazuje klucze, a tu ich nie ma: brak stopu
+                    problem = f"GET {path}: the broker shows stop keys, but this position has none after the PUT"
         if problem is not None:
             raise self._error(BrokerTimeout, f"{where}: stop outcome unknown ({problem})")
         _remember(self._deal_stops, deal_id, stop_level)
@@ -477,7 +495,7 @@ class TradingMixin:
                 params["dealId"] = deal_id
             budget.left -= 1
             payload = await self._request("GET", "/history/activity", params=params)
-            count, rows = self._parse(where, history.parse_activity, payload, start, end)
+            count, rows = self._parse(where, history.parse_activity, payload, start, end, deal_id)
             if count >= history.ACTIVITY_SUSPECT_ROWS:
                 halves = history.split_window(start, end)
                 if halves is None:

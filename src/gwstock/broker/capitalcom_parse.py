@@ -539,7 +539,9 @@ def check_amendment(payload: Any, deal_id: str) -> tuple[bool, Decimal | None]:
 
 @dataclass(frozen=True)
 class PositionRow:
-    """Element `GET /positions` / `GET /positions/{dealId}` (§2.11). `stop_reported`: klucz stopu był w odpowiedzi."""
+    """Element `GET /positions` / `GET /positions/{dealId}` (§2.11). `stop_reported`: jakikolwiek klucz stopu był w
+    odpowiedzi; `stop_level_reported`: był klucz `stopLevel` (poziom podany wprost, nie wyliczony z `stopDistance`,
+    którego punkt odniesienia, wykonanie czy notowanie, jest niepotwierdzony: C6)."""
 
     deal_id: str
     working_order_id: str | None
@@ -550,6 +552,7 @@ class PositionRow:
     opened_at: datetime
     stop_reported: bool
     stop_level: Decimal | None
+    stop_level_reported: bool = False
 
 
 def parse_position(item: Any, where: str = "") -> PositionRow:
@@ -585,6 +588,7 @@ def parse_position(item: Any, where: str = "") -> PositionRow:
         opened_at=utc_stamp(position, "createdDateUTC", pos_where),
         stop_reported=reported,
         stop_level=stop,
+        stop_level_reported="stopLevel" in position,
     )
 
 
