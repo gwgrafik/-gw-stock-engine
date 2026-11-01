@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 import gwstock.cli as cli
+import gwstock.execution as execution_mod
 from gwstock.app import EngineMisconfigured, Mode
 from gwstock.broker.fake import FakeBroker, _Rejected
 from gwstock.config import RuntimeConfig, load_runtime
@@ -1428,6 +1429,36 @@ async def test_resolve_lost_trade_books_exactly_a_listed_deal_without_a_stop_clo
     assert resolve_audit(engine.journal)[0]["listing"]["stop_level"] is None
 
 
+async def test_resolve_lost_trade_refuses_without_a_closure_when_a_listed_position_had_no_stop(engine, broker, clock):
+    # ruling I1: pozycja na liście bez stopu i bez zamknięcia w historii: straty nie da się ograniczyć, więc odmowa
+    await rejected_but_listed(engine, broker, clock, with_stop=False)
+    broker.positions.pop("DEAL-1")  # zniknęła, a historia (jeszcze) nie pokazuje zamknięcia
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed(), out=lines.append) == 1
+    reason = "pozycja DEAL-1 była na liście brokera bez stopu: bez zamknięcia w historii straty nie da się ograniczyć"
+    assert reason in lines[-1]
+    assert engine.journal.trades() == []
+
+
+async def test_resolve_lost_trade_says_truthfully_what_a_failed_booking_left_in_the_journal(
+    engine, broker, clock, monkeypatch
+):
+    # m9: po wierszu audytu BOOKING nieudane księgowanie nie może twierdzić, że „nic nie zmieniono”
+    await lost_trade(engine, broker, clock)
+
+    async def failing_book(*_args, **_kwargs):
+        raise execution_mod.BookingError("cannot book DEAL-1 from an estimate: gross 0.00 is not a loss")
+
+    monkeypatch.setattr(engine.executor, "book", failing_book)
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed("DEAL-1", "SZACUNEK"), out=lines.append) == 1
+    assert "nic nie zaksięgowano" in lines[-1] and "został tylko wiersz audytu BOOKING" in lines[-1]
+    assert not lines[-1].endswith("nic nie zmieniono")
+    assert [a["phase"] for a in resolve_audit(engine.journal)] == ["BOOKING", "REFUSED"]
+    assert resolve_audit(engine.journal)[-1]["code"] == "BOOKING_FAILED"
+    assert engine.journal.get_order(LOST_CID).state is OrderState.UNKNOWN
+
+
 async def test_resolve_lost_trade_refuses_a_chosen_closure_the_journal_never_tied_to_the_order(engine, broker, clock):
     order = await lost_trade(engine, broker, clock)  # dziennik zapisał dla zlecenia zamknięcie DEAL-1
     broker._closed[:] = [replace(broker._closed[0], deal_id="DEAL-4")]  # historia pokazuje inny deal
@@ -1594,6 +1625,18 @@ def edit_position(engine, **over):
     engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), **over))
 
 
+def edit_entry_context(engine, **over):
+    key = f"entry_ctx:{LOST_CID}"
+    engine.journal.set_meta(key, json.dumps({**json.loads(engine.journal.get_meta(key)), **over}))
+
+
+def journal_listing(engine, clock, **over):
+    """Zapis listy pozycji brokera z dealem DEAL-1 (jak po odczycie menedżera albo uzgadniania), z innymi polami."""
+    row = {"deal_id": "DEAL-1", "epic": "DE40", "side": "BUY", "size": "0.001", "open_level": str(MID + 1),
+           "stop_level": str(MID + 1 - 30), "opened_at": clock.now_utc().isoformat(), "stop_derived": False, **over}
+    engine.journal.append_raw("broker.list_positions", json.dumps({"response": [row]}), clock.now_utc())
+
+
 def foreign_position(clock):
     return OpenPosition("DEAL-5", "DE40", Side.BUY, D("0.001"), MID, MID - 30, clock.now_utc())
 
@@ -1660,6 +1703,18 @@ REFUSALS = {
     "confirm_names_another_deal": (
         lambda e, b, c: contradicting_confirm(b, deal_id="DEAL-9"), True, ("DEAL-1",),
         "wskazuje DEAL-9 BUY DE40, a nie wpisane zamknięcie DEAL-1",
+    ),
+    "entry_context_contradicts_the_order": (
+        lambda e, b, c: edit_entry_context(e, side="SELL"), False, ("DEAL-1",),
+        "kontekst wejścia zlecenia gws-20261102-DE40-1-entry ma kierunek SELL, a zlecenie BUY",
+    ),
+    "journaled_listing_contradicts_the_order": (
+        lambda e, b, c: journal_listing(e, c, side="SELL"), False, ("DEAL-1",),
+        "lista pozycji brokera w dzienniku pokazuje DEAL-1 SELL, a zlecenie gws-20261102-DE40-1-entry to BUY",
+    ),
+    "journaled_listing_unreadable": (
+        lambda e, b, c: journal_listing(e, c, size="many"), False, ("DEAL-1",),
+        "zapis listy pozycji brokera z dealem DEAL-1 w dzienniku jest nieczytelny",
     ),
     "value_per_point_mismatch": (
         lambda e, b, c: e.journal.set_meta(

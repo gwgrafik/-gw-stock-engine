@@ -1449,7 +1449,7 @@ def _listed_position(journal: Any, epic: str, deal_id: str) -> OpenPosition | No
     """Ostatni zapis brokera z tym dealem na liście pozycji (`broker.list_positions` menedżera, wykonawcy albo
     uzgadniania): prawdziwy kierunek, wielkość, poziom otwarcia i stop. None: broker nigdy go nie pokazał.
     Zapis z tym dealem, którego nie da się odczytać: ValueError (dowód może istnieć, nie zgadujemy)."""
-    needle = f'"deal_id":{json.dumps(deal_id)}'
+    needle = json.dumps(deal_id)  # szybki filtr wierszy: identyfikator jako napis JSON, niezależnie od formatowania
     for e in reversed(journal.events(SOURCE_POSITIONS)):
         if needle not in e.payload:
             continue
