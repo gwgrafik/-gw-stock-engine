@@ -1,0 +1,71 @@
+# CI gw-stock-engine (spec sekcja 12): testy logiki w macierzy Pythona oraz w obrazie Dockera.
+#
+# Zasady:
+# - CI NIE dostaje żadnych sekretów, kluczy brokera ani dostępu do VPS (spec sekcja 12). Testy
+#   `integration_live_readonly` nie biegną tu nigdy (znacznik wyklucza je z kolejki), a wdrożenie jest ręczne.
+# - Uprawnienia tokenu: tylko odczyt zawartości. Żadnych uprzywilejowanych wyzwalaczy, zapisu ani publikacji.
+# - Akcje zewnętrzne przypięte do PEŁNEGO skrótu commita (komentarz podaje tag). SHA ustalono 2026-11-01 z publicznego
+#   repozytorium akcji (`git ls-remote`, tagi lekkie wskazują bezpośrednio na commit); nowszy tag wybiera właściciel
+#   i przypina np. Dependabotem (`package-ecosystem: github-actions`) albo `pin-github-action`.
+# - Wypchnięcie pliku z `.github/workflows/` może wymagać uprawnienia `workflow` po stronie integracji GitHub
+#   (spec, pytanie 17); w razie odmowy właściciel dodaje ten plik przez interfejs GitHub.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  tests:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Zależności (przypięte wersje, z pliku lock)
+        run: python -m pip install -r requirements-dev.lock
+      - name: Strażnik live (pliki uzbrojenia, zaszyte klucze, live_allowed)
+        run: python scripts/hooks/guard_live.py --scan
+      - name: Testy (bez testów live; ostrzeżenia jako błędy)
+        run: python -m pytest -m "not integration_live_readonly" -q -W error
+
+  image:
+    name: image (testy w obrazie, bez sieci)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Budowa celu test
+        run: docker build -f docker/Dockerfile --target test -t gw-stock-engine:test .
+      - name: Testy w obrazie (bez sieci, system plików tylko do odczytu, jak w Compose)
+        run: >-
+          docker run --rm --network none --read-only --tmpfs /tmp:size=128m --cap-drop ALL
+          --security-opt no-new-privileges:true gw-stock-engine:test
+      - name: Budowa celu runtime
+        run: docker build -f docker/Dockerfile --target runtime -t gw-stock-engine:runtime .
+      - name: Obraz runtime importuje silnik (bez sieci)
+        run: >-
+          docker run --rm --network none --read-only --cap-drop ALL gw-stock-engine:runtime
+          python -c "import gwstock; import gwstock.calendar"

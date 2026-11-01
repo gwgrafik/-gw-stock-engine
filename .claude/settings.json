@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/scripts/hooks/guard_live.py"],
+            "timeout": 30,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(//home/claude/.config/gw/**)",
+      "Read(~/.config/gw/**)",
+      "Read(**/capitalcom*.json)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(/data/account.json)",
+      "Edit(**/ARM_LIVE)",
+      "Edit(**/L1_PASSED)",
+      "Bash(touch *ARM_LIVE*)",
+      "Bash(*touch *ARM_LIVE*)",
+      "Bash(tee *ARM_LIVE*)",
+      "Bash(*tee *ARM_LIVE*)",
+      "Bash(*>*ARM_LIVE*)",
+      "Bash(install *ARM_LIVE*)",
+      "Bash(ln *ARM_LIVE*)",
+      "Bash(cp *ARM_LIVE*)",
+      "Bash(mv *ARM_LIVE*)",
+      "Bash(dd *ARM_LIVE*)",
+      "Bash(truncate *ARM_LIVE*)",
+      "Bash(*python* -c*ARM_LIVE*)",
+      "Bash(touch *L1_PASSED*)",
+      "Bash(*touch *L1_PASSED*)",
+      "Bash(tee *L1_PASSED*)",
+      "Bash(*tee *L1_PASSED*)",
+      "Bash(*>*L1_PASSED*)",
+      "Bash(install *L1_PASSED*)",
+      "Bash(ln *L1_PASSED*)",
+      "Bash(cp *L1_PASSED*)",
+      "Bash(mv *L1_PASSED*)",
+      "Bash(dd *L1_PASSED*)",
+      "Bash(truncate *L1_PASSED*)",
+      "Bash(*python* -c*L1_PASSED*)",
+      "Bash(sed -i*runtime.toml*)",
+      "Bash(tee *runtime.toml*)",
+      "Bash(*>*runtime.toml*)"
+    ]
+  }
+}
