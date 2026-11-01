@@ -38,7 +38,8 @@ Zasady:
 - `closed_since`: kompletność albo wyjątek (szczegóły w `capitalcom_history`); zakres > 14 dni →
   `HISTORY_RANGE_TOO_LARGE` przed zapytaniem; okna ≤ 1 doba; obcięte okno dzielone; nieudane okno → wyjątek; deal,
   którego otwarcia nie ma w zakresie, jest szukany wstecz z filtrem `dealId` (do 14 dni, wspólny limit zapytań;
-  wyniki okien w całości przed `since` są zapamiętywane, najwyżej `LOOKBACK_CACHE_LIMIT` okien);
+  wyniki okien w całości przed `since` i skończonych co najmniej `LOOKBACK_CACHE_MIN_AGE` temu są zapamiętywane,
+  najwyżej `LOOKBACK_CACHE_LIMIT` okien);
 - pamięć adaptera (wysłane odległości stopu, stopy deali, strony deali, migawki potwierdzeń) jest ograniczona do
   `RECORD_LIMIT` wpisów na tablicę (najstarsze wypadają).
 """
@@ -47,7 +48,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -86,6 +87,8 @@ RECORD_LIMIT = 256
 """Najwięcej wpisów w każdej tablicy pamięci adaptera (referencje, deale, migawki)."""
 LOOKBACK_CACHE_LIMIT = 64
 """Najwięcej zapamiętanych okien wyszukiwania wstecz (deal, okno w całości przed `since`); najstarsze wypadają."""
+LOOKBACK_CACHE_MIN_AGE = timedelta(hours=23)
+"""Okno trafia do pamięci tylko, gdy skończyło się co najmniej tyle przed teraz (opóźnienie historii to sekundy, C7)."""
 NOT_FOUND_DEAL = "error.not-found.dealId"
 NOT_FOUND_REFERENCE = "error.not-found.dealReference"
 POSITION_NOT_FOUND = "POSITION_NOT_FOUND"
@@ -205,7 +208,9 @@ class TradingMixin:
                 ("dealId", row.deal_id == opening.deal_id),
                 ("epic", row.epic == opening.epic),
                 ("direction", row.side is opening.side),
-                ("size", row.size == opening.size),  # większa pozycja: zlecenie dołączyło do innej (C15)
+                # większa pozycja: zlecenie dołączyło do innej (C15); obie wielkości są w komunikacie, bo surowa
+                # odpowiedź pozycji nie trafia do dziennika (to liczby, nigdy sekrety)
+                (f"size: confirm {opening.size}, position {row.size}", row.size == opening.size),
                 # pozycja.workingOrderId == potwierdzenie.dealId (notatki §2.15, C2), gdy oba są podane
                 ("workingOrderId", None in (row.working_order_id, opening.order_id)
                  or row.working_order_id == opening.order_id),
@@ -213,7 +218,7 @@ class TradingMixin:
             mismatch = [name for name, ok in checks if not ok]
             if mismatch:
                 raise self._error(
-                    BrokerError, f"GET {path}: the position does not match the confirmation ({', '.join(mismatch)})"
+                    BrokerError, f"GET {path}: the position does not match the confirmation ({'; '.join(mismatch)})"
                 )
             self._note_stop_keys([row])
             opened_at, stop_reported, stop = row.opened_at, row.stop_reported, row.stop_level
@@ -470,7 +475,7 @@ class TradingMixin:
         windows = history.lookback_windows(since, now - history.HISTORY_MAX_RANGE)
         for deal_id in sorted(undecided):
             for window in windows:
-                for row in await self._lookback_rows(deal_id, window, since, budget):
+                for row in await self._lookback_rows(deal_id, window, since, now, budget):
                     merged.setdefault(row.key, row)
                 deal_rows = [r for r in merged.values() if r.deal_id == deal_id]
                 verdict = history.classify(deal_rows, self._deal_sides)
@@ -479,20 +484,25 @@ class TradingMixin:
         return list(merged.values())
 
     async def _lookback_rows(
-        self, deal_id: str, window: tuple[datetime, datetime], since: datetime, budget: _Budget
+        self, deal_id: str, window: tuple[datetime, datetime], since: datetime, now: datetime, budget: _Budget
     ) -> tuple[DealRow, ...]:
         """Wiersze deala w jednym oknie wyszukiwania wstecz (filtr `dealId`), kompletne albo wyjątek.
 
-        Okno w całości przed `since` (koniec < `since`, więc co najmniej ok. doby przed teraz: późne wiersze już nie
-        dochodzą) jest zapamiętywane w ograniczonej pamięci (`LOOKBACK_CACHE_LIMIT`, klucz z rachunkiem sesji), więc
-        kolejne odczyty z tym samym `since` nie powtarzają zapytań. Okno sięgające `since` jest zawsze czytane od nowa.
+        Okno, które się już nie zmieni, jest zapamiętywane w ograniczonej pamięci (`LOOKBACK_CACHE_LIMIT`, klucz z
+        rachunkiem sesji), więc kolejne odczyty z tym samym `since` nie powtarzają zapytań, a trafienie nie zużywa
+        limitu zapytań. Warunek zapisu jest tutaj, nie w budowie okien: okno kończy się przed `since` ORAZ co najmniej
+        `LOOKBACK_CACHE_MIN_AGE` przed teraz (opóźniony wiersz już nie dojdzie); okno sięgające `since` jest zawsze
+        czytane od nowa. Błąd odczytu nic nie zapisuje (wyjątek idzie przed zapisem, nigdy pusty wynik). Rachunek sesji
+        zmieniony w trakcie żądania (ponowne logowanie) oznacza, że nie wiadomo, czyje to wiersze: bez zapisu.
         """
-        key = (self._session_account_id, deal_id, *window)
+        account = self._session_account_id
+        key = (account, deal_id, *window)
         cached = self._lookback_cache.get(key)
         if cached is not None:
             return cached
         rows = tuple(await self._activity_rows([window], budget, deal_id=deal_id))
-        if window[1] < since:
+        settled = window[1] < since and window[1] <= now - LOOKBACK_CACHE_MIN_AGE
+        if settled and account is not None and self._session_account_id == account:
             _remember(self._lookback_cache, key, rows, LOOKBACK_CACHE_LIMIT)
         return rows
 

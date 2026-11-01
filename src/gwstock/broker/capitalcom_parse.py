@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -28,6 +29,10 @@ _FIELD = re.compile(r"[A-Za-z]+\.[A-Za-z_]+")
 # identyfikator brokera, który trafia do ścieżki URL (dealId, dealReference): bez `/`, `?`, `#`, spacji, `.`/`..`
 _IDENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
 _MAX_RAW_REASON_LEN = 4096
+_MAX_EXPONENT = 30
+"""Liczba z odpowiedzi brokera (cena, wielkość, saldo) ma rząd wielkości co najwyżej 10^30 w obie strony (zero zawsze
+przechodzi): absurdalny wykładnik mieści się jeszcze w `Decimal` (`1e999999999`), ale każde działanie na nim kończy się
+`decimal.Overflow`, więc odpowiedź z takim polem odrzucamy od razu, razem z nazwą pola."""
 
 
 class ParseError(ValueError):
@@ -52,7 +57,8 @@ def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def loads(raw: bytes | str) -> Any:
-    """JSON z liczbami jako `Decimal`; NaN, Infinity, powtórzony klucz i zły tekst → `ParseError`."""
+    """JSON z liczbami jako `Decimal`; NaN, Infinity, powtórzony klucz, zły tekst i liczba z wykładnikiem poza zakresem
+    `Decimal` (np. `1e99999999999999999999`) → `ParseError`."""
     problem = "not valid JSON"
     try:
         return json.loads(
@@ -64,8 +70,8 @@ def loads(raw: bytes | str) -> Any:
         )
     except _Duplicate:
         problem = "duplicate key in a JSON object"
-    except (ValueError, RecursionError):
-        pass
+    except (ValueError, RecursionError, ArithmeticError):
+        pass  # ArithmeticError: wykładnik liczby poza zakresem `Decimal` (`decimal.InvalidOperation` przy parsowaniu)
     raise ParseError(problem)
 
 
@@ -132,6 +138,8 @@ def dec(d: dict[str, Any], key: str, where: str) -> Decimal:
     value = get(d, key, where)
     if not isinstance(value, Decimal) or not value.is_finite():
         raise ParseError(f"{path(where, key)}: expected a JSON number, got {type(value).__name__}")
+    if value and abs(value.adjusted()) > _MAX_EXPONENT:  # np. 1e999999999: mieści się w Decimal, ale nie w niczym innym
+        raise ParseError(f"{path(where, key)}: number out of range")
     return value
 
 
@@ -313,12 +321,14 @@ _EXPECTED_SNAPSHOT_FIELDS = (("delayTime", Decimal(0)), ("scalingFactor", Decima
 _MAX_SHOWN_NUMBER_LEN = 24
 
 
-def snapshot_anomalies(payload: Any) -> list[str]:
+def snapshot_anomalies(payload: Any, scrub: Callable[[str], str] = lambda raw: raw) -> list[str]:
     """Opisy pól `snapshot.delayTime` ≠ 0 i `snapshot.scalingFactor` ≠ 1 z `GET /markets/{epic}` (np.
     `snapshot.delayTime=15`); brak pola albo migawki to nie anomalia, a zły kształt nie jest tu błędem.
 
     Znaczenie obu pól jest nieopisane (C10), w odczycie live DE40 to 0 i 1. Wynik służy tylko ostrzeżeniu: liczba
-    jest pokazana (przycięta), każda inna wartość jako znacznik bez treści (`shown`).
+    jest pokazana (przycięta), każda inna wartość jako znacznik bez treści (`shown`). `scrub` (adapter podaje
+    swoje usuwanie sekretów) działa na PEŁNYM zapisie liczby, dopiero potem następuje przycięcie: przycięta liczba
+    zostawiłaby początek sekretu złożonego z cyfr.
     """
     snapshot = payload.get("snapshot") if isinstance(payload, dict) else None
     if not isinstance(snapshot, dict):
@@ -330,7 +340,7 @@ def snapshot_anomalies(payload: Any) -> list[str]:
         value = snapshot[key]
         if isinstance(value, Decimal) and value == expected:
             continue
-        text_value = str(value)[:_MAX_SHOWN_NUMBER_LEN] if isinstance(value, Decimal) else shown(value)
+        text_value = scrub(str(value))[:_MAX_SHOWN_NUMBER_LEN] if isinstance(value, Decimal) else shown(value)
         found.append(f"snapshot.{key}={text_value}")
     return found
 

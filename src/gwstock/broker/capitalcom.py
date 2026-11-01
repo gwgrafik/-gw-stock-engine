@@ -529,7 +529,11 @@ class CapitalComBroker(TradingMixin):
             error = self._status_error(where, resp)
             code = _error_code(resp.body)
             # 403 bez errorCode Capital.com to strona brzegowa/WAF (przejściowa), a 403 z kodem przeciążenia, limitu
-            # albo przerwy technicznej też jest przejściowe: żadne z nich nie jest odrzuceniem danych logowania
+            # albo przerwy technicznej też jest przejściowe: żadne z nich nie jest odrzuceniem danych logowania.
+            # Znane ryzyko (decyzja kontrolera, przegląd G5 m5): 403 z kodem zawierającym `too-many` albo
+            # `unavailable`, który w rzeczywistości oznaczałby blokadę klucza, byłby ponawiany z odstępem do 300 s
+            # zamiast zatrzymać logowania; właściciel widzi go w alarmie LOGIN_FAILED (kod w treści) po 3 próbach.
+            # Dotyczy tylko 403: 401 zawsze liczy się do blokady.
             credential_403 = resp.status == 403 and code is not None and not _is_transient_code(code)
             if resp.status == 401 or credential_403 or code in _CREDENTIAL_ERROR_CODES:
                 raise self._error(BrokerAuthError, str(error))  # dane logowania odrzucone: nie ponawiać w kółko
@@ -843,7 +847,7 @@ class CapitalComBroker(TradingMixin):
         znaczenie pól jest nieopisane (C10), a ceny są używane tak, jak je podał broker."""
         if epic in self._snapshot_warned:
             return
-        found = snapshot_anomalies(payload)
+        found = snapshot_anomalies(payload, self._scrub)
         if found:
             self._snapshot_warned.add(epic)
             _LOG.warning(
@@ -863,8 +867,8 @@ class CapitalComBroker(TradingMixin):
         do teraz − `CANDLE_TO_SKEW_MARGIN_S` (pełne sekundy): pytanie o przyszłość brokera (zegar silnika może się
         spieszyć) mogłoby zostać odrzucone, a zakończona świeca ma znacznik ≤ teraz − 5 min (≤ teraz przy znaczniku =
         koniec okresu; wtedy świeca zakończona przed chwilą przyjdzie w odczycie po upływie marginesu). Okno puste po
-        obcięciu → [] bez zapytania; `max` liczony z okna obciętego. Wynik jest filtrowany lokalnie po
-        `snapshotTimeUTC`; pusta lista jest poprawna (świec jeszcze nie ma).
+        obcięciu albo krótsze niż sekunda (`from` == `to`) → [] bez zapytania; `max` liczony z okna obciętego. Wynik
+        jest filtrowany lokalnie po `snapshotTimeUTC`; pusta lista jest poprawna (świec jeszcze nie ma).
         """
         path = f"/prices/{_check_epic(epic)}"
         start, end = _utc_arg("start", start), _utc_arg("end", end)
@@ -879,7 +883,7 @@ class CapitalComBroker(TradingMixin):
             )
         newest = self._clock.now_utc() - timedelta(seconds=CANDLE_TO_SKEW_MARGIN_S)
         last = min(end + shift, newest).replace(microsecond=0)
-        if last < first:
+        if last <= first:  # `from` == `to` się nie wysyła (jak w historii): następny odczyt ma okno dłuższe
             return []
         points = (last - first) // _FIVE_MINUTES + 2
         params = {"resolution": "MINUTE_5", "from": _api_time(first), "to": _api_time(last), "max": str(points)}

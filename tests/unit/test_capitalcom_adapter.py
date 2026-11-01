@@ -21,7 +21,7 @@ import pytest
 from gwstock.broker import capitalcom
 from gwstock.broker.base import Broker, Capabilities
 from gwstock.broker.capitalcom import LIVE_BASE_URL, CapitalComBroker, Credentials, api_root, load_credentials
-from gwstock.broker.capitalcom_parse import ParseError, loads
+from gwstock.broker.capitalcom_parse import ParseError, dec, loads
 from gwstock.types import (
     AccountInfo,
     BrokerAuthError,
@@ -395,9 +395,20 @@ async def test_refused_login_is_a_credential_error_not_session_expired(server, m
         (429, {"errorCode": "error.too-many.requests"}, False),
         (500, None, False),
         (503, {"errorCode": "error.service.unavailable"}, False),
+        # 401 to zawsze odrzucenie danych logowania, także gdy kod brzmi jak przeciążenie (liczy się do blokady);
+        # wyjątek dla kodów przejściowych dotyczy tylko 403
+        (401, {"errorCode": "error.too-many.requests"}, True),
+        (401, {"errorCode": "error.service.unavailable"}, True),
+        (401, {"errorCode": "error.maintenance"}, True),
+        # 403 z kodem `error.invalid.*` (np. zły klucz API) to odrzucenie danych: żaden fragment kodu przejściowego
+        (403, {"errorCode": "error.invalid.details"}, True),
+        (403, {"errorCode": "error.invalid.api.key"}, True),
     ],
-    ids=["401", "403", "null-api-key", "other-400", "429", "500", "503"],
-)
+    ids=[
+        "401", "403", "null-api-key", "other-400", "429", "500", "503",
+        "401-too-many", "401-unavailable", "401-maintenance", "403-invalid-details", "403-invalid-api-key",
+    ],
+)  # fmt: skip
 async def test_only_credential_rejections_of_post_session_are_broker_auth_errors(
     server, broker, status, body, credential
 ):
@@ -709,6 +720,82 @@ def test_json_numbers_are_decimal_never_float():
 def test_json_loader_rejects_non_finite_duplicate_and_malformed(raw):
     with pytest.raises(ParseError):
         loads(raw)
+
+
+# Liczba JSON z wykładnikiem poza zakresem `Decimal` (`decimal.InvalidOperation` już przy parsowaniu) albo w zakresie
+# `Decimal`, ale poza zakresem działań (`decimal.Overflow` przy pierwszym mnożeniu): w obu przypadkach adapter oddaje
+# `BrokerError`, nigdy surowy wyjątek arytmetyczny.
+BEYOND_DECIMAL = [
+    "1e99999999999999999999",
+    "-1e-99999999999999999999",
+    "0e99999999999999999999999",
+    "1E+99999999999999999999",
+]
+OVERFLOWING = ["1e999999999", "1e1000000"]
+HUGE_NUMBERS = [*BEYOND_DECIMAL, *OVERFLOWING]
+
+
+@pytest.mark.parametrize("number", BEYOND_DECIMAL)
+def test_json_number_with_an_exponent_beyond_decimal_range_is_a_parse_error(number):
+    for raw in (f'{{"a": {number}}}', f"[{number}]", f'{{"a": {{"b": [{number}]}}}}', f" {number} "):
+        with pytest.raises(ParseError, match="^not valid JSON$") as info:
+            loads(raw)
+        assert info.value.__context__ is None
+
+
+@pytest.mark.parametrize("number", OVERFLOWING)
+def test_json_number_in_decimal_range_but_too_big_for_arithmetic_loads_as_a_finite_decimal(number):
+    # działania na takiej liczbie rzucają `decimal.Overflow`: parsery pól to obsługują (testy poniżej), `loads` nie
+    value = loads(f'{{"a": {number}}}')["a"]
+    assert isinstance(value, Decimal) and value.is_finite()
+
+
+@pytest.mark.parametrize(
+    ("number", "accepted"),
+    [("1E+30", True), ("-1E+30", True), ("1E-30", True), ("25782.3", True), ("0", True), ("0E-50", True),
+     ("0E+99", True), ("1E+31", False), ("-1E+31", False), ("1E-31", False), ("1e999999999", False),
+     ("-1e-999999999", False)],
+)  # fmt: skip
+def test_field_numbers_beyond_ten_to_the_thirtieth_are_refused_by_name(number, accepted):
+    # zakres 10^±30 (zero przechodzi zawsze); komunikat nazywa pole, nie niesie wartości
+    payload = loads(f'{{"snapshot": {{"bid": {number}}}}}')["snapshot"]
+    if accepted:
+        assert dec(payload, "bid", "snapshot") == Decimal(number)
+    else:
+        with pytest.raises(ParseError) as info:
+            dec(payload, "bid", "snapshot")
+        assert str(info.value) == "snapshot.bid: number out of range"
+
+
+@pytest.mark.parametrize("number", BEYOND_DECIMAL)
+async def test_response_and_error_bodies_with_a_number_beyond_decimal_range_are_broker_errors(server, broker, number):
+    await broker.login()
+    server.fail_next("/accounts", 200, text=f'{{"accounts": [], "x": {number}}}')
+    with pytest.raises(BrokerError, match="GET /accounts: malformed response") as info:
+        await broker.list_accounts()
+    assert type(info.value) is BrokerError
+    server.fail_next("/ping", 500, text=f'{{"errorCode": {number}}}')  # treść błędu też przechodzi przez `loads`
+    with pytest.raises(BrokerError, match="HTTP 500") as info:
+        await broker.keepalive()
+    assert type(info.value) is BrokerError
+    server.fail_next("/session", 401, text=f'{{"errorCode": {number}}}', method="POST")  # także przy logowaniu
+    with pytest.raises(BrokerError, match="HTTP 401") as info:
+        await broker.login()
+    assert type(info.value) is BrokerAuthError
+
+
+@pytest.mark.parametrize("number", HUGE_NUMBERS)
+async def test_price_bodies_with_a_huge_number_are_broker_errors(server, broker, number):
+    await broker.login()
+    day = candle(datetime(2026, 11, 1, tzinfo=timezone.utc))
+    marker = "7.7777"
+    day["openPrice"]["bid"] = Decimal(marker)
+    text = json.dumps(prices_reply(day), default=str).replace(f'"{marker}"', number)
+    assert number in text
+    server.fail_next("/prices/DE40", 200, text=text)
+    with pytest.raises(BrokerError, match="GET /prices/DE40") as info:
+        await broker.daily_candles("DE40", 1)
+    assert type(info.value) is BrokerError and info.value.__context__ is None
 
 
 # --- komunikaty wyjątków nigdy nie niosą sekretów (właściwość dla wielu trybów awarii) ----------
@@ -1074,6 +1161,22 @@ async def test_unexpected_delay_or_scaling_is_logged_once(server, broker, caplog
     assert "snapshot.delayTime" not in us100
     await broker.quote("US100")
     assert len(warnings()) == 2
+
+
+async def test_snapshot_warning_scrubs_secrets_before_it_cuts_a_long_number(server, make_broker, caplog):
+    # zasada modułu: najpierw usunąć sekrety, dopiero potem przyciąć; przycięcie przed usunięciem zostawiłoby początek
+    # sekretu z samych cyfr (identyfikator zwrócony jako `delayTime`), bo ucięty ciąg nie pasuje już do całości
+    caplog.set_level(logging.WARNING, logger="gwstock.broker.capitalcom")
+    numeric_login = "1234567890123456789012345678901"  # 31 cyfr: dłuższe niż przycięcie liczby w ostrzeżeniu
+    server.identifier = numeric_login
+    broker = make_broker(creds=Credentials(TEST_API_KEY, numeric_login, TEST_PASSWORD))
+    await broker.login()
+    server.markets["DE40"]["snapshot"].update(delayTime=Decimal(numeric_login))
+    await broker.quote("DE40")
+    [record] = [r for r in caplog.records if r.name == "gwstock.broker.capitalcom" and r.levelno == logging.WARNING]
+    message = record.getMessage()
+    assert "snapshot.delayTime=<redacted>" in message
+    assert "12345678" not in message and numeric_login not in message
 
 
 @pytest.mark.parametrize(
@@ -1485,6 +1588,36 @@ async def test_candles_to_is_capped_with_a_skew_margin(server, broker, clock, no
     [req] = server.requests("GET", "/prices/DE40")
     assert (req.query["to"], req.status) == (to, 200)
     assert capitalcom.CANDLE_TO_SKEW_MARGIN_S == 5  # stała procedury, nie parametr strategii
+
+
+@pytest.mark.parametrize("period_start", [True, False], ids=["stamp-is-start", "stamp-is-end"])
+async def test_candles_request_always_has_from_before_to(server, broker, clock, monkeypatch, period_start):
+    # przy znaczniku = koniec okresu drugi odczyt silnika (range_end + 5 s) dawał from == to (08:05:00–08:05:00), a
+    # takiego zapytania wolno nie wysyłać (jego obsługa po stronie brokera jest nieznana, jak w historii)
+    monkeypatch.setattr(capitalcom, "CANDLE_STAMP_IS_PERIOD_START", period_start)
+    await broker.login()
+    server.set_candles("DE40", "MINUTE_5", [candle(OPEN), candle(OPEN + M5)])
+    for tenth in range(0, 200, 5):  # od range_end do ok. 20 s po nim, co pół sekundy
+        advance_to(clock, OPEN + M5 + timedelta(seconds=tenth / 10))
+        await broker.candles_5m("DE40", OPEN, OPEN + M5)
+    requests = server.requests("GET", "/prices/DE40")
+    assert requests  # okno puste po obcięciu nie wysyła nic, ale późniejsze odczyty pytają
+    assert all(r.query["from"] < r.query["to"] for r in requests)  # znaczniki ISO porównują się leksykograficznie
+
+
+async def test_flipped_stamp_second_try_waits_for_a_window_with_positive_length(server, broker, clock, monkeypatch):
+    monkeypatch.setattr(capitalcom, "CANDLE_STAMP_IS_PERIOD_START", False)
+    await broker.login()
+    server.set_candles("DE40", "MINUTE_5", [candle(OPEN + M5)])  # znacznik 08:05 = koniec świecy 08:00
+    margin = timedelta(seconds=capitalcom.CANDLE_TO_SKEW_MARGIN_S)
+    advance_to(clock, OPEN + M5 + margin)  # to == from == 08:05:00: pusta rzecz, nic nie jest wysyłane
+    assert await broker.candles_5m("DE40", OPEN, OPEN + M5) == []
+    assert server.count("GET", "/prices/DE40") == 0
+    advance_to(clock, OPEN + M5 + margin + timedelta(seconds=1))
+    [got] = await broker.candles_5m("DE40", OPEN, OPEN + M5)
+    assert got.start == OPEN
+    [req] = server.requests("GET", "/prices/DE40")
+    assert (req.query["from"], req.query["to"]) == ("2026-11-02T08:05:00", "2026-11-02T08:05:01")
 
 
 async def test_candles_read_right_after_the_range_still_gets_its_candles(server, broker, clock):

@@ -42,6 +42,7 @@ from tests.unit.fake_capital_server import (
     FakePosition,
     activity,
 )
+from tests.unit.fake_capital_server import dumps as fake_dumps
 
 UTC = timezone.utc
 T0 = datetime(2026, 11, 2, 7, 30, tzinfo=UTC)  # = start fixture `clock`
@@ -643,6 +644,66 @@ async def test_confirm_cross_checks_the_listed_position(server, broker, field, v
     with pytest.raises(BrokerError) as info:
         await broker.confirm(ack.deal_reference)
     assert type(info.value) is BrokerError and "does not match the confirmation" in str(info.value)
+
+
+# Liczba z wykładnikiem poza zakresem `Decimal` (InvalidOperation przy parsowaniu) albo poza zakresem działań (Overflow
+# przy pierwszym mnożeniu): wynik zawsze `BrokerError` (zlecenie: UNKNOWN), nigdy surowy wyjątek arytmetyczny.
+HUGE_NUMBERS = ["1e99999999999999999999", "-1e-99999999999999999999", "1E+99999999999999999999", "1e999999999"]
+
+
+@pytest.mark.parametrize("number", HUGE_NUMBERS)
+@pytest.mark.parametrize("field", ["size", "level", "stopLevel"])
+async def test_position_list_and_snapshot_with_a_huge_number_are_broker_errors(server, broker, number, field):
+    server.position_stop_keys = "present"
+    await broker.login()
+    ack = await broker.open_position(entry())
+    fake = only_position(server)
+    listing = {"positions": [server._position_item(fake)]}
+    marker = Decimal("7.7777")
+    listing["positions"][0]["position"][field] = marker
+    server.fail_next("/positions", 200, text=fake_dumps(listing).replace("7.7777", number), method="GET")
+    with pytest.raises(BrokerError) as info:
+        await broker.list_positions()
+    assert type(info.value) is BrokerError and info.value.__context__ is None
+    item = server._position_item(fake)
+    item["position"][field] = marker  # ta sama pozycja przy potwierdzeniu: kontrola krzyżowa `GET /positions/{dealId}`
+    server.fail_next(f"/positions/{fake.deal_id}", 200, text=fake_dumps(item).replace("7.7777", number), method="GET")
+    with pytest.raises(BrokerError) as info:
+        await broker.confirm(ack.deal_reference)
+    assert type(info.value) is BrokerError and info.value.__context__ is None
+
+
+@pytest.mark.parametrize("number", HUGE_NUMBERS)
+@pytest.mark.parametrize("field", ["level", "size", "stopLevel"])
+async def test_confirm_body_with_a_huge_number_is_a_broker_error(server, broker, number, field):
+    server.confirm_stop_keys = True
+    await broker.login()
+    ack = await broker.open_position(entry())
+    payload = dict(server.confirms[ack.deal_reference])
+    payload[field] = Decimal("7.7777")
+    server.fail_next(f"/confirms/{ack.deal_reference}", 200, text=fake_dumps(payload).replace("7.7777", number))
+    with pytest.raises(BrokerError) as info:
+        await broker.confirm(ack.deal_reference)
+    assert type(info.value) is BrokerError and info.value.__context__ is None
+    assert (await broker.confirm(ack.deal_reference)).deal_id == only_position(server).deal_id  # nic nie zapamiętano
+
+
+@pytest.mark.parametrize("listed", [Decimal("0.002"), Decimal("0.0005")])
+async def test_confirm_size_mismatch_message_states_both_sizes(server, broker, listed):
+    # surowa odpowiedź `GET /positions/{dealId}` nie trafia do dziennika, więc komunikat sam musi pokazać obie wielkości
+    # (właściciel czyta je z alarmu przy pierwszym smoke), i nic więcej (żadnych identyfikatorów ani sekretów)
+    await broker.login()
+    ack = await broker.open_position(entry())
+    fake = only_position(server)
+    item = server._position_item(fake)
+    item["position"]["size"] = listed
+    server.fail_next(f"/positions/{fake.deal_id}", 200, item, method="GET")
+    with pytest.raises(BrokerError) as info:
+        await broker.confirm(ack.deal_reference)
+    message = str(info.value)
+    assert type(info.value) is BrokerError
+    assert message.endswith(f"does not match the confirmation (size: confirm 0.001, position {listed})")
+    assert not any(secret in message for secret in server_secrets(server))
 
 
 async def test_confirm_accepts_a_position_without_working_order_id(server, broker):
@@ -1894,6 +1955,112 @@ async def test_lookback_results_before_since_are_cached_and_bounded(server, brok
     mark = len(lookback_requests(server))
     assert await restarted.closed_since(since) == expected
     assert len(lookback_requests(server)) - mark == 5 and len(restarted._lookback_cache) == 2
+
+
+def foreign_deal_history(server) -> list[ClosedDeal]:
+    """F-1: otwarcie 5 dni temu, zamknięcie ręczne 20 minut temu (sprzed `since` = teraz − 1 h wyszukiwanie sięga
+    dzień po dniu wstecz); zwraca oczekiwany wynik `closed_since`."""
+    server.add_activity(activity("F-1", T0 - timedelta(days=5), source="USER", direction="BUY"))
+    server.add_activity(activity("F-1", T0 - timedelta(minutes=20), source="USER", direction="SELL", level="25001.0"))
+    return [ClosedDeal("F-1", "DE40", Decimal("25001.0"), "MANUAL", T0 - timedelta(minutes=20))]
+
+
+async def test_lookback_window_read_during_an_account_switch_is_not_cached(server, broker, monkeypatch):
+    # rachunek sesji może się zmienić W TRAKCIE żądania (ponowne logowanie po 401): wiersze nie wiadomo, z którego
+    # rachunku przyszły, więc nie zapisują się pod żadnym kluczem (ani starym, ani nowym)
+    expected = foreign_deal_history(server)
+    await broker.login()
+    original = broker._activity_rows
+    lookbacks = []
+
+    async def rows_then_switch(windows, budget, **kwargs):
+        rows = await original(windows, budget, **kwargs)
+        if kwargs.get("deal_id"):
+            lookbacks.append(windows[0])
+            if len(lookbacks) == 2:  # drugie okno wyszukiwania (pierwsze nigdy nie jest zapisywane)
+                broker._session_account_id = "ACC-EMPTY"
+        return rows
+
+    monkeypatch.setattr(broker, "_activity_rows", rows_then_switch)
+    assert await broker.closed_since(T0 - timedelta(hours=1)) == expected
+    assert len(lookbacks) == 5
+    assert {key[0] for key in broker._lookback_cache} == {"ACC-EMPTY"}  # nic pod kluczem rachunku sprzed zmiany
+    assert [key[2:] for key in broker._lookback_cache] == [window for window in lookbacks[2:]]  # tylko okna 3–5
+
+
+async def test_lookback_cache_stores_only_windows_that_ended_long_before_now(server, broker, monkeypatch):
+    # bezpieczeństwo pamięci wynika z warunku przy zapisie, nie z budowy okien: okno kończące się sekundę przed `since`
+    # (świeże dane, opóźniony wiersz jeszcze może dojść) nie może trafić do pamięci
+    expected = foreign_deal_history(server)
+    since = T0 - timedelta(hours=1)
+    near = (since - DAY - timedelta(seconds=1), since - timedelta(seconds=1))  # kończy się 1 s przed `since`
+    far = (T0 - 5 * DAY - timedelta(hours=1), T0 - 5 * DAY + timedelta(hours=1))  # obejmuje otwarcie z T0 − 5 dni
+    await broker.login()
+    monkeypatch.setattr(capitalcom_history, "lookback_windows", lambda s, cap: [near, far])
+    assert await broker.closed_since(since) == expected
+    assert [key[2:] for key in broker._lookback_cache] == [far]
+
+
+async def test_a_failed_lookback_window_is_not_cached_as_empty(server, broker):
+    # nieudany odczyt okna (tu: HTTP 500 na czwartym zapytaniu = trzecie okno wstecz) nie zostawia w pamięci pustego
+    # wyniku, który ukryłby otwarcie deala przy następnym odczycie; okna odczytane wcześniej zostają w pamięci
+    expected = foreign_deal_history(server)
+    await broker.login()
+    since = T0 - timedelta(hours=1)
+    server.fail_request("/history/activity", 4, 500)
+    with pytest.raises(BrokerError, match="HTTP 500"):
+        await broker.closed_since(since)
+    sent = lookback_requests(server)
+    assert len(sent) == 3 and len(broker._lookback_cache) == 1  # okno 2 (odczytane w całości) tak, nieudane okno 3 nie
+    [(_, _, cached_from, cached_to)] = broker._lookback_cache
+    assert (capitalcom_history.api_time(cached_from), capitalcom_history.api_time(cached_to)) == sent[1]
+    assert await broker.closed_since(since) == expected  # trzecie okno czytane od nowa, otwarcie znalezione
+    assert len(broker._lookback_cache) == 4 and all(len(r) <= 1 for r in broker._lookback_cache.values())
+    assert len(lookback_requests(server)) == 3 + 1 + 3  # okno 1 i okna 3–5 od nowa, okno 2 z pamięci
+
+
+async def test_lookback_cache_key_includes_the_whole_window(server, broker):
+    # to samo `from` z innym końcem (okno przycięte do granicy 14 dni przy innym `since`) i ten sam koniec z innym
+    # początkiem to różne wpisy: wynik jednego okna nie podmienia wyniku drugiego
+    await broker.login()
+    start = T0 - 3 * DAY
+    short, long = (start, start + timedelta(hours=1)), (start, start + timedelta(hours=12))
+    early = (start - timedelta(hours=6), start + timedelta(hours=1))
+    server.add_activity(activity("F-1", start + timedelta(hours=6), source="USER", direction="BUY"))
+    server.add_activity(activity("F-1", start - timedelta(hours=3), source="USER", direction="BUY"))
+    now, budget = broker._clock.now_utc(), capitalcom_trading._Budget(10)
+    for _ in range(2):  # drugi obieg z pamięci musi dać te same, osobne wyniki
+        assert await broker._lookback_rows("F-1", short, T0, now, budget) == ()
+        [late] = await broker._lookback_rows("F-1", long, T0, now, budget)
+        [first] = await broker._lookback_rows("F-1", early, T0, now, budget)
+        assert (first.ts, late.ts) == (start - timedelta(hours=3), start + timedelta(hours=6))
+    assert len(broker._lookback_cache) == 3 and budget.left == 7
+
+
+async def test_lookback_cache_never_stores_a_window_that_reaches_since(server, broker):
+    # `since` dość stare, by każde okno spełniało warunek wieku: okno kończące się w `since` (doba tuż przed zakresem
+    # głównym) i tak jest czytane od nowa, okno w całości przed `since` trafia do pamięci
+    await broker.login()
+    since = T0 - 3 * DAY
+    now, budget = broker._clock.now_utc(), capitalcom_trading._Budget(10)
+    reaching = (since - DAY, since)
+    before = (since - 2 * DAY + timedelta(seconds=1), since - DAY + timedelta(seconds=1))
+    for window in (reaching, before):
+        await broker._lookback_rows("F-1", window, since, now, budget)
+    assert [key[2:] for key in broker._lookback_cache] == [before]
+
+
+async def test_lookback_cache_hits_do_not_use_the_request_budget(server, broker):
+    await broker.login()
+    window = (T0 - 3 * DAY, T0 - 2 * DAY)
+    server.add_activity(activity("F-1", T0 - timedelta(days=2, hours=12), source="USER", direction="BUY"))
+    now, budget = broker._clock.now_utc(), capitalcom_trading._Budget(3)
+    first = await broker._lookback_rows("F-1", window, T0, now, budget)
+    assert budget.left == 2 and len(first) == 1
+    mark = since_mark(server)
+    for _ in range(5):
+        assert await broker._lookback_rows("F-1", window, T0, now, budget) == first
+    assert budget.left == 2 and seq(server, mark) == []  # trafienia: bez zapytania i bez zużycia limitu
 
 
 async def test_deal_lookback_that_exhausts_the_request_budget_raises(server, broker, monkeypatch):
