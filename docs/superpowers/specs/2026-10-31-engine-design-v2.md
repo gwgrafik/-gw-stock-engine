@@ -372,6 +372,11 @@ US100 i US500 (osobny profil giełdy NYSE, sesja od 15:30 czasu środkowoeuropej
 | 18 | Plan B, jeśli Capital.com odmówi lub odpowie niejednoznacznie: trasy, które regulamin wprost dopuszcza lub które mają jawne API dla klientów detalicznych (MetaTrader u Capital.com, cTrader u brokerów UE, Saxo OpenAPI, LYNX/IBKR) i ich ograniczenia (pamięć VPS, minimalny kapitał) | Decyzja właściciela po odpowiedzi supportu; adaptery są wymienne dzięki interfejsowi `Broker` |
 | 19 | Który z dwóch rachunków (0 € i 40 €) jest docelowy | Polecenie `bind-account`: wypisuje rachunki z walutą i saldem, zapisuje identyfikator po potwierdzeniu właściciela |
 
+### Odstępstwa od specyfikacji w v1
+
+- **D1: dane przez odpytywanie REST zamiast strumienia OHLC (sekcja 4).** Silnik v1 nie subskrybuje WebSocket: notowanie odczytuje `GET /markets/{epic}` co 5 s (stała `QUOTE_POLL_S`, w budżecie ok. 5 zapytań/s), świece 5-minutowe i dzienne `GET /prices`. „Cisza strumienia notowań > 60 s" znaczy w v1: brak ŚWIEŻEGO notowania (zmiany pary bid/ask) przez 60 s w oknie sesji, co włącza kill switch miękki (`QUOTE_SILENCE`). Koszt: opóźnienie danych do ok. 5 s. Strumień zostaje odroczony; wymaga osobnej zmiany adaptera i pomiaru pamięci.
+- **D2: semantyka stempla świec niepotwierdzona (pytanie 8, bramka L0).** Pierwsza świeca to wyłącznie świeca, której początek w UTC równa się otwarciu sesji; jej brak do 09:10 oznacza `NO_SIGNAL_DATA`. Zdarzenie decyzji w dzienniku zapisuje początek i OHLC wybranej świecy, a próba `smoke` wypisuje trzy ostatnie świece: przed uzbrojeniem właściciel porównuje je z wykresem 5-minutowym Capital.com.
+
 ## 17. Kryteria akceptacji v1
 
 1. Wszystkie testy jednostkowe i awaryjne z sekcji 12 przechodzą (lokalnie i w CI, na Pythonie 3.12 i 3.13 oraz w obrazie Dockera); niezmienniki spełnione po każdym teście awarii; kontrakt adaptera przechodzi na `FakeBroker` i w odczytach live.

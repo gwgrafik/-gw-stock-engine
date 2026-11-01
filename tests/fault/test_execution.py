@@ -282,6 +282,46 @@ async def test_account_unavailable_means_no_entry_and_no_kill(executor, signal, 
     assert journal.events("gate_block") == []
 
 
+# --- wejście próby smoke (L0): ta sama ścieżka, inna bramka i rola identyfikatora -----------------------
+
+
+SMOKE_CID = "gws-20261102-DE40-1-smoke"
+
+
+async def test_smoke_entry_uses_the_smoke_gate_and_the_smoke_role(executor, signal, rules, journal, fake, clock):
+    at(clock, T_ENTRY + timedelta(hours=3))  # 12:06: poza oknem strategii, check_entry by zablokował
+    q = Quote("DE40", BID, ASK, clock.now_utc())
+    fake.set_quote(q)
+    rec = await executor.enter(EntrySignal(Side.BUY, D("30"), D("0.001"), q), rules, DAY, smoke=True)
+    assert rec.state is O.CONFIRMED and rec.order_id == SMOKE_CID and rec.deal_id == "DEAL-1"
+    assert fake.calls == ["account", "open_position", "confirm"]
+    assert journal.get_meta(f"entry_ctx:{SMOKE_CID}") is not None and journal.get_meta("entry_last:DE40") == SMOKE_CID
+    assert journal.count_entry_orders(DAY) == 0 and journal.events("gate_block") == []
+
+
+async def test_smoke_entry_does_not_use_the_daily_entry_and_numbers_after_it(executor, signal, rules, journal, fake):
+    rec = await executor.enter(signal, rules, DAY, smoke=True)
+    await executor.flatten(position(journal), "SMOKE")
+    assert rec.order_id == SMOKE_CID and position(journal).state is P.FLAT
+    second = await executor.enter(signal, rules, DAY)  # wejście strategii tego samego dnia nadal możliwe
+    assert second.order_id == "gws-20261102-DE40-2-entry" and second.state is O.CONFIRMED
+
+
+async def test_smoke_entry_is_still_blocked_by_the_kill_switch(executor, signal, rules, journal, fake, kill):
+    kill.soft("STOP_FILE")
+    assert await executor.enter(signal, rules, DAY, smoke=True) is None
+    assert fake.calls == ["account"]
+    assert payloads(journal, "gate_block")[0]["reasons"] == [KILL]
+
+
+@pytest.mark.parametrize("live", [DEFAULT, False])
+async def test_smoke_entry_in_dry_run_never_sends(build, signal, rules, journal, fake, live):
+    assert await build(live=live).enter(signal, rules, DAY, smoke=True) is None
+    assert fake.calls == ["account"]
+    [decision] = payloads(journal, "decision")
+    assert decision["request"]["client_id"] == SMOKE_CID and journal.count_orders(DAY) == 0
+
+
 # --- wejście: kontekst i identyfikator --------------------------------------------------------------
 
 

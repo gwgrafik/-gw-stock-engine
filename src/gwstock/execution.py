@@ -110,6 +110,9 @@ SOURCE_SET_STOP = "broker.set_stop"
 SOURCE_QUOTE = "broker.quote"
 SOURCE_RULES = "broker.instrument_rules"
 
+ROLE_ENTRY = "entry"  # rola identyfikatora wejścia strategii (liczona przez ENTRIES_PER_DAY)
+ROLE_SMOKE = "smoke"  # rola identyfikatora próby akceptacyjnej L0 (nie zużywa dziennego wejścia)
+
 META_ENTRY_CTX = "entry_ctx:{}"  # client_id → kontekst wejścia (JSON), zapisany przed wysyłką
 META_ENTRY_BY_DEAL = "entry_by_deal:{}"  # deal_id → client_id, zapisany po CONFIRMED (pomocniczy)
 META_ENTRY_LAST = "entry_last:{}"  # epic → client_id ostatniego wejścia (pozycja przyjęta przez uzgadnianie)
@@ -218,8 +221,14 @@ class Executor:
 
     # --- wejście ----------------------------------------------------------------------------------------
 
-    async def enter(self, signal: EntrySignal, rules: InstrumentRules, day: date) -> OrderRecord | None:
+    async def enter(
+        self, signal: EntrySignal, rules: InstrumentRules, day: date, *, smoke: bool = False
+    ) -> OrderRecord | None:
         """Wejście z sygnału strategii; `day` to dzień handlowy (identyfikator zlecenia i jego numer kolejny).
+
+        `smoke=True`: próba akceptacyjna L0 (polecenie `smoke`): ta sama ścieżka, ale bramka `check_smoke` (bez okna,
+        sesji i limitu wejść dnia) i rola identyfikatora `smoke`, więc zlecenie nie zużywa dziennego wejścia strategii.
+        Tryb `dry_run` także tu nigdy nie wysyła zlecenia.
 
         None: bramka zablokowała (`gate_block`), tryb `dry_run` (`decision`), konto niedostępne (ACCOUNT_UNAVAILABLE)
         albo awaria dziennika przed wysyłką lub z menedżera (kill miękki JOURNAL_WRITE_FAILED). Inaczej rekord zlecenia
@@ -228,7 +237,7 @@ class Executor:
         i wyjątek dalej; `CancelledError` bez żadnej reakcji.
         """
         try:
-            request = await self._prepare(signal, rules, day)
+            request = await self._prepare(signal, rules, day, smoke)
         except JournalWriteError as exc:
             self._journal_failed("before the send", exc)
             return None
@@ -254,7 +263,9 @@ class Executor:
             raise
         return rec
 
-    async def _prepare(self, signal: EntrySignal, rules: InstrumentRules, day: date) -> EntryRequest | None:
+    async def _prepare(
+        self, signal: EntrySignal, rules: InstrumentRules, day: date, smoke: bool = False
+    ) -> EntryRequest | None:
         """Konto, bramka, identyfikator i kontekst wejścia; żądanie do wysłania albo None (bez wysyłki)."""
         signal_ts = self._now()
         quote = signal.decision_quote
@@ -277,12 +288,15 @@ class Executor:
             return None
         self._raw(SOURCE_ACCOUNT, response=account)
 
-        verdict = self._gate.check_entry(candidate, account)
+        verdict = self._gate.check_smoke(candidate, account) if smoke else self._gate.check_entry(candidate, account)
         if not verdict.passed:
             block = {"reasons": verdict.reasons, "candidate": candidate, "day": day.isoformat()}
+            if smoke:
+                block["smoke"] = True
             self._append(SOURCE_GATE_BLOCK, block)
             return None
-        client_id = make_client_id(day, self._epic, self._journal.next_seq(day), "entry")
+        role = ROLE_SMOKE if smoke else ROLE_ENTRY
+        client_id = make_client_id(day, self._epic, self._journal.next_seq(day), role)
         request = EntryRequest(client_id, self._epic, signal.side, signal.size, signal.stop_distance)
         if not self._live:
             self._append(SOURCE_DECISION, {"request": request, "candidate": candidate, "day": day.isoformat()})

@@ -311,6 +311,13 @@ def test_max_entries_per_day_comes_from_the_config(journal, risk_cfg, strat_cfg)
     assert reasons(gate) == [ENTRIES_PER_DAY]
 
 
+def test_smoke_orders_do_not_use_the_daily_entry(gate, journal):
+    journal.insert_order(order("gws-20261102-DE40-1-smoke", state=OrderState.CONFIRMED))
+    assert reasons(gate) == []
+    journal.insert_order(order("gws-20261102-DE40-2-entry"))
+    assert reasons(gate) == [ENTRIES_PER_DAY]
+
+
 def test_zero_entries_allowed_blocks_everything(journal, risk_cfg, strat_cfg):
     zero = dataclasses.replace(risk_cfg, max_entries_per_day=0)
     gate, _ = build_gate(journal, risk_cfg, strat_cfg, berlin(DAY, 9, 6), risk=zero)
@@ -687,7 +694,7 @@ def test_all_failing_reasons_are_collected_in_table_order_outside_the_window(jou
 # --- odporność: błąd odczytu = brak możliwości oceny = blokada --------------------------------------
 
 JOURNAL_FAULTS = [
-    ("count_orders", [ENTRIES_PER_DAY]),
+    ("count_entry_orders", [ENTRIES_PER_DAY]),
     ("realized_pnl", [DAILY_LOSS]),
     ("realized_pnl_total", [TOTAL_DRAWDOWN]),
     ("current_position", [DAILY_LOSS, DUPLICATE]),  # ryzyko otwartej też nie do policzenia
@@ -765,3 +772,66 @@ def test_unexpected_internal_error_blocks_instead_of_raising(gate, monkeypatch):
 def test_kill_view_is_optional(journal, risk_cfg, strat_cfg):
     gate = RiskGate(risk_cfg, strat_cfg, journal, CAL, FakeClock(berlin(DAY, 9, 6)))
     assert gate.check_entry(cand(), ACCT).passed
+
+
+# --- check_smoke: próba L0 (jedno minimalne wejście poza oknem strategii) --------------------------
+
+
+def smoke_reasons(gate: RiskGate, c=None, account=ACCT) -> list[str]:
+    return gate.check_smoke(cand() if c is None else c, account).reasons
+
+
+def test_smoke_ignores_the_session_the_window_and_the_daily_entry(journal, risk_cfg, strat_cfg):
+    saturday = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+    gate, _ = build_gate(journal, risk_cfg, strat_cfg, saturday)
+    journal.insert_order(order("gws-20261107-DE40-1-entry"))
+    assert reasons(gate) == [ENTRIES_PER_DAY, NOT_SESSION]
+    assert smoke_reasons(gate) == []
+    gate, _ = build_gate(journal, risk_cfg, strat_cfg, berlin(DAY, 12, 0))  # dzień sesji, poza oknem 09:05-09:10
+    journal.insert_order(order("gws-20261102-DE40-1-entry"))
+    assert reasons(gate) == [ENTRIES_PER_DAY, OUTSIDE_WINDOW]
+    assert smoke_reasons(gate) == []
+
+
+def test_smoke_keeps_every_other_check_in_table_order(journal, risk_cfg, strat_cfg, kill):
+    xmas_eve = date(2026, 12, 24)
+    gate, _ = build_gate(journal, risk_cfg, strat_cfg, berlin(xmas_eve, 9, 6), kill=kill)
+    journal.insert_order(order("gws-20261224-DE40-1-entry"))
+    journal.add_realized_pnl(xmas_eve, D("-10"))
+    journal.add_realized_pnl(date(2026, 12, 1), D("-5"))
+    journal.upsert_position(position())
+    kill.soft("test")
+    c = cand(side="BUY", size=D("0.2"), quote_age_s=61)
+    v = gate.check_smoke(c, acct(equity="40", available="40"))
+    assert not v.passed
+    assert v.reasons == [
+        FORMAT, LOSS_PER_TRADE, LEVERAGE, MARGIN, DAILY_LOSS, TOTAL_DRAWDOWN, DUPLICATE, STALE_DATA, KILL,
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("over", "expected"),
+    [
+        (dict(stop_distance=None), [FORMAT, NO_STOP]),
+        (dict(stop_distance=D("0")), [NO_STOP]),
+        (dict(stop_distance=D("1000.01")), [LOSS_PER_TRADE]),  # 0.001 × 1000.01 = 1.00001 > 1.00
+        (dict(quote_age_s=61), [STALE_DATA]),
+    ],
+    ids=["no-stop-field", "zero-stop", "loss-per-trade", "stale"],
+)
+def test_smoke_blocks_on_its_own_checks(gate, over, expected):
+    assert smoke_reasons(gate, cand(**over)) == expected
+
+
+def test_smoke_is_blocked_by_the_live_kill_switch_and_by_the_account(gate, kill):
+    assert smoke_reasons(gate, account=acct(equity="0", available="0")) == [LEVERAGE, MARGIN]
+    kill.soft("x")
+    assert smoke_reasons(gate) == [KILL]
+
+
+def test_smoke_never_raises_on_an_internal_error(gate, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(gate, "_today", boom)
+    assert gate.check_smoke(cand(), ACCT) == Verdict(False, [FORMAT])

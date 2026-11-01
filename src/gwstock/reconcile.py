@@ -196,6 +196,11 @@ class Reconciler:
         self._booker = booker
         self._entry_gate = entry_gate
 
+    @property
+    def booker(self) -> TradeBooker | None:
+        """Księgujący zamknięcia (tylko odczyt): silnik w trybie live sprawdza, że to jego wykonawca."""
+        return self._booker
+
     async def run_once(self) -> ReconcileResult:
         """Jeden przebieg uzgadniania. Wyjątki brokera i dziennika z odczytów propagują się bez zmiany stanu.
 

@@ -350,6 +350,25 @@ def test_count_orders_rejects_datetime_day(journal):
         journal.count_orders(T0)  # datetime jest podklasą date, ale to nie jest dzień
 
 
+def test_count_entry_orders_counts_only_the_entry_role_of_the_day_in_any_state(journal):
+    assert journal.count_entry_orders(DAY) == 0
+    journal.insert_order(make_order("gws-20261102-DE40-1-smoke", state=OrderState.CONFIRMED))
+    journal.insert_order(make_order("gws-20261102-DE40-2-entry", state=OrderState.REJECTED))
+    journal.insert_order(make_order("gws-20261102-DE40-3-entry", state=OrderState.INTENT))
+    journal.insert_order(make_order("gws-20261102-DE40-4-reentry", state=OrderState.CONFIRMED))  # inna rola
+    journal.insert_order(make_order("gws-20261103-DE40-1-entry", state=OrderState.CONFIRMED))
+    journal.insert_order(make_order("manual-20261102-x-entry"))  # cudzy prefix nie jest liczony
+    assert journal.count_entry_orders(DAY) == 2
+    assert journal.count_entry_orders(NEXT_DAY) == 1
+    # numeracja dnia nadal liczy wszystkie role: identyfikator zlecenia próby smoke nie wraca
+    assert journal.count_orders(DAY) == 4 and journal.next_seq(DAY) == 5
+
+
+def test_count_entry_orders_rejects_datetime_day(journal):
+    with pytest.raises(TypeError):
+        journal.count_entry_orders(T0)
+
+
 # --- pozycje -------------------------------------------------------------------------------
 
 

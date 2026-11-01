@@ -309,6 +309,7 @@ _TRADE_INSERT = (
     "ON CONFLICT(deal_id) DO NOTHING"
 )  # konflikt tylko na deal_id jest pomijany; naruszenie NOT NULL itp. nadal jest błędem
 _DAY_PREFIX = "gws-{:%Y%m%d}-"  # prefiks identyfikatora z `make_client_id` (dzień handlowy, bez znajomości stref)
+_ENTRY_SUFFIX = "-entry"  # rola wejścia strategii (ostatni segment identyfikatora)
 
 
 def _order_from_row(r: tuple) -> OrderRecord:
@@ -629,6 +630,22 @@ class Journal:
         return self._read(
             lambda c: c.execute(
                 "SELECT count(*) FROM orders WHERE substr(order_id, 1, ?) = ?", (len(prefix), prefix)
+            ).fetchone()[0]
+        )
+
+    def count_entry_orders(self, day: date) -> int:
+        """Liczba zleceń WEJŚCIA dnia (rola `entry`, każdy stan): podstawa ENTRIES_PER_DAY bramki ryzyka.
+
+        Zlecenia innych ról (np. `smoke`, próba akceptacyjna L0) zużywają numer kolejny dnia (`count_orders`), ale nie
+        dzienne wejście strategii.
+        """
+        _check_day(day)
+        prefix = _DAY_PREFIX.format(day)
+        suffix = _ENTRY_SUFFIX
+        return self._read(
+            lambda c: c.execute(
+                "SELECT count(*) FROM orders WHERE substr(order_id, 1, ?) = ? AND substr(order_id, -?) = ?",
+                (len(prefix), prefix, len(suffix), suffix),
             ).fetchone()[0]
         )
 

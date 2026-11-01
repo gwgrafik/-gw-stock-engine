@@ -117,6 +117,12 @@ def spy_states(journal, monkeypatch):
     return states
 
 
+def test_booker_is_exposed_read_only_for_the_engine_wiring_check(journal, fake, clock, kill_sink, risk_cfg, booker):
+    # silnik w trybie live odmawia startu bez księgującego: musi umieć to sprawdzić
+    assert Reconciler(journal, fake, clock, kill_sink, risk_cfg, "DE40", booker=booker).booker is booker
+    assert Reconciler(journal, fake, clock, kill_sink, risk_cfg, "DE40").booker is None
+
+
 # --- §7 wiersz 1: pozycja u brokera, a my mamy UNKNOWN lub SUBMITTING → przyjmij jako własną ---------
 
 

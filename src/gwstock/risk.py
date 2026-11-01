@@ -24,8 +24,9 @@ Kontrole (próg, granica, powód):
   albo `capital <= 0`. Brak konta (zły typ) też blokuje.
 - MARGIN: `required = size × entry_price × value_per_point × margin_rate`; blokuje, gdy
   `required > account.available × (1 − margin_reserve_fraction)` (równo przechodzi).
-- ENTRIES_PER_DAY: `journal.count_orders(day) >= max_entries_per_day`; `day` to lokalna data handlowa
-  (`calendar.to_local(clock.now_utc()).date()`), a liczą się wszystkie zlecenia dnia w każdym stanie.
+- ENTRIES_PER_DAY: `journal.count_entry_orders(day) >= max_entries_per_day`; `day` to lokalna data handlowa
+  (`calendar.to_local(clock.now_utc()).date()`), a liczą się wszystkie zlecenia WEJŚCIA dnia (rola `entry`) w każdym
+  stanie; zlecenie próby `smoke` nie zużywa dziennego wejścia.
 - DAILY_LOSS: `loss_so_far = max(0, −journal.realized_pnl(day)) + open_risk`, gdzie `open_risk` to ryzyko pozycji
   instrumentu zapisanej w dzienniku (stan inny niż FLAT): `size × |open_level − stop_level| × value_per_point`,
   a przy nieznanym stopie lub wielkości pełne `max_loss_per_trade`; 0, gdy pozycji nie ma. Blokuje, gdy
@@ -47,6 +48,10 @@ Kontrole (próg, granica, powód):
   albo nieliczbowy to STALE_DATA (nie da się go ocenić), nie FORMAT.
 - KILL: `max(kill.level(), journal.kill_state().level) != NONE`. Poziom w pamięci się liczy, bo zapis kill
   switcha do dziennika mógł się nie udać.
+
+`check_smoke` (próba akceptacyjna L0: jedno minimalne wejście poza oknem strategii, polecenie `smoke`) to te same
+kontrole w tej samej kolejności BEZ NOT_SESSION, OUTSIDE_WINDOW i ENTRIES_PER_DAY; pozostałe (KILL, DUPLICATE, FORMAT,
+NO_STOP, LOSS_PER_TRADE, LEVERAGE, MARGIN, DAILY_LOSS, TOTAL_DRAWDOWN, STALE_DATA) obowiązują bez zmian.
 
 Kill switch (`KillSwitch`) to awaryjny wyłącznik. Poziom jest w pamięci (decyduje natychmiast) i w dzienniku
 (przeżywa restart, `set_kill`), a zdjąć go może wyłącznie jawne `clear`:
@@ -108,6 +113,8 @@ OUTSIDE_WINDOW = "OUTSIDE_WINDOW"
 DUPLICATE = "DUPLICATE"
 STALE_DATA = "STALE_DATA"
 KILL = "KILL"
+# Kontrole, których nie stosuje `check_smoke` (próba L0 biegnie poza oknem strategii i nie zużywa wejścia dnia).
+_SMOKE_EXEMPT = frozenset({NOT_SESSION, OUTSIDE_WINDOW, ENTRIES_PER_DAY})
 
 # Przyczyny kill switcha nadawane przez sam moduł oraz znacznik awarii zapisu w treści alarmu.
 STOP_FILE = "STOP_FILE"
@@ -214,15 +221,22 @@ class RiskGate:
         return Verdict(True, [])
 
     def check_entry(self, c: EntryCandidate, account: AccountInfo) -> Verdict:
+        return self._evaluate(c, account, frozenset())
+
+    def check_smoke(self, c: EntryCandidate, account: AccountInfo) -> Verdict:
+        """Wejście próby `smoke` (L0): jak `check_entry`, ale bez NOT_SESSION, OUTSIDE_WINDOW i ENTRIES_PER_DAY."""
+        return self._evaluate(c, account, _SMOKE_EXEMPT)
+
+    def _evaluate(self, c: object, account: object, exempt: frozenset[str]) -> Verdict:
         try:
-            return self._check_entry(c, account)
+            return self._check_entry(c, account, exempt)
         except Exception:  # siatka bezpieczeństwa: bramka nie rzuca, a niepewny kandydat nie przechodzi
             _LOG.exception("risk gate failed unexpectedly, blocking the entry")
             return Verdict(False, [FORMAT])
 
     # --- ocena ---
 
-    def _check_entry(self, c: object, account: object) -> Verdict:
+    def _check_entry(self, c: object, account: object, exempt: frozenset[str] = frozenset()) -> Verdict:
         epic, side, size, stop, price, vpp, rate, age = self._fields(c)
         epic_ok = isinstance(epic, str) and epic == self._strat.instrument
         size_d, price_d, vpp_d, rate_d = _positive(size), _positive(price), _positive(vpp), _positive(rate)
@@ -269,7 +283,7 @@ class RiskGate:
             return required > usable
 
         def entries_per_day() -> bool:
-            return day is None or self._journal.count_orders(day) >= self._cfg.max_entries_per_day
+            return day is None or self._journal.count_entry_orders(day) >= self._cfg.max_entries_per_day
 
         def daily_loss() -> bool:
             if day is None:
@@ -311,7 +325,7 @@ class RiskGate:
             (STALE_DATA, stale),
             (KILL, kill_active),
         ]
-        reasons = [reason for reason, check in checks if self._blocks(reason, check)]
+        reasons = [reason for reason, check in checks if reason not in exempt and self._blocks(reason, check)]
         return Verdict(not reasons, reasons)
 
     @staticmethod
