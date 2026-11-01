@@ -35,8 +35,8 @@ Niezmienniki (prawdziwe pieniądze):
   → rekord zdegradowany, ale zaksięgowany (COST_FALLBACK); błąd dziennika propaguje się (pozycja nie jest FLAT, więc
   kolejny przebieg księguje ponownie);
 - przyczyna wyjścia w księdze: STOP, gdy zamknął stop brokera; FORCED, gdy wyjście zainicjował silnik (zapis
-  `exit_intent:<deal_id>` na starcie spłaszczenia) albo broker wymusił zamknięcie; MANUAL, gdy zamknięto wywołaniem
-  bez zamiaru silnika (właściciel);
+  `exit_intent:<deal_id>` tuż przed wysłaniem zamknięcia, nigdy, gdy nic nie wysłano) albo broker wymusił zamknięcie;
+  MANUAL, gdy zamknięto wywołaniem bez zamiaru silnika (właściciel);
 - kontrole limitów strat (`enforce_loss_limits`, także po każdym księgowaniu, również ponownym): dzień ≤
   −`max_daily_loss` → miękki, ≤ −2 × `max_daily_loss` → twardy, łącznie ≤ −`max_total_drawdown` → twardy; idempotentne,
   więc silnik może je ponowić przy starcie (poziom utracony przez przerwanie wraca z liczników dziennika);
@@ -47,9 +47,11 @@ Niezmienniki (prawdziwe pieniądze):
 - pozycja bez stopu: stop (3 próby co 3 s) albo kill switch twardy UNPROTECTED_POSITION i awaryjne spłaszczenie;
   HARD włącza się także wtedy, gdy zabezpieczenie przerwie wyjątek lub anulowanie (wtedy spłaszczenie wykona silnik);
 - awaryjne spłaszczenie: no-op przy FLAT; inaczej do `EMERGENCY_ATTEMPTS` prób ze skróconym limitem czasu; pozycja
-  BLOCKED tylko wtedy, gdy jest dowodnie nasza (zapis ma deal_id, a lista brokera właśnie go pokazuje; zapis EXITING z
-  widoku brokera); obcej (bez deal_id) nie dotykamy nigdy; bez FLAT → alarm EMERGENCY_FLATTEN_INCOMPLETE (pozycja pod
-  nadzorem, kill switch zostaje HARD do decyzji właściciela);
+  BLOCKED tylko przy kill switchu HARD w tej chwili i tylko wtedy, gdy jest dowodnie nasza (zapis ma deal_id, a lista
+  brokera właśnie go pokazuje; zapis EXITING z widoku brokera); obcej (bez deal_id) nie dotykamy nigdy; nieczytelny
+  dziennik → tylko ostatni NASZ deal tego procesu, który lista brokera właśnie pokazuje (EMERGENCY_FLATTEN_JOURNAL_
+  UNREADABLE); bez FLAT → alarm EMERGENCY_FLATTEN_INCOMPLETE (pozycja pod nadzorem, kill switch zostaje HARD do
+  decyzji właściciela); alarm JOURNAL_WRITE_FAILED po procedurze zamknięcia mówi, czy zamknięcie poszło do brokera;
 - wyjść nie blokuje ani bramka, ani kill switch; awaria notyfikatora nie przerywa przebiegu; każda surowa odpowiedź
   brokera trafia do dziennika przed interpretacją, a każda zmiana stanu pozycji przechodzi przez automat stanów.
 
@@ -96,6 +98,7 @@ from gwstock.types import (
     ClosedDeal,
     EntryRequest,
     InstrumentRules,
+    KillLevel,
     MarketClosed,
     OpenPosition,
     OrderState,
@@ -151,6 +154,8 @@ OUTCOME_AWAIT_HISTORY = "AWAIT_HISTORY"  # pozycji nie ma u brokera, zamknięcie
 OUTCOME_BOOKING_FAILED = "BOOKING_FAILED"  # zamknięcie znalezione, księgowanie zawiodło
 OUTCOME_REFUSED = "REFUSED"  # pozycja w dzienniku nie nadaje się do spłaszczenia
 OUTCOME_NOT_AT_BROKER = "NOT_AT_BROKER"  # BLOCKED z deal_id, którego broker nie pokazuje: nie dotykamy
+OUTCOME_UNKNOWN_DEAL = "UNKNOWN_DEAL"  # dziennik nieczytelny, a ten proces nie widział naszego deala: nic nie zamykamy
+OUTCOME_CLOSED_UNBOOKED = "CLOSED_UNBOOKED"  # dziennik nieczytelny, nasz deal zamknięty; zaksięguje uzgadnianie
 _EMERGENCY_RETRY = frozenset({OUTCOME_STILL_OPEN, OUTCOME_UNVERIFIED})  # pozycja może być nadal otwarta
 
 # Stałe procedur ze spec §8 i §9 (nie parametry strategii ani ryzyka).
@@ -166,6 +171,7 @@ EMERGENCY_MIN_TIMEOUT_S = 1  # skrócony limit = max(1 s, submit_timeout_s / 2)
 
 _RESOLVED = frozenset({_O.CONFIRMED, _O.REJECTED, _O.NOT_PLACED})
 _FLATTENABLE = frozenset({_P.OPEN, _P.EXITING})
+_HELD = frozenset({_P.OPEN, _P.EXITING, _P.BLOCKED})  # stany, w których deal_id zapisu dziennika jest naszą pozycją
 _ZERO = Decimal("0")
 _MILLISECOND = timedelta(milliseconds=1)
 
@@ -189,9 +195,12 @@ class ExitMemory:
 
     `closes_sent`: deale, dla których `close_position` poszło do brokera (sukces albo niejasny błąd; odmowa przy
     zamkniętym rynku się nie liczy): kolejna próba zawsze zaczyna od listy pozycji, nawet gdy dziennik nadal mówi OPEN.
+    `last_own_deal`: ostatni NASZ deal widziany w dzienniku (OPEN/EXITING/BLOCKED) albo przekazany zabezpieczeniu;
+    awaryjne spłaszczenie przy nieczytelnym dzienniku zamyka tylko jego (i tylko gdy broker go pokazuje).
     """
 
     closes_sent: set[str] = field(default_factory=set)
+    last_own_deal: str | None = None
 
 
 async def _with_timeout(call: Awaitable[T], timeout: float) -> T:
@@ -241,6 +250,7 @@ class Executor:
         self._epic = strat.instrument
         self._timeout = risk.submit_timeout_s
         self._memory = memory if memory is not None else ExitMemory()
+        self._closes_started = 0  # wywołania `close_position` w tym wykonawcy (czy procedura cokolwiek wysłała)
 
     @property
     def live(self) -> bool:
@@ -368,21 +378,24 @@ class Executor:
         if position is None or position.state is not _P.OPEN or position.deal_id != rec.deal_id:
             self._unresolved(rec, position)
             return
+        self._remember_deal(position)
         if position.stop_level is None:
             if not await self._protect(_as_open(position), signal.stop_distance):
                 return  # kill switch twardy i awaryjne spłaszczenie już wykonane
         failures: list[str] = []
         quote = signal.decision_quote
+        closes_before: int | None = None
         try:
             causes = self._guard_values(
                 position, quote.bid, quote.ask, signal.stop_distance, rules.value_per_point, signal.size, failures
             )
             if causes:
+                closes_before = self._closes_started
                 await self.flatten(position, "FORCED")
             self._mark_fill_guarded(position, causes, FILL_GUARD_PASS, failures)
             self._set_meta(META_ENTRY_BY_DEAL.format(rec.deal_id), rec.order_id, best_effort=failures)
         finally:
-            self._report_journal_failures(failures, f"entry {rec.order_id}")
+            self._report_journal_failures(failures, f"entry {rec.order_id}", closes_before=closes_before)
 
     async def guard_adopted_fill(self) -> bool:
         """Straże po wypełnieniu (poślizg, ryzyko faktycznej wielkości) dla pozycji, której wejścia nie sprawdził
@@ -397,6 +410,7 @@ class Executor:
         obowiązkowego spłaszczenia (EXITING) propaguje się; znacznika wtedy nie ma, więc straż pobiegnie znowu.
         """
         position = self._journal.current_position(self._epic)
+        self._remember_deal(position)  # każdy przebieg: ostatni nasz deal dla awaryjnego spłaszczenia bez dziennika
         if position is None or position.state is not _P.OPEN or position.deal_id is None:
             return False
         deal_id = position.deal_id
@@ -405,6 +419,7 @@ class Executor:
         if any(o.epic == self._epic for o in self._journal.unresolved_orders()):
             return False  # pozycja może jeszcze należeć do zlecenia bez deal_id: kontekst nie byłby pewny
         failures: list[str] = []
+        closes_before: int | None = None
         try:
             found = self._guard_context(deal_id, position.epic)
             if found is not None:
@@ -428,13 +443,14 @@ class Executor:
                 source=source,
             )  # fmt: skip
             if causes:
+                closes_before = self._closes_started
                 await self.flatten(position, "FORCED")
             self._mark_fill_guarded(position, causes, passed, failures)
             if found is not None:
                 self._set_meta(META_ENTRY_BY_DEAL.format(deal_id), order_id, best_effort=failures)
             return bool(causes)
         finally:
-            self._report_journal_failures(failures, f"fill guard of {deal_id}")
+            self._report_journal_failures(failures, f"fill guard of {deal_id}", closes_before=closes_before)
 
     def _guard_context(self, deal_id: str, epic: str) -> tuple[str, dict[str, Decimal]] | None:
         """(client_id, wartości) z kontekstu wejścia pozycji; nieczytelny albo bez sensu = brak (None). Błąd dziennika
@@ -564,10 +580,11 @@ class Executor:
         (EXITING, surowe odpowiedzi, księga) propaguje się; kill switch nigdy nie blokuje wyjścia.
         """
         failures: list[str] = []
+        closes_before = self._closes_started
         try:
             closed, _ = await self._flatten(position, reason, self._timeout, failures=failures)
         finally:
-            self._report_journal_failures(failures, f"flatten {position.deal_id}")
+            self._report_journal_failures(failures, f"flatten {position.deal_id}", closes_before=closes_before)
         return closed
 
     async def _flatten(
@@ -603,11 +620,20 @@ class Executor:
                 journal_deal_id=None if current is None else current.deal_id,
             )  # fmt: skip
             return None, OUTCOME_REFUSED
-        self._set_meta(META_EXIT_INTENT.format(deal_id), reason, best_effort=failures)
+        self._remember_deal(current)
 
         if current.state is _P.BLOCKED:
-            # Tylko awaryjnie i tylko nasz deal, który broker teraz pokazuje; zapis EXITING z widoku brokera (to jest
-            # pozycja, którą zamykamy i księgujemy, np. inna wielkość po SIZE_MISMATCH).
+            # Tylko awaryjnie, tylko przy kill switchu HARD w tej chwili i tylko nasz deal, który broker teraz pokazuje;
+            # zapis EXITING z widoku brokera (to jest pozycja, którą zamykamy i księgujemy, np. inna wielkość po
+            # SIZE_MISMATCH).
+            if self._kill.level() is not KillLevel.HARD:
+                self._alert("ERROR", f"FLATTEN_REFUSED {deal_id}: journal position is BLOCKED and the kill switch is "
+                                     "not HARD; nothing sent")  # fmt: skip
+                self._event(
+                    "FLATTEN_REFUSED", best_effort=must, deal_id=deal_id, flatten_reason=reason,
+                    journal_state=current.state, journal_deal_id=deal_id, why="NOT_HARD",
+                )  # fmt: skip
+                return None, OUTCOME_REFUSED
             read_ok, at_broker, error = await self._find_at_broker(deal_id, timeout, must)
             if not read_ok:
                 self._alert("ERROR", f"FLATTEN_UNVERIFIED {deal_id}: BLOCKED, position list unreadable; not touched")
@@ -645,8 +671,7 @@ class Executor:
                 if at_broker is None:
                     return await self._settle(current, reason, timeout, must)
 
-        sent_before = deal_id in self._memory.closes_sent
-        self._memory.closes_sent.add(deal_id)  # przed wysyłką: także anulowanie w trakcie to niejasność
+        sent_before = self._before_close(deal_id, reason, failures)
         try:
             await _with_timeout(self._broker.close_position(deal_id), timeout)
         except MarketClosed as exc:
@@ -675,6 +700,22 @@ class Executor:
         else:
             self._raw(SOURCE_CLOSE, best_effort=must, deal_id=deal_id, flatten_reason=reason, response=None)
         return await self._settle(current, reason, timeout, must)
+
+    def _before_close(self, deal_id: str, reason: str, failures: list[str]) -> bool:
+        """Tuż przed `close_position` (i tylko wtedy): pamięć wysłanych zamknięć (także anulowanie w trakcie to
+        niejasność), licznik wysyłek i zamiar wyjścia silnika w dzienniku (wg możliwości). Zwraca, czy zamknięcie tego
+        deala poszło już wcześniej w tym procesie."""
+        sent_before = deal_id in self._memory.closes_sent
+        self._memory.closes_sent.add(deal_id)
+        self._closes_started += 1
+        self._set_meta(META_EXIT_INTENT.format(deal_id), reason, best_effort=failures)
+        return sent_before
+
+    def _remember_deal(self, record: PositionRecord | None) -> None:
+        """Ostatni NASZ deal (zapis dziennika z deal_id w stanie OPEN/EXITING/BLOCKED) dla awaryjnego spłaszczenia przy
+        nieczytelnym dzienniku."""
+        if record is not None and record.deal_id is not None and record.state in _HELD:
+            self._memory.last_own_deal = record.deal_id
 
     def _to_exiting(self, current: PositionRecord, target: PositionRecord, must: Failures) -> PositionRecord:
         """Przejście do EXITING (automat stanów); w trybie awaryjnym zapis wg możliwości (zwraca stan docelowy)."""
@@ -771,16 +812,28 @@ class Executor:
         kill switch miękki JOURNAL_WRITE_FAILED). Pozycja BLOCKED: tylko nasz deal_id, który lista brokera właśnie
         pokazuje; obcej nie dotykamy. Ponawia tylko, gdy pozycja może być nadal otwarta (zamknięcie zawiodło albo lista
         była nieczytelna); rynek zamknięty, zamknięcie czekające na historię, BLOCKED spoza brokera i ENTERING kończą
-        próby. Bez FLAT: alarm EMERGENCY_FLATTEN_INCOMPLETE.
+        próby. Bez FLAT: alarm EMERGENCY_FLATTEN_INCOMPLETE. Nieczytelny dziennik: zamknięcie tylko NASZEGO ostatniego
+        deala tego procesu i tylko wtedy, gdy lista brokera go właśnie pokazuje (alarm
+        EMERGENCY_FLATTEN_JOURNAL_UNREADABLE; zaksięguje uzgadnianie, gdy dziennik wróci); nieznanego nie zamykamy.
         """
         timeout = max(EMERGENCY_MIN_TIMEOUT_S, self._risk.submit_timeout_s / 2)
         failures: list[str] = []
         outcome, attempts = "", 0
+        closes_before = self._closes_started
         try:
             for attempt in range(1, EMERGENCY_ATTEMPTS + 1):
                 if attempt > 1:
                     await self._clock.sleep(EMERGENCY_PAUSE_S)
-                current = self._journal.current_position(self._epic)
+                try:
+                    current = self._journal.current_position(self._epic)
+                except JournalError as exc:  # ochrona nie czeka na dziennik
+                    attempts = attempt
+                    outcome = await self._flatten_without_journal(exc, timeout, failures)
+                    if outcome == OUTCOME_CLOSED_UNBOOKED:
+                        return
+                    if outcome not in _EMERGENCY_RETRY:
+                        break
+                    continue
                 if current is None or current.state is _P.FLAT:
                     return
                 if current.state not in _FLATTENABLE | {_P.BLOCKED} or current.deal_id is None:
@@ -796,20 +849,67 @@ class Executor:
                     return
                 if outcome not in _EMERGENCY_RETRY:
                     break
-            current = self._journal.current_position(self._epic)
-            if current is None or current.state is _P.FLAT:
-                return
+            try:
+                current = self._journal.current_position(self._epic)
+            except JournalError:
+                deal_id, state = self._memory.last_own_deal, "UNKNOWN"  # dziennik nieczytelny: nie wiemy, nie FLAT
+            else:
+                if current is None or current.state is _P.FLAT:
+                    return
+                deal_id, state = current.deal_id, current.state.value
             self._alert(
                 "ERROR",
-                f"EMERGENCY_FLATTEN_INCOMPLETE: position {current.deal_id} {current.state.value} after {attempts} "
-                f"attempt(s) ({outcome}); kept under watch",
+                f"EMERGENCY_FLATTEN_INCOMPLETE: position {deal_id} {state} after {attempts} attempt(s) ({outcome}); "
+                "kept under watch",
             )
             self._event(
-                "EMERGENCY_FLATTEN_INCOMPLETE", best_effort=failures, deal_id=current.deal_id, state=current.state,
-                attempts=attempts, outcome=outcome,
+                "EMERGENCY_FLATTEN_INCOMPLETE", best_effort=failures, deal_id=deal_id, state=state, attempts=attempts,
+                outcome=outcome,
             )  # fmt: skip
         finally:
-            self._report_journal_failures(failures, "emergency flatten")
+            self._report_journal_failures(failures, "emergency flatten", closes_before=closes_before)
+
+    async def _flatten_without_journal(self, error: JournalError, timeout: float, failures: list[str]) -> str:
+        """Jedna próba awaryjna przy nieczytelnym dzienniku: tylko ostatni NASZ deal tego procesu (widziany w dzienniku
+        albo przekazany zabezpieczeniu), tylko gdy lista brokera go właśnie pokazuje (nigdy wysyłka na ślepo); każdy
+        zapis wg możliwości, bez księgowania (zrobi je uzgadnianie z dziennika, który wróci)."""
+        why = f"{type(error).__name__}: {error}"
+        code = "EMERGENCY_FLATTEN_JOURNAL_UNREADABLE"
+        deal_id = self._memory.last_own_deal
+        if deal_id is None:
+            self._alert(
+                "ERROR", f"{code}: journal unreadable ({why}) and no own deal seen in this process; nothing closed, "
+                "check the broker positions",
+            )  # fmt: skip
+            return OUTCOME_UNKNOWN_DEAL
+        read_ok, at_broker, list_error = await self._find_at_broker(deal_id, timeout, failures)
+        if not read_ok:
+            self._alert("ERROR", f"{code}: journal unreadable ({why}), position list unreadable ({list_error}); "
+                                 f"nothing sent for {deal_id}")  # fmt: skip
+            return OUTCOME_UNVERIFIED
+        if at_broker is None:
+            self._alert("ERROR", f"{code}: journal unreadable ({why}); our deal {deal_id} is not listed by the broker; "
+                                 "nothing closed, check the broker positions")  # fmt: skip
+            return OUTCOME_NOT_AT_BROKER
+        sent_before = self._before_close(deal_id, "EMERGENCY", failures)
+        try:
+            await _with_timeout(self._broker.close_position(deal_id), timeout)
+        except MarketClosed as exc:
+            if not sent_before:
+                self._memory.closes_sent.discard(deal_id)
+            self._raw_error(SOURCE_CLOSE, exc, best_effort=failures, deal_id=deal_id, flatten_reason="EMERGENCY")
+            self._alert("ERROR", f"{code}: journal unreadable ({why}); {deal_id} not closed, market closed (the stop "
+                                 "at the broker stays)")  # fmt: skip
+            return OUTCOME_MARKET_CLOSED
+        except Exception as exc:  # nie wiemy, czy zamknięto: kolejna próba zaczyna od listy
+            self._raw_error(SOURCE_CLOSE, exc, best_effort=failures, deal_id=deal_id, flatten_reason="EMERGENCY")
+            self._alert("ERROR", f"{code}: journal unreadable ({why}); close of {deal_id} failed "
+                                 f"({type(exc).__name__}: {exc}); listed again before any retry")  # fmt: skip
+            return OUTCOME_UNVERIFIED
+        self._raw(SOURCE_CLOSE, best_effort=failures, deal_id=deal_id, flatten_reason="EMERGENCY", response=None)
+        self._alert("ERROR", f"{code}: {deal_id} closed at the broker with the journal unreadable ({why}); "
+                             "reconciliation books it once the journal is readable")  # fmt: skip
+        return OUTCOME_CLOSED_UNBOOKED
 
     # --- zabezpieczenie stopem ----------------------------------------------------------------------------
 
@@ -825,6 +925,8 @@ class Executor:
         return await self._protect(position, None)
 
     async def _protect(self, position: OpenPosition, distance: Decimal | None) -> bool:
+        # nasza pozycja (z potwierdzenia wejścia albo z uzgadniania: deal z dziennika u brokera)
+        self._memory.last_own_deal = position.deal_id
         failures: list[str] = []
         attached = False
         level: Decimal | None = None
@@ -1148,16 +1250,22 @@ class Executor:
     def _set_meta(self, key: str, value: str, *, best_effort: Failures = None) -> None:
         self._write(best_effort, lambda: self._journal.set_meta(key, value))
 
-    def _report_journal_failures(self, failures: list[str], where: str) -> None:
-        """Po działaniu ochronnym: zapisy wg możliwości, które zawiodły → kill switch miękki i alarm."""
+    def _report_journal_failures(self, failures: list[str], where: str, *, closes_before: int | None = None) -> None:
+        """Po działaniu ochronnym: zapisy wg możliwości, które zawiodły → kill switch miękki i alarm.
+
+        `closes_before`: stan licznika wysyłek `close_position` na początku procedury, która miała zamknąć pozycję;
+        alarm mówi wtedy, czy zamknięcie poszło do brokera (zapis obowiązkowy mógł je przerwać przed wysyłką)."""
         if not failures:
             return
         self._kill.soft(JOURNAL_WRITE_FAILED)
         more = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
-        self._alert(
-            "ERROR",
-            f"{JOURNAL_WRITE_FAILED} during {where}: {failures[0]}{more}; broker actions were carried out regardless",
-        )
+        if closes_before is None:
+            outcome = "broker actions were carried out regardless"
+        elif self._closes_started > closes_before:
+            outcome = "the close was sent to the broker regardless"
+        else:
+            outcome = "the close was NOT sent (the next management pass retries it)"
+        self._alert("ERROR", f"{JOURNAL_WRITE_FAILED} during {where}: {failures[0]}{more}; {outcome}")
 
     def _alert(self, level: str, message: str) -> None:
         try:
