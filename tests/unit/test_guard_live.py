@@ -1016,7 +1016,8 @@ def all_steps(ci_doc: dict):
 
 def test_ci_triggers_and_least_privilege(ci):
     assert set(triggers(ci)) == {"push", "pull_request", "workflow_dispatch"}
-    assert triggers(ci)["push"] == {"branches": ["main"]}  # gałąź z otwartym PR nie biegnie podwójnie (przegląd M8)
+    # push: main oraz gałęzie feat/** (praca przed PR też dostaje CI, w tym zadanie `image`); żadnych innych gałęzi
+    assert triggers(ci)["push"] == {"branches": ["main", "feat/**"]}
     assert ci["permissions"] == {"contents": "read"}
     for job in ci["jobs"].values():
         assert "permissions" not in job  # żadne zadanie nie poszerza uprawnień
