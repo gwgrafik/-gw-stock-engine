@@ -571,7 +571,7 @@ class KillSwitch:
         """Ponawia odczyt zapisanego stanu, którego nie udało się odczytać przy starcie (woła się pod blokadą).
 
         Po sukcesie: zapisany poziom nie niższy od bieżącego wchodzi do pamięci (HARD wraca; dziennik już go ma, więc
-        bez zapisu); niższy od bieżącego (np. NONE) zostaje zastąpiony poziomem z pamięci, który trafia do dziennika.
+        bez zapisu; przy równym poziomie przyczyny z pamięci zostają znane, więc ich powtórzenie jest no-opem); niższy od bieżącego (np. NONE) zostaje zastąpiony poziomem z pamięci, który trafia do dziennika.
         Nigdy nie obniżamy poziomu. Dopóki odczyt zawodzi, nic się nie zmienia, a poziom zostaje tylko w pamięci.
         """
         if not self._state_unknown:
@@ -585,7 +585,10 @@ class KillSwitch:
         ts = self._now()
         memory_level, memory_reason = self._level, self._reason
         if stored_level >= memory_level:
-            self._level, self._reason, self._reasons = stored_level, stored_reason, {stored_reason}
+            # Ten sam poziom: przyczyny z pamięci zostają znane (ich alarmy już poszły), więc powtórzenie ich przez
+            # Reconcilera nie krzyczy drugi raz. Wyższy zapisany poziom zaczyna od własnej przyczyny.
+            kept = self._reasons if stored_level == memory_level else set()
+            self._level, self._reason, self._reasons = stored_level, stored_reason, {stored_reason} | kept
             self._unsynced = False  # dziennik już ma ten stan
             self._audit("RECOVERED", stored_level, stored_reason, memory_level, memory_reason, ts)
             self._alert(

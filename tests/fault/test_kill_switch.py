@@ -724,6 +724,41 @@ def test_recovered_stored_state_of_equal_level_keeps_its_own_reason_and_is_not_r
     assert len(notifier.alerts) == 2 and notifier.alerts[-1][0] == "SOFT" and "restored" in notifier.alerts[-1][1]
 
 
+def test_recovery_merge_keeps_the_memory_reasons_of_the_same_level(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
+):
+    journal.set_kill(KillLevel.SOFT, "DAILY_LOSS", clock.now_utc())
+    set_kill_calls.clear()
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    ks.soft("FOREIGN_POSITION")  # przy nieznanym stanie: przyczyna tylko w pamięci (alarm już poszedł)
+    state["down"] = False
+    ks.scan_files()  # odczyt wrócił: zapisany SOFT (DAILY_LOSS) ma ten sam poziom co pamięć
+    assert ks.level() is KillLevel.SOFT and ks.reason() == "DAILY_LOSS"
+    alerts = len(notifier.alerts)
+    for _ in range(3):  # Reconciler zgłasza tę samą przyczynę co 10 s: to nadal znana przyczyna tego poziomu
+        ks.soft("FOREIGN_POSITION")
+    assert len(notifier.alerts) == alerts and set_kill_calls == []
+    ks.soft("NEW_REASON")  # a naprawdę nowa przyczyna nadal jest zapisywana i ogłaszana
+    assert set_kill_calls == [(KillLevel.SOFT, "NEW_REASON")] and len(notifier.alerts) == alerts + 1
+
+
+def test_recovery_to_a_higher_stored_level_does_not_inherit_the_memory_reasons(
+    journal, clock, data_dir, notifier, monkeypatch, set_kill_calls
+):
+    journal.set_kill(KillLevel.HARD, "original", clock.now_utc())
+    set_kill_calls.clear()
+    state = flaky_kill_state(monkeypatch, journal)
+    ks = KillSwitch(journal, clock, data_dir, notifier)
+    ks.soft("X")  # przyczyna SOFT tylko w pamięci
+    state["down"] = False
+    ks.scan_files()  # odczyt wrócił: zapisany HARD wchodzi do pamięci
+    assert ks.level() is KillLevel.HARD and ks.reason() == "original"
+    ks.hard("X")  # ta sama nazwa, ale jako przyczyna HARD jest nowa: zapis i alarm
+    assert set_kill_calls == [(KillLevel.HARD, "X")]
+    assert notifier.alerts[-1][0] == "HARD" and "X" in notifier.alerts[-1][1]
+
+
 def test_recovered_read_but_failing_write_stays_unsynced_and_keeps_retrying(
     journal, clock, data_dir, notifier, monkeypatch
 ):
