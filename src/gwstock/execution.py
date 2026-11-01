@@ -454,8 +454,10 @@ class Executor:
         `enter` (przyjętej przez uzgadnianie); silnik woła ją po każdym udanym przebiegu uzgadniania, po zabezpieczeniu.
 
         Nic nie robi (żadnego wywołania brokera), gdy pozycja w dzienniku nie jest OPEN z deal_id, kill switch jest
-        HARD (zamyka awaryjne spłaszczenie tego samego taktu; bez znacznika), pozycja ma już znacznik `fill_guarded`,
-        albo na instrumencie jest zlecenie nierozstrzygnięte (najpierw uzgadnianie). Z kontekstem
+        HARD (zamyka awaryjne spłaszczenie tego samego taktu; bez znacznika), pozycja ma znacznik `fill_guarded` bez
+        przyczyny (PASS, NO_CONTEXT_PASS), albo na instrumencie jest zlecenie nierozstrzygnięte (najpierw uzgadnianie).
+        Znacznik z przyczynami przy pozycji znów OPEN (np. BLOCK_CLEARED po chwilowym błędzie listy): ponowne
+        spłaszczenie (FILL_GUARD_REFLATTEN), bez nowych zdarzeń straży. Z kontekstem
         wejścia: notowanie decyzji, żądana wielkość, odległość stopu i wartość punktu z kontekstu. Bez niego (albo
         z nieczytelnym): tylko ryzyko wielkości z odległości stopu pozycji i wartości punktu brokera; pozycja bez stopu
         czeka na zabezpieczenie, nieczytelne reguły brokera → alarm FILL_GUARD_UNAVAILABLE i ponowienie w następnym
@@ -470,13 +472,24 @@ class Executor:
         if self._kill.level() is KillLevel.HARD:
             return False  # wyjście należy do awaryjnego spłaszczenia, które silnik woła zaraz po uzgadnianiu (ten takt)
         deal_id = position.deal_id
-        if self._journal.get_meta(META_FILL_GUARDED.format(deal_id)) is not None:
+        marker = self._journal.get_meta(META_FILL_GUARDED.format(deal_id))
+        if marker in (FILL_GUARD_PASS, FILL_GUARD_NO_CONTEXT_PASS):
             return False
         if any(o.epic == self._epic for o in self._journal.unresolved_orders()):
             return False  # pozycja może jeszcze należeć do zlecenia bez deal_id: kontekst nie byłby pewny
         failures: list[str] = []
         closes_before: int | None = None
         try:
+            if marker is not None:
+                # straż już zadziałała (znacznik z przyczynami), a pozycja znów jest OPEN (np. EXITING → BLOCKED →
+                # BLOCK_CLEARED po chwilowym błędzie listy): zamykamy jeszcze raz, bez nowych zdarzeń straży
+                causes = marker.split("+")
+                self._alert("ERROR", f"FILL_GUARD_REFLATTEN {deal_id}: closed by the fill guard before ({marker}) "
+                                     "and OPEN again in the journal; closing again")  # fmt: skip
+                self._event("FILL_GUARD_REFLATTEN", best_effort=failures, deal_id=deal_id, causes=causes)
+                closes_before = self._closes_started
+                await self._guard_flatten(position, causes, failures)
+                return True
             found = self._guard_context(deal_id, position.epic)
             if found is not None:
                 order_id, ctx = found

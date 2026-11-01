@@ -757,6 +757,8 @@ async def test_guard_adopted_fill_without_entry_context_checks_the_size_risk_fro
     if case == "normal":
         assert fired is False and fake.calls == ["instrument_rules"] and marker == "NO_CONTEXT_PASS"
         assert guard["causes"] == [] and position(journal) == stored
+        fake.calls.clear()
+        assert await executor.guard_adopted_fill() is False and fake.calls == []  # NO_CONTEXT_PASS: sprawdzone
         return
     assert fired is True and guard["causes"] == ["SIZE_MISMATCH_RISK"]
     [risk] = events(journal, "SIZE_MISMATCH_RISK")
@@ -764,6 +766,41 @@ async def test_guard_adopted_fill_without_entry_context_checks_the_size_risk_fro
     assert fake.calls[:2] == ["instrument_rules", "close_position"] and fake.calls.count("close_position") == 1
     assert position(journal) == PositionRecord("DE40", P.FLAT) and journal.trades()[0].exit_reason == "FORCED"
     assert marker == "SIZE_MISMATCH_RISK" and journal.get_meta("entry_by_deal:DEAL-9") is None
+
+
+async def test_a_guarded_deal_that_is_open_again_is_closed_again_without_new_guard_events(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, notifier, monkeypatch
+):
+    # zamknięcie straży zawodzi, a chwilowy błąd listy ukrywa DEAL-1: EXITING (znacznik z przyczyną) → BLOCKED
+    # (LOCAL_POSITION_MISSING) → BLOCK_CLEARED → OPEN; nadwypełnienie znów otwarte, więc straż zamyka je jeszcze raz
+    fake.fill_size_factor = D("5")
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    real_list = fake.list_positions
+    hide = {"n": 2}  # lista po zamknięciu i najbliższy przebieg uzgadniania nie pokazują DEAL-1
+
+    async def glitchy():
+        result = await real_list()
+        if hide["n"] > 0:
+            hide["n"] -= 1
+            return [p for p in result if p.deal_id != "DEAL-1"]
+        return result
+
+    monkeypatch.setattr(fake, "list_positions", glitchy)
+    fake.fail_next("close_position", BrokerTimeout(), applied=False)  # nie zamknięte, odpowiedź zgubiona
+    assert await executor.guard_adopted_fill() is True
+    assert position(journal).state is P.EXITING and journal.get_meta("fill_guarded:DEAL-1") == "SIZE_MISMATCH_RISK"
+    for expected in (P.BLOCKED, P.OPEN):
+        clock.advance(risk_cfg.reconcile_interval_s)
+        await adopting.run_once()
+        assert position(journal).state is expected
+    fake.calls.clear()
+    assert await executor.guard_adopted_fill() is True
+    assert fake.calls[:2] == ["list_positions", "close_position"]  # zamknięcie już raz poszło: najpierw lista
+    assert position(journal) == PositionRecord("DE40", P.FLAT) and len(journal.trades()) == 1
+    assert len(events(journal, "SIZE_MISMATCH_RISK")) == 1  # bez nowych zdarzeń straży
+    [again] = events(journal, "FILL_GUARD_REFLATTEN")
+    assert again["deal_id"] == "DEAL-1" and again["causes"] == ["SIZE_MISMATCH_RISK"]
+    assert [lvl for lvl, _ in alerts(notifier, "FILL_GUARD_REFLATTEN DEAL-1")] == ["ERROR"]
 
 
 async def test_guard_adopted_fill_leaves_the_exit_to_the_emergency_flatten_while_hard(
