@@ -647,11 +647,15 @@ async def test_the_owner_alert_for_rejected_but_listed_says_the_broker_position_
 
 
 async def test_a_rejected_confirm_with_an_unreadable_position_list_stays_unknown(
-    journal, fake, mgr, req, reconciler, clock, kill_sink
+    journal, fake, mgr, req, reconciler, clock, kill_sink, monkeypatch
 ):
     fake.reject_next_entry("INSUFFICIENT_FUNDS")
     fake.fail_next("list_positions", BrokerTimeout())
+    log = spy_writes(journal, monkeypatch)
     rec = await mgr.submit_entry(req)
+    # surowy błąd odczytu listy i zdarzenie są w dzienniku przed zapisem UNKNOWN, który uzasadniają
+    raw = ["broker.open_position", "broker.confirm", "broker.list_positions", "order.event"]
+    assert log[2:] == [("order", OrderState.UNKNOWN, raw)]
     assert rec.state == OrderState.UNKNOWN and rec.note == "CAUSE=confirm:BrokerRejected_UNVERIFIED"
     assert rec.deal_reference == "REF-1"
     assert position(journal).state == PositionState.ENTERING  # nieudany odczyt nie jest dowodem braku pozycji
@@ -1063,12 +1067,16 @@ async def test_in_flight_is_true_only_while_an_entry_is_being_submitted(journal,
     assert seen == [True, True, True, True] and not mgr.in_flight  # open, confirm, confirm (runda 1), lista
 
 
-@pytest.mark.parametrize("running", ["entry_on_another_epic", "resolution"])
-async def test_submit_entry_refuses_while_another_call_is_in_flight(journal, fake, mgr, req, monkeypatch, running):
+@pytest.mark.parametrize("epic", ["US500", "DE40"], ids=["another_epic", "same_epic"])
+@pytest.mark.parametrize("running", ["entry", "resolution"])
+async def test_submit_entry_refuses_while_another_call_is_in_flight(
+    journal, fake, mgr, req, monkeypatch, running, epic
+):
     # drugi piszący naraz złamałby `in_flight` (jego `finally` zgasiłby flagę pierwszego); ochrona dziennika nie łapie
-    # wejścia na innym instrumencie, więc odmowa musi przyjść przed czymkolwiek innym
-    other = replace(req, client_id="gws-20261102-US500-2-entry", epic="US500")
-    method = "open_position" if running == "entry_on_another_epic" else "list_positions"
+    # wejścia na innym instrumencie, więc odmowa musi przyjść przed czymkolwiek innym, także przed ochroną dziennika
+    # na tym samym instrumencie (inaczej EntryBlocked zamiast RuntimeError)
+    other = replace(req, client_id=f"gws-20261102-{epic}-2-entry", epic=epic)
+    method = "open_position" if running == "entry" else "list_positions"
     real = getattr(fake, method)
     probes = []
 
@@ -1081,7 +1089,7 @@ async def test_submit_entry_refuses_while_another_call_is_in_flight(journal, fak
         return await real(*args)
 
     monkeypatch.setattr(fake, method, call_and_probe)
-    if running == "entry_on_another_epic":
+    if running == "entry":
         rec = await mgr.submit_entry(req)
     else:
         unknown = unresolved(OrderState.UNKNOWN)
@@ -1091,7 +1099,7 @@ async def test_submit_entry_refuses_while_another_call_is_in_flight(journal, fak
     assert probes == ["probed", True] and not mgr.in_flight
     assert rec.state in (OrderState.CONFIRMED, OrderState.NOT_PLACED)
     assert journal.get_order(other.client_id) is None and journal.current_position("US500") is None  # nic nie zapisano
-    assert fake.calls.count("open_position") == (1 if running == "entry_on_another_epic" else 0)
+    assert fake.calls.count("open_position") == (1 if running == "entry" else 0)
 
 
 async def test_in_flight_is_never_set_when_the_guard_refuses(journal, fake, mgr, req):
