@@ -942,6 +942,37 @@ async def test_in_flight_is_true_only_while_an_entry_is_being_submitted(journal,
     assert seen == [True, True, True, True] and not mgr.in_flight  # open, confirm, confirm (runda 1), lista
 
 
+@pytest.mark.parametrize("running", ["entry_on_another_epic", "resolution"])
+async def test_submit_entry_refuses_while_another_call_is_in_flight(journal, fake, mgr, req, monkeypatch, running):
+    # drugi piszący naraz złamałby `in_flight` (jego `finally` zgasiłby flagę pierwszego); ochrona dziennika nie łapie
+    # wejścia na innym instrumencie, więc odmowa musi przyjść przed czymkolwiek innym
+    other = replace(req, client_id="gws-20261102-US500-2-entry", epic="US500")
+    method = "open_position" if running == "entry_on_another_epic" else "list_positions"
+    real = getattr(fake, method)
+    probes = []
+
+    async def call_and_probe(*args):
+        if not probes:
+            probes.append("probed")
+            with pytest.raises(RuntimeError, match="in flight"):
+                await mgr.submit_entry(other)
+            probes.append(mgr.in_flight)  # odmowa nie gasi flagi trwającego wywołania
+        return await real(*args)
+
+    monkeypatch.setattr(fake, method, call_and_probe)
+    if running == "entry_on_another_epic":
+        rec = await mgr.submit_entry(req)
+    else:
+        unknown = unresolved(OrderState.UNKNOWN)
+        journal.insert_order(unknown)
+        journal.upsert_position(PositionRecord("DE40", PositionState.ENTERING))
+        rec = await mgr.resolve_unknown(unknown)
+    assert probes == ["probed", True] and not mgr.in_flight
+    assert rec.state in (OrderState.CONFIRMED, OrderState.NOT_PLACED)
+    assert journal.get_order(other.client_id) is None and journal.current_position("US500") is None  # nic nie zapisano
+    assert fake.calls.count("open_position") == (1 if running == "entry_on_another_epic" else 0)
+
+
 async def test_in_flight_is_never_set_when_the_guard_refuses(journal, fake, mgr, req):
     journal.insert_order(unresolved(OrderState.UNKNOWN))
     with pytest.raises(EntryBlocked):

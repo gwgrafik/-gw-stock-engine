@@ -17,7 +17,8 @@ Niezmienniki (prawdziwe pieniądze):
   (dziennik mówi wtedy SUBMITTING lub UNKNOWN, a uzgadnianie traktuje to jak UNKNOWN);
 - anulowanie zadania w trakcie wywołania brokera zostawia SUBMITTING (lub UNKNOWN) i jest przekazywane dalej;
 - `in_flight` jest prawdziwe od przejścia ochrony do końca `submit_entry` / `resolve_unknown` (zawsze gaszone
-  w `finally`): uzgadnianie pomija wtedy swój przebieg, więc zlecenie w toku ma jednego piszącego.
+  w `finally`): uzgadnianie pomija wtedy swój przebieg, więc zlecenie w toku ma jednego piszącego; drugie
+  `submit_entry` lub `resolve_unknown` w tym czasie to `RuntimeError` przed jakimkolwiek zapisem.
 
 Odrzucenie: odrzucony POST (`open_position`) to REJECTED od razu (nic nie powstało). Odrzucenie odroczone (POST przyjęty,
 REJECTED dopiero w `confirm`) to REJECTED tylko po udanym odczycie listy pozycji bez dopasowania; nasza pozycja na
@@ -141,7 +142,12 @@ class OrderManager:
         `EntryBlocked` i `ValueError` (brak stopu): nic nie zapisano i nic nie wysłano. `JournalWriteError` przed
         wysyłką: nic nie wysłano; po wysyłce: zlecenie zostaje w dzienniku SUBMITTING/UNKNOWN i rozstrzyga je
         uzgadnianie. W żadnym przypadku wywołujący nie ponawia wejścia.
+
+        `RuntimeError`, gdy inne `submit_entry` / `resolve_unknown` jest w toku (także na innym instrumencie): przed
+        jakimkolwiek odczytem i zapisem, bez zmiany flagi `in_flight` trwającego wywołania.
         """
+        if self._in_flight:
+            raise RuntimeError(f"submit_entry: another entry or resolution is in flight, refusing {req.client_id!r}")
         if not req.stop_distance > 0:
             raise ValueError(f"entry {req.client_id!r} without a stop is never sent: stop_distance {req.stop_distance}")
         self._guard(req)
