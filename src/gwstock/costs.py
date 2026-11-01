@@ -14,7 +14,9 @@ Zasady:
 - `net_pnl = gross − spread_cost − slippage_penalty − financing − fees` z już ZAOKRĄGLONYCH składników,
   więc wiersz księgi sumuje się co do grosza.
 
-Nieprawidłowe wejście to `ValueError` z nazwą pola; poprawne wejście nigdy nie rzuca.
+Nieprawidłowe wejście to `ValueError` z nazwą pola; poprawne wejście nigdy nie rzuca. Wielkości `TradeFacts` mają
+granicę |wartość| < 10^30 (dość dla każdej realnej ceny i wielkości), więc iloczyny mieszczą się w kontekście
+obliczeń (120 cyfr) i nie trzeba polegać na łapaniu wyjątków `decimal` ze środka liczenia.
 """
 
 from __future__ import annotations
@@ -37,6 +39,10 @@ FINANCING_NOT_MODELLED = "FINANCING_NOT_MODELLED"
 
 _CENT = Decimal("0.01")
 _ZERO = Decimal("0.00")
+# Granica wielkości faktów transakcji: |wartość| < 10^30. Iloczyn dwóch takich wartości ma < 61 cyfr, a wynik brutto
+# (różnica cen razy wielkość razy wartość punktu) < 10^91, więc razem z dwoma miejscami po przecinku mieści się w
+# kontekście `_CTX` (120 cyfr).
+_MAGNITUDE_LIMIT = Decimal(10) ** 30
 # Szeroka precyzja, żeby iloczyny i sumy były dokładne dla każdej realnej ceny i wielkości.
 _CTX = Context(
     prec=120,
@@ -47,12 +53,17 @@ _CTX = Context(
 )
 
 
-def _check_decimal(owner: str, name: str, value: object, *, minimum: str | None = None, positive: bool = False) -> None:
+def _check_decimal(
+    owner: str, name: str, value: object, *, minimum: str | None = None, positive: bool = False, bounded: bool = False
+) -> None:
     where = f"{owner}.{name}"
     if not isinstance(value, Decimal):
         raise ValueError(f"{where}: expected Decimal, got {type(value).__name__} {value!r}")
     if not value.is_finite():
         raise ValueError(f"{where}: expected a finite Decimal, got {value!r}")
+    # porównanie jest dokładne; `abs()` zaokrągliłoby wartość do precyzji kontekstu otoczenia
+    if bounded and not -_MAGNITUDE_LIMIT < value < _MAGNITUDE_LIMIT:
+        raise ValueError(f"{where}: magnitude must be below {_MAGNITUDE_LIMIT:.0E}, got {value}")
     if positive and value <= 0:
         raise ValueError(f"{where}: must be > 0, got {value}")
     if minimum is not None and value < Decimal(minimum):
@@ -60,7 +71,13 @@ def _check_decimal(owner: str, name: str, value: object, *, minimum: str | None 
 
 
 def _money(value: Decimal) -> Decimal:
-    """Do 0,01 (ROUND_HALF_UP); zero zawsze jako `0.00`, nigdy `-0.00`."""
+    """Do 0,01 (ROUND_HALF_UP); zero zawsze jako `0.00`, nigdy `-0.00`.
+
+    Uwaga: `quantize` bierze precyzję z kontekstu OTOCZENIA (tylko tryb zaokrąglenia jest podany jawnie) i rzuca
+    `InvalidOperation`, gdy wynik ma więcej cyfr, niż kontekst pozwala. Dlatego wolno wywoływać ją wyłącznie wewnątrz
+    `localcontext(_CTX)` (120 cyfr), tak jak robi to `CostModel.compute`; w domyślnym kontekście (28 cyfr) duży wynik
+    by się nie zmieścił.
+    """
     cents = value.quantize(_CENT, rounding=ROUND_HALF_UP)
     return _ZERO if cents.is_zero() else cents
 
@@ -95,12 +112,12 @@ def _validate_facts(t: object) -> None:
         raise ValueError(f"expected TradeFacts, got {type(t).__name__}")
     if not isinstance(t.side, Side):
         raise ValueError(f"TradeFacts.side: expected Side, got {t.side!r}")
-    _check_decimal("TradeFacts", "size", t.size, positive=True)
-    _check_decimal("TradeFacts", "value_per_point", t.value_per_point, positive=True)
+    _check_decimal("TradeFacts", "size", t.size, positive=True, bounded=True)
+    _check_decimal("TradeFacts", "value_per_point", t.value_per_point, positive=True, bounded=True)
     for name in ("mid_entry", "mid_exit", "entry_fill", "exit_fill"):
-        _check_decimal("TradeFacts", name, getattr(t, name))
+        _check_decimal("TradeFacts", name, getattr(t, name), bounded=True)
     for name in ("spread_entry", "spread_exit"):
-        _check_decimal("TradeFacts", name, getattr(t, name), minimum="0")
+        _check_decimal("TradeFacts", name, getattr(t, name), minimum="0", bounded=True)
     if not isinstance(t.exit_reason, str) or t.exit_reason not in CLOSE_REASONS:
         raise ValueError(f"TradeFacts.exit_reason: expected one of {sorted(CLOSE_REASONS)}, got {t.exit_reason!r}")
     # bool jest podklasą int, ale `True` jako liczba nocy to błąd wywołującego

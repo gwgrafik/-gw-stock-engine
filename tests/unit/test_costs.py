@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 from pathlib import Path
 
@@ -334,6 +334,55 @@ def test_large_but_plausible_values_do_not_raise():
     assert b.net_pnl == b.gross_pnl - b.spread_cost - b.slippage_penalty - b.financing - b.fees
 
 
+_BOUND = D(10) ** 30
+_SIGNED_FIELDS = ("mid_entry", "mid_exit", "entry_fill", "exit_fill")
+_NON_NEGATIVE_FIELDS = ("size", "value_per_point", "spread_entry", "spread_exit")
+_OVERSIZED = [
+    (field, value)
+    for field in _SIGNED_FIELDS
+    for value in (_BOUND, -_BOUND, _BOUND * 10, -_BOUND * 10, D("1E+400"), D("-1E+400"))
+] + [(field, value) for field in _NON_NEGATIVE_FIELDS for value in (_BOUND, _BOUND * 10, D("1E+400"))]
+
+
+@pytest.mark.parametrize(("field", "value"), _OVERSIZED)
+def test_trade_facts_magnitudes_are_bounded_below_1e30(field, value):
+    """Granica na wejściu zamiast łapania wyjątku `decimal` w środku liczenia: dość szeroka dla każdej realnej ceny."""
+    with pytest.raises(ValueError, match=field):
+        facts(**{field: value})
+
+
+def test_trade_facts_just_below_the_bound_are_accepted_and_the_ledger_row_adds_up_exactly():
+    big = D("999999999999999999999999999999.999999")  # 30 cyfr całkowitych i część ułamkowa (napis: bez zaokrąglenia)
+    assert big < _BOUND
+    neg = big.copy_negate()  # `-big` zaokrągliłoby do 28 cyfr kontekstu domyślnego
+    t = facts(size=big, value_per_point=big, mid_entry=neg, mid_exit=big, entry_fill=big, exit_fill=neg,
+              spread_entry=big, spread_exit=big, exit_reason="STOP", nights_held=1)  # fmt: skip
+    b = model_fx.compute(t)
+    with localcontext() as ctx:  # domyślny kontekst (28 cyfr) zaokrągliłby sumę i wzorzec: sprawdzamy dokładnie
+        ctx.prec = 400
+        assert b.net_pnl == b.gross_pnl - b.spread_cost - b.slippage_penalty - b.financing - b.fees
+        assert parts(b) == _oracle(CFG_FX, t)
+
+
+def test_the_bound_is_checked_again_when_facts_bypass_the_constructor():
+    f = facts()
+    object.__setattr__(f, "mid_exit", _BOUND)
+    with pytest.raises(ValueError, match="mid_exit"):
+        model.compute(f)
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_fx_markup_zero_with_apply_fx_markup_true_gives_zero_fees_also_for_wide_values(sign):
+    """Stawka 0 przy włączonym markupie: opłata to `0.00` (bez „-0.00” i bez wyjątku) także dla ogromnego wyniku."""
+    zero_markup = CostModel(dataclasses.replace(CFG, apply_fx_markup=True, fx_markup=D("0")))
+    wide = facts(size=D("1E+20"), mid_exit=D("25000.0") + sign * D("1E+12"), entry_fill=D("25000.0"),
+                 exit_fill=D("25000.0") + sign * D("1E+12"))  # fmt: skip
+    for t in (wide, facts(mid_exit=D("25000.0") + sign * D("30"))):
+        b = zero_markup.compute(t)
+        assert b.fees == D("0.00") and str(b.fees) == "0.00"
+        assert b.net_pnl == b.gross_pnl - b.spread_cost - b.slippage_penalty - b.financing
+
+
 def test_zero_price_move_is_valid():
     b = model.compute(facts(mid_exit=D("25000.0"), entry_fill=D("25000.0"), exit_fill=D("25000.0"),
                             spread_entry=D("0"), spread_exit=D("0")))  # fmt: skip
@@ -481,11 +530,14 @@ def test_ledger_row_adds_up_exactly_and_matches_exact_oracle_on_a_sweep():
 
 
 def test_spread_cost_is_never_below_the_quoted_spread_model_on_a_sweep():
+    # spread 2.0 × wielkość 0.0125 = 0.025 dokładnie: remis, w którym ROUND_HALF_UP (0.03) i half-even (0.02) się różnią,
+    # więc zaokrąglenie w modelu jest przypięte także tutaj
     for side, size, (dev_in, dev_out) in itertools.product(
-        (Side.BUY, Side.SELL), (D("0.2"), D("1.37")), [(D("-5"), D("-5")), (D("0"), D("0")), (D("4"), D("4"))]
-    ):
+        (Side.BUY, Side.SELL), (D("0.2"), D("1.37"), D("0.0125")),
+        [(D("-5"), D("-5")), (D("0"), D("0")), (D("4"), D("4"))],
+    ):  # fmt: skip
         sign = 1 if side is Side.BUY else -1
-        t = facts(side=side, size=size, mid_exit=D("25010.0"),
+        t = facts(side=side, size=size, mid_exit=D("25010.0"), spread_entry=D("2.0"), spread_exit=D("2.0"),
                   entry_fill=D("25000.0") + sign * dev_in, exit_fill=D("25010.0") - sign * dev_out)  # fmt: skip
-        modeled = ((t.spread_entry + t.spread_exit) / 2 * size).quantize(D("0.01"))
+        modeled = ((t.spread_entry + t.spread_exit) / 2 * size).quantize(D("0.01"), rounding=ROUND_HALF_UP)
         assert model.compute(t).spread_cost >= modeled
