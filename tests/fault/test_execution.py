@@ -1494,6 +1494,55 @@ async def test_late_booking_uses_the_entry_spread_not_the_current_quote(
     assert "EXIT_SPREAD_FROM_ENTRY" in event["notes"]
 
 
+# --- księgowanie przez właściciela (resolve-lost-trade, BUG-E2E-2) -----------------------------------
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL], ids=["buy", "sell"])
+async def test_book_estimated_uses_the_worst_case_entry_and_flags_the_trade(executor, journal, fake, notifier, side):
+    # wejście przyjęte = wyjście ∓ odległość stopu (najgorsza strata ze stopu), notowanie decyzji = wejście, spready 0
+    exit_level = D("25752.3")
+    entry = exit_level + 30 if side is Side.BUY else exit_level - 30
+    pos = PositionRecord("DE40", P.BLOCKED, "DEAL-9", side, D("0.007"), entry, None, T_ENTRY)
+    closed = ClosedDeal("DEAL-9", "DE40", exit_level, "STOP", T_ENTRY + timedelta(hours=1))
+    await executor.book(pos, closed, estimated=True)
+    # gross −30 × 0.007 = −0.21; poślizg STOP (0.5 + 1.0) × 0.007 = 0.0105 → 0.01; spread 0; netto −0.22
+    assert journal.trades() == [
+        TradeRecord("DE40", side, D("0.007"), entry, entry, entry, exit_level, D("-0.21"), D("0.00"), D("0.01"),
+                    D("0.00"), D("0.00"), D("-0.22"), T_ENTRY, T_ENTRY, T_ENTRY, closed.ts, 0, "STOP")
+    ]  # fmt: skip
+    assert journal.trade_flags("DEAL-9") == "ESTIMATED RESOLVED_BY_OWNER" and journal.realized_pnl(DAY) == D("-0.22")
+    [event] = events(journal, "TRADE_BOOKED")
+    assert event["estimated"] is True and event["net_pnl"] == "-0.22" and event["cost_fallback"] is False
+    assert events(journal, "COST_FALLBACK") == []  # szacunek to nie awaria kosztów
+    [(level, message)] = alerts(notifier, "LOST_TRADE_ESTIMATED")
+    assert level == "ERROR" and message.startswith("LOST_TRADE_ESTIMATED DEAL-9: worst-case loss booked")
+    assert fake.calls == ["instrument_rules"]  # wartość punktu od brokera: szacunek nie ma kontekstu tego deala
+
+
+@pytest.mark.parametrize(
+    ("size", "exit_level"),
+    [(D("0.007"), D("25782.3")), (D("0.007"), D("25790.0")), (D("0.001"), D("25780.3"))],
+    ids=["flat", "profit", "loss_rounds_to_zero"],
+)
+async def test_book_estimated_refuses_a_non_negative_gross(executor, journal, fake, notifier, size, exit_level):
+    pos = PositionRecord("DE40", P.BLOCKED, "DEAL-9", Side.BUY, size, D("25782.3"), None, T_ENTRY)
+    closed = ClosedDeal("DEAL-9", "DE40", exit_level, "MANUAL", T_ENTRY + timedelta(hours=1))
+    with pytest.raises(execution.BookingError, match="estimate"):  # zysku (ani zera) z szacunku nigdy nie księgujemy
+        await executor.book(pos, closed, estimated=True)
+    assert journal.trades() == [] and journal.realized_pnl_total() == 0 and journal.trade_flags("DEAL-9") is None
+    assert events(journal, "TRADE_BOOKED") == [] and alerts(notifier, "LOST_TRADE_ESTIMATED") == []
+    assert alerts(notifier, "BOOKING_FAILED DEAL-9")[0][0] == "ERROR"
+
+
+async def test_book_by_the_owner_flags_an_exact_trade_without_the_estimate_marks(executor, journal, notifier):
+    await executor.book(seeded_position(journal), SEEDED_CLOSE, by_owner=True)
+    [booked] = journal.trades()
+    assert booked.entry_fill == D("25721") and booked.net_pnl == D("-0.21")  # dokładnie, z kontekstem wejścia
+    assert journal.trade_flags("DEAL-7") == "RESOLVED_BY_OWNER"
+    [event] = events(journal, "TRADE_BOOKED")
+    assert "estimated" not in event and alerts(notifier, "LOST_TRADE_ESTIMATED") == []
+
+
 # --- kontrole limitów strat po księgowaniu -----------------------------------------------------------
 
 

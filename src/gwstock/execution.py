@@ -152,6 +152,9 @@ COST_FALLBACK = "COST_FALLBACK"
 NO_ENTRY_CONTEXT = "NO_ENTRY_CONTEXT"
 EXIT_SPREAD_FROM_ENTRY = "EXIT_SPREAD_FROM_ENTRY"  # księgowanie późne: spread wyjścia = spread wejścia
 ADOPTED_BY_RECONCILER = "ADOPTED_BY_RECONCILER"  # pierwszy token notatki zlecenia przyjętego przez `gwstock.reconcile`
+# Znaczniki księgi transakcji zaksięgowanej przez właściciela (`resolve-lost-trade`): dokładnie albo szacunek.
+FLAGS_BY_OWNER = "RESOLVED_BY_OWNER"
+FLAGS_ESTIMATED = "ESTIMATED RESOLVED_BY_OWNER"
 
 # Wynik jednej próby spłaszczenia (`_flatten`).
 OUTCOME_FLAT = "FLAT"  # zamknięte i zaksięgowane (FLAT, albo dziennik dogoni to w uzgadnianiu)
@@ -1055,26 +1058,40 @@ class Executor:
 
     # --- księgowanie --------------------------------------------------------------------------------------
 
-    async def book(self, position: PositionRecord, closed: ClosedDeal) -> None:
+    async def book(
+        self, position: PositionRecord, closed: ClosedDeal, *, estimated: bool = False, by_owner: bool = False
+    ) -> None:
         """Księguje zamknięcie naszej pozycji (`TradeBooker`); idempotentny po `closed.deal_id`.
 
         Już zaksięgowane: tylko ponowne nałożenie limitów strat, bez żadnego odczytu brokera. Nie zmienia stanu pozycji
         ani zleceń (to robi wywołujący po powrocie). Błąd dziennika propaguje się; `BookingError`, gdy nie da się
         zbudować nawet rekordu zdegradowanego.
-        """
-        await self._book(position, closed, self._timeout)
 
-    async def _book(self, position: PositionRecord, closed: ClosedDeal, timeout: float) -> None:
+        Właściciel (`resolve-lost-trade`): `by_owner=True` — dokładne dane brokera, znacznik księgi RESOLVED_BY_OWNER;
+        `estimated=True` — SZACUNEK najgorszej straty ze stopu: `position.open_level` to przyjęte wejście, wiersz jest
+        rekordem zdegradowanym (mid wejścia = wejście, spready 0, wartość punktu jak w rekordzie zdegradowanym), znacznik
+        ESTIMATED RESOLVED_BY_OWNER, alarm ERROR LOST_TRADE_ESTIMATED; brutto >= 0 → `BookingError` (zysku ani zera z
+        szacunku nigdy nie księgujemy).
+        """
+        await self._book(position, closed, self._timeout, estimated=estimated, by_owner=by_owner)
+
+    async def _book(
+        self, position: PositionRecord, closed: ClosedDeal, timeout: float, *, estimated: bool = False,
+        by_owner: bool = False,
+    ) -> None:  # fmt: skip
         exit_day = self._calendar.to_local(closed.ts).date()
         if self._journal.has_trade(closed.deal_id):
             self._enforce_loss_limits(exit_day, announce=False)  # domyka okno przerwania między księgą a kill switchem
             return
         exit_reason = self._exit_reason(closed)
         fallback: str | None = None
+        build = self._estimated_trade if estimated else self._full_trade
         try:
-            trade, notes = await self._full_trade(position, closed, exit_reason, timeout)
+            trade, notes = await build(position, closed, exit_reason, timeout)
         except (JournalReadError, JournalWriteError):
             raise  # dziennik leży: księgowanie powtórzy się z pełnym kontekstem
+        except BookingError:
+            raise  # szacunek właściciela, którego nie wolno zaksięgować (zysk, brak wartości punktu): bez zdegradowanego
         except Exception as exc:  # brak kontekstu, ujemny spread, złe typy: rekord zdegradowany, ale zaksięgowany
             fallback = NO_ENTRY_CONTEXT if isinstance(exc, _NoContext) else f"{type(exc).__name__}: {exc}"
             try:
@@ -1084,19 +1101,45 @@ class Executor:
             except Exception as exc2:
                 self._alert("ERROR", f"BOOKING_FAILED {closed.deal_id}: {type(exc2).__name__}: {exc2} ({fallback})")
                 raise BookingError(f"cannot book {closed.deal_id}: {type(exc2).__name__}: {exc2}") from exc2
-        booked = self._journal.record_trade(trade, closed.deal_id, exit_day)
+        flags = FLAGS_ESTIMATED if estimated else FLAGS_BY_OWNER if by_owner else ""
+        booked = self._journal.record_trade(trade, closed.deal_id, exit_day, flags=flags)
         triggered = self._enforce_loss_limits(exit_day, announce=booked)  # kill przed zapisami zdarzeń
         if not booked:
             return  # zaksięgował ktoś w międzyczasie: w księdze nic się nie zmienia
         if fallback is not None:
             self._alert("WARN", f"{COST_FALLBACK} {closed.deal_id}: degraded ledger row ({fallback}); check the broker")
             self._event(COST_FALLBACK, deal_id=closed.deal_id, reason=fallback)
+        if estimated:
+            self._alert(
+                "ERROR",
+                f"LOST_TRADE_ESTIMATED {closed.deal_id}: worst-case loss booked (net {trade.net_pnl} EUR, entry "
+                f"assumed at the stop distance); compare it with the Capital.com history",
+            )
+        owner = {"estimated": True} if estimated else {}
+        if flags:
+            owner["flags"] = flags
         self._event(
             "TRADE_BOOKED", deal_id=closed.deal_id, exit_day=exit_day.isoformat(), exit_reason=trade.exit_reason,
-            net_pnl=trade.net_pnl, notes=list(notes), cost_fallback=fallback is not None,
+            net_pnl=trade.net_pnl, notes=list(notes), cost_fallback=fallback is not None, **owner,
         )  # fmt: skip
         for code, detail in triggered:
             self._event(code, **detail)
+
+    async def _estimated_trade(
+        self, position: PositionRecord, closed: ClosedDeal, exit_reason: str, timeout: float
+    ) -> tuple[TradeRecord, tuple[str, ...]]:
+        """Szacunek właściciela: rekord zdegradowany z przyjętym wejściem; brutto musi być stratą."""
+        try:
+            trade, notes = await self._fallback_trade(position, closed, exit_reason, timeout)
+        except (JournalReadError, JournalWriteError):
+            raise
+        except Exception as exc:
+            self._alert("ERROR", f"BOOKING_FAILED {closed.deal_id}: {type(exc).__name__}: {exc} (estimate)")
+            raise BookingError(f"cannot book {closed.deal_id} from an estimate: {type(exc).__name__}: {exc}") from exc
+        if not trade.gross_pnl < 0:
+            self._alert("ERROR", f"BOOKING_FAILED {closed.deal_id}: estimated gross {trade.gross_pnl} is not a loss")
+            raise BookingError(f"cannot book {closed.deal_id} from an estimate: gross {trade.gross_pnl} is not a loss")
+        return trade, notes
 
     def _exit_reason(self, closed: ClosedDeal) -> str:
         """STOP: stop brokera; FORCED: wyjście silnika (zamiar w dzienniku albo w pamięci tego procesu, gdy zapis
