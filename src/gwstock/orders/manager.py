@@ -30,7 +30,9 @@ gdy znamy referencję, najpierw `confirm`, potem zawsze `list_positions`. Dopaso
 (epic, kierunek, `opened_at >= created_at − _CLOCK_SKEW_TOLERANCE`; wielkość nie: zapisujemy faktyczną).
 Migawka `confirm` (odpowiedź na NASZĄ referencję) jest przyjmowana, gdy epic i kierunek są zgodne oraz pasuje czasem
 albo jej deal_id jest na liście pozycji; sprzeczna (inny epic lub kierunek) albo niesprawdzalna przy udanym odczycie
-listy to BLOCKED. NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy bez dopasowania ORAZ udanym odczycie
+listy to BLOCKED. REJECTED w `confirm` w trakcie rozstrzygania nie jest dowodem braku pozycji: dopasowanie na liście →
+BLOCKED REJECTED_BUT_LISTED, inaczej (po udanym odczycie listy) historia jak niżej i NOT_PLACED REJECTED_ON_CONFIRM.
+NOT_PLACED tylko po `UNKNOWN_CHECKS` udanych odczytach listy bez dopasowania ORAZ udanym odczycie
 historii zamknięć od `created_at − HISTORY_MARGIN` bez zamknięcia na naszym instrumencie: wejście mogło się wykonać
 i zostać wybite stopem, zanim zobaczyliśmy pozycję. Takie zamknięcie → UNKNOWN UNMATCHED_CLOSED_DEAL i pozycja BLOCKED
 (bez księgowania: cena wejścia i wielkość nieznane, odtwarza właściciel); nieudany odczyt historii → UNKNOWN
@@ -217,9 +219,10 @@ class OrderManager:
         jego instrumentu w dzienniku ENTERING; inaczej `ValueError`. W trakcie innego wejścia w toku: `RuntimeError`.
 
         Wynik: CONFIRMED (pozycja OPEN z faktycznymi danymi brokera), NOT_PLACED (pozycja FLAT) albo UNKNOWN z notatką
-        AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED / UNMATCHED_CLOSED_DEAL (pozycja BLOCKED: decyduje
-        uzgadnianie lub właściciel) lub CHECKS_INCOMPLETE (pozycja ENTERING: nieudany odczyt listy albo historii,
-        rozstrzygnie uzgadnianie). NOT_PLACED dopiero po czystej historii zamknięć.
+        AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED / REJECTED_BUT_LISTED / UNMATCHED_CLOSED_DEAL (pozycja
+        BLOCKED: decyduje uzgadnianie lub właściciel) lub CHECKS_INCOMPLETE (pozycja ENTERING: nieudany odczyt listy albo
+        historii, rozstrzygnie uzgadnianie). NOT_PLACED (także po REJECTED w `confirm`) dopiero po udanym odczycie listy
+        bez dopasowania i czystej historii zamknięć.
         """
         if self._in_flight:
             raise RuntimeError(f"resolve_unknown: an entry is already in flight, refusing {order.order_id!r}")
@@ -244,12 +247,13 @@ class OrderManager:
         for attempt in range(1, UNKNOWN_CHECKS + 1):
             await self._clock.sleep(UNKNOWN_CHECK_INTERVAL_S)
             snapshot: OpenPosition | None = None
+            rejected: str | None = None
             if order.deal_reference is not None:
                 try:
                     snapshot = await self._call(self._broker.confirm(order.deal_reference))
                 except BrokerRejected as exc:
                     self._record_error(SOURCE_CONFIRM, order, exc, attempt=attempt)
-                    return self._not_placed(order, _note(f"REJECTED_ON_CONFIRM={exc.reason}", cause))
+                    rejected = exc.reason
                 except Exception as exc:
                     self._record_error(SOURCE_CONFIRM, order, exc, attempt=attempt)
                 else:
@@ -263,6 +267,16 @@ class OrderManager:
             else:
                 self._record(SOURCE_POSITIONS, order, attempt=attempt, response=positions)
 
+            if rejected is not None:
+                # REJECTED na referencję nie jest dowodem braku pozycji (POST mógł ją otworzyć): lista, potem historia
+                if positions is None:
+                    continue  # odrzucenia nie da się sprawdzić w tej rundzie
+                matches = match_entry_positions(order, positions)
+                if matches:
+                    return self._block(order, "REJECTED_BUT_LISTED", deal_ids=[p.deal_id for p in matches], cause=cause)
+                return await self._check_history_before_not_placed(
+                    order, cause, not_placed=f"REJECTED_ON_CONFIRM={rejected}", rejected=rejected
+                )
             if snapshot is not None:
                 if _contradicts(order, snapshot):
                     return self._block(order, "CONFIRM_MISMATCH", deal_ids=[snapshot.deal_id], cause=cause)
@@ -282,26 +296,32 @@ class OrderManager:
             clean_checks += 1
         if clean_checks < UNKNOWN_CHECKS:
             return self._incomplete(order, cause, clean_checks=clean_checks, history_read=False)
-        return await self._check_history_before_not_placed(order, cause)
+        return await self._check_history_before_not_placed(
+            order, cause, not_placed=f"NOT_FOUND_AFTER_CHECKS={UNKNOWN_CHECKS}", clean_checks=UNKNOWN_CHECKS
+        )
 
-    async def _check_history_before_not_placed(self, order: OrderRecord, cause: str) -> OrderRecord:
-        """Ostatni krok przed NOT_PLACED: historia zamknięć od INTENT − `HISTORY_MARGIN`.
+    async def _check_history_before_not_placed(
+        self, order: OrderRecord, cause: str, *, not_placed: str, **details: Any
+    ) -> OrderRecord:
+        """Ostatni krok przed NOT_PLACED (`not_placed`: kod notatki wyniku): historia zamknięć od INTENT −
+        `HISTORY_MARGIN`.
 
         Zamknięcie na naszym instrumencie w tym oknie (wejście wykonane i wybite, zanim zobaczyliśmy pozycję) →
         UNKNOWN UNMATCHED_CLOSED_DEAL, pozycja BLOCKED, bez księgowania. Wyjątek odczytu → CHECKS_INCOMPLETE (pozycja
-        ENTERING). Zamknięcia spoza instrumentu i sprzed okna (adapter zwrócił więcej) nie są dowodem.
+        ENTERING; `details` trafiają do zdarzenia). Zamknięcia spoza instrumentu i sprzed okna (adapter zwrócił więcej)
+        nie są dowodem.
         """
         since = order.created_at - HISTORY_MARGIN
         try:
             closures = await self._call(self._broker.closed_since(since))
         except Exception as exc:
             self._record_error(SOURCE_CLOSED, order, exc, since=since)
-            return self._incomplete(order, cause, clean_checks=UNKNOWN_CHECKS, history_read=False)
+            return self._incomplete(order, cause, **details, history_read=False)
         self._record(SOURCE_CLOSED, order, since=since, response=closures)
         ours = [c for c in closures if c.epic == order.epic and c.ts >= since]
         if ours:
             return self._block(order, "UNMATCHED_CLOSED_DEAL", deal_ids=[c.deal_id for c in ours], cause=cause)
-        return self._not_placed(order, _note(f"NOT_FOUND_AFTER_CHECKS={UNKNOWN_CHECKS}", cause))
+        return self._not_placed(order, _note(not_placed, cause))
 
     def _incomplete(self, order: OrderRecord, cause: str, **details: Any) -> OrderRecord:
         """Za mało udanych odczytów, żeby cokolwiek orzec: zlecenie zostaje UNKNOWN, pozycja ENTERING."""

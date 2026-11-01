@@ -233,7 +233,65 @@ async def test_rejection_found_while_resolving_is_not_placed(journal, fake, mgr,
     assert rec.state == OrderState.NOT_PLACED
     assert rec.note == "REJECTED_ON_CONFIRM=INSUFFICIENT_FUNDS CAUSE=confirm:BrokerTimeout"
     assert position(journal).state == PositionState.FLAT
+    assert fake.calls == ["open_position", "confirm", "confirm", "list_positions", "closed_since"]
+
+
+def _rejected_in_round_1(fake, *, filled):
+    """Potwierdzenie: najpierw timeout (UNKNOWN), w 1. rundzie rozstrzygania REJECTED. `filled`: POST mimo to otworzył
+    pozycję (sprzeczne dowody), inaczej broker naprawdę nic nie otworzył."""
+    if filled:
+        fake.fail_next("confirm", BrokerTimeout())
+        fake.fail_next("confirm", BrokerRejected("INSUFFICIENT_FUNDS"))
+    else:
+        fake.reject_next_entry("INSUFFICIENT_FUNDS")
+        fake.fail_next("confirm", BrokerTimeout())
+
+
+REJECTED_IN_RESOLUTION = {
+    "listed": (
+        lambda fake: _rejected_in_round_1(fake, filled=True),
+        OrderState.UNKNOWN, "REJECTED_BUT_LISTED", PositionRecord("DE40", PositionState.BLOCKED),
+    ),
+    "stopped_out": (
+        lambda fake: (
+            _rejected_in_round_1(fake, filled=True),
+            fake.on_call("list_positions", lambda: fake.trigger_stop("DEAL-1", STOP), once=True),
+        ),
+        OrderState.UNKNOWN, "UNMATCHED_CLOSED_DEAL", PositionRecord("DE40", PositionState.BLOCKED),
+    ),
+    "history_unreadable": (
+        lambda fake: (_rejected_in_round_1(fake, filled=False), fake.fail_next("closed_since", BrokerTimeout())),
+        OrderState.UNKNOWN, "CHECKS_INCOMPLETE", PositionRecord("DE40", PositionState.ENTERING),
+    ),
+    "list_unreadable_every_round": (
+        lambda fake: (
+            _rejected_in_round_1(fake, filled=False),
+            *(fake.fail_next("list_positions", BrokerTimeout()) for _ in range(3)),
+        ),
+        OrderState.UNKNOWN, "CHECKS_INCOMPLETE", PositionRecord("DE40", PositionState.ENTERING),
+    ),
+    "clean": (
+        lambda fake: _rejected_in_round_1(fake, filled=False),
+        OrderState.NOT_PLACED, "REJECTED_ON_CONFIRM=INSUFFICIENT_FUNDS", PositionRecord("DE40", PositionState.FLAT),
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("setup", "state", "code", "pos"), list(REJECTED_IN_RESOLUTION.values()), ids=list(REJECTED_IN_RESOLUTION)
+)
+async def test_rejected_on_confirm_during_resolution_checks_the_list_and_history_before_not_placed(
+    journal, fake, mgr, req, setup, state, code, pos
+):
+    # REJECTED na referencję w trakcie rozstrzygania nie jest dowodem braku pozycji: POST mógł ją otworzyć
+    setup(fake)
+    rec = await mgr.submit_entry(req)
+    assert rec.state == state and rec.note == f"{code} CAUSE=confirm:BrokerTimeout"
+    assert position(journal) == pos and journal.trades() == []
     assert fake.calls.count("open_position") == 1
+    if state is OrderState.NOT_PLACED:  # NOT_PLACED tylko po udanym odczycie listy i czystej historii
+        assert fake.calls[-2:] == ["list_positions", "closed_since"]
+        assert [p["response"] for p in payloads(journal, "broker.closed_since")] == [[]]
 
 
 async def test_ambiguous_match_blocks_and_never_guesses(journal, fake, mgr, req):
