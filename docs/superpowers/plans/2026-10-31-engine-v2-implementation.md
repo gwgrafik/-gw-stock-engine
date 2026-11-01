@@ -625,7 +625,7 @@ def test_engine_code_never_creates_arm_file(): ...                              
 
 **Interfaces:**
 - Consumes: `Journal`, `TradeRecord`, `load_config`.
-- Produces: `fingerprint(paths: list[Path], adapter: str, instrument_class: str) -> str` (SHA-256 hex); `export_csv(journal: Journal, path: Path) -> int` (liczba wierszy); `GateL1(sessions_at_min_size: int, unreconciled_over_60s: int, unhandled_rejections: int, cost_deviation_ratio: Decimal)`; `gate_l1_status(journal) -> GateL1`; `python -m gwstock.report` drukuje dzienny raport (brutto, netto, koszty, liczniki błędów).
+- Produces: `fingerprint(paths: list[Path], adapter: str, instrument_class: str) -> str` (SHA-256 hex); `export_csv(journal: Journal, path: Path) -> int` (liczba wierszy); `GateL1(sessions_at_min_size: int, unreconciled_over_60s: int, unhandled_rejections: int, cost_deviation_ratio: Decimal, cost_samples: int = 0)`; `gate_l1_status(journal) -> GateL1`; `python -m gwstock.report` drukuje dzienny raport (brutto, netto, koszty, liczniki błędów).
 
 - [ ] **Step 1: Write the failing tests**
 
