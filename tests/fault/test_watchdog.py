@@ -239,7 +239,7 @@ async def test_silence_is_measured_from_a_late_start_not_from_the_window_start(w
 def test_three_consecutive_login_failures_soft_kill_and_stop_further_logins(wd, clock, kill, notifier):
     for n in range(1, 4):
         assert wd.may_login()
-        wd.note_login_failure("HTTP 401 error.invalid.details")
+        wd.note_login_failure("HTTP 401 error.invalid.details", credential=True)
         assert (kill.level() is KillLevel.SOFT) == (n == 3)
         clock.advance(watchdog_mod.LOGIN_RETRY_PAUSE_S)
     assert kill.reason() == LOGIN_FAILED
@@ -272,7 +272,7 @@ def test_a_successful_login_resets_the_failure_count(wd, clock, kill):
 
 def test_owner_reset_file_lifts_the_lockout_once_and_is_consumed(wd, clock, kill, data_dir, notifier):
     for _ in range(3):
-        wd.note_login_failure("x")
+        wd.note_login_failure("x", credential=True)
         clock.advance(watchdog_mod.LOGIN_RETRY_PAUSE_S)
     assert not wd.may_login()
     (data_dir / "LOGIN_RESET").write_text("")
@@ -280,6 +280,56 @@ def test_owner_reset_file_lifts_the_lockout_once_and_is_consumed(wd, clock, kill
     assert not (data_dir / "LOGIN_RESET").exists()
     assert kill.level() is KillLevel.SOFT  # kill switch zdejmuje wyłącznie właściciel (clear)
     assert alerts_with(notifier, "LOGIN_LOCKOUT_RESET")
+
+
+def test_transient_login_failures_back_off_exponentially_and_never_lock_out(wd, clock, kill, notifier):
+    pauses = []
+    for _ in range(8):  # awaria sieci, timeout, 5xx, 429: to nie jest odrzucenie danych logowania
+        assert wd.may_login()
+        wd.note_login_failure("BrokerTimeout: POST /session: no response")
+        waited = 0
+        while not wd.may_login() and waited <= 3600:  # ograniczenie: zła implementacja nie zawiesza testu
+            clock.advance(1)
+            waited += 1
+        pauses.append(waited)
+    assert pauses == [30, 60, 120, 240, 300, 300, 300, 300]  # 30 s, podwajane, najwyżej 5 minut
+    assert not alerts_with(notifier, "LOGIN_LOCKOUT")
+    assert kill.reason() == LOGIN_FAILED  # trzy porażki z rzędu: brak nowych wejść, ale logowania trwają
+    wd.note_login_success()
+    wd.note_login_failure("timeout")
+    clock.advance(30)
+    assert wd.may_login()  # po udanym logowaniu odstęp zaczyna się od nowa
+
+
+def test_only_credential_rejections_count_toward_the_lockout(wd, clock, kill):
+    for credential in (True, False, True, False, False):
+        wd.note_login_failure("x", credential=credential)
+        clock.advance(watchdog_mod.LOGIN_BACKOFF_MAX_S)
+    assert wd.may_login()  # dwa odrzucenia danych logowania: jeszcze bez blokady
+    wd.note_login_failure("HTTP 401 error.invalid.details", credential=True)
+    clock.advance(24 * 3600)
+    assert not wd.may_login()
+
+
+def test_two_failures_then_success_neither_kills_nor_locks(wd, clock, kill):
+    wd.note_login_failure("timeout")
+    clock.advance(30)
+    wd.note_login_failure("timeout")
+    clock.advance(60)
+    assert wd.may_login()
+    wd.note_login_success()
+    assert kill.level() is KillLevel.NONE
+
+
+async def test_silence_watch_can_be_rearmed_after_a_long_entry(wd, clock, kill):
+    wd.note_quote(T0)
+    clock.advance(70)  # wejście trwało 70 s (rozstrzyganie UNKNOWN), bez odczytu notowań w pętli
+    wd.rearm_silence()
+    await wd.tick()
+    assert kill.level() is KillLevel.NONE
+    clock.advance(61)
+    await wd.tick()
+    assert kill.reason() == QUOTE_SILENCE  # po ponownym uzbrojeniu straż działa normalnie
 
 
 # --- trzy odrzucenia z rzędu → kill miękki --------------------------------------------------------

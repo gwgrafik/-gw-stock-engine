@@ -24,6 +24,7 @@ from gwstock.broker.capitalcom import LIVE_BASE_URL, CapitalComBroker, Credentia
 from gwstock.broker.capitalcom_parse import ParseError, loads
 from gwstock.types import (
     AccountInfo,
+    BrokerAuthError,
     BrokerError,
     BrokerRejected,
     BrokerTimeout,
@@ -372,12 +373,37 @@ async def test_account_switch_adopts_tokens_rotated_by_put_session(server, make_
     assert server.log[-1].status == 200 and server.count("POST", "/session") == 1
 
 
-async def test_refused_login_is_a_broker_error_not_session_expired(server, make_broker):
+async def test_refused_login_is_a_credential_error_not_session_expired(server, make_broker):
     broker = make_broker(creds=Credentials(TEST_API_KEY, TEST_IDENTIFIER, "wrong-password-123"))
+    with pytest.raises(BrokerAuthError) as info:
+        await broker.login()
+    assert isinstance(info.value, BrokerError) and not isinstance(info.value, SessionExpired)
+    assert str(info.value) == "login: POST /session: HTTP 401 error.invalid.details"
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "credential"),
+    [
+        (401, {"errorCode": "error.invalid.details"}, True),
+        (403, {"errorCode": "error.forbidden"}, True),
+        (400, {"errorCode": "error.null.api.key"}, True),
+        (400, {"errorCode": "error.invalid.something"}, False),
+        (429, {"errorCode": "error.too-many.requests"}, False),
+        (500, None, False),
+        (503, {"errorCode": "error.service.unavailable"}, False),
+    ],
+    ids=["401", "403", "null-api-key", "other-400", "429", "500", "503"],
+)
+async def test_only_credential_rejections_of_post_session_are_broker_auth_errors(
+    server, broker, status, body, credential
+):
+    # Silnik blokuje dalsze logowania wyłącznie po odrzuceniu danych logowania (ochrona klucza przed blokadą);
+    # awaria transportu, przeciążenie i limit zapytań to zwykły BrokerError (ponawiany z odstępem, bez blokady).
+    server.fail_next("/session", status, body, method="POST")
     with pytest.raises(BrokerError) as info:
         await broker.login()
-    assert type(info.value) is BrokerError
-    assert str(info.value) == "login: POST /session: HTTP 401 error.invalid.details"
+    assert isinstance(info.value, BrokerAuthError) is credential
+    assert not isinstance(info.value, SessionExpired)
 
 
 @pytest.mark.parametrize(

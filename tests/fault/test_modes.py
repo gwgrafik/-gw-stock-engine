@@ -22,11 +22,20 @@ from pathlib import Path
 import pytest
 
 import gwstock.cli as cli
-from gwstock.app import Mode
+from gwstock.app import EngineMisconfigured, Mode
 from gwstock.broker.fake import FakeBroker
 from gwstock.config import RuntimeConfig, load_runtime
-from gwstock.journal import Journal
-from gwstock.types import AccountInfo, BrokerError, BrokerRejected, Candle, KillLevel, OrderState, PositionState
+from gwstock.journal import Journal, JournalError, JournalWriteError
+from gwstock.types import (
+    AccountInfo,
+    BrokerError,
+    BrokerRejected,
+    BrokerTimeout,
+    Candle,
+    KillLevel,
+    OrderState,
+    PositionState,
+)
 from gwstock.watchdog import AlreadyRunning, InstanceLock
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     DAY,
@@ -38,9 +47,12 @@ from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     broker,
     calls_at,
     cfgs,
+    daily_candles,
     clock,
+    config_dir,
     data_dir,
     day_rules,
+    disarm,
     engine,
     engine_decisions,
     five_minute_candles,
@@ -49,6 +61,7 @@ from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     market,
     payloads,
     runtime,
+    set_live_allowed,
     sim_root,
     stop_engine_at,
 )
@@ -266,6 +279,118 @@ async def test_healthy_account_keeps_live_and_enters(engine, broker, clock):
     assert engine.mode is Mode.LIVE and rep.entries == 1 and broker.calls.count("open_position") == 1
 
 
+# --- uzbrojenie sprawdzane przy każdym dniu i tuż przed wejściem (C1) ----------------------------------------------
+
+
+class Died(BaseException):
+    """Śmierć procesu w wybranej chwili."""
+
+
+def die(*_a):
+    raise Died()
+
+
+async def test_arm_file_removed_between_days_stops_entries_and_the_leftover_is_still_flattened(
+    make_engine, broker, clock, data_dir, notifier
+):
+    first = make_engine(Mode.LIVE)
+    at_time(broker, clock, berlin(DAY, 11, 0), die)  # pozycja z poniedziałku zostaje otwarta
+    with pytest.raises(Died):
+        await first.run_day(DAY)
+    disarm(data_dir)  # właściciel rozbraja wieczorem
+    tuesday = DAY + timedelta(days=1)
+    broker.set_daily_candles(daily_candles(tuesday))
+    broker.set_candles_5m(five_minute_candles(tuesday, D("25780"), D("25790")))
+    clock.advance((berlin(tuesday, 8, 45) - clock.now_utc()).total_seconds())
+    second = make_engine.restart(first, Mode.LIVE)
+    closes = calls_at(broker, clock, "close_position")
+    stop_engine_at(second, clock, berlin(tuesday, 9, 20))
+    rep = await second.run_day(tuesday)
+    assert second.mode is Mode.DRY_RUN and rep.mode == "dry_run"
+    assert broker.calls.count("open_position") == 1  # tylko poniedziałkowe wejście
+    assert closes and second.journal.current_position("DE40").state is P.FLAT  # pozostałość spłaszczona
+    [(_, message)] = [a for a in alerts(notifier, "MODE_DOWNGRADED")]
+    assert "ARM_LIVE removed" in message and "restart" in message
+    [event] = second.journal.events("engine")
+    assert event.ts == berlin(tuesday, 8, 45)  # już na początku dnia, nie dopiero przed wejściem o 09:05
+
+
+async def test_arm_file_removed_between_0900_and_0905_means_no_entry(make_engine, broker, clock, data_dir, notifier):
+    engine = make_engine(Mode.LIVE)
+    at_time(broker, clock, berlin(DAY, 9, 2), lambda: disarm(data_dir))
+    closes = calls_at(broker, clock, "close_position")
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    rep = await engine.run_day(DAY)
+    assert "open_position" not in broker.calls and engine.mode is Mode.DRY_RUN and rep.skip_reason == "DRY_RUN"
+    [d] = engine_decisions(engine.journal)
+    assert d["outcome"] == "SIGNAL"  # decyzja zapisana, wejście dopiero przed wysyłką zatrzymane
+    assert alerts(notifier, "ARM_LIVE removed") and closes == []
+
+
+async def test_live_allowed_flipped_to_false_stops_the_next_entry_but_the_open_position_is_flattened(
+    make_engine, broker, clock, config_dir, notifier
+):
+    engine = make_engine(Mode.LIVE)
+    at_time(broker, clock, berlin(DAY, 12, 0), lambda: set_live_allowed(config_dir, False))
+    closes = calls_at(broker, clock, "close_position")
+    rep = await engine.run_day(DAY)  # pozycja z 09:05 nadal zarządzana i spłaszczona o 17:25
+    assert closes == [berlin(DAY, 17, 25)] and rep.final_position_state is P.FLAT
+    tuesday = DAY + timedelta(days=1)
+    broker.set_daily_candles(daily_candles(tuesday))
+    broker.set_candles_5m(five_minute_candles(tuesday, D("25780"), D("25790")))
+    stop_engine_at(engine, clock, berlin(tuesday, 9, 20))
+    await engine.run_day(tuesday)
+    assert broker.calls.count("open_position") == 1 and engine.mode is Mode.DRY_RUN
+    assert alerts(notifier, "live_allowed")
+
+
+async def test_live_engine_without_a_config_dir_refuses_to_start(make_engine, broker):
+    engine = make_engine(Mode.LIVE, config_dir=None)  # live_allowed nie dałoby się sprawdzić ponownie
+    with pytest.raises(EngineMisconfigured, match="config_dir"):
+        await engine.run_day(DAY)
+    assert broker.calls == []
+
+
+# --- rachunek sprawdzany jeszcze raz tuż przed zleceniem (I1) -------------------------------------------------------
+
+
+async def test_relogin_inside_the_decision_never_enters_on_an_unverified_account(engine, broker, clock, notifier):
+    # sonda P1: ponowne logowanie w trakcie odczytu świec, sesja ląduje na innym (zasilonym) rachunku
+    broker.accounts[0] = AccountInfo("ACC-0", "EUR", "ENABLED", D("40"), D("40"), D("0"))
+    n = {"c": 0}
+
+    def on_candles():
+        n["c"] += 1
+        if n["c"] == 1:
+            broker.expire_session()
+        elif n["c"] == 2:
+            broker._active_account_id = "ACC-0"
+
+    broker.on_call("candles_5m", on_candles)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    assert "open_position" not in broker.calls and engine.mode is Mode.DRY_RUN
+    assert alerts(notifier, "WRONG_ACTIVE_ACCOUNT")
+
+
+async def test_account_mismatch_at_the_last_moment_downgrades_and_sends_nothing(engine, broker, clock, notifier):
+    def switch():
+        if clock.now_utc() >= DECISION_UTC:  # tuż przed zleceniem wykonawca czyta rachunek: sesja na innym
+            broker._active_account_id = "ACC-0"
+
+    broker.on_call("account", switch)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    rep = await engine.run_day(DAY)
+    assert "open_position" not in broker.calls and engine.mode is Mode.DRY_RUN
+    assert alerts(notifier, "ACCOUNT_MISMATCH") and rep.entries == 0
+
+
+async def test_live_broker_refuses_an_entry_on_an_unverified_session(engine, broker, req):
+    with pytest.raises(BrokerRejected, match="ACCOUNT_UNVERIFIED"):  # rachunek jeszcze niesprawdzony w tej sesji
+        await engine.broker.open_position(req)
+    assert "open_position" not in broker.calls
+
+
 # --- dry_run: pełna logika, żadnego zlecenia -----------------------------------------------------------------------
 
 
@@ -275,7 +400,7 @@ async def test_dry_run_never_calls_open_position(make_engine, broker, clock):
     assert "open_position" not in broker.calls and "close_position" not in broker.calls
     assert "set_stop" not in broker.calls
     assert rep.skip_reason == "DRY_RUN" and rep.entries == 0 and rep.mode == "dry_run"
-    assert broker.calls.count("candles_5m") == 1 and "daily_candles" in broker.calls  # dane i decyzja były
+    assert broker.calls.count("candles_5m") >= 1 and "daily_candles" in broker.calls  # dane i decyzja były
     [d] = engine_decisions(engine.journal)
     assert d["mode"] == "dry_run" and d["outcome"] == "SIGNAL"
     assert [p for p in payloads(engine.journal, "decision") if "request" in p]  # zapis decyzji wykonawcy
@@ -449,6 +574,18 @@ async def test_smoke_second_close_that_is_not_position_not_found_is_a_loud_fail(
     assert alerts(notifier, "SMOKE_SECOND_CLOSE_UNEXPECTED") and engine.kill.level() is KillLevel.SOFT
 
 
+async def test_smoke_skips_the_second_close_when_the_position_is_not_confirmed_gone(engine, broker, smoke_clock):
+    def timing_out():
+        raise BrokerTimeout("DELETE /positions: timeout")
+
+    broker.on_call("close_position", timing_out)
+    lines: list[str] = []
+    assert await cli.smoke(engine, out=lines.append) == 1
+    assert any(line.startswith("FAIL [4]") for line in lines) and any(line.startswith("FAIL [5]") for line in lines)
+    assert any(line.startswith("INFO [6] skipped: position not confirmed gone") for line in lines)
+    assert not any(line.startswith(("PASS [6]", "FAIL [6]")) for line in lines)
+
+
 async def test_smoke_refuses_in_dry_run(make_engine, broker, smoke_clock):
     engine = make_engine(Mode.DRY_RUN)
     lines: list[str] = []
@@ -483,7 +620,7 @@ def test_smoke_stop_uses_the_strategy_stop_or_twice_the_minimum(day_rules, strat
 
 
 async def test_status_shows_mode_kill_position_orders_heartbeat_decision_and_trades(
-    make_engine, broker, clock, data_dir, sim_root, monkeypatch
+    make_engine, broker, clock, data_dir, config_dir, monkeypatch
 ):
     monkeypatch.setitem(sys.modules, "gwstock.prereg", None)
     make_engine.journal_path = data_dir / "journal.sqlite"  # układ produkcyjny: dziennik w data/
@@ -491,13 +628,9 @@ async def test_status_shows_mode_kill_position_orders_heartbeat_decision_and_tra
     stop_engine_at(engine, clock, berlin(DAY, 9, 20))
     await engine.run_day(DAY)
     lines: list[str] = []
-    config_dir = sim_root / "config"
-    config_dir.mkdir()
-    for name in ("strategy_v1.toml", "risk_v1.toml", "costs_v1.toml", "runtime.toml"):
-        (config_dir / name).write_text(Path("config", name).read_text())
     assert cli.status(config_dir, data_dir, out=lines.append, now=clock.now_utc()) == 0
     text = "\n".join(lines)
-    assert "mode (files): dry_run" in text and "live_allowed is not true" in text
+    assert "mode (files): dry_run (no frozen pre-registration fingerprint" in text  # reszta uzbrojenia jest
     assert "kill switch: NONE" in text and "position DE40: OPEN deal DEAL-1 BUY size 0.001" in text
     assert "unresolved orders: 0" in text and "heartbeat: 5 s ago, engine mode live, state MANAGING" in text
     assert "last decision 2026-11-02: SIGNAL" in text and "first candle 2026-11-02T08:00:00+00:00" in text
@@ -534,7 +667,7 @@ def test_cli_dispatches_each_command(monkeypatch, argv, command, tmp_path):
     monkeypatch.setenv("GW_DATA_DIR", str(tmp_path / "d"))
     monkeypatch.setenv("GW_CAPITALCOM_KEY_FILE", str(tmp_path / "k.json"))
     for name in cli.COMMANDS:
-        monkeypatch.setitem(cli.COMMANDS, name, lambda paths, name=name: seen.append((name, paths)) or 7)
+        monkeypatch.setitem(cli.COMMANDS, name, lambda paths, args, name=name: seen.append((name, paths)) or 7)
     assert cli.main(argv) == 7
     [(name, paths)] = seen
     assert name == command
@@ -551,10 +684,10 @@ def test_cli_defaults_and_unknown_command(monkeypatch):
 
 
 def test_cli_maps_a_second_instance_and_bad_files_to_exit_codes(monkeypatch, capsys):
-    def busy(paths):
+    def busy(paths, args):
         raise AlreadyRunning("another engine instance holds data/engine.lock (pid 1)")
 
-    def bad(paths):
+    def bad(paths, args):
         raise ValueError("secrets file /secrets/capitalcom.json: missing key api_key")
 
     monkeypatch.setitem(cli.COMMANDS, "run", busy)
@@ -595,6 +728,48 @@ def test_cli_holds_the_instance_lock_for_smoke_and_bind(monkeypatch, tmp_path):
         assert cli.main(["bind-account"]) == 3
         assert cli.main(["smoke"]) == 3  # blokada przed konfiguracją, dziennikiem i siecią
     assert not (data / "journal.sqlite").exists()
+
+
+def test_run_takes_the_instance_lock_before_anything_else(monkeypatch, tmp_path):
+    data = tmp_path / "d"
+    data.mkdir()
+    monkeypatch.setenv("GW_DATA_DIR", str(data))
+    monkeypatch.setenv("GW_CONFIG_DIR", str(tmp_path / "missing-config"))
+    with InstanceLock(data / "engine.lock"):
+        assert cli.main(["run"]) == 3  # blokada przed konfiguracją, dziennikiem i siecią
+    assert not (data / "journal.sqlite").exists()
+
+
+def test_main_maps_journal_errors_to_an_exit_code_without_a_traceback(monkeypatch, capsys):
+    def broken(paths, args):
+        raise JournalError("cannot open journal 'data/journal.sqlite': disk I/O error")
+
+    monkeypatch.setitem(cli.COMMANDS, "run", broken)
+    assert cli.main(["run"]) == 2
+    err = capsys.readouterr().err
+    assert "JournalError" in err and "Traceback" not in err
+
+
+async def test_status_opens_the_journal_read_only(make_engine, broker, clock, data_dir, monkeypatch):
+    make_engine.journal_path = data_dir / "journal.sqlite"
+    engine = make_engine(Mode.LIVE)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+
+    def no_writable_open(path):
+        raise AssertionError("status must not open the journal for writing")
+
+    monkeypatch.setattr(Journal, "open", no_writable_open)
+    lines: list[str] = []
+    assert cli.status(Path("config"), data_dir, out=lines.append, now=clock.now_utc()) == 0
+    assert any(line.startswith("position DE40: OPEN") for line in lines)
+    ro = Journal.open_readonly(str(data_dir / "journal.sqlite"))
+    try:
+        with pytest.raises(JournalWriteError):
+            ro.set_meta("x", "y")
+        assert ro.current_position("DE40").state is P.OPEN
+    finally:
+        ro.close()
 
 
 # --- kod nigdy nie tworzy plików uzbrojenia --------------------------------------------------------------------------

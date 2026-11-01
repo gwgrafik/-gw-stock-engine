@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Context, Decimal, Inexact, InvalidOperation, Overflow
 from enum import Enum
+from pathlib import Path
 from typing import Any, TypeVar
 
 from gwstock.types import (
@@ -443,6 +444,33 @@ class Journal:
             raise JournalError(f"cannot open journal {path!r}: {exc}") from exc
         try:
             cls._setup(conn, path)
+        except BaseException:
+            conn.close()
+            raise
+        return cls(conn)
+
+    @classmethod
+    def open_readonly(cls, path: str) -> Journal:
+        """Otwiera istniejący dziennik TYLKO DO ODCZYTU (`status`): URI `mode=ro`, bez zmiany schematu i trybu.
+
+        Każdy zapis to `JournalWriteError`. Nieistniejący plik, inna wersja schematu albo baza spoza gwstock: błąd.
+        """
+        target = Path(path).resolve()
+        if not target.is_file():
+            raise JournalError(f"cannot open journal {path!r} read-only: no such file")
+        try:
+            conn = sqlite3.connect(
+                f"{target.as_uri()}?mode=ro", uri=True, check_same_thread=False, isolation_level=None
+            )
+        except sqlite3.Error as exc:
+            raise JournalError(f"cannot open journal {path!r} read-only: {exc}") from exc
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version != SCHEMA_VERSION:
+                raise JournalSchemaError(f"{path!r} has schema version {version}, expected {SCHEMA_VERSION}")
+        except sqlite3.Error as exc:
+            conn.close()
+            raise JournalError(f"cannot read journal {path!r}: {exc}") from exc
         except BaseException:
             conn.close()
             raise

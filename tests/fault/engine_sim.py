@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from gwstock.app import Engine, Mode
+from gwstock.app import ARM_FILE, Engine, Mode
 from gwstock.broker.fake import FakeBroker
 from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.clock import FakeClock
@@ -135,9 +135,10 @@ class SimClock(FakeClock):
 
 
 @pytest.fixture
-def clock() -> SimClock:
-    """Nadpisuje fixture z conftest w module, który go importuje: 08:45 w Berlinie w dniu wzorcowym."""
-    return SimClock(START_UTC)
+def clock(request) -> SimClock:
+    """Nadpisuje fixture z conftest w module, który go importuje: 08:45 w Berlinie w dniu wzorcowym; parametr
+    pośredni (`indirect=["clock"]`) podaje inny start (np. dni zmiany czasu)."""
+    return SimClock(getattr(request, "param", START_UTC))
 
 
 @pytest.fixture
@@ -193,11 +194,49 @@ def journal_path(sim_root) -> Path:
     return sim_root / "journal.sqlite"
 
 
+def arm(data_dir: Path, config_dir: Path) -> None:
+    """Uzbrojenie symulacji tak, jak robi to WŁAŚCICIEL: plik uzbrojenia w `data/` i `live_allowed = true`.
+
+    (Kod silnika nigdy nie tworzy tego pliku; tu tworzy go fixture testu w roli właściciela.)
+    """
+    (data_dir / ARM_FILE).write_text("")
+    set_live_allowed(config_dir, True)
+
+
+def bind(data_dir: Path, account_id: str | None) -> None:
+    """Powiązanie rachunku tak, jak zapisuje je `bind-account` (None: brak powiązania)."""
+    path = data_dir / "account.json"
+    if account_id is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.write_text(json.dumps({"account_id": account_id}))
+
+
+def disarm(data_dir: Path) -> None:
+    """Właściciel usuwa plik uzbrojenia."""
+    (data_dir / ARM_FILE).unlink()
+
+
+def set_live_allowed(config_dir: Path, flag: bool) -> None:
+    (config_dir / "runtime.toml").write_text(f"live_allowed = {'true' if flag else 'false'}\n")
+
+
+@pytest.fixture
+def config_dir(sim_root) -> Path:
+    """Katalog `config/` symulacji: kopie plików strategii, ryzyka i kosztów oraz `runtime.toml` właściciela."""
+    path = sim_root / "config"
+    path.mkdir()
+    for name in ("strategy_v1.toml", "risk_v1.toml", "costs_v1.toml", "runtime.toml"):
+        (path / name).write_text(Path("config", name).read_text())
+    return path
+
+
 class EngineFactory:
     """Buduje silnik na tym samym brokerze i (domyślnie) tym samym pliku dziennika; `restart()` zamyka dziennik
-    i otwiera go na nowo z dysku (nowe obiekty: nic z pamięci poprzedniej instancji)."""
+    i otwiera go na nowo z dysku (nowe obiekty: nic z pamięci poprzedniej instancji). Symulacja jest uzbrojona
+    (plik uzbrojenia i `live_allowed = true`), więc tryb live działa, dopóki test go nie rozbroi."""
 
-    def __init__(self, broker, clock, cfgs, data_dir, runtime, journal_path, notifier) -> None:
+    def __init__(self, broker, clock, cfgs, data_dir, runtime, journal_path, notifier, config_dir) -> None:
         self.broker = broker
         self.clock = clock
         self.cfgs = cfgs
@@ -205,14 +244,19 @@ class EngineFactory:
         self.runtime = runtime
         self.journal_path = journal_path
         self.notifier = notifier
+        self.config_dir = config_dir
         self.journals: list[Journal] = []
+        arm(data_dir, config_dir)
 
     def __call__(self, mode: Mode = Mode.LIVE, **kw) -> Engine:
         journal = kw.pop("journal", None) or self.open_journal()
         cfgs = kw.pop("cfgs", self.cfgs)
+        runtime = kw.pop("runtime", self.runtime)
+        bind(self.data_dir, runtime.account_id)  # jak w produkcji: runtime.account_id pochodzi z data/account.json
         return Engine(
             kw.pop("broker", self.broker), journal, self.clock, kw.pop("calendar", CAL), cfgs, self.data_dir,
-            kw.pop("runtime", self.runtime), mode, notifier=kw.pop("notifier", self.notifier), **kw,
+            runtime, mode, notifier=kw.pop("notifier", self.notifier),
+            config_dir=kw.pop("config_dir", self.config_dir), **kw,
         )  # fmt: skip
 
     def open_journal(self) -> Journal:
@@ -238,8 +282,8 @@ def cfgs(strat_cfg, risk_cfg, cost_cfg):
 
 
 @pytest.fixture
-def make_engine(broker, clock, cfgs, data_dir, runtime, journal_path, notifier):
-    factory = EngineFactory(broker, clock, cfgs, data_dir, runtime, journal_path, notifier)
+def make_engine(broker, clock, cfgs, data_dir, runtime, journal_path, notifier, config_dir):
+    factory = EngineFactory(broker, clock, cfgs, data_dir, runtime, journal_path, notifier, config_dir)
     yield factory
     factory.close()
 

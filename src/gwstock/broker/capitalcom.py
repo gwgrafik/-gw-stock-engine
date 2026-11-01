@@ -75,6 +75,7 @@ from gwstock.broker.capitalcom_trading import TradingMixin
 from gwstock.clock import Clock
 from gwstock.types import (
     AccountInfo,
+    BrokerAuthError,
     BrokerError,
     BrokerRejected,
     BrokerTimeout,
@@ -118,6 +119,9 @@ _FIVE_MINUTES = timedelta(minutes=5)
 _ONE_DAY = timedelta(days=1)
 _SECRET_MIN_LEN = 4  # krótszych wartości nie da się sensownie wyciąć z komunikatu (zniszczyłoby tekst)
 _MAX_ERROR_CODE_LEN = 200
+# Odrzucenie danych logowania przez `POST /session` (notatki §2.4: 401 error.invalid.details, 400 error.null.api.key);
+# 401/403 z dowolnym kodem też. Tylko to jest `BrokerAuthError` (blokada dalszych logowań w silniku).
+_CREDENTIAL_ERROR_CODES = frozenset({"error.invalid.details", "error.null.api.key"})
 _MAX_RAW_ERROR_CODE_LEN = 4096  # tylko ogranicza pracę; przycięcie do komunikatu dopiero po usunięciu sekretów
 
 
@@ -495,7 +499,10 @@ class CapitalComBroker(TradingMixin):
         body = {"identifier": self._creds.identifier, "password": self._creds.api_password, "encryptedPassword": False}
         resp = await self._send(where, "POST", "/session", {"X-CAP-API-KEY": self._creds.api_key}, body=body)
         if resp.status != 200:
-            raise self._status_error(where, resp)
+            error = self._status_error(where, resp)
+            if resp.status in (401, 403) or _error_code(resp.body) in _CREDENTIAL_ERROR_CODES:
+                raise self._error(BrokerAuthError, str(error))  # dane logowania odrzucone: nie ponawiać w kółko
+            raise error
         tokens = self._tokens_from(resp)
         if tokens is None:
             raise self._error(BrokerError, f"{where}: response without valid CST/X-SECURITY-TOKEN headers")

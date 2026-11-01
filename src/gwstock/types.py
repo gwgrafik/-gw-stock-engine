@@ -249,6 +249,14 @@ class BrokerRejected(BrokerError):
         self.reason = reason
 
 
+class BrokerAuthError(BrokerError):
+    """Broker odrzucił DANE LOGOWANIA (klucz, identyfikator, hasło): ponawianie grozi blokadą klucza lub konta.
+
+    Tylko taki błąd logowania liczy się do blokady dalszych logowań (Watchdog); awaria transportu, przeciążenie
+    i limit zapytań to zwykły `BrokerError`.
+    """
+
+
 class SessionExpired(BrokerError):
     """Sesja wygasła: potrzebne ponowne logowanie."""
 

@@ -43,6 +43,7 @@ zostaje u brokera ze stopem, co trafia do logu. Anulowanie (`CancelledError`) pr
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ from typing import Any, TypeVar
 from gwstock.broker.base import Broker, Capabilities
 from gwstock.calendar import ExchangeCalendar
 from gwstock.clock import Clock
-from gwstock.config import CostConfig, RiskConfig, RuntimeConfig, StrategyConfig
+from gwstock.config import CostConfig, RiskConfig, RuntimeConfig, StrategyConfig, load_runtime
 from gwstock.costs import CostModel
 from gwstock.execution import KILL_CHECK_FAILED, Executor
 from gwstock.journal import Journal, JournalError, JournalWriteError, PositionRecord
@@ -67,6 +68,8 @@ from gwstock.serialization import dump
 from gwstock.strategy import ATR_PERIOD, NO_SIGNAL_DATA, EntrySignal, Skip, atr14, decide
 from gwstock.types import (
     AccountInfo,
+    BrokerAuthError,
+    BrokerError,
     BrokerRejected,
     Candle,
     ClosedDeal,
@@ -74,6 +77,7 @@ from gwstock.types import (
     EntryRequest,
     InstrumentRules,
     KillLevel,
+    MarketClosed,
     OpenPosition,
     OrderState,
     PositionState,
@@ -105,7 +109,9 @@ HEARTBEAT_FILE = "heartbeat.json"
 LOCK_FILE = "engine.lock"
 ALERTS_FILE = "alerts.log"
 L1_PASSED_FILE = "L1_PASSED"  # bramka L1: tworzy WYŁĄCZNIE właściciel; silnik tylko sprawdza obecność
+ARM_FILE = "ARM_LIVE"  # uzbrojenie live: tworzy WYŁĄCZNIE właściciel; silnik tylko sprawdza obecność
 FLATTEN_REASON = "FORCED"
+MARKET_CLOSED_RETRY_S = 60  # wyjście przy zamkniętym rynku: kolejna próba najwcześniej po minucie (nie co takt)
 
 # Przyczyny braku wejścia w `DayReport.skip_reason` (obok przyczyn strategii DOJI, STOP_TOO_TIGHT, SKIPPED_MIN_SIZE).
 NOT_SESSION = "NOT_SESSION"
@@ -125,6 +131,14 @@ SOURCE_ENGINE = "engine"
 _NOT_READY_WHY = frozenset({"NOT_LOGGED_IN", "STARTUP_RECONCILE_PENDING", "ACCOUNT_UNVERIFIED"})
 # Metody brokera, których odrzucenia (BrokerRejected) liczy Watchdog (trzy z rzędu → kill miękki).
 _ORDER_METHODS = frozenset({"open_position", "confirm", "close_position", "set_stop"})
+
+
+def arm_file_exists(data_dir: Path) -> bool:
+    """Czy właściciel utworzył plik uzbrojenia (tylko sprawdzenie; błąd odczytu = nie)."""
+    try:
+        return (Path(data_dir) / ARM_FILE).is_file()
+    except OSError:
+        return False
 
 
 class EngineMisconfigured(RuntimeError):
@@ -181,18 +195,22 @@ class _DayState:
     next_manage: datetime | None = None
     next_ping: datetime | None = None
     next_data: datetime | None = None
+    candles_seen: list[Candle] = field(default_factory=list)  # ostatnia odpowiedź na zapytanie o pierwszą świecę
+    candles_followup_at: datetime | None = None  # zdarzenie DECISION_CANDLES (sąsiednie świece, kontrola L0)
     notes: list[str] = field(default_factory=list)
 
 
 class _SessionGuard:
     """Wywołania brokera z ponownym logowaniem po `SessionExpired` (szeregowanym, z ochroną przed blokadą konta)."""
 
-    def __init__(self, inner: Broker, watchdog: Watchdog, alerts: RateLimitedNotifier) -> None:
+    def __init__(self, inner: Broker, watchdog: Watchdog, alerts: RateLimitedNotifier, clock: Clock) -> None:
         self._inner = inner
         self._watchdog = watchdog
         self._alerts = alerts
+        self._clock = clock
         self._lock = asyncio.Lock()
         self.gen = 0  # liczba udanych logowań w tym procesie
+        self.market_closed_at: datetime | None = None  # ostatnie zamknięcie odrzucone przez zamknięty rynek
 
     async def login(self, cause: str = "start") -> bool:
         """Jawne logowanie (start dnia); True: sesja jest. Nie rzuca (porażkę liczy Watchdog)."""
@@ -236,8 +254,9 @@ class _SessionGuard:
             await self._inner.login()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            self._watchdog.note_login_failure(f"{type(exc).__name__}: {exc} ({cause})")
+        except Exception as exc:  # tylko odrzucenie danych logowania liczy się do blokady prób
+            credential = isinstance(exc, BrokerAuthError)
+            self._watchdog.note_login_failure(f"{type(exc).__name__}: {exc} ({cause})", credential=credential)
             return False
         self._watchdog.note_login_success()
         self.gen += 1
@@ -247,10 +266,22 @@ class _SessionGuard:
 class GuardedBroker:
     """`Broker` dla menedżera, wykonawcy i uzgadniania: każde wywołanie przez `_SessionGuard` silnika."""
 
-    def __init__(self, inner: Broker, guard: _SessionGuard, entries_allowed: Callable[[], bool]) -> None:
+    def __init__(
+        self,
+        inner: Broker,
+        guard: _SessionGuard,
+        entry_block: Callable[[], str | None],
+        *,
+        on_account: Callable[[AccountInfo], None] | None = None,
+        on_quote: Callable[[Quote], None] | None = None,
+        clock: Clock | None = None,
+    ) -> None:
         self._inner = inner
         self._guard = guard
-        self._entries_allowed = entries_allowed
+        self._entry_block = entry_block
+        self._on_account = on_account
+        self._on_quote = on_quote
+        self._clock = clock
 
     @property
     def inner(self) -> Broker:
@@ -271,7 +302,10 @@ class GuardedBroker:
         return await self._guard.call("instrument_rules", self._inner.instrument_rules, epic)
 
     async def quote(self, epic: str) -> Quote:
-        return await self._guard.call("quote", self._inner.quote, epic)
+        q = await self._guard.call("quote", self._inner.quote, epic)
+        if self._on_quote is not None:  # każde notowanie (także wykonawcy w trakcie wejścia) karmi straż ciszy
+            self._on_quote(q)
+        return q
 
     async def daily_candles(self, epic: str, count: int) -> list[Candle]:
         return await self._guard.call("daily_candles", self._inner.daily_candles, epic, count)
@@ -280,8 +314,9 @@ class GuardedBroker:
         return await self._guard.call("candles_5m", self._inner.candles_5m, epic, start, end)
 
     async def open_position(self, req: EntryRequest) -> EntryAck:
-        if not self._entries_allowed():  # druga linia obrony: dry_run nigdy nie wysyła wejścia
-            raise BrokerRejected("DRY_RUN_NO_ORDERS")
+        blocked = self._entry_block()  # druga linia obrony: dry_run albo rachunek niesprawdzony w tej sesji
+        if blocked is not None:
+            raise BrokerRejected(blocked)
         return await self._guard.call("open_position", self._inner.open_position, req, retry=False)
 
     async def confirm(self, deal_reference: str) -> OpenPosition | None:
@@ -294,7 +329,13 @@ class GuardedBroker:
         return await self._guard.call("list_working_orders", self._inner.list_working_orders)
 
     async def close_position(self, deal_id: str) -> None:
-        return await self._guard.call("close_position", self._inner.close_position, deal_id)
+        try:
+            await self._guard.call("close_position", self._inner.close_position, deal_id)
+        except MarketClosed:
+            if self._clock is not None:
+                self._guard.market_closed_at = self._clock.now_utc()
+            raise
+        self._guard.market_closed_at = None
 
     async def set_stop(self, deal_id: str, stop_level: Decimal) -> None:
         return await self._guard.call("set_stop", self._inner.set_stop, deal_id, stop_level)
@@ -303,7 +344,11 @@ class GuardedBroker:
         return await self._guard.call("closed_since", self._inner.closed_since, since)
 
     async def account(self) -> AccountInfo:
-        return await self._guard.call("account", self._inner.account)
+        """Aktywny rachunek sesji; w live porównany z rachunkiem związanym (wykonawca czyta go tuż przed zleceniem)."""
+        info = await self._guard.call("account", self._inner.account)
+        if self._on_account is not None:
+            self._on_account(info)  # niezgodność: zejście do dry_run i BrokerError (żadnego zlecenia)
+        return info
 
     async def list_accounts(self) -> list[AccountInfo]:
         return await self._guard.call("list_accounts", self._inner.list_accounts)
@@ -330,6 +375,7 @@ class Engine:
         reconciler: Reconciler | None = None,
         quote_poll_s: float = QUOTE_POLL_S,
         lock: InstanceLock | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         strat, risk, costs = cfgs
         if not quote_poll_s > 0:
@@ -340,6 +386,7 @@ class Engine:
         self.strat, self.risk, self.costs = strat, risk, costs
         self.data_dir = Path(data_dir)
         self.runtime = runtime
+        self._config_dir = Path(config_dir) if config_dir is not None else None
         self._mode = Mode(mode)
         self._epic = strat.instrument
         self._quote_poll_s = quote_poll_s
@@ -350,8 +397,11 @@ class Engine:
         self.watchdog = Watchdog(
             clock, journal, self.kill, broker, risk, self.data_dir / HEARTBEAT_FILE, notifier=self.alerts
         )
-        self._guard = _SessionGuard(broker, self.watchdog, self.alerts)
-        self.broker = GuardedBroker(broker, self._guard, lambda: self._mode is Mode.LIVE)
+        self._guard = _SessionGuard(broker, self.watchdog, self.alerts, clock)
+        self.broker = GuardedBroker(
+            broker, self._guard, self._entry_block, on_account=self._check_session_account,
+            on_quote=lambda q: self.watchdog.note_quote(q.ts), clock=clock,
+        )  # fmt: skip
         self.manager = OrderManager(journal, self.broker, clock, risk)
         self.gate = RiskGate(risk, strat, journal, calendar, clock, kill=self.kill)
         self._cost_model = CostModel(costs)
@@ -362,6 +412,7 @@ class Engine:
         self._shutdown = False
         self._stop_logged = False
         self._verified_gen = -1  # pokolenie sesji, dla którego sprawdzono rachunek (live)
+        self._day_states: dict[date, _DayState] = {}  # stan dnia przeżywa ponowienie dnia w run_forever
         self.last_quote: Quote | None = None
         self.watchdog.set_status(mode=self._mode.value, state="CREATED")
 
@@ -383,6 +434,8 @@ class Engine:
         """Odmowa startu silnika złożonego niebezpiecznie (live)."""
         if self._mode is not Mode.LIVE:
             return
+        if self._config_dir is None:
+            raise EngineMisconfigured("live engine without config_dir: live_allowed could not be re-checked")
         if not self.executor.live:
             raise EngineMisconfigured("live engine with an executor that does not send orders")
         if getattr(self.reconciler, "booker", None) is not self.executor:
@@ -417,6 +470,46 @@ class Engine:
         self._alert("MODE_DOWNGRADED", "ERROR", f"MODE_DOWNGRADED live -> dry_run for the rest of this run: {reason}")
         self._event("MODE_DOWNGRADED", reason=reason)
 
+    def _armed_problem(self) -> str | None:
+        """Czy uzbrojenie nadal trwa: plik właściciela, `live_allowed` i ten sam związany rachunek (z plików)."""
+        if not arm_file_exists(self.data_dir):
+            return f"{ARM_FILE} removed by the owner"
+        if self._config_dir is None:
+            return "no config_dir to re-check live_allowed"
+        try:
+            runtime = load_runtime(self._config_dir, self.data_dir)
+        except Exception as exc:  # nieczytelna konfiguracja: nie zgadujemy, rozbrajamy
+            return f"runtime configuration unreadable ({type(exc).__name__})"
+        if runtime.live_allowed is not True:
+            return "live_allowed is no longer true in config/runtime.toml"
+        if runtime.account_id != self.runtime.account_id:
+            return "the bound account in data/account.json changed"
+        return None
+
+    def _check_armed(self) -> None:
+        """Na początku każdego dnia i tuż przed wejściem: rozbrojenie przez właściciela → dry_run (na stałe)."""
+        if self._mode is not Mode.LIVE:
+            return
+        problem = self._armed_problem()
+        if problem is not None:
+            self._downgrade(f"{problem}; re-arming requires a restart of the engine")
+
+    def _entry_block(self) -> str | None:
+        """Powód odmowy wysłania wejścia (None: wolno): dry_run albo rachunek niesprawdzony w bieżącej sesji."""
+        if self._mode is not Mode.LIVE:
+            return "DRY_RUN_NO_ORDERS"
+        if self._verified_gen != self._guard.gen:
+            return "ACCOUNT_UNVERIFIED"
+        return None
+
+    def _check_session_account(self, info: AccountInfo) -> None:
+        """Ostatnia kontrola przed zleceniem: aktywny rachunek sesji musi być związanym (live)."""
+        bound = self.runtime.account_id
+        if self._mode is not Mode.LIVE or bound is None or info.account_id == bound:
+            return
+        self._downgrade("ACCOUNT_MISMATCH: the session's active account is not the bound one")
+        raise BrokerError("ACCOUNT_MISMATCH: the session's active account is not the bound one; no order sent")
+
     # --- wywołania brokera ---
 
     async def _call(self, fn: Callable[..., Awaitable[T]], *args: Any) -> T:
@@ -450,9 +543,10 @@ class Engine:
             return f"ACCOUNT_NOT_EUR (currency {acc.currency})"
         if not acc.equity > 0:
             return "ACCOUNT_ZERO_BALANCE"
-        active = await self.broker.account()
+        active = await self._call(self.raw_broker.account)  # bez haka niezgodności: tu liczy się powód
         if active.account_id != bound:
             return "WRONG_ACTIVE_ACCOUNT: the session is on another account than the bound one"
+        self._verified_gen = self._guard.gen  # odczyt rachunku należy do sesji bieżącego pokolenia
         return None
 
     async def reconcile_once(self) -> ReconcileResult | None:
@@ -483,6 +577,7 @@ class Engine:
     async def run_day(self, day: date) -> DayReport:
         """Jeden dzień giełdy (patrz docstring modułu). Wraca po uzgadnianiu końcowym albo po prośbie o zatrzymanie."""
         self.check_wiring()
+        self._check_armed()
         try:
             return await self._run_day(day)
         except asyncio.CancelledError:
@@ -501,7 +596,10 @@ class Engine:
             await self._idle_until(times.preopen)
             if self._shutdown:
                 return self._report(day, SHUTDOWN, interrupted=True)
-        st = _DayState(day, times, self._now(), self._guard.gen)
+        st = self._day_states.get(day)
+        if st is None or st.times != times:  # ponowienie dnia (wyjątek w run_forever) kontynuuje ten sam stan
+            st = _DayState(day, times, self._now(), self._guard.gen)
+            self._day_states = {day: st}
         self.watchdog.set_session_window(times.open, times.close)
         try:
             await self._loop(st, times.close)
@@ -518,7 +616,7 @@ class Engine:
     async def run_forever(self) -> None:
         """Dzień po dniu do zatrzymania; blokada instancji przez całe życie; zwykły wyjątek dnia nie zabija silnika."""
         self.check_wiring()
-        with self._lock:
+        with contextlib.nullcontext() if self._lock.held else self._lock:  # main bierze blokadę przed wszystkim
             _LOG.info("engine started: mode %s, instrument %s", self._mode.value, self._epic)
             try:
                 while not self._shutdown:
@@ -572,6 +670,7 @@ class Engine:
             lambda: self._manage_step(st),
             lambda: self._signal_data_step(st),
             lambda: self._decision_step(st),
+            lambda: self._candles_followup_step(st),
         ]
         for step in steps:
             if self._shutdown:
@@ -708,14 +807,20 @@ class Engine:
             st.reconciled = True
         if self._shutdown:
             return
+        backed_off = self._market_closed_backoff()
         if self.kill.level() is KillLevel.HARD:
-            await self._safe("emergency_flatten", self.executor.emergency_flatten)
+            if not backed_off:
+                await self._safe("emergency_flatten", self.executor.emergency_flatten)
             return
         position = self._position()
-        if position is None:
+        if position is None or backed_off:  # zamknięty rynek: stop u brokera chroni, próba co minutę
             return
         if position.state is _P.EXITING or (position.state is _P.OPEN and self._must_flatten(st, position, now)):
             await self._safe("flatten", self.executor.flatten, position, FLATTEN_REASON)
+
+    def _market_closed_backoff(self) -> bool:
+        closed_at = self._guard.market_closed_at
+        return closed_at is not None and (self._now() - closed_at).total_seconds() < MARKET_CLOSED_RETRY_S
 
     async def _signal_data_step(self, st: _DayState) -> None:
         t, now = st.times, self._now()
@@ -750,7 +855,8 @@ class Engine:
         if now > t.deadline:
             why = "STARTED_AFTER_DEADLINE" if st.started > t.deadline else (st.why_waiting or "DEADLINE_PASSED")
             reason = NOT_READY if why in _NOT_READY_WHY else NO_SIGNAL_DATA
-            self._record_decision(st, reason=reason, why=why)
+            neighbours = [] if why == "STARTED_AFTER_DEADLINE" else await self._neighbour_candles(t)
+            self._record_decision(st, reason=reason, why=why, neighbours=neighbours)
             st.decided, st.skip_reason = True, reason
             return
         if self._guard.gen == st.login_gen:
@@ -781,6 +887,7 @@ class Engine:
             message = f"CANDLES_UNAVAILABLE: {type(exc).__name__}: {exc}; retrying to the deadline"
             self._alert("CANDLES", "WARN", message)
             return
+        st.candles_seen = list(candles)
         first = next((c for c in candles if c.start == t.open), None)  # wyłącznie równość ze startem sesji (UTC)
         if first is None:
             st.why_waiting = "FIRST_CANDLE_MISSING"
@@ -803,6 +910,7 @@ class Engine:
             refreshed = None
         rules = refreshed or st.rules
         st.rules = rules
+        neighbours = await self._neighbour_candles(t)
         if self._shutdown:  # prośba o zatrzymanie w trakcie odczytów: bez decyzji i bez wejścia
             return
         try:
@@ -816,20 +924,22 @@ class Engine:
             raise
         except Exception as exc:  # błąd danych lub wywołującego: brak wejścia, alarm
             self._alert("DECIDE_FAILED", "ERROR", f"DECIDE_FAILED: {type(exc).__name__}: {exc}; no entry today")
-            self._record_decision(st, first=first, quote=quote, reason=NO_SIGNAL_DATA, why="DECIDE_FAILED")
+            self._record_decision(
+                st, first=first, quote=quote, reason=NO_SIGNAL_DATA, why="DECIDE_FAILED", neighbours=neighbours
+            )
             st.decided, st.skip_reason = True, NO_SIGNAL_DATA
             return
         st.decided = True
         if isinstance(outcome, Skip):
             self._record_decision(
                 st, first=first, quote=quote, reason=outcome.reason, session_index=session_index,
-                rule_size_allowed=rule_size_allowed,
+                rule_size_allowed=rule_size_allowed, neighbours=neighbours,
             )  # fmt: skip
             st.skip_reason = outcome.reason
             return
         self._record_decision(
             st, first=first, quote=quote, signal=outcome, session_index=session_index,
-            rule_size_allowed=rule_size_allowed,
+            rule_size_allowed=rule_size_allowed, neighbours=neighbours,
         )  # fmt: skip
         if self._shutdown:
             st.skip_reason = SHUTDOWN
@@ -837,6 +947,13 @@ class Engine:
         await self._enter(st, outcome, rules)
 
     async def _enter(self, st: _DayState, signal: EntrySignal, rules: InstrumentRules) -> None:
+        self._check_armed()  # właściciel mógł rozbroić między 09:00 a 09:05: wtedy wejście tylko jako dry_run
+        if self._mode is Mode.LIVE and self._verified_gen != self._guard.gen:
+            await self._check_account(st)  # ponowne logowanie w trakcie decyzji: rachunek jeszcze raz przed wysyłką
+            if self._mode is Mode.LIVE and self._verified_gen != self._guard.gen:
+                st.skip_reason = "ACCOUNT_UNVERIFIED"
+                st.notes.append("ENTRY_SKIPPED_ACCOUNT_UNVERIFIED")
+                return
         try:
             blocks_before = len(self.journal.events("gate_block"))
         except JournalError:
@@ -849,6 +966,8 @@ class Engine:
             _LOG.error("entry failed: %s: %s", type(exc).__name__, exc)
             st.skip_reason = ENTRY_NOT_SENT
             return
+        finally:
+            self.watchdog.rearm_silence()  # w trakcie długiego wejścia pętla nie odczytywała notowań
         if rec is not None:
             st.skip_reason = None if rec.state is OrderState.CONFIRMED else f"ENTRY_{rec.state.value}"
             return
@@ -876,8 +995,14 @@ class Engine:
         why: str | None = None,
         session_index: int | None = None,
         rule_size_allowed: bool | None = None,
+        neighbours: list[Candle] | None = None,
     ) -> None:
-        """Zdarzenie `decision` (DECISION): zawsze, także dla braku danych; awaria zapisu → kill miękki."""
+        """Zdarzenie `decision` (DECISION): zawsze, także dla braku danych; awaria zapisu → kill miękki.
+
+        Dla kontroli L0 (konwencja stempla niepotwierdzona) zawiera WSZYSTKIE świece z zapytania o pierwszą świecę
+        i świecę sprzed otwarcia, każdą ze startem UTC, etykietą czasu lokalnego i OHLC; świecę po pierwszej dopisuje
+        zdarzenie DECISION_CANDLES, gdy się zakończy.
+        """
         if session_index is None:
             session_index = self._safe_read(lambda: len(self.journal.trades()), -1)
         if rule_size_allowed is None:
@@ -888,6 +1013,8 @@ class Engine:
             "mode": self._mode.value,
             "first_candle": first,
             "first_candle_start_utc": first.start if first is not None else None,
+            "candles_returned": [self._candle_view(c) for c in st.candles_seen],
+            "neighbours": [self._candle_view(c) for c in neighbours or ()],
             "atr": st.atr,
             "quote": quote,
             "session_index": session_index,
@@ -906,10 +1033,53 @@ class Engine:
         except Exception as exc:
             self.kill.soft(JOURNAL_WRITE_FAILED)
             self._alert("DECISION_JOURNAL", "ERROR", f"{JOURNAL_WRITE_FAILED}: decision not journaled: {exc}")
+        if st.times is not None and why != "STARTED_AFTER_DEADLINE":
+            span = timedelta(minutes=self.strat.range_minutes)
+            st.candles_followup_at = st.times.open + 2 * span  # świeca po pierwszej jest wtedy zakończona
         _LOG.info(
             "decision %s: %s %s (first candle %s)", st.day, payload["outcome"], reason or "",
             first.start.isoformat() if first is not None else "missing",
         )  # fmt: skip
+
+    def _candle_view(self, c: Candle) -> dict[str, Any]:
+        local = self.calendar.to_local(c.start)
+        return {
+            "start": c.start, "local": f"{local:%H:%M} {local.tzname()}", "open": c.open, "high": c.high,
+            "low": c.low, "close": c.close,
+        }  # fmt: skip
+
+    async def _neighbour_candles(self, t: _Times) -> list[Candle]:
+        """Świeca przed otwarciem (kontekst kontroli L0); błąd odczytu nie przeszkadza decyzji."""
+        span = timedelta(minutes=self.strat.range_minutes)
+        try:
+            return await self.broker.candles_5m(self._epic, t.open - span, t.open)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return []
+
+    async def _candles_followup_step(self, st: _DayState) -> None:
+        """DECISION_CANDLES: świeca przed, pierwsza i po pierwszej, po zakończeniu tej ostatniej (kontrola L0)."""
+        t, due = st.times, st.candles_followup_at
+        if t is None or due is None or self._now() < due:
+            return
+        st.candles_followup_at = None
+        span = timedelta(minutes=self.strat.range_minutes)
+        try:
+            candles = await self.broker.candles_5m(self._epic, t.open - span, t.open + 2 * span)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOG.info("decision candle follow-up unavailable: %s", type(exc).__name__)
+            return
+        payload = {
+            "event": "DECISION_CANDLES", "day": st.day.isoformat() if st.day else None,
+            "first_candle_start_utc": t.open, "candles": [self._candle_view(c) for c in candles],
+        }  # fmt: skip
+        try:
+            self.journal.append_raw(SOURCE_DECISION, dump(payload), self._now())
+        except Exception as exc:
+            _LOG.warning("DECISION_CANDLES not journaled: %s", exc)
 
     def _event(self, code: str, **details: Any) -> None:
         try:

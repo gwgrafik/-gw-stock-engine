@@ -7,11 +7,13 @@ Wyzwalacze (każdy idempotentny: kill switch nie powtarza zapisu ani alarmu tej 
 - QUOTE_SILENCE: w oknie sesji (ustawianym przez silnik) brak ŚWIEŻEGO notowania dłużej niż `stale_quote_s`.
   `Quote.ts` to chwila ostatniej ZMIANY pary (bid, ask), więc zamrożone notowanie też jest ciszą. Cisza liczy się
   od najpóźniejszej z chwil: ostatnie notowanie, początek okna, ustawienie okna (start silnika w środku sesji);
-- LOGIN_FAILED: `LOGIN_FAILURE_LIMIT` nieudanych logowań z rzędu. Wtedy też blokada logowań (`may_login()` zwraca
-  False): Capital.com może zablokować konto po serii błędnych logowań (np. obrócony klucz), więc silnik przestaje
-  próbować do udanego logowania (niemożliwego bez próby), do restartu procesu albo do pliku `data/LOGIN_RESET`
-  utworzonego przez właściciela (Watchdog go usuwa przy odczycie: jeden plik = jedna seria prób). Między nieudanymi
-  próbami co najmniej `LOGIN_RETRY_PAUSE_S`, więc seria trzech porażek nie mieści się w jednym takcie;
+- LOGIN_FAILED: `LOGIN_FAILURE_LIMIT` nieudanych logowań z rzędu (dowolnego rodzaju): brak nowych wejść.
+  Blokada logowań (`may_login()` zwraca False na stałe) WYŁĄCZNIE po `LOGIN_FAILURE_LIMIT` odrzuceniach DANYCH
+  LOGOWANIA (`note_login_failure(..., credential=True)`, adapter: `BrokerAuthError`): Capital.com może zablokować klucz
+  po serii błędnych logowań, więc silnik przestaje próbować do restartu procesu (licznik jest w pamięci: restart daje
+  trzy nowe próby) albo do pliku `data/LOGIN_RESET` utworzonego przez właściciela (usuwany przy odczycie). Awaria
+  transportu, timeout, 5xx i 429 NIE blokują: kolejna próba po 30 s, potem odstęp podwajany do 5 minut, bez końca
+  (chwilowa awaria nie może odwołać spłaszczenia o 17:25). Po odrzuceniu danych logowania przerwa 30 s;
 - REJECTIONS: `REJECTION_LIMIT` odrzuceń zleceń (wejście, zamknięcie, stop) z rzędu;
 - RECONCILE_FAILING: `RECONCILE_FAILURE_LIMIT` przebiegów uzgadniania z wyjątkiem z rzędu (np. historia dłuższa
   niż 14 dni: każdy przebieg rzuca, a MISMATCH_TIMEOUT uzgadniania nigdy by nie wypalił). Każdy błąd jest widoczny
@@ -56,8 +58,10 @@ RECONCILE_FAILING = "RECONCILE_FAILING"
 UNKNOWN_BROKER_RESPONSES = "UNKNOWN_BROKER_RESPONSES"
 
 # Stałe procedur nadzoru (spec §9, §13; nie parametry strategii ani ryzyka).
-LOGIN_FAILURE_LIMIT = 3  # nieudane logowania z rzędu → kill miękki i blokada dalszych prób
-LOGIN_RETRY_PAUSE_S = 30  # najkrótsza przerwa po nieudanym logowaniu przed kolejną próbą
+LOGIN_FAILURE_LIMIT = 3  # nieudane logowania z rzędu → kill miękki; tyle odrzuceń danych logowania → blokada prób
+LOGIN_RETRY_PAUSE_S = 30  # przerwa po odrzuceniu danych logowania przed kolejną próbą
+LOGIN_BACKOFF_START_S = 30  # przerwa po pierwszej awarii innej niż odrzucenie danych (transport, 5xx, 429)
+LOGIN_BACKOFF_MAX_S = 300  # najdłuższa przerwa między próbami przy awarii transportu (bez blokady)
 REJECTION_LIMIT = 3  # spec §9: trzy odrzucenia z rzędu
 RECONCILE_FAILURE_LIMIT = 3  # przebiegi uzgadniania z wyjątkiem z rzędu (3 × 10 s)
 RECONCILE_SKIP_LIMIT = 6  # pominięte przebiegi z rzędu (zagłodzenie uzgadniania): sam alarm
@@ -220,8 +224,11 @@ class Watchdog:
         self._last_quote_ts: datetime | None = None
         self._mode = ""
         self._state = ""
-        self._login_failures = 0
+        self._login_failures = 0  # porażki z rzędu (dowolne): kill miękki przy limicie
+        self._auth_failures = 0  # odrzucenia danych logowania od ostatniego sukcesu: blokada przy limicie
+        self._transient_failures = 0  # awarie transportu z rzędu: wykładniczy odstęp
         self._last_login_failure: datetime | None = None
+        self._login_pause_s = 0.0
         self._rejections = 0
         self._reconcile_errors = 0
         self._reconcile_skips = 0
@@ -250,6 +257,11 @@ class Watchdog:
             return
         self._window = _Window(start, end, self._now())
 
+    def rearm_silence(self) -> None:
+        """Cisza notowań liczona od teraz (po długim wejściu, w trakcie którego pętla nie odczytywała notowań)."""
+        if self._window is not None:
+            self._window = _Window(self._window.start, self._window.end, self._now())
+
     # --- notyfikacje od silnika ---
 
     def note_quote(self, ts: datetime) -> None:
@@ -257,33 +269,48 @@ class Watchdog:
         if self._last_quote_ts is None or ts > self._last_quote_ts:
             self._last_quote_ts = ts
 
-    def note_login_failure(self, detail: str = "") -> None:
+    def note_login_failure(self, detail: str = "", *, credential: bool = False) -> None:
+        """Nieudane logowanie. `credential=True`: broker odrzucił dane logowania (liczy się do blokady prób)."""
         self._login_failures += 1
         self._last_login_failure = self._now()
         n = self._login_failures
-        self._alert_keyed("LOGIN_FAILED", "ERROR", f"LOGIN_FAILED attempt {n}/{LOGIN_FAILURE_LIMIT}: {detail}")
+        if credential:
+            self._auth_failures += 1
+            self._login_pause_s = LOGIN_RETRY_PAUSE_S
+        else:
+            self._transient_failures += 1
+            self._login_pause_s = min(
+                LOGIN_BACKOFF_START_S * 2 ** (self._transient_failures - 1), LOGIN_BACKOFF_MAX_S
+            )
+        kind = "credentials rejected" if credential else f"retry in {self._login_pause_s:g} s"
+        self._alert_keyed("LOGIN_FAILED", "ERROR", f"LOGIN_FAILED {n} in a row ({kind}): {detail}")
         if n >= LOGIN_FAILURE_LIMIT:
             self._kill.soft(LOGIN_FAILED)
+        if credential and self._auth_failures >= LOGIN_FAILURE_LIMIT:
+            n = self._auth_failures
             self._alert_keyed(
                 "LOGIN_LOCKOUT",
                 "ERROR",
-                f"LOGIN_LOCKOUT: {n} failed logins in a row; no further login attempts (account lock-out protection) "
-                f"until the owner creates data/{LOGIN_RESET_FILE} or restarts the engine; positions keep their broker "
-                "stops",
+                f"LOGIN_LOCKOUT: {n} credential rejections; no further login attempts (key lock-out protection) "
+                f"until the owner creates data/{LOGIN_RESET_FILE} or restarts the engine (3 fresh attempts); "
+                "positions keep their broker stops",
             )
             self._event("LOGIN_LOCKOUT", failures=n, detail=detail)
 
     def note_login_success(self) -> None:
         self._login_failures = 0
+        self._auth_failures = 0
+        self._transient_failures = 0
         self._last_login_failure = None
+        self._login_pause_s = 0.0
 
     def may_login(self) -> bool:
         """Czy wolno wywołać `broker.login()` teraz (blokada po serii porażek, przerwa po porażce)."""
         self._consume_reset()
-        if self._login_failures >= LOGIN_FAILURE_LIMIT:
+        if self._auth_failures >= LOGIN_FAILURE_LIMIT:
             return False
         if self._last_login_failure is not None:
-            if (self._now() - self._last_login_failure).total_seconds() < LOGIN_RETRY_PAUSE_S:
+            if (self._now() - self._last_login_failure).total_seconds() < self._login_pause_s:
                 return False
         return True
 
@@ -400,9 +427,12 @@ class Watchdog:
         except OSError as exc:  # nieusuwalny plik nie może zdejmować blokady w kółko
             _LOG.warning("cannot consume %s: %s", self._reset_path, exc)
             return
-        was = self._login_failures
+        was = self._auth_failures
         self._login_failures = 0
+        self._auth_failures = 0
+        self._transient_failures = 0
         self._last_login_failure = None
+        self._login_pause_s = 0.0
         self._alert_keyed(
             "LOGIN_LOCKOUT_RESET", "INFO", f"LOGIN_LOCKOUT_RESET by the owner ({was} failures forgotten); logins resume"
         )

@@ -24,7 +24,16 @@ from gwstock.app import Engine, EngineMisconfigured, Mode
 from gwstock.calendar import XETRA, ExchangeCalendar, ExchangeProfile
 from gwstock.journal import JournalReadError, JournalWriteError, PositionRecord, TradeRecord
 from gwstock.reconcile import Reconciler
-from gwstock.types import BrokerError, BrokerTimeout, KillLevel, MarketClosed, OrderState, PositionState, Side
+from gwstock.types import (
+    BrokerAuthError,
+    BrokerError,
+    BrokerTimeout,
+    KillLevel,
+    MarketClosed,
+    OrderState,
+    PositionState,
+    Side,
+)
 from gwstock.watchdog import AlreadyRunning, InstanceLock
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     CAL,
@@ -43,6 +52,7 @@ from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     calls_at,
     cfgs,
     clock,
+    config_dir,
     daily_candles,
     data_dir,
     day_rules,
@@ -228,7 +238,15 @@ async def test_missing_first_candle_at_0910_means_no_entry_and_logged(make_engin
     broker.set_candles_5m(five_minute_candles(DAY, D("25780"), D("25790"), include_first=False))
     engine = make_engine(Mode.LIVE)
     stop_engine_at(engine, clock, berlin(DAY, 9, 20))
-    reads = calls_at(broker, clock, "candles_5m")
+    reads = []
+    real = broker.candles_5m
+
+    async def spy(epic, start, end):
+        if start == OPEN_UTC:  # tylko zapytania o pierwszą świecę (bez świec kontekstu do kontroli L0)
+            reads.append(clock.now_utc())
+        return await real(epic, start, end)
+
+    broker.candles_5m = spy
     rep = await engine.run_day(DAY)
     assert rep.skip_reason == "NO_SIGNAL_DATA" and rep.entries == 0
     assert "open_position" not in broker.calls
@@ -273,6 +291,24 @@ async def test_decision_event_records_first_candle_start_and_ohlc(engine, broker
     assert d["quote"]["bid"] == "25780.3" and d["quote"]["ask"] == "25782.3"
     assert d["outcome"] == "SIGNAL" and d["signal"] == {"side": "BUY", "stop_distance": "30.0", "size": "0.001"}
     assert d["decided_at"] == DECISION_UTC.isoformat()
+
+
+async def test_decision_event_records_every_returned_candle_and_the_neighbours_with_local_labels(
+    engine, broker, clock
+):
+    # L0: błąd konwencji stempla o ±5 min (świeca 08:55 albo 09:05 wzięta za 09:00) musi być widoczny w dzienniku
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    [d] = engine_decisions(engine.journal)
+    assert [c["start"] for c in d["candles_returned"]] == ["2026-11-02T08:00:00+00:00"]
+    assert d["candles_returned"][0]["local"] == "09:00 CET"
+    assert [(c["start"], c["local"]) for c in d["neighbours"]] == [("2026-11-02T07:55:00+00:00", "08:55 CET")]
+    assert d["neighbours"][0]["open"] == "25779" and d["neighbours"][0]["close"] == "25780"
+    [follow] = [p for p in payloads(engine.journal, "decision") if p.get("event") == "DECISION_CANDLES"]
+    assert [(c["local"], c["open"]) for c in follow["candles"]] == [
+        ("08:55 CET", "25779"), ("09:00 CET", "25780"), ("09:05 CET", "25790"),
+    ]  # fmt: skip
+    assert follow["first_candle_start_utc"] == "2026-11-02T08:00:00+00:00"
 
 
 @pytest.mark.parametrize(
@@ -338,7 +374,7 @@ async def test_relogin_failing_three_times_soft_kills_and_stops_calling_login(ma
 
     def broken_login():
         if clock.now_utc() >= ten:
-            raise BrokerError("login: POST /session: HTTP 401 error.invalid.details")
+            raise BrokerAuthError("login: POST /session: HTTP 401 error.invalid.details")
 
     broker.on_call("login", broken_login)
     at_time(broker, clock, ten, broker.expire_session)
@@ -389,6 +425,65 @@ async def test_position_left_from_an_earlier_day_is_flattened_at_once(make_engin
     assert rep.final_position_state is P.FLAT and len(second.journal.trades()) == 1
 
 
+async def test_transient_login_outage_does_not_cancel_the_1725_exit(engine, broker, clock, notifier):
+    # sonda P4: 75 s bez odpowiedzi na POST /session to nie odrzucenie danych logowania: bez blokady prób
+    noon = datetime(2026, 11, 2, 11, 0, tzinfo=timezone.utc)
+    outage_end = noon + timedelta(seconds=75)
+
+    def flaky_login():
+        if noon <= clock.now_utc() < outage_end:
+            raise BrokerTimeout("POST /session: no response within 10 s")
+
+    logins = calls_at(broker, clock, "login")  # przed wstrzyknięciem awarii: callback, który rzuca, kończy kolejkę
+    closes = calls_at(broker, clock, "close_position")
+    broker.on_call("login", flaky_login)
+    at_time(broker, clock, noon, broker.expire_session)
+    rep = await engine.run_day(DAY)
+    assert logins[1:] == [noon, noon + timedelta(seconds=30), noon + timedelta(seconds=90)]  # 30 s, potem 60 s
+    assert closes == [FLATTEN_UTC] and rep.final_position_state is P.FLAT and broker.positions == {}
+    assert not alerts(notifier, "LOGIN_LOCKOUT")
+    # 90 s bez sesji to uczciwy kill MIĘKKI (cisza notowań, uzgadnianie): blokuje wejścia, wyjść nigdy
+    assert engine.kill.level() is KillLevel.SOFT and "LOGIN_FAILED" not in kill_reasons(engine.journal)
+
+
+async def test_long_transient_login_outage_backs_off_and_recovers_without_lockout(engine, broker, clock, notifier):
+    noon = datetime(2026, 11, 2, 11, 0, tzinfo=timezone.utc)
+    outage_end = noon + timedelta(minutes=20)
+
+    def flaky_login():
+        if noon <= clock.now_utc() < outage_end:
+            raise BrokerError("login: POST /session: HTTP 503")
+
+    logins = calls_at(broker, clock, "login")
+    broker.on_call("login", flaky_login)
+    at_time(broker, clock, noon, broker.expire_session)
+    rep = await engine.run_day(DAY)
+    offsets = [(t - noon).total_seconds() for t in logins[1:]]
+    assert offsets == [0, 30, 90, 210, 450, 750, 1050, 1350]  # 30, 60, 120, 240, potem co 300 s; bez blokady
+    assert not alerts(notifier, "LOGIN_LOCKOUT")
+    assert "LOGIN_FAILED" in kill_reasons(engine.journal)  # trzy porażki z rzędu: brak nowych wejść (miękki)
+    assert rep.final_position_state is P.FLAT and len(engine.journal.trades()) == 1  # wyjście o 17:25 się odbyło
+
+
+async def test_slow_entry_does_not_trip_the_quote_silence_watch(engine, broker, clock, monkeypatch):
+    real = engine.executor.enter
+
+    async def slow_enter(*args, **kwargs):
+        await clock.sleep(70)  # rozstrzyganie UNKNOWN trwa dłużej niż straż ciszy (60 s); pętla nie odczytuje notowań
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(engine.executor, "enter", slow_enter)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    assert "QUOTE_SILENCE" not in kill_reasons(engine.journal) and engine.kill.level() is KillLevel.NONE
+
+
+async def test_every_quote_read_through_the_engine_feeds_the_silence_watch(engine, broker, clock):
+    clock.advance(30)
+    q = await engine.broker.quote("DE40")  # np. odczyt wykonawcy przy księgowaniu, poza pętlą odczytu notowań
+    assert engine.watchdog.last_quote_ts == q.ts == clock.now_utc()
+
+
 async def test_engine_pings_every_300s_during_session(engine, broker, clock):
     pings = calls_at(broker, clock, "keepalive")
     stop_engine_at(engine, clock, datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc))
@@ -403,17 +498,32 @@ async def test_engine_pings_every_300s_during_session(engine, broker, clock):
 
 async def test_kill_hard_runs_emergency_flatten_every_tick(engine, broker, clock, data_dir):
     ten = datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)
-    at_time(broker, clock, ten, lambda: (broker.set_market_closed(True), (data_dir / "HARD_STOP").write_text("")))
     reopen = ten + timedelta(minutes=1)
-    at_time(broker, clock, reopen, lambda: broker.set_market_closed(False), method="list_positions")
+
+    def timing_out():
+        if ten <= clock.now_utc() < reopen:
+            raise BrokerTimeout("DELETE /positions: timeout")
+
     closes = calls_at(broker, clock, "close_position")
+    at_time(broker, clock, ten, lambda: (data_dir / "HARD_STOP").write_text(""))
+    broker.on_call("close_position", timing_out)
     stop_engine_at(engine, clock, reopen + timedelta(minutes=5))
     rep = await engine.run_day(DAY)
     assert engine.kill.level() is KillLevel.HARD
-    attempts = [c for c in closes if c <= reopen]
-    assert len(attempts) >= 6 and all((b - a).total_seconds() <= 11 for a, b in zip(attempts, attempts[1:]))
+    ticks = sorted({c.replace(second=c.second - c.second % 10, microsecond=0) for c in closes if c < reopen})
+    assert len(ticks) >= 5  # awaryjne spłaszczenie w KAŻDYM takcie (co 10 s), po kilka prób w takcie
     assert rep.final_position_state is P.FLAT and len(engine.journal.trades()) == 1
     assert closes[-1] < reopen + timedelta(seconds=30)
+
+
+async def test_kill_hard_with_a_closed_market_backs_off_to_one_close_a_minute(engine, broker, clock, data_dir):
+    ten = datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)
+    at_time(broker, clock, ten, lambda: (broker.set_market_closed(True), (data_dir / "HARD_STOP").write_text("")))
+    closes = calls_at(broker, clock, "close_position")
+    stop_engine_at(engine, clock, ten + timedelta(minutes=10))
+    await engine.run_day(DAY)
+    assert 9 <= len(closes) <= 11  # zamknięty rynek: najwyżej jedno zamknięcie na minutę, nie co 10 s
+    assert all((b - a).total_seconds() >= 60 for a, b in zip(closes, closes[1:]))
 
 
 async def test_exiting_position_is_retried_every_tick(engine, broker, clock):
@@ -441,7 +551,21 @@ async def test_market_closed_at_flatten_keeps_exiting_and_retries_until_reopen(e
             method="list_positions")  # fmt: skip
     closes = calls_at(broker, clock, "close_position")
     rep = await engine.run_day(DAY)
-    assert len(closes) >= 4 and rep.final_position_state is P.FLAT
+    assert closes == [FLATTEN_UTC, FLATTEN_UTC + timedelta(seconds=60)]  # ponowienie po minucie, potem FLAT
+    assert rep.final_position_state is P.FLAT
+
+
+async def test_overnight_exiting_with_the_market_closed_sends_one_close_a_minute(engine, broker, clock):
+    # sonda P3: przez całą noc DELETE co 10 s to 360 zapytań na godzinę bez szansy na skutek
+    at_time(broker, clock, berlin(DAY, 17, 24), lambda: broker.set_market_closed(True))
+    closes = calls_at(broker, clock, "close_position")
+    stop_engine_at(engine, clock, berlin(DAY, 20, 0))
+    await engine.run_day(DAY)
+    if not engine.shutdown_requested:
+        await engine._idle_until(berlin(DAY, 20, 0))  # jak run_forever: zarządzanie pozostałą pozycją po zamknięciu
+    hour = [c for c in closes if berlin(DAY, 18, 0) <= c < berlin(DAY, 19, 0)]
+    assert 59 <= len(hour) <= 61
+    assert engine.journal.current_position("DE40").state is P.EXITING  # stop u brokera zostaje, alarm, ponawianie
 
 
 async def test_reconcile_exceptions_alarm_and_soft_kill_after_threshold(engine, broker, clock, notifier):
@@ -641,6 +765,49 @@ async def test_run_forever_survives_an_exception_in_a_day(engine, broker, clock,
     await engine.run_forever()
     assert state["n"] == 2 and alerts(notifier, "bug in the day")
     assert len(engine_decisions(engine.journal)) == 1
+
+
+async def test_run_forever_rerun_of_a_day_after_an_exception_keeps_the_day_state(make_engine, broker, clock):
+    engine = make_engine(Mode.DRY_RUN)
+    real = engine.watchdog.tick
+    state = {"raised": False}
+
+    async def tick_once_broken():
+        if not state["raised"] and clock.now_utc() >= berlin(DAY, 9, 6):
+            state["raised"] = True
+            raise RuntimeError("heartbeat bug")
+        return await real()
+
+    engine.watchdog.tick = tick_once_broken
+    stop_engine_at(engine, clock, berlin(DAY, 9, 30))
+    await engine.run_forever()
+    assert state["raised"]
+    assert len(engine_decisions(engine.journal)) == 1  # ponowiony dzień nie podejmuje decyzji drugi raz
+
+
+DST_DAYS = [date(2026, 10, 23), date(2026, 10, 26), date(2027, 3, 25), date(2027, 3, 30)]
+
+
+@pytest.mark.parametrize(
+    ("clock", "day"),
+    [(berlin(d, 8, 45), d) for d in DST_DAYS],
+    ids=["CEST-fri-before", "CET-mon-after", "CET-thu-before", "CEST-tue-after"],
+    indirect=["clock"],
+)
+async def test_dst_days_enter_and_flatten_at_the_local_session_times(make_engine, broker, clock, day):
+    broker.set_daily_candles(daily_candles(day))
+    broker.set_candles_5m(five_minute_candles(day, D("25780"), D("25790")))
+    engine = make_engine(Mode.LIVE)
+    entries = calls_at(broker, clock, "open_position")
+    closes = calls_at(broker, clock, "close_position")
+    rep = await engine.run_day(day)
+    offset = 2 if day.month == 10 and day.day < 25 or day.month == 3 and day.day > 28 else 1
+    assert entries == [datetime.combine(day, time(9 - offset, 5), tzinfo=timezone.utc)]  # 09:05 lokalnie
+    assert closes == [datetime.combine(day, time(17 - offset, 25), tzinfo=timezone.utc)]  # 17:25 lokalnie
+    assert entries == [berlin(day, 9, 5)] and closes == [berlin(day, 17, 25)]
+    [d] = engine_decisions(engine.journal)
+    assert d["first_candle_start_utc"] == berlin(day, 9, 0).isoformat()
+    assert rep.final_position_state is P.FLAT and rep.entries == 1
 
 
 async def test_run_forever_refuses_a_second_instance(engine, broker, data_dir):

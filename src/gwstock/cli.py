@@ -31,8 +31,18 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from gwstock.app import ACCOUNT_CURRENCY, ACCOUNT_STATUS, HEARTBEAT_FILE, LOCK_FILE, Engine, Mode
+from gwstock.app import (
+    ACCOUNT_CURRENCY,
+    ACCOUNT_STATUS,
+    ARM_FILE,
+    HEARTBEAT_FILE,
+    LOCK_FILE,
+    Engine,
+    Mode,
+    arm_file_exists,
+)
 from gwstock.config import RuntimeConfig, StrategyConfig, load_config, load_runtime
+from gwstock.journal import JournalError
 from gwstock.strategy import EntrySignal, atr14, round_up_to_step
 from gwstock.types import BrokerRejected, OrderState, PositionState, Side
 from gwstock.watchdog import AlreadyRunning, InstanceLock, heartbeat_age_s, read_heartbeat
@@ -50,7 +60,6 @@ DEFAULT_CONFIG_DIR = "config"
 DEFAULT_DATA_DIR = "data"
 DEFAULT_KEY_FILE = "/secrets/capitalcom.json"
 
-ARM_FILE = "ARM_LIVE"  # tworzy WYŁĄCZNIE właściciel; kod tylko sprawdza obecność
 PREREG_FILE = "preregistration.json"
 ACCOUNT_FILE = "account.json"
 JOURNAL_FILE = "journal.sqlite"
@@ -126,13 +135,6 @@ def frozen_fingerprint(data_dir: Path) -> str | None:
         return None
     value = data.get("fingerprint") if isinstance(data, dict) else None
     return value if isinstance(value, str) and value else None
-
-
-def arm_file_exists(data_dir: Path) -> bool:
-    try:
-        return (Path(data_dir) / ARM_FILE).is_file()
-    except OSError:
-        return False
 
 
 def runtime_mode(config_dir: Path, data_dir: Path, runtime: RuntimeConfig) -> tuple[Mode, list[str]]:
@@ -361,25 +363,12 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print) -> int:
                  f"financing {t.financing}, net {t.net_pnl}, exit {t.exit_reason}")  # fmt: skip
     step(5, gone and booked, f"position gone at the broker and the trade booked{costs}")
 
-    # [6] drugie zamknięcie: ma być POSITION_NOT_FOUND (założenie ścieżki awaryjnej wykonawcy)
-    outcome = "accepted (!)"
-    ok = False
-    try:
-        await engine.probe(engine.raw_broker.close_position, deal_id)
-    except BrokerRejected as exc:
-        outcome, ok = f"BrokerRejected({exc.reason})", exc.reason == "POSITION_NOT_FOUND"
-    except Exception as exc:
-        outcome = f"{type(exc).__name__}: {exc}"
-    if not ok:
-        leftovers = [p for p in (await _positions(engine)) if p.epic == epic]
-        engine.kill.soft("SMOKE_SECOND_CLOSE_UNEXPECTED")
-        engine.alerts.alert("ERROR", f"SMOKE_SECOND_CLOSE_UNEXPECTED: {outcome}; positions on {epic}: {leftovers}")
-        now_open = [(p.deal_id, p.side.value, str(p.size)) for p in leftovers]
-        out(f"FAIL [6] LOUD: a second close of {deal_id} gave {outcome} instead of POSITION_NOT_FOUND; the emergency "
-            f"path relies on it. Positions on {epic} now: {now_open}")
-        results.append(False)
+    # [6] drugie zamknięcie: ma być POSITION_NOT_FOUND (założenie ścieżki awaryjnej wykonawcy). Tylko gdy pozycji
+    # na pewno nie ma: inaczej „drugie" zamknięcie byłoby pierwszym zamknięciem pozycji, która nadal jest otwarta.
+    if gone:
+        await _second_close_check(engine, deal_id, step, out, results)
     else:
-        step(6, True, f"second close of {deal_id} rejected with POSITION_NOT_FOUND")
+        info(6, "skipped: position not confirmed gone (steps 4/5 failed); the engine's reconciliation handles it")
 
     # [7] ostatnie świece 5-minutowe: stempel do porównania z wykresem (L0)
     now = clock.now_utc()
@@ -404,6 +393,29 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print) -> int:
     passed = all(results)
     out(f"{'PASS' if passed else 'FAIL'} smoke: {sum(results)}/{len(results)} checks passed")
     return 0 if passed else 1
+
+
+async def _second_close_check(
+    engine: Engine, deal_id: str, step: Callable[[int, bool, str], bool], out: Callable[[str], None], results: list
+) -> None:
+    epic = engine.strat.instrument
+    outcome, ok = "accepted (!)", False
+    try:
+        await engine.probe(engine.raw_broker.close_position, deal_id)
+    except BrokerRejected as exc:
+        outcome, ok = f"BrokerRejected({exc.reason})", exc.reason == "POSITION_NOT_FOUND"
+    except Exception as exc:
+        outcome = f"{type(exc).__name__}: {exc}"
+    if ok:
+        step(6, True, f"second close of {deal_id} rejected with POSITION_NOT_FOUND")
+        return
+    leftovers = [p for p in (await _positions(engine)) if p.epic == epic]
+    engine.kill.soft("SMOKE_SECOND_CLOSE_UNEXPECTED")
+    engine.alerts.alert("ERROR", f"SMOKE_SECOND_CLOSE_UNEXPECTED: {outcome}; positions on {epic}: {leftovers}")
+    now_open = [(p.deal_id, p.side.value, str(p.size)) for p in leftovers]
+    out(f"FAIL [6] LOUD: a second close of {deal_id} gave {outcome} instead of POSITION_NOT_FOUND; the emergency "
+        f"path relies on it. Positions on {epic} now: {now_open}")  # fmt: skip
+    results.append(False)
 
 
 async def _positions(engine: Engine) -> list:
@@ -470,7 +482,7 @@ def status(config_dir: Path, data_dir: Path, out: Callable[[str], None] = print,
     if not path.exists():
         out("journal: none yet")
         return 0
-    journal = Journal.open(str(path))
+    journal = Journal.open_readonly(str(path))  # status nigdy nie pisze (sqlite mode=ro)
     try:
         ks = journal.kill_state()
         out(f"kill switch: {ks.level.name}" + (f" ({ks.reason}, since {ks.since.isoformat()})" if ks.since else ""))
@@ -550,13 +562,29 @@ def prepare_run(paths: Paths) -> RunContext:
     return RunContext(cfgs, runtime, mode, missing, creds)
 
 
-def build_engine(ctx: RunContext, http: Any, journal: Any, clock: Any, data_dir: Path) -> Engine:
-    """Silnik na prawdziwym adapterze Capital.com (wyłącznie host live) i kalendarzu XETRA."""
+def build_engine(
+    ctx: RunContext,
+    http: Any,
+    journal: Any,
+    clock: Any,
+    data_dir: Path,
+    *,
+    config_dir: Path | None = None,
+    lock: InstanceLock | None = None,
+) -> Engine:
+    """Silnik na prawdziwym adapterze Capital.com (wyłącznie host live) i kalendarzu XETRA.
+
+    `config_dir`: silnik live ponownie sprawdza w nim `live_allowed` (na początku dnia i przed wejściem).
+    `lock`: blokada instancji wzięta już przez polecenie (przed dziennikiem i siecią).
+    """
     from gwstock.broker.capitalcom import LIVE_BASE_URL, CapitalComBroker
     from gwstock.calendar import XETRA, ExchangeCalendar
 
     broker = CapitalComBroker(ctx.creds, http, clock, base_url=LIVE_BASE_URL)
-    return Engine(broker, journal, clock, ExchangeCalendar(XETRA), ctx.cfgs, data_dir, ctx.runtime, ctx.mode)
+    return Engine(
+        broker, journal, clock, ExchangeCalendar(XETRA), ctx.cfgs, data_dir, ctx.runtime, ctx.mode,
+        config_dir=config_dir, lock=lock,
+    )  # fmt: skip
 
 
 def _log_mode(ctx: RunContext) -> None:
@@ -566,7 +594,7 @@ def _log_mode(ctx: RunContext) -> None:
         _LOG.info("mode: dry_run, no orders will be sent: %s", "; ".join(ctx.missing))
 
 
-async def _with_engine(paths: Paths, action: Callable[[Engine], Any], *, bound: bool = True) -> int:
+async def _with_engine(paths: Paths, action: Callable[[Engine], Any], *, lock: InstanceLock | None = None) -> int:
     import aiohttp
 
     from gwstock.clock import SystemClock
@@ -578,7 +606,7 @@ async def _with_engine(paths: Paths, action: Callable[[Engine], Any], *, bound: 
     async with aiohttp.ClientSession() as http:
         journal = Journal.open(str(paths.data_dir / JOURNAL_FILE))
         try:
-            engine = build_engine(ctx, http, journal, clock, paths.data_dir)
+            engine = build_engine(ctx, http, journal, clock, paths.data_dir, config_dir=paths.config_dir, lock=lock)
             return await action(engine)
         finally:
             journal.close()
@@ -592,12 +620,13 @@ async def _run_engine(paths: Paths) -> int:
         await engine.run_forever()
         return 0
 
-    return await _with_engine(paths, run)
+    with InstanceLock(paths.data_dir / LOCK_FILE) as lock:  # blokada przed konfiguracją, dziennikiem i siecią
+        return await _with_engine(paths, run, lock=lock)
 
 
 async def _smoke_engine(paths: Paths) -> int:
-    with InstanceLock(paths.data_dir / LOCK_FILE):  # nigdy obok działającego silnika: blokada przed wszystkim innym
-        return await _with_engine(paths, smoke)
+    with InstanceLock(paths.data_dir / LOCK_FILE) as lock:  # nigdy obok działającego silnika: blokada najpierw
+        return await _with_engine(paths, smoke, lock=lock)
 
 
 async def _bind(paths: Paths) -> int:
@@ -618,27 +647,27 @@ async def _bind(paths: Paths) -> int:
     return 0
 
 
-def _cmd_run(paths: Paths) -> int:
+def _cmd_run(paths: Paths, args: argparse.Namespace) -> int:
     return asyncio.run(_run_engine(paths))
 
 
-def _cmd_smoke(paths: Paths) -> int:
+def _cmd_smoke(paths: Paths, args: argparse.Namespace) -> int:
     return asyncio.run(_smoke_engine(paths))
 
 
-def _cmd_bind(paths: Paths) -> int:
+def _cmd_bind(paths: Paths, args: argparse.Namespace) -> int:
     return asyncio.run(_bind(paths))
 
 
-def _cmd_status(paths: Paths) -> int:
+def _cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     return status(paths.config_dir, paths.data_dir)
 
 
-def _cmd_health(paths: Paths) -> int:
+def _cmd_health(paths: Paths, args: argparse.Namespace) -> int:
     return health(paths.data_dir)
 
 
-COMMANDS: dict[str, Callable[[Paths], int]] = {
+COMMANDS: dict[str, Callable[[Paths, argparse.Namespace], int]] = {
     "run": _cmd_run,
     "bind-account": _cmd_bind,
     "smoke": _cmd_smoke,
@@ -668,10 +697,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     paths = paths_from_env()
     try:
-        return COMMANDS[command](paths)
+        return COMMANDS[command](paths, args)
     except AlreadyRunning as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 3
-    except (ValueError, OSError) as exc:  # konfiguracja, plik sekretów, account.json: bez treści sekretów
-        print(f"cannot start {command}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    except (ValueError, OSError, JournalError) as exc:  # konfiguracja, sekrety, account.json, dziennik: bez sekretów
+        print(f"cannot run {command}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
