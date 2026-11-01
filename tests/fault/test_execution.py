@@ -766,6 +766,31 @@ async def test_guard_adopted_fill_without_entry_context_checks_the_size_risk_fro
     assert marker == "SIZE_MISMATCH_RISK" and journal.get_meta("entry_by_deal:DEAL-9") is None
 
 
+@pytest.mark.parametrize("corrupt", ["bad_json", "wrong_client", "missing_field", "float_value", "zero_vpp"])
+async def test_guard_adopted_fill_treats_a_malformed_entry_context_as_missing(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, corrupt
+):
+    # uszkodzony kontekst nie może zatrzymać straży (wyjątek w każdym przebiegu = pozycja ponad limit do 17:25):
+    # liczy się jak brak, a ryzyko wielkości z faktycznego stopu i reguł brokera nadal zamyka nadwypełnienie
+    fake.fill_size_factor = D("5")  # 0.035 × 30 × 1 = 1.05 > 1.00
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    key = f"entry_ctx:{CID}"
+    ctx = json.loads(journal.get_meta(key))
+    text = {
+        "bad_json": "{not json",
+        "wrong_client": json.dumps({**ctx, "client_id": "other"}),
+        "missing_field": json.dumps({k: v for k, v in ctx.items() if k != "decision_ask"}),
+        "float_value": json.dumps({**ctx, "value_per_point": 1.0}),
+        "zero_vpp": json.dumps({**ctx, "value_per_point": "0"}),
+    }[corrupt]
+    journal.set_meta(key, text)
+    assert await executor.guard_adopted_fill() is True
+    [guard] = events(journal, "FILL_GUARD_ADOPTED")
+    assert guard["source"] == "broker_rules" and guard["causes"] == ["SIZE_MISMATCH_RISK"]
+    assert fake.calls[:2] == ["instrument_rules", "close_position"] and fake.calls.count("close_position") == 1
+    assert position(journal) == PositionRecord("DE40", P.FLAT) and len(journal.trades()) == 1
+
+
 @pytest.mark.parametrize("stored", ["EXITING", "BLOCKED", "FLAT", "ENTERING", "none", "unresolved_order"])
 async def test_guard_adopted_fill_leaves_exiting_blocked_flat_and_entering_alone(executor, journal, fake, stored):
     oversize = replace(NO_CTX_POSITION, size=D("0.040"))

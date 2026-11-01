@@ -677,6 +677,49 @@ async def test_reconcile_once_attaches_the_stop_before_the_fill_guard_closes_an_
     assert t.size == D("0.040") and t.exit_reason == "FORCED" and position(second) == PositionRecord("DE40", P.FLAT)
 
 
+async def test_hard_with_a_full_disk_still_closes_an_adopted_oversize_fill_in_the_same_tick(make_engine, broker, clock):
+    broker.fill_size_factor = D("40")  # 0.040 × 30 × 1 = 1.20 > 1.00
+    first = make_engine(Mode.LIVE)
+    broker.on_call("confirm", die, once=True)
+    with pytest.raises(ProcessDied):
+        await first.run_day(DAY)
+    second = make_engine.restart(first, Mode.LIVE)
+    await second.reconciler.run_once()  # przyjęta, bez znacznika straży
+    second.kill.hard("HARD_STOP_FILE")
+    real = second.journal.upsert_position
+
+    def upsert(rec):
+        if rec.state is P.EXITING:
+            raise JournalWriteError("disk full")  # EXITING się nie zapisze
+        return real(rec)
+
+    second.journal.upsert_position = upsert
+    broker.calls.clear()
+    result = await second.reconcile_once()  # straż nie przerywa taktu (i nie wysyła przy HARD)
+    assert result is not None and "close_position" not in broker.calls
+    await second.executor.emergency_flatten()  # gałąź HARD tego samego taktu
+    assert broker.calls.count("close_position") == 1 and "DEAL-1" not in broker.positions
+
+
+async def test_a_failing_fill_guard_never_stops_the_management_tick(engine, broker, clock, data_dir, notifier):
+    eleven = datetime(2026, 11, 2, 11, 0, tzinfo=timezone.utc)
+    closes = calls_at(broker, clock, "close_position")
+
+    async def broken_guard():
+        raise JournalWriteError("disk full")
+
+    def at_eleven() -> None:  # pozycja OPEN, kill switch twardy z pliku, a straż wypełnienia rzuca w każdym przebiegu
+        engine.executor.guard_adopted_fill = broken_guard
+        (data_dir / "HARD_STOP").write_text("")
+
+    at_time(broker, clock, eleven, at_eleven)
+    stop_engine_at(engine, clock, eleven + timedelta(minutes=2))
+    rep = await engine.run_day(DAY)  # dzień nie pada (run_forever nie kręciłby DAY_FAILED)
+    assert len(closes) == 1 and eleven <= closes[0] <= eleven + timedelta(seconds=20)  # awaryjne w tym samym takcie
+    assert rep.final_position_state is P.FLAT and engine.kill.level() is KillLevel.HARD
+    assert alerts(notifier, "JOURNAL_WRITE_FAILED during guard_adopted_fill")
+
+
 @pytest.mark.parametrize("why", ["shutdown_requested", "skipped_pass"])
 async def test_reconcile_once_runs_no_fill_guard_after_a_skipped_pass_or_a_shutdown_request(
     make_engine, broker, clock, monkeypatch, why
