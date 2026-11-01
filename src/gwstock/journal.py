@@ -6,7 +6,8 @@ Zasady (spec §3, §6, §9, §10):
 - każdy zapis przechodzi przez jedną funkcję `_write` (BEGIN IMMEDIATE ... COMMIT, przy błędzie ROLLBACK):
   nieudany zapis wielu instrukcji nie zostawia po sobie nic; gdy zawiedzie sam ROLLBACK, połączenie jest porzucane
   (zamknięcie wycofuje transakcję), a następny dostęp otwiera nowe z tymi samymi pragmami, nigdy nie tworząc schematu;
-- żaden wyjątek `sqlite3` nie wycieka: błąd zapisu to `JournalWriteError`, błąd odczytu `JournalReadError`,
+- żaden wyjątek `sqlite3` nie wycieka: błąd zapisu to `JournalWriteError` (także liczba poza INTEGER, napis
+  niezakodowalny w UTF-8 i niedokładna suma licznika w trakcie zapisu), błąd odczytu `JournalReadError`,
   uszkodzone dane to `JournalCorruptError`, nieobsługiwany schemat to `JournalSchemaError`;
 - `Decimal` zapisany jako TEXT (dokładnie, bez float), czas jako ISO-8601 UTC, enumy po wartości;
 - dziennik nie ma zegara: każdy znacznik czasu podaje wywołujący (zegar silnika);
@@ -201,6 +202,7 @@ _TRADE_DECIMALS = (
     "spread_cost", "slippage_penalty", "financing", "fees", "net_pnl",
 )
 _TRADE_TIMES = ("signal_ts", "submit_ts", "confirm_ts", "exit_ts")
+_SQLITE_INT_MAX = 2**63 - 1  # największa wartość kolumny INTEGER (64 bity ze znakiem)
 
 
 @dataclass(frozen=True)
@@ -239,6 +241,10 @@ class TradeRecord:
             raise TypeError(f"TradeRecord.latency_ms: expected int, got {type(self.latency_ms).__name__}")
         if self.latency_ms < 0:
             raise ValueError(f"TradeRecord.latency_ms: must not be negative, got {self.latency_ms}")
+        if self.latency_ms > _SQLITE_INT_MAX:
+            raise ValueError(
+                f"TradeRecord.latency_ms: must be at most {_SQLITE_INT_MAX} (SQLite INTEGER), got {self.latency_ms}"
+            )
         _require_str(self, "exit_reason", non_empty=True)
 
 
@@ -601,8 +607,13 @@ class Journal:
                         self._drop(conn, "dropped after a failed ROLLBACK")
                     raise
                 return result
-            except sqlite3.Error as exc:
-                raise JournalWriteError(f"journal write failed: {exc}") from exc
+            except (sqlite3.Error, OverflowError, UnicodeEncodeError) as exc:
+                # OverflowError: liczba poza INTEGER SQLite; UnicodeEncodeError: napis z samotnym surogatem
+                raise JournalWriteError(f"journal write failed: {type(exc).__name__}: {exc}") from exc
+            except JournalError as exc:
+                if type(exc) is not JournalError:
+                    raise  # konkretna diagnoza (np. JournalCorruptError, JournalWriteError) zostaje sobą
+                raise JournalWriteError(f"journal write failed: {exc}") from exc  # np. niedokładna suma licznika
 
     def _read(self, op: Callable[[sqlite3.Connection], T]) -> T:
         """Jedyna ścieżka odczytu."""

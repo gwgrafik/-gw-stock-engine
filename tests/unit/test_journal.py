@@ -686,6 +686,39 @@ def test_a_journal_that_cannot_reopen_after_a_failed_rollback_fails_every_call(t
         j.events()  # jawne zamknięcie nie otwiera ponownie
 
 
+def test_write_errors_outside_sqlite_are_journal_write_errors(journal):
+    huge = make_trade()
+    object.__setattr__(huge, "latency_ms", 2**63)  # z pominięciem walidacji rekordu: SQLite nie zwiąże tej liczby
+    with pytest.raises(JournalWriteError) as caught:
+        journal.record_trade(huge, "DEAL-1", DAY)
+    assert isinstance(caught.value.__cause__, OverflowError)
+    with pytest.raises(JournalWriteError) as caught:
+        journal.append_raw("broker", "\ud800", T0)  # samotny surogat: nie da się go zakodować w UTF-8
+    assert isinstance(caught.value.__cause__, UnicodeEncodeError)
+    with pytest.raises(JournalWriteError):
+        journal.set_meta("k", "\udcff")
+    with pytest.raises(JournalWriteError):
+        journal.insert_order(make_order(note="\ud800"))
+    journal.add_realized_pnl(DAY, Decimal("1E+100"))
+    with pytest.raises(JournalWriteError) as caught:
+        journal.add_realized_pnl(DAY, Decimal("1E-100"))  # suma nie mieści się dokładnie w 60 cyfrach
+    assert type(caught.value.__cause__) is JournalError
+    with pytest.raises(JournalWriteError):
+        journal.record_trade(make_trade(net_pnl=Decimal("1E-100")), "DEAL-2", DAY)
+    # nic nie zapisano (także wiersz transakcji przed nieudanym licznikiem), a dziennik działa dalej
+    assert journal.trades() == [] and journal.events() == [] and journal.get_meta("k") is None
+    assert journal.get_order(make_order().order_id) is None and journal.realized_pnl(DAY) == Decimal("1E+100")
+    assert journal.record_trade(make_trade(), "DEAL-1", NEXT_DAY) is True
+
+
+def test_latency_ms_is_bounded(journal):
+    top = make_trade(latency_ms=2**63 - 1)  # największa liczba, którą SQLite przechowa jako INTEGER
+    assert journal.record_trade(top, "DEAL-1", DAY) is True
+    assert journal.trades()[0].latency_ms == 2**63 - 1
+    with pytest.raises(ValueError, match="latency_ms"):
+        make_trade(latency_ms=2**63)
+
+
 def test_real_sqlite_readonly_failure_is_wrapped_and_nothing_is_written(journal):
     journal._conn.execute("PRAGMA query_only = ON")  # SQLite sam odmawia zapisu: „attempt to write a readonly database”
     with pytest.raises(JournalWriteError) as caught:
