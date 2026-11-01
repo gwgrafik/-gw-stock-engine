@@ -12,9 +12,15 @@ Niezmienniki (prawdziwe pieniądze):
   ENTRY_EXCEPTION, alarm i wyjątek dalej; anulowanie (`CancelledError`) przechodzi nietknięte;
 - po CONFIRMED kolejność: brak stopu → zabezpieczenie; potem obie straże: poślizg wejścia względem notowania decyzji
   (> `slippage_guard_fraction` × stop) i ryzyko FAKTYCZNEJ wielkości i odległości stopu (> `max_loss_per_trade`);
-  którakolwiek → zdarzenie i natychmiastowe spłaszczenie; dopiero potem zapis pomocniczy `entry_by_deal`. Zdarzenia
-  straży i zapis pomocniczy są „wg możliwości": ich awaria nie zatrzymuje ochrony, tylko kończy się kill switchem
-  miękkim JOURNAL_WRITE_FAILED;
+  którakolwiek → zdarzenie i natychmiastowe spłaszczenie; dopiero potem znacznik `fill_guarded:<deal_id>` i zapis
+  pomocniczy `entry_by_deal`. Zdarzenia straży, znacznik i zapis pomocniczy są „wg możliwości": ich awaria nie
+  zatrzymuje ochrony, tylko kończy się kill switchem miękkim JOURNAL_WRITE_FAILED;
+- te same straże dla wypełnienia przyjętego przez uzgadnianie (zgubione potwierdzenie, restart lub awaria dziennika po
+  wysyłce): `guard_adopted_fill` po każdym udanym przebiegu uzgadniania (po zabezpieczeniu stopem), dla pozycji OPEN
+  bez znacznika `fill_guarded`; z kontekstem wejścia obie straże, bez niego ryzyko wielkości z odległości stopu
+  pozycji i wartości punktu brokera. Znacznik (nie wynik uzgadniania) jest kluczem idempotencji: zapisany, gdy żadna
+  straż nie zadziałała, albo po spłaszczeniu, które wyprowadziło pozycję z OPEN, więc przerwanie w dowolnym miejscu
+  kończy się ponowieniem straży;
 - spłaszczenie (`flatten`): OPEN → EXITING (BLOCKED, ENTERING, FLAT: odmowa ze zdarzeniem), jedno zamknięcie; po
   timeoucie lub odmowie NAJPIERW lista pozycji, nigdy druga wysyłka na ślepo: zamknięcie idzie do brokera tylko przy
   przejściu do EXITING albo gdy lista pozycji właśnie potwierdziła, że pozycja nadal jest (ponowienie na pozycji
@@ -117,6 +123,10 @@ META_ENTRY_CTX = "entry_ctx:{}"  # client_id → kontekst wejścia (JSON), zapis
 META_ENTRY_BY_DEAL = "entry_by_deal:{}"  # deal_id → client_id, zapisany po CONFIRMED (pomocniczy)
 META_ENTRY_LAST = "entry_last:{}"  # epic → client_id ostatniego wejścia (pozycja przyjęta przez uzgadnianie)
 META_EXIT_INTENT = "exit_intent:{}"  # deal_id → przyczyna wyjścia zainicjowanego przez silnik (wg możliwości)
+# deal_id → wynik straży wypełnienia: PASS, przyczyny złączone `+` albo NO_CONTEXT_PASS (klucz idempotencji straży)
+META_FILL_GUARDED = "fill_guarded:{}"
+FILL_GUARD_PASS = "PASS"
+FILL_GUARD_NO_CONTEXT_PASS = "NO_CONTEXT_PASS"
 
 # Przyczyny kill switcha nadawane przez wykonawcę (JOURNAL_WRITE_FAILED z `gwstock.risk`).
 ENTRY_EXCEPTION = "ENTRY_EXCEPTION"
@@ -339,12 +349,123 @@ class Executor:
             if not await self._protect(_as_open(position), signal.stop_distance):
                 return  # kill switch twardy i awaryjne spłaszczenie już wykonane
         failures: list[str] = []
+        quote = signal.decision_quote
         try:
-            if self._guard_fill(position, signal, rules, failures):
+            causes = self._guard_values(
+                position, quote.bid, quote.ask, signal.stop_distance, rules.value_per_point, signal.size, failures
+            )
+            if causes:
                 await self.flatten(position, "FORCED")
+            self._mark_fill_guarded(position, causes, FILL_GUARD_PASS, failures)
             self._set_meta(META_ENTRY_BY_DEAL.format(rec.deal_id), rec.order_id, best_effort=failures)
         finally:
             self._report_journal_failures(failures, f"entry {rec.order_id}")
+
+    async def guard_adopted_fill(self) -> bool:
+        """Straże po wypełnieniu (poślizg, ryzyko faktycznej wielkości) dla pozycji, której wejścia nie sprawdził
+        `enter` (przyjętej przez uzgadnianie); silnik woła ją po każdym udanym przebiegu uzgadniania, po zabezpieczeniu.
+
+        Nic nie robi (żadnego wywołania brokera), gdy pozycja w dzienniku nie jest OPEN z deal_id, ma już znacznik
+        `fill_guarded`, albo na instrumencie jest zlecenie nierozstrzygnięte (najpierw uzgadnianie). Z kontekstem
+        wejścia: notowanie decyzji, żądana wielkość, odległość stopu i wartość punktu z kontekstu. Bez niego (albo
+        z nieczytelnym): tylko ryzyko wielkości z odległości stopu pozycji i wartości punktu brokera; pozycja bez stopu
+        czeka na zabezpieczenie, nieczytelne reguły brokera → alarm FILL_GUARD_UNAVAILABLE i ponowienie w następnym
+        przebiegu. Zadziałała straż → spłaszczenie FORCED. True: straż zadziałała i spłaszczenie ruszyło. Błąd zapisu
+        obowiązkowego spłaszczenia (EXITING) propaguje się; znacznika wtedy nie ma, więc straż pobiegnie znowu.
+        """
+        position = self._journal.current_position(self._epic)
+        if position is None or position.state is not _P.OPEN or position.deal_id is None:
+            return False
+        deal_id = position.deal_id
+        if self._journal.get_meta(META_FILL_GUARDED.format(deal_id)) is not None:
+            return False
+        if any(o.epic == self._epic for o in self._journal.unresolved_orders()):
+            return False  # pozycja może jeszcze należeć do zlecenia bez deal_id: kontekst nie byłby pewny
+        failures: list[str] = []
+        try:
+            found = self._guard_context(deal_id, position.epic)
+            if found is not None:
+                order_id, ctx = found
+                causes = self._guard_values(
+                    position, ctx["decision_bid"], ctx["decision_ask"], ctx["stop_distance"], ctx["value_per_point"],
+                    ctx["size"], failures, adopted=True,
+                )  # fmt: skip
+                source, passed = "entry_ctx", FILL_GUARD_PASS
+            else:
+                if position.stop_level is None:
+                    return False  # ochrona stopem najpierw (zabezpieczenie); straż w następnym przebiegu
+                order_id = self._entry_client_id(deal_id, position.epic)
+                vpp = await self._guard_rules_vpp(position, failures)
+                if vpp is None:
+                    return False
+                causes = self._guard_values(position, None, None, None, vpp, None, failures, adopted=True)
+                source, passed = "broker_rules", FILL_GUARD_NO_CONTEXT_PASS
+            self._event(
+                "FILL_GUARD_ADOPTED", best_effort=failures, deal_id=deal_id, order_id=order_id, causes=causes,
+                source=source,
+            )  # fmt: skip
+            if causes:
+                await self.flatten(position, "FORCED")
+            self._mark_fill_guarded(position, causes, passed, failures)
+            if found is not None:
+                self._set_meta(META_ENTRY_BY_DEAL.format(deal_id), order_id, best_effort=failures)
+            return bool(causes)
+        finally:
+            self._report_journal_failures(failures, f"fill guard of {deal_id}")
+
+    def _guard_context(self, deal_id: str, epic: str) -> tuple[str, dict[str, Decimal]] | None:
+        """(client_id, wartości) z kontekstu wejścia pozycji; nieczytelny albo bez sensu = brak (None). Błąd dziennika
+        propaguje się."""
+        try:
+            ctx = self._context(deal_id, epic)
+            if ctx is None:
+                return None
+            keys = ("decision_bid", "decision_ask", "stop_distance", "value_per_point", "size")
+            values = {key: _ctx_decimal(ctx, key) for key in keys}
+        except JournalError:
+            raise
+        except Exception:  # zły JSON, brak pola, zły typ: jak brak kontekstu
+            return None
+        if not (values["stop_distance"] > 0 and values["value_per_point"] > 0 and values["size"] > 0):
+            return None
+        return ctx["client_id"], values
+
+    async def _guard_rules_vpp(self, position: PositionRecord, failures: list[str]) -> Decimal | None:
+        """Wartość punktu od brokera dla straży bez kontekstu (limit czasu jak w zabezpieczeniu); None: alarm."""
+        deal_id = position.deal_id
+        try:
+            rules = await _with_timeout(
+                self._broker.instrument_rules(position.epic), min(self._timeout, PROTECT_CALL_TIMEOUT_S)
+            )
+        except Exception as exc:
+            self._raw_error(SOURCE_RULES, exc, best_effort=failures, deal_id=deal_id, context="fill_guard")
+            self._alert(
+                "WARN",
+                f"FILL_GUARD_UNAVAILABLE {deal_id}: instrument rules unreadable ({type(exc).__name__}: {exc}); the "
+                "size risk of the adopted fill is checked on the next reconciliation pass",
+            )
+            return None
+        self._raw(SOURCE_RULES, best_effort=failures, deal_id=deal_id, context="fill_guard", response=rules)
+        if not rules.value_per_point > 0:
+            self._alert("WARN", f"FILL_GUARD_UNAVAILABLE {deal_id}: value per point {rules.value_per_point}; retrying")
+            return None
+        return rules.value_per_point
+
+    def _mark_fill_guarded(
+        self, position: PositionRecord, causes: list[str], passed: str, failures: list[str]
+    ) -> None:
+        """Znacznik `fill_guarded` (wg możliwości): bez przyczyny od razu; po zadziałaniu straży tylko wtedy, gdy
+        spłaszczenie wyprowadziło pozycję z OPEN (inaczej, także przy nieczytelnym dzienniku, straż pobiegnie znowu)."""
+        deal_id = position.deal_id
+        if causes:
+            try:
+                current = self._journal.current_position(position.epic)
+            except JournalError:
+                return
+            if current is not None and current.state is _P.OPEN and current.deal_id == deal_id:
+                return
+        value = "+".join(causes) if causes else passed
+        self._set_meta(META_FILL_GUARDED.format(deal_id), value, best_effort=failures)
 
     def _unresolved(self, rec: OrderRecord, position: PositionRecord | None) -> None:
         state = None if position is None else position.state
@@ -356,38 +477,53 @@ class Executor:
         )
         self._event(ENTRY_UNRESOLVED, order_id=rec.order_id, state=rec.state, note=rec.note, position=state)
 
-    def _guard_fill(
-        self, position: PositionRecord, signal: EntrySignal, rules: InstrumentRules, failures: list[str]
+    def _guard_values(
+        self,
+        position: PositionRecord,
+        decision_bid: Decimal | None,
+        decision_ask: Decimal | None,
+        stop_distance: Decimal | None,
+        value_per_point: Decimal,
+        requested_size: Decimal | None,
+        failures: list[str],
+        *,
+        adopted: bool = False,
     ) -> list[str]:
-        """Straż poślizgu (spec §5 pkt 7) i ryzyko faktycznej wielkości; obie zawsze sprawdzane, zdarzenia (wg
-        możliwości) przed zamknięciem. Zwraca przyczyny natychmiastowego spłaszczenia."""
-        quote = signal.decision_quote
+        """Straż poślizgu (spec §5 pkt 7; tylko ze znanym notowaniem decyzji i odległością stopu) i ryzyko faktycznej
+        wielkości (zawsze); obie sprawdzane, zdarzenia (wg możliwości) przed zamknięciem. Odległość dla ryzyka: stop
+        pozycji, a bez niego `stop_distance` (stop ustawiony przed chwilą w tej odległości). `adopted`: wypełnienie
+        przyjęte przez uzgadnianie. Zwraca przyczyny natychmiastowego spłaszczenia."""
         causes: list[str] = []
-        if position.side is Side.BUY:
-            deviation = position.open_level - quote.ask  # BUY kupuje po ask: gorzej = wyżej
-        else:
-            deviation = quote.bid - position.open_level  # SELL sprzedaje po bid: gorzej = niżej
-        limit = self._strat.slippage_guard_fraction * signal.stop_distance
-        if deviation > limit:
-            causes.append("SLIPPAGE_GUARD")
-            self._event(
-                "SLIPPAGE_GUARD", best_effort=failures, deal_id=position.deal_id, side=position.side,
-                decision_bid=quote.bid, decision_ask=quote.ask, open_level=position.open_level, deviation=deviation,
-                limit=limit,
-            )  # fmt: skip
+        if decision_bid is not None and decision_ask is not None and stop_distance is not None:
+            if position.side is Side.BUY:
+                deviation = position.open_level - decision_ask  # BUY kupuje po ask: gorzej = wyżej
+            else:
+                deviation = decision_bid - position.open_level  # SELL sprzedaje po bid: gorzej = niżej
+            limit = self._strat.slippage_guard_fraction * stop_distance
+            if deviation > limit:
+                causes.append("SLIPPAGE_GUARD")
+                self._event(
+                    "SLIPPAGE_GUARD", best_effort=failures, deal_id=position.deal_id, side=position.side,
+                    decision_bid=decision_bid, decision_ask=decision_ask, open_level=position.open_level,
+                    deviation=deviation, limit=limit, adopted=adopted,
+                )  # fmt: skip
         if position.stop_level is not None:
             distance = abs(position.open_level - position.stop_level)
-        else:
-            distance = signal.stop_distance  # stop ustawiony przed chwilą w tej odległości
-        risk = position.size * distance * rules.value_per_point
+        elif stop_distance is not None:
+            distance = stop_distance
+        else:  # wywołujący gwarantuje stop albo odległość: straży ryzyka nigdy nie pomijamy po cichu
+            raise ValueError(f"fill guard of {position.deal_id}: neither a stop level nor a stop distance")
+        risk = position.size * distance * value_per_point
         if risk > self._risk.max_loss_per_trade:
             causes.append("SIZE_MISMATCH_RISK")
             self._event(
                 "SIZE_MISMATCH_RISK", best_effort=failures, deal_id=position.deal_id, size=position.size,
-                requested=signal.size, distance=distance, risk=risk, limit=self._risk.max_loss_per_trade,
+                requested=requested_size, distance=distance, risk=risk, limit=self._risk.max_loss_per_trade,
+                adopted=adopted,
             )  # fmt: skip
         if causes:
-            self._alert("ERROR", f"{' + '.join(causes)}: closing {position.deal_id} at once")
+            where = " (adopted by reconciliation)" if adopted else ""
+            self._alert("ERROR", f"{' + '.join(causes)}: closing {position.deal_id} at once{where}")
         return causes
 
     # --- spłaszczenie -------------------------------------------------------------------------------------
@@ -918,18 +1054,25 @@ class Executor:
 
     # --- kontekst wejścia ---------------------------------------------------------------------------------
 
-    def _context(self, deal_id: str | None, epic: str) -> dict[str, Any] | None:
-        """Kontekst wejścia pozycji `deal_id`: przez `entry_by_deal`, a bez niego przez wskaźnik ostatniego wejścia,
-        jeśli jego zlecenie ma w dzienniku ten sam deal_id (pozycja przyjęta przez uzgadnianie). None: brak."""
+    def _entry_client_id(self, deal_id: str | None, epic: str) -> str | None:
+        """Identyfikator wejścia pozycji `deal_id`: z `entry_by_deal`, a bez niego wskaźnik ostatniego wejścia, jeśli
+        jego zlecenie ma w dzienniku ten sam deal_id (pozycja przyjęta przez uzgadnianie). None: brak."""
         if deal_id is None:
             return None
         client_id = self._journal.get_meta(META_ENTRY_BY_DEAL.format(deal_id))
-        if not client_id:
-            last = self._journal.get_meta(META_ENTRY_LAST.format(epic))
-            order = self._journal.get_order(last) if last else None
-            if order is None or order.deal_id != deal_id or order.epic != epic:
-                return None
-            client_id = last
+        if client_id:
+            return client_id
+        last = self._journal.get_meta(META_ENTRY_LAST.format(epic))
+        order = self._journal.get_order(last) if last else None
+        if order is None or order.deal_id != deal_id or order.epic != epic:
+            return None
+        return last
+
+    def _context(self, deal_id: str | None, epic: str) -> dict[str, Any] | None:
+        """Kontekst wejścia pozycji `deal_id` (przez `_entry_client_id`). None: brak; zły kontekst: ValueError."""
+        client_id = self._entry_client_id(deal_id, epic)
+        if client_id is None:
+            return None
         text = self._journal.get_meta(META_ENTRY_CTX.format(client_id))
         if text is None:
             return None

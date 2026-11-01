@@ -762,19 +762,44 @@ async def test_control_on_time_confirm_closes_the_oversize_fill_at_once(rig, wor
     assert "SIZE_MISMATCH_RISK" in disk.codes() and disk.position.state is P.FLAT and len(disk.trades) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-E2E-1: entry adopted by the Reconciler (lost ack/confirm, restart or journal failure after the send) "
-    "never runs the fill guards (SIZE_MISMATCH_RISK, SLIPPAGE_GUARD): the over-risk fill stays OPEN until 17:25",
-)
 @pytest.mark.parametrize("path", ["checks_incomplete", "restart_after_send", "journal_failure_after_send"])
 async def test_bug_e2e_1_an_adopted_oversize_fill_is_closed_by_the_risk_guard(rig, world, path):
+    closes = calls_with_index(world.broker, "close_position")
     await oversize_entry_via(rig, world, path)
     disk = read_disk(rig.path)
-    assert disk.order(CID).state is O.CONFIRMED and disk.position.size == SIZE * OVERSIZE  # przyjęta z wielkością brokera
-    # oczekiwane jak przy potwierdzeniu na czas (spec §5 pkt 7, §9): straż ryzyka zamyka pozycję od razu
-    assert "SIZE_MISMATCH_RISK" in disk.codes()
-    assert disk.position.state is P.FLAT
+    assert disk.order(CID).state is O.CONFIRMED and disk.order(CID).note.startswith("ADOPTED_BY_RECONCILER")
+    # jak przy potwierdzeniu na czas (spec §5 pkt 7, §9): straż ryzyka zamyka pozycję od razu
+    assert "SIZE_MISMATCH_RISK" in disk.codes() and "FILL_GUARD_ADOPTED" in disk.codes()
+    [t] = disk.trades
+    assert t.size == SIZE * OVERSIZE and t.exit_reason == "FORCED"  # przyjęta z wielkością brokera
+    assert disk.position == PositionRecord(EPIC, P.FLAT) and world.broker.positions == {} and len(closes) == 1
+    assert disk.meta[f"fill_guarded:{DEAL}"] == "SIZE_MISMATCH_RISK"
+    assert_books_balance(disk)
+
+
+async def test_crash_after_adoption_before_the_fill_guard_still_closes_after_the_restart(rig, world):
+    world.broker.fill_size_factor = OVERSIZE
+    world.broker.fail_next("open_position", ProcessDied(), applied=True)
+    with pytest.raises(ProcessDied):
+        await enter(rig)
+    rig.restart()
+    # uzgadnianie przyjmuje pozycję (zapis CONFIRMED trafia na dysk), proces ginie przed strażą wypełnienia
+    crash_after(rig.s.journal, "update_order", when=lambda _order_id, **f: f.get("state") is O.CONFIRMED)
+    with pytest.raises(ProcessDied):
+        await manage(rig)
+    disk = read_disk(rig.path)
+    assert disk.order(CID).state is O.CONFIRMED and disk.position.state is P.OPEN
+    assert "SIZE_MISMATCH_RISK" not in disk.codes() and f"fill_guarded:{DEAL}" not in disk.meta
+    rig.restart()
+    closes = calls_with_index(world.broker, "close_position")
+    await manage(rig)  # znacznik, nie wynik uzgadniania, decyduje: straż biegnie przy pierwszym przebiegu
+    disk = read_disk(rig.path)
+    assert "SIZE_MISMATCH_RISK" in disk.codes() and disk.position == PositionRecord(EPIC, P.FLAT)
+    [t] = disk.trades
+    assert t.size == SIZE * OVERSIZE and t.exit_reason == "FORCED" and len(closes) == 1
+    assert_books_balance(disk)
+    await manage(rig)
+    assert len(read_disk(rig.path).trades) == 1 and len(closes) == 1
 
 
 # --- f: atomowość księgowania na poziomie dziennika (kryterium A) -----------------------------------------------------
@@ -1016,23 +1041,23 @@ async def test_control_engine_without_a_restart_closes_a_slipped_fill_at_once(en
     assert "SLIPPAGE_GUARD" in disk.codes() and disk.position.state is P.FLAT and len(disk.trades) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-E2E-1: after a restart mid-entry the Reconciler adopts the fill and no component runs the slippage "
-    "guard (spec §5 pkt 7): a fill 10 pts worse than the decision quote stays OPEN until 17:25",
-)
 async def test_bug_e2e_1_engine_restart_mid_entry_still_closes_a_slipped_fill(engine_rig, broker, clock):
     broker.fill_slippage = D("10")
     broker.on_call("confirm", die, once=True)  # zlecenie przyjęte, proces ginie przed potwierdzeniem
     with pytest.raises(ProcessDied):
         await engine_rig.engine.run_day(DAY)
     engine_rig.restart()
+    closes = calls_at(broker, clock, "close_position")
     stop_engine_at(engine_rig.engine, clock, berlin(DAY, 9, 20))
     await engine_rig.engine.run_day(DAY)
     disk = read_disk(engine_rig.path)
-    assert disk.order(CID).state is O.CONFIRMED and disk.position.open_level == FILL + 10  # przyjęta po restarcie
-    assert "SLIPPAGE_GUARD" in disk.codes()
-    assert disk.position.state is P.FLAT
+    assert disk.order(CID).state is O.CONFIRMED and disk.order(CID).note.startswith("ADOPTED_BY_RECONCILER")
+    assert "SLIPPAGE_GUARD" in disk.codes() and "FILL_GUARD_ADOPTED" in disk.codes()
+    [t] = disk.trades
+    assert t.entry_fill == FILL + 10 and t.exit_reason == "FORCED"  # przyjęta po restarcie, zamknięta przez straż
+    assert disk.position == PositionRecord(EPIC, P.FLAT) and len(closes) == 1 and closes[0] < berlin(DAY, 9, 20)
+    assert broker.calls.count("open_position") == 1
+    assert_books_balance(disk)
 
 
 async def test_e_a_crash_between_the_entry_context_and_the_intent_row_sends_nothing_and_blocks_the_retry(rig, world):

@@ -602,6 +602,199 @@ async def test_both_guards_are_checked_and_the_position_is_closed_once(executor,
     assert fake.calls.count("close_position") == 1 and len(journal.trades()) == 1
 
 
+# --- straże wypełnienia przyjętego przez uzgadnianie (BUG-E2E-1) ------------------------------------------
+
+
+def make_reconciler(journal, fake, clock, kill, risk_cfg, executor, mgr):
+    return Reconciler(journal, fake, clock, kill, risk_cfg, "DE40", booker=executor, entry_gate=lambda: mgr.in_flight)
+
+
+async def adopted_entry(executor, reconciler, signal, rules, journal, fake, clock, risk_cfg):
+    """Wejście przyjęte, odpowiedź zgubiona, lista nieczytelna przez 30 s (UNKNOWN CHECKS_INCOMPLETE, kill miękki
+    ENTRY_UNRESOLVED); uzgadnianie przyjmuje pozycję z danymi brokera. Straże wejścia nie biegły; czyści `fake.calls`."""
+    fake.fail_next("open_position", BrokerTimeout(), applied=True)
+    for _ in range(3):
+        fake.fail_next("list_positions", BrokerError("HTTP 502"))
+    rec = await executor.enter(signal, rules, DAY)
+    assert rec.state is O.UNKNOWN and codes(journal) == ["ENTRY_UNRESOLVED"]
+    clock.advance(risk_cfg.reconcile_interval_s)
+    await reconciler.run_once()
+    assert journal.get_order(CID).state is O.CONFIRMED and position(journal).state is P.OPEN
+    assert journal.get_meta("fill_guarded:DEAL-1") is None
+    fake.calls.clear()
+
+
+@pytest.fixture
+def adopting(executor, mgr, journal, fake, clock, kill, risk_cfg):
+    return make_reconciler(journal, fake, clock, kill, risk_cfg, executor, mgr)
+
+
+async def test_guard_adopted_fill_closes_an_oversize_fill_adopted_by_reconciliation(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, notifier
+):
+    fake.fill_size_factor = D("5")  # 0.035 × 30 × 1 = 1.05 > max_loss_per_trade 1.00
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    assert position(journal).size == D("0.035")
+    assert await executor.guard_adopted_fill() is True
+    [risk] = events(journal, "SIZE_MISMATCH_RISK")
+    assert risk["adopted"] is True and D(risk["size"]) == D("0.035") and D(risk["requested"]) == SIZE
+    assert D(risk["distance"]) == D("30") and D(risk["risk"]) == D("1.05") and D(risk["limit"]) == D("1.00")
+    [guard] = events(journal, "FILL_GUARD_ADOPTED")
+    assert guard == {
+        "event": "FILL_GUARD_ADOPTED", "deal_id": "DEAL-1", "order_id": CID, "causes": ["SIZE_MISMATCH_RISK"],
+        "source": "entry_ctx",
+    }  # fmt: skip
+    assert events(journal, "SLIPPAGE_GUARD") == []
+    assert fake.calls.count("close_position") == 1 and "DEAL-1" not in fake.positions
+    [booked] = journal.trades()
+    assert booked.exit_reason == "FORCED" and booked.size == D("0.035") and booked.decision_bid == BID
+    assert position(journal) == PositionRecord("DE40", P.FLAT)
+    [(level, message)] = alerts(notifier, "SIZE_MISMATCH_RISK:")
+    assert level == "ERROR" and "(adopted by reconciliation)" in message
+    assert journal.get_meta("fill_guarded:DEAL-1") == "SIZE_MISMATCH_RISK"
+    assert journal.get_meta("entry_by_deal:DEAL-1") == CID  # księgowanie znajdzie kontekst bezpośrednio
+
+
+async def test_guard_adopted_fill_closes_a_slipped_fill_using_the_decision_quote_of_the_entry_context(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg
+):
+    fake.fill_slippage = D("10")  # wypełnienie 25792.3 przy ask decyzji 25782.3: 10 > 25% × 30
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    # rynek doszedł do wypełnienia: liczy się notowanie decyzji z kontekstu, nie bieżące (tu poślizg byłby ujemny)
+    fake.set_quote(Quote("DE40", D("25791.3"), D("25793.3"), clock.now_utc()))
+    assert await executor.guard_adopted_fill() is True
+    [slip] = events(journal, "SLIPPAGE_GUARD")
+    assert slip["adopted"] is True and slip["decision_bid"] == "25780.3" and slip["decision_ask"] == "25782.3"
+    assert D(slip["open_level"]) == D("25792.3")
+    assert D(slip["deviation"]) == D("10") and D(slip["limit"]) == D("7.5")
+    assert events(journal, "FILL_GUARD_ADOPTED")[0]["causes"] == ["SLIPPAGE_GUARD"]
+    assert fake.calls.count("close_position") == 1 and position(journal).state is P.FLAT
+    assert journal.trades()[0].exit_reason == "FORCED"
+    assert journal.get_meta("fill_guarded:DEAL-1") == "SLIPPAGE_GUARD"
+
+
+@pytest.mark.parametrize("fill", ["pass", "closed"])
+async def test_guard_adopted_fill_is_idempotent(executor, adopting, signal, rules, journal, fake, clock, risk_cfg, fill):
+    if fill == "closed":
+        fake.fill_size_factor = D("5")
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    assert await executor.guard_adopted_fill() is (fill == "closed")
+    if fill == "pass":
+        assert fake.calls == [] and position(journal).state is P.OPEN  # z kontekstem: bez odczytu brokera
+        assert journal.get_meta("fill_guarded:DEAL-1") == "PASS"
+        assert events(journal, "FILL_GUARD_ADOPTED")[0]["causes"] == []
+    fake.calls.clear()
+    seen = len(journal.events())
+    assert await executor.guard_adopted_fill() is False
+    assert fake.calls == [] and len(journal.events()) == seen
+
+
+@pytest.mark.parametrize("slip", ["0", "10"], ids=["pass", "slipped"])
+async def test_after_submit_marks_the_fill_guarded_so_reconciliation_never_reruns_the_guards(
+    executor, signal, rules, journal, fake, slip
+):
+    fake.fill_slippage = D(slip)
+    rec = await executor.enter(signal, rules, DAY)
+    assert rec.state is O.CONFIRMED
+    assert journal.get_meta("fill_guarded:DEAL-1") == ("PASS" if slip == "0" else "SLIPPAGE_GUARD")
+    fake.calls.clear()
+    seen = len(journal.events())
+    assert await executor.guard_adopted_fill() is False
+    assert fake.calls == [] and len(journal.events()) == seen
+
+
+NO_CTX_POSITION = PositionRecord("DE40", P.OPEN, "DEAL-9", Side.BUY, D("0.010"), D("25700"), D("25670"), T_ENTRY)
+
+
+@pytest.mark.parametrize("case", ["oversize", "normal", "rules_unreadable", "no_stop"])
+async def test_guard_adopted_fill_without_entry_context_checks_the_size_risk_from_broker_rules(
+    executor, journal, fake, kill, notifier, case
+):
+    # pozycja OPEN z deal_id bez kontekstu wejścia (np. kontekst nieczytelny): tylko ryzyko wielkości, wartość punktu
+    # od brokera; stop 30 pkt; 0.040 × 30 × 1 = 1.20 > 1.00, 0.010 × 30 × 1 = 0.30
+    stored = replace(NO_CTX_POSITION, size=D("0.040") if case == "oversize" else D("0.010"))
+    if case == "no_stop":
+        stored = replace(stored, stop_level=None)
+    journal.upsert_position(stored)
+    fake.positions["DEAL-9"] = OpenPosition("DEAL-9", "DE40", Side.BUY, stored.size, D("25700"), stored.stop_level,
+                                            T_ENTRY)  # fmt: skip
+    if case == "rules_unreadable":
+        fake.fail_next("instrument_rules", BrokerError("HTTP 503"))
+    fired = await executor.guard_adopted_fill()
+    marker = journal.get_meta("fill_guarded:DEAL-9")
+    if case == "no_stop":  # stop ustawia procedura zabezpieczenia; straż czeka na następny przebieg
+        assert fired is False and fake.calls == [] and marker is None and journal.events() == []
+        return
+    if case == "rules_unreadable":
+        assert fired is False and fake.calls == ["instrument_rules"] and marker is None
+        assert [lvl for lvl, _ in alerts(notifier, "FILL_GUARD_UNAVAILABLE DEAL-9")] == ["WARN"]
+        assert "close_position" not in fake.calls and position(journal) == stored
+        assert await executor.guard_adopted_fill() is False  # następny przebieg ponawia
+        assert fake.calls == ["instrument_rules"] * 2 and journal.get_meta("fill_guarded:DEAL-9") == "NO_CONTEXT_PASS"
+        return
+    [guard] = events(journal, "FILL_GUARD_ADOPTED")
+    assert guard["source"] == "broker_rules" and guard["order_id"] is None
+    assert events(journal, "SLIPPAGE_GUARD") == []  # bez notowania decyzji poślizgu nie da się sprawdzić
+    if case == "normal":
+        assert fired is False and fake.calls == ["instrument_rules"] and marker == "NO_CONTEXT_PASS"
+        assert guard["causes"] == [] and position(journal) == stored
+        return
+    assert fired is True and guard["causes"] == ["SIZE_MISMATCH_RISK"]
+    [risk] = events(journal, "SIZE_MISMATCH_RISK")
+    assert risk["requested"] is None and D(risk["risk"]) == D("1.20") and risk["adopted"] is True
+    assert fake.calls[:2] == ["instrument_rules", "close_position"] and fake.calls.count("close_position") == 1
+    assert position(journal) == PositionRecord("DE40", P.FLAT) and journal.trades()[0].exit_reason == "FORCED"
+    assert marker == "SIZE_MISMATCH_RISK" and journal.get_meta("entry_by_deal:DEAL-9") is None
+
+
+@pytest.mark.parametrize("stored", ["EXITING", "BLOCKED", "FLAT", "ENTERING", "none", "unresolved_order"])
+async def test_guard_adopted_fill_leaves_exiting_blocked_flat_and_entering_alone(executor, journal, fake, stored):
+    oversize = replace(NO_CTX_POSITION, size=D("0.040"))
+    record = {
+        "EXITING": replace(oversize, state=P.EXITING),
+        "BLOCKED": replace(oversize, state=P.BLOCKED),
+        "FLAT": PositionRecord("DE40", P.FLAT),
+        "ENTERING": PositionRecord("DE40", P.ENTERING),
+        "none": None,
+        "unresolved_order": oversize,  # zlecenie nierozstrzygnięte: najpierw rozstrzyga je uzgadnianie
+    }[stored]
+    if record is not None:
+        journal.upsert_position(record)
+    if stored == "unresolved_order":
+        journal.insert_order(OrderRecord(CID, "DE40", Side.BUY, SIZE, D("30"), O.UNKNOWN, None, None, T_ENTRY, T_ENTRY))
+    fake.positions["DEAL-9"] = OpenPosition("DEAL-9", "DE40", Side.BUY, D("0.040"), D("25700"), D("25670"), T_ENTRY)
+    assert await executor.guard_adopted_fill() is False
+    assert fake.calls == [] and journal.events() == [] and journal.get_meta("fill_guarded:DEAL-9") is None
+    assert position(journal) == record
+
+
+@pytest.mark.parametrize("failure", ["exiting_write", "position_left_open"])
+async def test_guard_adopted_fill_retries_when_the_exiting_write_of_its_flatten_fails(
+    executor, adopting, signal, rules, journal, fake, clock, risk_cfg, monkeypatch, failure
+):
+    fake.fill_size_factor = D("5")
+    await adopted_entry(executor, adopting, signal, rules, journal, fake, clock, risk_cfg)
+    if failure == "exiting_write":
+        failing = switchable(monkeypatch, journal, "upsert_position", JournalWriteError("disk full"))
+        with pytest.raises(JournalWriteError):  # zwykłe spłaszczenie: EXITING przed zamknięciem (spec §8)
+            await executor.guard_adopted_fill()
+        failing["on"] = False
+    else:  # spłaszczenie wróciło, a pozycja nadal OPEN (np. odmowa): znacznika nie ma, straż pobiegnie znowu
+        real = executor.flatten
+
+        async def left_open(_position, _reason):
+            return None
+
+        monkeypatch.setattr(executor, "flatten", left_open)
+        assert await executor.guard_adopted_fill() is True
+        monkeypatch.setattr(executor, "flatten", real)
+    assert "close_position" not in fake.calls and position(journal).state is P.OPEN
+    assert journal.get_meta("fill_guarded:DEAL-1") is None  # straż pobiegnie znowu
+    assert await executor.guard_adopted_fill() is True
+    assert fake.calls.count("close_position") == 1 and position(journal).state is P.FLAT
+    assert len(journal.trades()) == 1 and journal.get_meta("fill_guarded:DEAL-1") == "SIZE_MISMATCH_RISK"
+
+
 # --- zabezpieczenie stopem ---------------------------------------------------------------------------
 
 

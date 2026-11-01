@@ -13,8 +13,9 @@ Oś dnia (godziny wyłącznie z kalendarza i konfiguracji, porównania w UTC):
   jest pozostała pozycja);
 - takt (co `quote_poll_s`, uzgadnianie co `reconcile_interval_s`, ping co `ping_interval_s`): pliki kill switcha,
   logowanie (w razie potrzeby), kontrola rachunku (live), notowanie → Watchdog, ping, zarządzanie (uzgadnianie,
-  stop dla pozycji bez stopu, HARD → awaryjne spłaszczenie, EXITING → ponowienie, OPEN po godzinie spłaszczenia →
-  spłaszczenie FORCED), dane sygnału (reguły, ATR14), decyzja, tętno;
+  stop dla pozycji bez stopu, straże wypełnienia przyjętego przez uzgadnianie, HARD → awaryjne spłaszczenie,
+  EXITING → ponowienie, OPEN po godzinie spłaszczenia → spłaszczenie FORCED), dane sygnału (reguły, ATR14), decyzja,
+  tętno;
 - decyzja po zamknięciu pierwszej świecy (otwarcie + `range_minutes`): świeca 5-minutowa o starcie RÓWNYM otwarciu
   sesji w UTC (nigdy „najbliższa"); brak → ponawianie do terminu (+ `entry_deadline_after_range_min`) i potem
   `NO_SIGNAL_DATA`; start po terminie → `NO_SIGNAL_DATA`. Zdarzenie `decision` (DECISION) zawsze zapisuje świecę
@@ -554,7 +555,11 @@ class Engine:
         return None
 
     async def reconcile_once(self) -> ReconcileResult | None:
-        """Jeden przebieg uzgadniania z obsługą błędów (Watchdog, kill switch); None przy wyjątku."""
+        """Jeden przebieg uzgadniania z obsługą błędów (Watchdog, kill switch); None przy wyjątku.
+
+        Po udanym przebiegu: stop dla naszych pozycji bez stopu, potem straże wypełnienia przyjętego przez uzgadnianie
+        (`Executor.guard_adopted_fill`; najpierw stop, potem straże). Po przebiegu pominiętym i po prośbie o
+        zatrzymanie żadnego z tych kroków."""
         try:
             result = await self.reconciler.run_once()
         except asyncio.CancelledError:
@@ -574,6 +579,8 @@ class Engine:
             if self._shutdown:
                 break
             await self._safe("protect_unprotected", self.executor.protect_unprotected, p)
+        if not self._shutdown:
+            await self._safe("guard_adopted_fill", self.executor.guard_adopted_fill)
         return result
 
     # --- dzień ---

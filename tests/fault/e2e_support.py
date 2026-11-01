@@ -255,13 +255,15 @@ class Rig:
 
 
 async def reconcile(rig: Rig, *, advance: bool = True) -> ReconcileResult:
-    """Jeden przebieg uzgadniania co `reconcile_interval_s`, z zabezpieczeniem pozycji bez stopu (jak `Engine`)."""
+    """Jeden przebieg uzgadniania co `reconcile_interval_s`, jak `Engine.reconcile_once`: zabezpieczenie pozycji bez
+    stopu, potem straże wypełnienia przyjętego przez uzgadnianie (najpierw stop, potem straże; nic po pominiętym)."""
     if advance:
         rig.world.clock.advance(rig.world.risk.reconcile_interval_s)
     result = await rig.s.reconciler.run_once()
     if not result.skipped:
         for p in result.unprotected:
             await rig.s.executor.protect_unprotected(p)
+        await rig.s.executor.guard_adopted_fill()
     return result
 
 

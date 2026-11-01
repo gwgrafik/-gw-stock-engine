@@ -654,6 +654,51 @@ async def test_unprotected_position_gets_a_stop(engine, broker, clock):
     assert engine.kill.level() is KillLevel.NONE and rep.final_position_state is P.OPEN
 
 
+async def test_reconcile_once_attaches_the_stop_before_the_fill_guard_closes_an_adopted_oversize_fill(
+    make_engine, broker, clock
+):
+    # broker wypełnia 0.040 zamiast 0.001 (ryzyko 0.040 × 30 × 1 = 1.20 > 1.00) i nie trzyma stopu; proces ginie przed
+    # potwierdzeniem, więc straże wejścia nie biegły; po restarcie pierwszy przebieg przyjmuje, chroni i zamyka
+    broker.fill_size_factor = D("40")
+    first = make_engine(Mode.LIVE)
+    broker.on_call("confirm", die, once=True)
+    with pytest.raises(ProcessDied):
+        await first.run_day(DAY)
+    broker.positions["DEAL-1"] = replace(broker.positions["DEAL-1"], stop_level=None)
+    second = make_engine.restart(first, Mode.LIVE)
+    broker.calls.clear()
+    result = await second.reconcile_once()
+    assert [p.deal_id for p in result.unprotected] == ["DEAL-1"]
+    assert broker.calls.index("set_stop") < broker.calls.index("close_position")  # najpierw stop, potem straż
+    assert broker.calls.count("close_position") == 1 and "DEAL-1" not in broker.positions
+    events = [p["event"] for p in payloads(second.journal, "event")]
+    assert events.index("STOP_ATTACHED") < events.index("SIZE_MISMATCH_RISK") < events.index("FILL_GUARD_ADOPTED")
+    [t] = second.journal.trades()
+    assert t.size == D("0.040") and t.exit_reason == "FORCED" and position(second) == PositionRecord("DE40", P.FLAT)
+
+
+@pytest.mark.parametrize("why", ["shutdown_requested", "skipped_pass"])
+async def test_reconcile_once_runs_no_fill_guard_after_a_skipped_pass_or_a_shutdown_request(
+    make_engine, broker, clock, monkeypatch, why
+):
+    broker.fill_size_factor = D("40")
+    first = make_engine(Mode.LIVE)
+    broker.on_call("confirm", die, once=True)
+    with pytest.raises(ProcessDied):
+        await first.run_day(DAY)
+    second = make_engine.restart(first, Mode.LIVE)
+    if why == "shutdown_requested":  # prośba o zatrzymanie w trakcie przebiegu, który przyjmuje pozycję
+        broker.on_call("list_working_orders", second.request_shutdown, once=True)
+    else:  # przyjęta wcześniej (sam przebieg uzgadniania), teraz wejście w toku: przebieg pominięty
+        await second.reconciler.run_once()
+        monkeypatch.setattr(second.manager, "_in_flight", True)
+    result = await second.reconcile_once()
+    assert result is not None and result.skipped is (why == "skipped_pass")
+    assert position(second).state is P.OPEN and position(second).size == D("0.040")
+    assert "close_position" not in broker.calls and second.journal.get_meta("fill_guarded:DEAL-1") is None
+
+
+
 async def test_startup_restores_loss_limit_kills_from_the_journal(make_engine, broker, clock):
     engine = make_engine(Mode.LIVE)
     yesterday_exit = datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc)  # piątek
