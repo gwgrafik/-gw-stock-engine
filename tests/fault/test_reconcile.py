@@ -992,8 +992,12 @@ async def test_closure_not_in_history_is_journaled_even_when_the_alert_cannot_be
     result = await time_out_a_missing_deal(rec, clock, risk_cfg)  # awaria kanału alarmów nie przerywa przebiegu
 
     assert not result.skipped and kill_sink.calls == ["MISMATCH_TIMEOUT"]
+    for _ in range(3):  # ten sam incydent: nieudana wysyłka nie jest ponawiana co przebieg, zdarzenie zostaje jedno
+        clock.advance(risk_cfg.reconcile_interval_s)
+        assert not (await rec.run_once()).skipped
+    assert kill_sink.calls == ["MISMATCH_TIMEOUT"] * 4
     assert [e["event"] for e in payloads(journal, "reconcile.event")].count("CLOSURE_NOT_IN_HISTORY") == 1
-    assert len(notifier.alerts) == (0 if sink == "no_notifier" else 1)
+    assert len(notifier.alerts) == (0 if sink == "no_notifier" else 1)  # jedna próba wysyłki na incydent
 
 
 def test_engine_close_source_is_the_executor_raw_source():
