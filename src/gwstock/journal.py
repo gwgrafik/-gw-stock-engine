@@ -311,6 +311,7 @@ _TRADE_INSERT = (
 )  # konflikt tylko na deal_id jest pomijany; naruszenie NOT NULL itp. nadal jest błędem
 _DAY_PREFIX = "gws-{:%Y%m%d}-"  # prefiks identyfikatora z `make_client_id` (dzień handlowy, bez znajomości stref)
 _ENTRY_SUFFIX = "-entry"  # rola wejścia strategii (ostatni segment identyfikatora)
+_SMOKE_SUFFIX = "-smoke"  # rola próby akceptacyjnej L0
 
 
 def _order_from_row(r: tuple) -> OrderRecord:
@@ -788,6 +789,23 @@ class Journal:
         _check_str(deal_id, "has_trade.deal_id", non_empty=True)
         row = self._read(lambda c: c.execute("SELECT 1 FROM trades WHERE deal_id = ?", (deal_id,)).fetchone())
         return row is not None
+
+    def count_smoke_trades(self) -> int:
+        """Liczba zaksięgowanych transakcji próby `smoke` (L0), które nie są sesjami strategii.
+
+        Transakcja jest próbą smoke, gdy jej deal_id ma zlecenie o roli `smoke` (`...-smoke`) albo wskaźnik wykonawcy
+        `entry_by_deal:<deal_id>` prowadzi do takiego zlecenia. Licznik sesji live = `len(trades()) − ta liczba`.
+        """
+        suffix = _SMOKE_SUFFIX
+        return self._read(
+            lambda c: c.execute(
+                "SELECT count(*) FROM trades t WHERE "
+                "EXISTS (SELECT 1 FROM orders o WHERE o.deal_id = t.deal_id AND substr(o.order_id, -?) = ?) "
+                "OR EXISTS (SELECT 1 FROM meta m WHERE m.key = 'entry_by_deal:' || t.deal_id "
+                "AND substr(m.value, -?) = ?)",
+                (len(suffix), suffix, len(suffix), suffix),
+            ).fetchone()[0]
+        )
 
     def trades(self) -> list[TradeRecord]:
         """Księga w kolejności zaksięgowania."""

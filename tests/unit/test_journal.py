@@ -746,3 +746,18 @@ def test_record_trade_rejects_empty_deal_id_and_datetime_exit_day(journal):
     with pytest.raises(TypeError):
         journal.record_trade(make_trade(), "DEAL-1", T0)
     assert journal.trades() == [] and journal.realized_pnl_total() == Decimal("0")
+
+
+def test_count_smoke_trades_recognises_smoke_entries_by_order_or_entry_pointer(journal):
+    # transakcje próby smoke (L0) nie są sesjami strategii: licznik sesji live je pomija
+    journal.record_trade(make_trade(), "DEAL-1", DAY)  # wejście strategii
+    journal.insert_order(make_order("gws-20261102-DE40-1-entry", state=OrderState.CONFIRMED, deal_id="DEAL-1"))
+    journal.record_trade(make_trade(), "DEAL-2", DAY)  # smoke rozpoznany po zleceniu (rola smoke, ten deal_id)
+    journal.insert_order(make_order("gws-20261102-DE40-2-smoke", state=OrderState.CONFIRMED, deal_id="DEAL-2"))
+    journal.record_trade(make_trade(), "DEAL-3", NEXT_DAY)  # smoke rozpoznany po wskaźniku wykonawcy
+    journal.set_meta("entry_by_deal:DEAL-3", "gws-20261103-DE40-1-smoke")
+    journal.record_trade(make_trade(), "DEAL-4", NEXT_DAY)  # wskaźnik na wejście strategii
+    journal.set_meta("entry_by_deal:DEAL-4", "gws-20261103-DE40-2-entry")
+    journal.insert_order(make_order("gws-20261103-DE40-9-smoke", state=OrderState.REJECTED))  # bez transakcji
+    assert journal.count_smoke_trades() == 2
+    assert len(journal.trades()) == 4

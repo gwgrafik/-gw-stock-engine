@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
 import importlib
 import json
@@ -34,21 +35,26 @@ from typing import Any
 from gwstock.app import (
     ACCOUNT_CURRENCY,
     ACCOUNT_STATUS,
+    ALERTS_FILE,
     ARM_FILE,
     HEARTBEAT_FILE,
+    L1_PASSED_FILE,
     LOCK_FILE,
     Engine,
     Mode,
     arm_file_exists,
 )
 from gwstock.config import RuntimeConfig, StrategyConfig, load_config, load_runtime
-from gwstock.journal import JournalError
+from gwstock.journal import JournalError, PositionRecord
+from gwstock.orders.fsm import check_position_transition
+from gwstock.serialization import dump
 from gwstock.strategy import EntrySignal, atr14, round_up_to_step
-from gwstock.types import BrokerRejected, OrderState, PositionState, Side
+from gwstock.types import BrokerRejected, KillLevel, OrderState, PositionState, Side
 from gwstock.watchdog import AlreadyRunning, InstanceLock, heartbeat_age_s, read_heartbeat
 
 __all__ = [
     "Mode", "BindAccountError", "resolve_mode", "mode_decision", "bind_account", "smoke", "status", "health", "main",
+    "clear_kill", "reset_position",
 ]  # fmt: skip
 
 _LOG = logging.getLogger("gwstock.cli")
@@ -72,6 +78,12 @@ OVERWRITE_WORD = "OVERWRITE"
 SMOKE_SETTLE_ATTEMPTS = 10
 SMOKE_SETTLE_PAUSE_S = 3
 SMOKE_CANDLE_LOOKBACK_MIN = 30
+SMOKE_HOLD_MAX_S = 600  # `smoke --hold`: najdłużej 10 minut z otwartą pozycją próby
+SMOKE_HOLD_COUNTDOWN_S = 15
+SMOKE_HOLD_TICK_S = 5
+CLEAR_WORD = "CLEAR"
+RESET_WORD = "RESET"
+SOURCE_OWNER_RESET = "owner.reset"
 
 
 # --- tryb ---------------------------------------------------------------------------------------------------
@@ -248,13 +260,19 @@ def smoke_stop_distance(rules: Any, atr: Decimal | None, strat: StrategyConfig) 
     return distance
 
 
-async def smoke(engine: Engine, out: Callable[[str], None] = print) -> int:
+async def smoke(engine: Engine, out: Callable[[str], None] = print, hold_s: int = 0) -> int:
     """Próba akceptacyjna L0 (tylko `live`): jedno minimalne wejście ze stopem, natychmiastowe zamknięcie i kontrole.
 
     Kroki PASS/FAIL/INFO (bez sekretów): rachunek, wejście, widoczność pozycji, spłaszczenie, księga, drugie zamknięcie
     (`POSITION_NOT_FOUND`, założenie ścieżki awaryjnej wykonawcy), ostatnie świece 5-minutowe do porównania z wykresem
     (semantyka stempla, L0) i opóźnienie historii. Kod wyjścia 0 tylko, gdy każdy krok PASS przeszedł.
+
+    `hold_s` (0-600): po sprawdzeniu pozycji tyle sekund normalnego nadzoru (uzgadnianie, notowania, tętno), żeby
+    właściciel obejrzał pozycję i jej stop w aplikacji; każda wątpliwość (kill switch, pozycja nie OPEN, nieudane
+    uzgadnianie) kończy wstrzymanie i spłaszcza od razu.
     """
+    if isinstance(hold_s, bool) or not isinstance(hold_s, int) or not 0 <= hold_s <= SMOKE_HOLD_MAX_S:
+        raise ValueError(f"hold_s: expected an integer from 0 to {SMOKE_HOLD_MAX_S}, got {hold_s!r}")
     results: list[bool] = []
 
     def step(n: int, ok: bool, text: str) -> bool:
@@ -336,6 +354,8 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print) -> int:
     # [3] widoczność
     visible = at_broker is not None and at_broker.stop_level is not None
     step(3, visible, "position visible in list_positions with a stop")
+    if hold_s > 0 and visible and position is not None and position.state is PositionState.OPEN:
+        await _hold(engine, deal_id, hold_s, info)
 
     # [4] spłaszczenie wykonawcą (DELETE po dealId)
     closed_at = clock.now_utc()
@@ -393,6 +413,44 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print) -> int:
     passed = all(results)
     out(f"{'PASS' if passed else 'FAIL'} smoke: {sum(results)}/{len(results)} checks passed")
     return 0 if passed else 1
+
+
+async def _hold(engine: Engine, deal_id: str | None, hold_s: int, info: Callable[[int, str], None]) -> None:
+    """Wstrzymanie z otwartą pozycją próby: zwykły nadzór; wątpliwość → koniec wstrzymania (spłaszczenie od razu)."""
+    clock, epic = engine.clock, engine.strat.instrument
+    start = clock.now_utc()
+    end = start + timedelta(seconds=hold_s)
+    next_print, next_reconcile = start, start
+    while True:
+        now = clock.now_utc()
+        remaining = (end - now).total_seconds()
+        if remaining <= 0:
+            info(3, "hold finished: flattening now")
+            return
+        if now >= next_print:
+            info(3, f"holding {remaining:.0f} s more: look at the position and its stop in the Capital.com app")
+            next_print += timedelta(seconds=SMOKE_HOLD_COUNTDOWN_S)
+        doubt = None
+        engine.kill.scan_files()
+        if now >= next_reconcile:
+            next_reconcile += timedelta(seconds=engine.risk.reconcile_interval_s)
+            result = await engine.reconcile_once()
+            if result is None or result.skipped or result.blocked:
+                doubt = "reconciliation failed or blocked"
+        try:
+            await engine.broker.quote(epic)  # karmi straż ciszy notowań
+        except Exception as exc:
+            doubt = doubt or f"quote unavailable ({type(exc).__name__})"
+        await engine.watchdog.tick()
+        position = engine.journal.current_position(epic)
+        if position is None or position.state is not PositionState.OPEN or position.deal_id != deal_id:
+            doubt = doubt or f"journal position is {position.state.value if position else 'missing'}"
+        if engine.kill.level() is not KillLevel.NONE:
+            doubt = doubt or f"kill switch {engine.kill.level().name} ({engine.kill.reason()})"
+        if doubt is not None:
+            info(3, f"hold stopped: {doubt}; flattening at once")
+            return
+        await clock.sleep(min(SMOKE_HOLD_TICK_S, remaining))
 
 
 async def _second_close_check(
@@ -506,6 +564,9 @@ def status(config_dir: Path, data_dir: Path, out: Callable[[str], None] = print,
                 f"first candle {candle.get('start')} {ohlc}")  # fmt: skip
         else:
             out("last decision: none")
+        sessions = len(journal.trades()) - journal.count_smoke_trades()
+        l1 = (data_dir / L1_PASSED_FILE).exists()
+        out(f"live sessions (trades without smoke): {sessions}; {L1_PASSED_FILE}: {'yes' if l1 else 'no'}")
         calendar = ExchangeCalendar(XETRA)
         today = calendar.to_local(now).date()
         todays = [t for t in journal.trades() if calendar.to_local(t.exit_ts).date() == today]
@@ -521,6 +582,139 @@ def health(data_dir: Path, now: datetime | None = None, max_age_s: float = HEALT
     """Healthcheck Dockera: 0, gdy tętno jest świeższe niż `max_age_s`; inaczej 1."""
     age = heartbeat_age_s(Path(data_dir) / HEARTBEAT_FILE, now or datetime.now(timezone.utc))
     return 0 if age is not None and math.isfinite(age) and -max_age_s < age < max_age_s else 1
+
+
+# --- polecenia operatorskie: clear-kill, reset-position -----------------------------------------------------------
+
+
+def _tail(path: Path, n: int) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def clear_kill(
+    data_dir: Path, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print, clock: Any = None
+) -> int:
+    """Zdjęcie kill switcha przez właściciela (silnik zatrzymany: blokada instancji bierze wywołujący).
+
+    Odmowa (1): brak dziennika albo poziom NONE, istniejący `data/STOP` lub `data/HARD_STOP`. Wypisuje poziom,
+    przyczynę i ostatnie alarmy; bez wpisanego `CLEAR` nic nie zmienia (2). `KillSwitch.clear` zapisuje stan NONE
+    i wiersz audytu `kill.audit` (CLEAR, kto). 0: zdjęty.
+    """
+    from gwstock.clock import SystemClock
+    from gwstock.journal import Journal
+    from gwstock.notify import FileNotifier
+    from gwstock.risk import KillSwitch
+
+    data_dir = Path(data_dir)
+    path = data_dir / JOURNAL_FILE
+    if not path.exists():
+        out("kill switch: NONE (no journal yet); nothing to clear")
+        return 1
+    clock = clock if clock is not None else SystemClock()
+    journal = Journal.open(str(path))
+    try:
+        kill = KillSwitch(journal, clock, data_dir, FileNotifier(data_dir / ALERTS_FILE, clock))
+        level, reason = kill.level(), kill.reason()
+        if level is KillLevel.NONE:
+            out("kill switch: NONE; nothing to clear")
+            return 1
+        present = [name for name in ("HARD_STOP", "STOP") if (data_dir / name).exists()]
+        if present:
+            out(f"refused: data/{present[0]} exists; remove it first, otherwise the engine engages the kill switch "
+                "again at once")  # fmt: skip
+            return 1
+        since = journal.kill_state().since
+        out(f"kill switch: {level.name} ({reason}" + (f", since {since.isoformat()})" if since else ")"))
+        out("last alerts:")
+        for line in _tail(data_dir / ALERTS_FILE, 10):
+            out(f"  {line}")
+        if ask(f"Type {CLEAR_WORD} to clear the kill switch: ").strip() != CLEAR_WORD:
+            out("aborted: the kill switch stays as it is")
+            return 2
+        try:
+            kill.clear(requested_by=by)
+        except ValueError as exc:
+            out(f"refused: {exc}")
+            return 1
+        out(f"kill switch cleared by {by.strip()} (was {level.name}: {reason}); start the engine")
+        return 0
+    finally:
+        journal.close()
+
+
+async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print) -> int:
+    """Wyczyszczenie lokalnego stanu pozycji (BLOCKED/ENTERING → FLAT) przez właściciela, gdy broker jest pusty.
+
+    Odmowa (1): pozycja już FLAT; nierozstrzygnięte zlecenie w dzienniku (rozstrzyga uzgadnianie silnika); pozycja
+    OPEN/EXITING (silnik sam ją uzgadnia i księguje: reset mógłby pominąć zaksięgowanie prawdziwego zamknięcia);
+    brak powiązanego rachunku, sesja na innym rachunku, broker nieczytelny; broker pokazuje pozycję albo zlecenie
+    oczekujące na instrumencie. Bez wpisanego `RESET` nic nie zmienia (2). Zdarzenie audytowe `owner.reset` (kto,
+    poprzedni stan) przed zapisem FLAT przez automat stanów. 0: wyczyszczone.
+    """
+    journal, epic = engine.journal, engine.strat.instrument
+    position = journal.current_position(epic)
+    if position is None or position.state is PositionState.FLAT:
+        out(f"position {epic}: FLAT; nothing to reset")
+        return 1
+    unresolved = [o.order_id for o in journal.unresolved_orders() if o.epic == epic]
+    if unresolved:
+        out(f"refused: unresolved orders in the journal ({', '.join(unresolved)}): start the engine and let it "
+            "reconcile them; see the runbook, section 8.5")  # fmt: skip
+        return 1
+    if position.state in (PositionState.OPEN, PositionState.EXITING):
+        out(f"refused: position {epic} is {position.state.value}: the engine reconciles and books it itself; start "
+            "the engine (reset-position is for BLOCKED)")  # fmt: skip
+        return 1
+    bound = engine.runtime.account_id
+    if bound is None:
+        out("refused: no bound account (run bind-account)")
+        return 1
+    if not await engine.login():
+        out("refused: login failed")
+        return 1
+    try:
+        active = await engine.probe(engine.raw_broker.account)
+        positions = await engine.probe(engine.raw_broker.list_positions)
+        working = await engine.probe(engine.raw_broker.list_working_orders)
+    except Exception as exc:
+        out(f"refused: the broker cannot be read ({type(exc).__name__}: {exc})")
+        return 1
+    if active.account_id != bound:
+        out("refused: the session is not on the bound account; nothing checked, nothing changed")
+        return 1
+    mine = [p for p in positions if p.epic == epic]
+    if mine:
+        deals = ", ".join(f"{p.deal_id} {p.side.value} {p.size}" for p in mine)
+        out(f"refused: the broker still shows a position on {epic} ({deals}); decide about it in the Capital.com app")
+        return 1
+    orders = [w.order_id for w in working if w.epic == epic]
+    if orders:
+        out(f"refused: a working order on {epic} exists at the broker ({', '.join(orders)}); cancel it in the app")
+        return 1
+    out(f"journal position {epic}: {position.state.value} deal {position.deal_id} "
+        f"{position.side.value if position.side else '?'} size {position.size} open {position.open_level} stop "
+        f"{position.stop_level}")  # fmt: skip
+    out(f"broker: no position and no working order on {epic} on the bound account")
+    if position.deal_id and not journal.has_trade(position.deal_id):
+        out(f"WARNING: deal {position.deal_id} is not booked in the ledger, so its result is NOT in the loss limits; "
+            "check the Capital.com activity")  # fmt: skip
+    if ask(f"Type {RESET_WORD} to set the journal position FLAT: ").strip() != RESET_WORD:
+        out("aborted: nothing changed")
+        return 2
+    now = engine.clock.now_utc()
+    journal.append_raw(
+        SOURCE_OWNER_RESET,
+        dump({"event": "OWNER_RESET", "by": by.strip(), "previous": position, "account_id": bound,
+              "broker_positions": [], "working_orders": []}),  # fmt: skip
+        now,
+    )
+    check_position_transition(position.state, PositionState.FLAT)
+    journal.upsert_position(PositionRecord(epic, PositionState.FLAT))
+    out(f"position {epic} set FLAT by {by.strip()} (was {position.state.value}); start the engine")
+    return 0
 
 
 # --- main ------------------------------------------------------------------------------------------------------
@@ -624,9 +818,28 @@ async def _run_engine(paths: Paths) -> int:
         return await _with_engine(paths, run, lock=lock)
 
 
-async def _smoke_engine(paths: Paths) -> int:
-    with InstanceLock(paths.data_dir / LOCK_FILE) as lock:  # nigdy obok działającego silnika: blokada najpierw
-        return await _with_engine(paths, smoke, lock=lock)
+@contextlib.contextmanager
+def _engine_stopped(paths: Paths):
+    """Blokada instancji dla poleceń właściciela, które wolno uruchomić tylko przy zatrzymanym silniku."""
+    lock = InstanceLock(paths.data_dir / LOCK_FILE)
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        raise AlreadyRunning(f"{exc}; stop the engine first (a running engine keeps its own state)") from None
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
+async def _smoke_engine(paths: Paths, hold_s: int = 0) -> int:
+    with _engine_stopped(paths) as lock:  # nigdy obok działającego silnika: blokada najpierw
+        return await _with_engine(paths, lambda engine: smoke(engine, hold_s=hold_s), lock=lock)
+
+
+async def _reset_engine(paths: Paths, by: str) -> int:
+    with _engine_stopped(paths) as lock:
+        return await _with_engine(paths, lambda engine: reset_position(engine, by, input), lock=lock)
 
 
 async def _bind(paths: Paths) -> int:
@@ -636,7 +849,7 @@ async def _bind(paths: Paths) -> int:
     from gwstock.clock import SystemClock
 
     creds = dataclasses.replace(load_credentials(paths.key_file), account_id=None)
-    with InstanceLock(paths.data_dir / LOCK_FILE):
+    with _engine_stopped(paths):
         async with aiohttp.ClientSession() as http:
             broker = CapitalComBroker(creds, http, SystemClock(), base_url=LIVE_BASE_URL)
             try:
@@ -652,7 +865,16 @@ def _cmd_run(paths: Paths, args: argparse.Namespace) -> int:
 
 
 def _cmd_smoke(paths: Paths, args: argparse.Namespace) -> int:
-    return asyncio.run(_smoke_engine(paths))
+    return asyncio.run(_smoke_engine(paths, getattr(args, "hold", 0)))
+
+
+def _cmd_clear_kill(paths: Paths, args: argparse.Namespace) -> int:
+    with _engine_stopped(paths):  # działający silnik trzymałby swój poziom w pamięci
+        return clear_kill(paths.data_dir, args.by, input)
+
+
+def _cmd_reset_position(paths: Paths, args: argparse.Namespace) -> int:
+    return asyncio.run(_reset_engine(paths, args.by))
 
 
 def _cmd_bind(paths: Paths, args: argparse.Namespace) -> int:
@@ -673,6 +895,8 @@ COMMANDS: dict[str, Callable[[Paths, argparse.Namespace], int]] = {
     "smoke": _cmd_smoke,
     "status": _cmd_status,
     "health": _cmd_health,
+    "clear-kill": _cmd_clear_kill,
+    "reset-position": _cmd_reset_position,
 }
 
 _HELP = {
@@ -681,14 +905,37 @@ _HELP = {
     "smoke": "L0 acceptance probe: one minimal entry with a stop, closed at once (live only)",
     "status": "read-only state: mode, kill switch, position, orders, heartbeat, last decision, today's trades",
     "health": "exit 0 if the heartbeat is fresher than 120 s (Docker healthcheck)",
+    "clear-kill": "owner: clear the kill switch (engine stopped; asks for CLEAR)",
+    "reset-position": "owner: set a BLOCKED position FLAT when the broker shows nothing (engine stopped; RESET)",
 }
+
+
+def _hold_seconds(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected whole seconds, got {text!r}") from None
+    if not 0 <= value <= SMOKE_HOLD_MAX_S:
+        raise argparse.ArgumentTypeError(f"expected 0 to {SMOKE_HOLD_MAX_S} seconds, got {value}")
+    return value
+
+
+def _owner_name(text: str) -> str:
+    if not text.strip():
+        raise argparse.ArgumentTypeError("a non-empty name of who does it")
+    return text.strip()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m gwstock", description="gw-stock-engine (DE40 CFD, Capital.com)")
     sub = parser.add_subparsers(dest="command", metavar="command")
-    for name in COMMANDS:
-        sub.add_parser(name, help=_HELP[name])
+    parsers = {name: sub.add_parser(name, help=_HELP[name]) for name in COMMANDS}
+    parsers["smoke"].add_argument(
+        "--hold", type=_hold_seconds, default=0, metavar="SECONDS",
+        help=f"keep the probe position open for 0-{SMOKE_HOLD_MAX_S} s under normal supervision before closing it",
+    )  # fmt: skip
+    for name in ("clear-kill", "reset-position"):
+        parsers[name].add_argument("--by", type=_owner_name, required=True, help="who does it (audit trail)")
     args = parser.parse_args(argv)
     command = args.command or "run"
     if command not in ("health", "status"):

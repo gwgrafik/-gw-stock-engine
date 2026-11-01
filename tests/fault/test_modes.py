@@ -25,7 +25,7 @@ import gwstock.cli as cli
 from gwstock.app import EngineMisconfigured, Mode
 from gwstock.broker.fake import FakeBroker
 from gwstock.config import RuntimeConfig, load_runtime
-from gwstock.journal import Journal, JournalError, JournalWriteError
+from gwstock.journal import Journal, JournalError, JournalWriteError, OrderRecord
 from gwstock.types import (
     AccountInfo,
     BrokerError,
@@ -35,6 +35,7 @@ from gwstock.types import (
     KillLevel,
     OrderState,
     PositionState,
+    Side,
 )
 from gwstock.watchdog import AlreadyRunning, InstanceLock
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
@@ -770,6 +771,227 @@ async def test_status_opens_the_journal_read_only(make_engine, broker, clock, da
         assert ro.current_position("DE40").state is P.OPEN
     finally:
         ro.close()
+
+
+# --- polecenia operatorskie: clear-kill, reset-position, smoke --hold, licznik sesji -------------------------------
+
+
+class Typed:
+    """Atrapa terminala: kolejne odpowiedzi właściciela; zapisuje pytania."""
+
+    def __init__(self, *answers: str) -> None:
+        self.answers = list(answers)
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.answers.pop(0)
+
+
+def soft_killed_journal(data_dir: Path, clock, reason="QUOTE_SILENCE", level="soft") -> None:
+    """Dziennik z kill switchem (jak po dniu silnika) i kilkoma alarmami w alerts.log."""
+    from gwstock.notify import FileNotifier
+    from gwstock.risk import KillSwitch
+
+    journal = Journal.open(str(data_dir / "journal.sqlite"))
+    try:
+        kill = KillSwitch(journal, clock, data_dir, FileNotifier(data_dir / "alerts.log", clock))
+        getattr(kill, level)(reason)
+    finally:
+        journal.close()
+
+
+def test_clear_kill_prints_the_state_and_alerts_and_clears_after_the_typed_confirmation(data_dir, clock):
+    soft_killed_journal(data_dir, clock)
+    lines: list[str] = []
+    owner = Typed("CLEAR")
+    assert cli.clear_kill(data_dir, "wlasciciel", owner, out=lines.append, clock=clock) == 0
+    text = "\n".join(lines)
+    assert "kill switch: SOFT (QUOTE_SILENCE" in text and "last alerts:" in text
+    assert "kill switch SOFT: QUOTE_SILENCE" in text  # ostatnie alarmy z alerts.log
+    assert "cleared by wlasciciel (was SOFT: QUOTE_SILENCE)" in text and "CLEAR" in owner.prompts[0]
+    journal = Journal.open(str(data_dir / "journal.sqlite"))
+    try:
+        assert journal.kill_state().level is KillLevel.NONE
+        audit = [json.loads(e.payload) for e in journal.events("kill.audit")]
+        assert audit[-1]["event"] == "CLEAR" and audit[-1]["requested_by"] == "wlasciciel"
+    finally:
+        journal.close()
+
+
+@pytest.mark.parametrize("answer", ["clear", "yes", ""])
+def test_clear_kill_without_the_exact_confirmation_changes_nothing(data_dir, clock, answer):
+    soft_killed_journal(data_dir, clock, level="hard", reason="HARD_STOP_FILE")
+    assert cli.clear_kill(data_dir, "wlasciciel", Typed(answer), out=lambda _: None, clock=clock) == 2
+    journal = Journal.open(str(data_dir / "journal.sqlite"))
+    try:
+        assert journal.kill_state().level is KillLevel.HARD
+    finally:
+        journal.close()
+
+
+def test_clear_kill_refuses_when_nothing_is_engaged_or_a_stop_file_exists(data_dir, clock):
+    lines: list[str] = []
+    assert cli.clear_kill(data_dir, "wlasciciel", Typed(), out=lines.append, clock=clock) == 1  # brak dziennika
+    soft_killed_journal(data_dir, clock)
+    (data_dir / "STOP").write_text("")
+    lines.clear()
+    owner = Typed()
+    assert cli.clear_kill(data_dir, "wlasciciel", owner, out=lines.append, clock=clock) == 1
+    assert any("data/STOP" in line for line in lines) and owner.prompts == []  # odmowa przed pytaniem
+    (data_dir / "STOP").unlink()
+    assert cli.clear_kill(data_dir, "wlasciciel", Typed("CLEAR"), out=lambda _: None, clock=clock) == 0
+    lines.clear()
+    assert cli.clear_kill(data_dir, "wlasciciel", Typed(), out=lines.append, clock=clock) == 1
+    assert any("NONE" in line for line in lines)
+
+
+def test_clear_kill_command_refuses_while_the_engine_runs(monkeypatch, tmp_path, capsys):
+    data = tmp_path / "d"
+    data.mkdir()
+    monkeypatch.setenv("GW_DATA_DIR", str(data))
+    with InstanceLock(data / "engine.lock"):
+        assert cli.main(["clear-kill", "--by", "wlasciciel"]) == 3
+    assert "stop the engine first" in capsys.readouterr().err
+
+
+def test_clear_kill_and_reset_position_require_a_name():
+    for argv in (["clear-kill"], ["reset-position"], ["clear-kill", "--by", "  "], ["reset-position", "--by", ""]):
+        with pytest.raises(SystemExit) as exc:  # audyt musi wiedzieć, kto to zrobił
+            cli.main(argv)
+        assert exc.value.code == 2
+
+
+async def blocked_position(engine, broker, clock):
+    """Pozycja BLOCKED w dzienniku przy pustym brokerze (np. właściciel zamknął ją ręcznie w aplikacji)."""
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    del broker.positions["DEAL-1"]  # zniknęła poza silnikiem; w dzienniku zostaje BLOCKED do decyzji właściciela
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=P.BLOCKED))
+
+
+async def test_reset_position_sets_a_blocked_position_flat_after_checks_and_confirmation(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    lines: list[str] = []
+    owner = Typed("RESET")
+    assert await cli.reset_position(engine, "wlasciciel", owner, out=lines.append) == 0
+    assert engine.journal.current_position("DE40").state is P.FLAT
+    [audit] = payloads(engine.journal, "owner.reset")
+    assert audit["by"] == "wlasciciel" and audit["previous"]["state"] == "BLOCKED" and audit["previous"]["deal_id"]
+    assert "list_positions" in broker.calls and "list_working_orders" in broker.calls
+    assert any("not booked" in line for line in lines)  # zamknięcie poza silnikiem: wynik NIE jest w księdze
+
+
+async def test_reset_position_without_the_exact_confirmation_changes_nothing(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    assert await cli.reset_position(engine, "wlasciciel", Typed("reset"), out=lambda _: None) == 2
+    assert engine.journal.current_position("DE40").state is P.BLOCKED
+    assert payloads(engine.journal, "owner.reset") == []
+
+
+async def test_reset_position_refuses_while_the_broker_shows_a_position(engine, broker, clock):
+    stop_engine_at(engine, clock, berlin(DAY, 9, 20))
+    await engine.run_day(DAY)
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=P.BLOCKED))
+    lines: list[str] = []
+    owner = Typed()
+    assert await cli.reset_position(engine, "wlasciciel", owner, out=lines.append) == 1
+    assert any("DEAL-1" in line for line in lines) and owner.prompts == []
+    assert engine.journal.current_position("DE40").state is P.BLOCKED
+
+
+async def test_reset_position_refuses_with_a_working_order_on_the_instrument(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    broker.add_working_order("DE40", Side.BUY, D("0.001"), D("25000"))
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed(), out=lines.append) == 1
+    assert any("working order" in line for line in lines)
+    assert engine.journal.current_position("DE40").state is P.BLOCKED
+
+
+async def test_reset_position_refuses_unresolved_orders_and_engine_managed_states(engine, broker, clock):
+    await blocked_position(engine, broker, clock)
+    t = clock.now_utc()
+    engine.journal.insert_order(OrderRecord(
+        "gws-20261102-DE40-2-entry", "DE40", Side.BUY, D("0.001"), D("30"), OrderState.UNKNOWN, None, None, t, t,
+    ))  # fmt: skip
+    lines: list[str] = []
+    before = len(broker.calls)
+    assert await cli.reset_position(engine, "wlasciciel", Typed(), out=lines.append) == 1
+    assert any("unresolved" in line and "reconcile" in line for line in lines)
+    assert broker.calls[before:] == []  # odmowa z dziennika, zanim zapytamy brokera
+
+
+@pytest.mark.parametrize("state", [P.OPEN, P.EXITING])
+async def test_reset_position_refuses_open_or_exiting_which_the_engine_books_itself(engine, broker, clock, state):
+    await blocked_position(engine, broker, clock)
+    engine.journal.upsert_position(replace(engine.journal.current_position("DE40"), state=state))
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed(), out=lines.append) == 1
+    assert engine.journal.current_position("DE40").state is state
+    assert any("start the engine" in line for line in lines)
+
+
+async def test_reset_position_refuses_when_already_flat_or_on_the_wrong_account(engine, broker, clock):
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed(), out=lines.append) == 1  # brak pozycji
+    await blocked_position(engine, broker, clock)
+    broker.on_call("account", lambda: setattr(broker, "_active_account_id", "ACC-0"))  # sesja na innym rachunku
+    lines.clear()
+    assert await cli.reset_position(engine, "wlasciciel", Typed(), out=lines.append) == 1
+    assert any("bound account" in line for line in lines)
+
+
+def test_reset_position_command_takes_the_instance_lock_first(monkeypatch, tmp_path):
+    data = tmp_path / "d"
+    data.mkdir()
+    monkeypatch.setenv("GW_DATA_DIR", str(data))
+    monkeypatch.setenv("GW_CONFIG_DIR", str(tmp_path / "missing"))
+    with InstanceLock(data / "engine.lock"):
+        assert cli.main(["reset-position", "--by", "wlasciciel"]) == 3
+    assert not (data / "journal.sqlite").exists()
+
+
+async def test_smoke_hold_keeps_managing_and_counts_down_before_the_flatten(engine, broker, smoke_clock):
+    lines: list[str] = []
+    closes = calls_at(broker, smoke_clock, "close_position")
+    start = smoke_clock.now_utc()
+    assert await cli.smoke(engine, out=lines.append, hold_s=60) == 0
+    countdown = [line for line in lines if line.startswith("INFO [3] holding")]
+    assert [c.split("holding ")[1].split(" s")[0] for c in countdown] == ["60", "45", "30", "15"]
+    assert (closes[0] - start).total_seconds() >= 60  # spłaszczenie dopiero po wstrzymaniu
+    held = [c for c in broker.calls if c in ("list_positions", "quote")]
+    assert held.count("list_positions") >= 6 and held.count("quote") >= 12  # uzgadnianie i notowania w trakcie
+
+
+async def test_smoke_hold_flattens_at_once_when_in_doubt(engine, broker, smoke_clock, data_dir):
+    at_time(broker, smoke_clock, smoke_clock.now_utc() + timedelta(seconds=20),
+            lambda: (data_dir / "STOP").write_text(""))  # fmt: skip
+    closes = calls_at(broker, smoke_clock, "close_position")
+    start = smoke_clock.now_utc()
+    lines: list[str] = []
+    await cli.smoke(engine, out=lines.append, hold_s=300)
+    assert (closes[0] - start).total_seconds() < 60  # wątpliwość (kill switch): bez czekania do końca
+    assert any("hold stopped" in line for line in lines)
+
+
+@pytest.mark.parametrize("value", ["-1", "601", "x"])
+def test_smoke_hold_is_limited_to_600_seconds(value):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["smoke", "--hold", value])
+    assert exc.value.code == 2
+
+
+async def test_smoke_trades_do_not_count_as_live_sessions(make_engine, broker, smoke_clock, clock, data_dir):
+    make_engine.journal_path = data_dir / "journal.sqlite"
+    engine = make_engine(Mode.LIVE)
+    assert await cli.smoke(engine, out=lambda _: None) == 0
+    j = engine.journal
+    assert len(j.trades()) == 1 and j.count_smoke_trades() == 1
+    assert engine.session_index() == 0
+    lines: list[str] = []
+    assert cli.status(Path("config"), engine.data_dir, out=lines.append, now=clock.now_utc()) == 0
+    assert any("live sessions (trades without smoke): 0" in line for line in lines)
 
 
 # --- kod nigdy nie tworzy plików uzbrojenia --------------------------------------------------------------------------

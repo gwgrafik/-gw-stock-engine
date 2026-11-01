@@ -527,6 +527,10 @@ class Engine:
         """Lokalna data handlowa teraz (kalendarz giełdy)."""
         return self._today()
 
+    def session_index(self) -> int:
+        """Zakończone sesje live dla polityki wielkości: transakcje w księdze bez prób `smoke` (L0)."""
+        return len(self.journal.trades()) - self.journal.count_smoke_trades()
+
     async def verify_account(self) -> str | None:
         """Kontrola rachunku związanego (spec §9): None = w porządku, inaczej powód. Błąd odczytu → wyjątek."""
         bound = self.runtime.account_id
@@ -914,7 +918,7 @@ class Engine:
         if self._shutdown:  # prośba o zatrzymanie w trakcie odczytów: bez decyzji i bez wejścia
             return
         try:
-            session_index = len(self.journal.trades())
+            session_index = self.session_index()
             rule_size_allowed = (self.data_dir / L1_PASSED_FILE).exists()
             outcome = decide(
                 first, st.atr, quote, rules, self.strat, self.risk, session_index=session_index,
@@ -1004,7 +1008,7 @@ class Engine:
         zdarzenie DECISION_CANDLES, gdy się zakończy.
         """
         if session_index is None:
-            session_index = self._safe_read(lambda: len(self.journal.trades()), -1)
+            session_index = self._safe_read(self.session_index, -1)
         if rule_size_allowed is None:
             rule_size_allowed = (self.data_dir / L1_PASSED_FILE).exists()
         payload = {
