@@ -124,6 +124,19 @@ def test_pragma_rejects_anything_but_a_plain_name(journal):
     assert journal.pragma("journal_mode") == "wal"
 
 
+def test_pragma_reads_only_whitelisted_names(journal):
+    expected = {
+        "journal_mode": "wal", "synchronous": 2, "user_version": 1, "application_id": APPLICATION_ID,
+        "busy_timeout": 5000, "page_size": 4096, "wal_autocheckpoint": 1000,
+    }  # fmt: skip
+    assert {name: journal.pragma(name) for name in expected} == expected
+    # pragmy z efektem ubocznym (checkpoint, optymalizacja, zwolnienie pamięci) i każde inne: odmowa bez wykonania
+    for name in ("optimize", "wal_checkpoint", "shrink_memory", "incremental_vacuum", "integrity_check",
+                 "query_only", "foreign_keys", "table_info"):  # fmt: skip
+        with pytest.raises(ValueError, match="pragma"):
+            journal.pragma(name)
+
+
 def test_open_refuses_database_with_newer_schema_version_and_leaves_it_untouched(tmp_path):
     path = tmp_path / "newer.sqlite"
     raw = sqlite3.connect(path)

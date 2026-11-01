@@ -41,6 +41,10 @@ SCHEMA_VERSION = 1
 # `PRAGMA application_id` dziennika: ASCII "gwsj" (int ze znakiem, 32 bity). Plik z innym niezerowym znacznikiem
 # należy do innej aplikacji i nie jest otwierany; dziennik v1 sprzed znacznika (0) jest przyjmowany i oznaczany.
 APPLICATION_ID = int.from_bytes(b"gwsj", "big")
+# Pragmy, które `Journal.pragma` czyta (bez efektów ubocznych odczytu).
+_READABLE_PRAGMAS = frozenset({
+    "journal_mode", "synchronous", "user_version", "application_id", "busy_timeout", "page_size", "wal_autocheckpoint",
+})
 
 T = TypeVar("T")
 
@@ -640,9 +644,15 @@ class Journal:
                 raise JournalReadError(f"journal read failed: {exc}") from exc
 
     def pragma(self, name: str) -> str | int | None:
-        """Wartość pragmy tylko do odczytu (np. `journal_mode`, `synchronous`, `user_version`)."""
-        if not re.fullmatch(r"[a-z_]+", name):
+        """Wartość pragmy z białej listy `_READABLE_PRAGMAS` (np. `journal_mode`, `synchronous`, `user_version`).
+
+        Każda inna nazwa to ValueError bez wykonania: część pragm ma efekt uboczny już przy odczycie (`optimize`,
+        `wal_checkpoint`, `shrink_memory`).
+        """
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z_]+", name):
             raise ValueError(f"pragma: expected a plain name, got {name!r}")
+        if name not in _READABLE_PRAGMAS:
+            raise ValueError(f"pragma: {name!r} is not readable here; allowed: {sorted(_READABLE_PRAGMAS)}")
 
         def op(conn: sqlite3.Connection) -> str | int | None:
             row = conn.execute(f"PRAGMA {name}").fetchone()
