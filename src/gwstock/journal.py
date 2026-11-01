@@ -333,6 +333,15 @@ _ENTRY_SUFFIX = "-entry"  # rola wejścia strategii (ostatni segment identyfikat
 _SMOKE_SUFFIX = "-smoke"  # rola próby akceptacyjnej L0
 
 
+def _day_range(day: date) -> tuple[str, str]:
+    """Zakres klucza głównego `[prefiks, następnik)` dla identyfikatorów dnia: prefiks kończy się na "-", a "." to
+    następny znak, więc w porządku BINARY (UTF-8) w zakresie są dokładnie napisy zaczynające się od prefiksu.
+    Wyszukiwanie po indeksie klucza zamiast przeglądania całej tabeli."""
+    _check_day(day)
+    prefix = _DAY_PREFIX.format(day)
+    return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
 def _order_from_row(r: tuple) -> OrderRecord:
     return OrderRecord(
         order_id=r[0], epic=r[1], side=Side(r[2]), size=_dec(r[3]), stop_distance=_dec(r[4]),
@@ -761,11 +770,10 @@ class Journal:
 
     def count_orders(self, day: date) -> int:
         """Liczba zleceń dnia handlowego (w każdym stanie i roli), po prefiksie `gws-{YYYYMMDD}-` w `order_id`."""
-        _check_day(day)
-        prefix = _DAY_PREFIX.format(day)
+        low, high = _day_range(day)
         return self._read(
             lambda c: c.execute(
-                "SELECT count(*) FROM orders WHERE substr(order_id, 1, ?) = ?", (len(prefix), prefix)
+                "SELECT count(*) FROM orders WHERE order_id >= ? AND order_id < ?", (low, high)
             ).fetchone()[0]
         )
 
@@ -775,13 +783,12 @@ class Journal:
         Zlecenia innych ról (np. `smoke`, próba akceptacyjna L0) zużywają numer kolejny dnia (`count_orders`), ale nie
         dzienne wejście strategii.
         """
-        _check_day(day)
-        prefix = _DAY_PREFIX.format(day)
+        low, high = _day_range(day)
         suffix = _ENTRY_SUFFIX
         return self._read(
             lambda c: c.execute(
-                "SELECT count(*) FROM orders WHERE substr(order_id, 1, ?) = ? AND substr(order_id, -?) = ?",
-                (len(prefix), prefix, len(suffix), suffix),
+                "SELECT count(*) FROM orders WHERE order_id >= ? AND order_id < ? AND substr(order_id, -?) = ?",
+                (low, high, len(suffix), suffix),
             ).fetchone()[0]
         )
 

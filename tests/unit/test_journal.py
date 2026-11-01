@@ -481,6 +481,55 @@ def test_count_entry_orders_rejects_datetime_day(journal):
         journal.count_entry_orders(T0)
 
 
+MIXED_ORDER_IDS = [
+    "gws-20261102-DE40-1-entry", "gws-20261102-DE40-2-smoke", "gws-20261102-DE40-3-ENTRY", "gws-20261102-DE40-4-xentry",
+    "gws-20261102-entry", "gws-20261102-", "gws-20261102-é-entry", "gws-20261102-\x7f", "gws-20261102-DE40-5-entry ",
+    "gws-20261102", "gws-20261102.", "gws-20261102.x-entry", "gws-202611020-DE40-1-entry", "gws-20261102/-entry", "GWS-20261102-DE40-1-entry",
+    "gws-20261101-DE40-1-entry", "gws-20261103-DE40-1-entry", "gws-20261103-DE40-2-entry", "xgws-20261102-DE40-1-entry",
+    "manual-20261102-x-entry",
+]  # fmt: skip
+
+
+def test_count_orders_and_entry_orders_give_the_prefix_counts_on_a_mixed_journal(journal):
+    for i, order_id in enumerate(MIXED_ORDER_IDS):
+        journal.insert_order(make_order(order_id, state=list(OrderState)[i % len(OrderState)]))
+    for day in (date(2026, 11, 1), DAY, NEXT_DAY, date(2026, 11, 4)):
+        prefix = f"gws-{day:%Y%m%d}-"
+        ours = [o for o in MIXED_ORDER_IDS if o.startswith(prefix)]
+        assert journal.count_orders(day) == len(ours)
+        assert journal.count_entry_orders(day) == len([o for o in ours if o.endswith("-entry")])
+    assert journal.count_orders(DAY) == 9 and journal.count_entry_orders(DAY) == 3  # dzień z przypadkami brzegowymi
+
+
+class RecordingConn:
+    """Proxy połączenia SQLite zapisujący wykonane instrukcje (do planu zapytania)."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self.real = real
+        self.statements: list[tuple[str, tuple]] = []
+
+    def execute(self, sql, params=()):
+        self.statements.append((sql, tuple(params)))
+        return self.real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def test_count_orders_and_entry_orders_search_the_primary_key_instead_of_scanning(journal):
+    for order_id in MIXED_ORDER_IDS:
+        journal.insert_order(make_order(order_id))
+    recording = RecordingConn(journal._conn)
+    journal._conn = recording
+    journal.count_orders(DAY)
+    journal.count_entry_orders(DAY)
+    journal._conn = recording.real
+    assert len(recording.statements) == 2
+    for sql, params in recording.statements:
+        plan = " | ".join(row[-1] for row in journal._conn.execute(f"EXPLAIN QUERY PLAN {sql}", params))
+        assert plan.startswith("SEARCH orders USING") and "SCAN" not in plan, plan
+
+
 # --- pozycje -------------------------------------------------------------------------------
 
 
