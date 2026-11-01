@@ -279,14 +279,12 @@ def arming_files_created(data_dir: Path, existed_before: frozenset[str]) -> list
 def _no_test_creates_the_real_arming_files():
     """Test, który zapomniał o tmp_path i uzbroił prawdziwy `data/`, ma wywalić przebieg (spec §9: uzbraja tylko właściciel).
 
-    Sprawdzamy tylko wtedy, gdy `<repo>/data` istnieje (VPS, dev po uruchomieniu silnika); plik, który istniał przed
+    Kontrola działa ZAWSZE, także gdy `<repo>/data` nie istnieje na starcie (świeży checkout, CI): wtedy zbiór "przed"
+    jest pusty, a test, który sam utworzy `data/` i plik uzbrojenia, wywala sesję na końcu. Plik, który istniał przed
     przebiegiem (utworzył go właściciel), nie jest błędem.
     """
     data_dir = Path(__file__).resolve().parents[1] / "data"
-    if not data_dir.is_dir():
-        yield
-        return
-    before = frozenset(name for name in ARMING_FILE_NAMES if (data_dir / name).exists())
+    before = frozenset(name for name in ARMING_FILE_NAMES if (data_dir / name).exists())  # puste, gdy brak `data/`
     yield
     created = arming_files_created(data_dir, before)
     assert not created, f"testy utworzyły prawdziwe pliki uzbrojenia w {data_dir}: {created} (uzbraja tylko właściciel)"

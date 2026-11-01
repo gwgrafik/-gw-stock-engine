@@ -372,6 +372,9 @@ def test_pathological_long_lines_do_not_blow_up_the_scan():
         "PASSWORD_" * n + "\n",
         "open(" * 2000 + ")" * 2000 + "\n",
         "(\n" * 30 + "x\n",
+        '"API_KEY=" ' * n + "\n",  # wpisy w cudzysłowie sklejone w jeden literał
+        "API_KEY=" * n + "\n",
+        "password: " * n + "\n",
     ]
     started = time.monotonic()
     for text in texts:
@@ -1268,7 +1271,6 @@ HARDCODED_KEYS_FIX1 = [
     "secret: Zx9fLq2mTn8bVc4dxx",
     "password = 'Tr0ub4dor&3xKcdQ'",
     "password = 'correct-horse-battery-staple'",
-    "api_password: 'correct horse battery'",
     '"password": "p@ss-w0rd!#2024xyz"',
     "os.environ['CAPITALCOM_API_KEY'] = 'Zx9fLq2mTn8bVc4d'",
     'os.environ["GW_API_PASSWORD"] = "Tr0ub4dor&3xKcdQ"',
@@ -1498,3 +1500,244 @@ def test_codeowners_names_the_repository_owner():
     assert ["*", "@gwgrafik"] in lines  # właściciel z adresu origin: github.com/gwgrafik
     for pattern in ("/scripts/hooks/", "/.claude/", "/.github/", "/config/runtime.toml", "/tests/unit/test_guard_live.py"):
         assert [pattern, "@gwgrafik"] in lines, pattern
+
+
+# =====================================================================================================================
+# Runda 2 poprawek: N-I1, N-I2, m1-m4
+# =====================================================================================================================
+
+# --- N-I1: wpisy w cudzysłowie (`- "KEY=v"`, `Environment=KEY=v`, `-e "KEY=v"`, `["KEY=v"]`) -----------------------------
+
+QUOTED_ENTRY_KEYS = [
+    '    environment:\n      - "CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d"',
+    "    environment:\n      - 'CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d'",
+    "Environment=CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d",
+    'Environment="CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d"',
+    "Environment='CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d'",
+    "Environment=GW_API_PASSWORD=Tr0ub4dor&3xKcdQ",
+    "ExecStart=/usr/bin/env CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d python -m gwstock",
+    'docker run -e "CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d" img',
+    'docker run --env "API_PASSWORD=Tr0ub4dor&3xKcdQ" img',
+    'docker run --env="CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d" img',
+    'environment: ["CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d"]',
+    'env = ["CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d"]',
+    'env = {"CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d"}',
+    "env = ('API_KEY=Zx9fLq2mTn8bVc4d',)",
+    'subprocess.run(cmd, env=["API_KEY=Zx9fLq2mTn8bVc4d"])',
+    'cmd = ["docker", "run", "-e", "CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d", "img"]',
+]
+
+
+@pytest.mark.parametrize("text", QUOTED_ENTRY_KEYS)
+def test_quoted_entry_spellings_of_key_assignments_are_flagged(text):
+    assert violates(text)
+
+
+NOT_QUOTED_ENTRY_KEYS = [
+    '    - "CAPITALCOM_API_KEY=${CAPITALCOM_API_KEY}"',
+    'Environment="CAPITALCOM_API_KEY=$KEY"',
+    'Environment=CAPITALCOM_API_KEY=%d',
+    'docker run -e "CAPITALCOM_API_KEY=$CAPITALCOMEXCHANGEKEY" img',
+    '- "GW_CAPITALCOM_KEY_FILE=/secrets/capitalcom.json"',
+    '- "GW_DATA_DIR=/data"',
+    'env = ["PATH=/usr/bin"]',
+    'env = ["API_KEY=<redacted>"]',
+    'env = ["API_KEY=changeme"]',
+    'env = ["API_KEY=xxxxxxxxxxxxxxxx"]',
+    'env = ["API_KEY="]',
+    'env = ["PASSWORD=short"]',
+    'url = f"api_key={api_key_value_from_config}"',
+    'line = "api_key=%s" % key',
+    'headers = "X-CAP-API-KEY=" + key',
+    'Environment=GW_CAPITALCOM_KEY_FILE=/secrets/capitalcom.json',
+    'url = f"password={self._password_value}"',
+    'env = [f"API_PASSWORD={settings.password_value}"]',
+]
+
+
+@pytest.mark.parametrize("text", NOT_QUOTED_ENTRY_KEYS)
+def test_placeholders_and_references_in_quoted_entries_stay_clean(text):
+    assert not violates(text)
+
+
+def test_quoted_entries_forgive_test_values_only_under_tests():
+    g = guard()
+    text = 'env = ["API_KEY=test-Zx9fLq2mTn8bVc4d"]\n'
+    assert g.violates_in("tests/unit/test_x.py", text) == []
+    assert g.violates_in("src/gwstock/x.py", text) != []
+    assert g.violates_in("tests/unit/test_x.py", 'env = ["API_KEY=Zx9fLq2mTn8bVc4d"]\n') != []
+    for path in ("deploy/gw.service", "docker/compose.yml", "scripts/run.sh", "Procfile"):  # w Pythonie wartość bez cudzysłowu to nie napis
+        assert g.violates_in(path, "Environment=CAPITALCOM_API_KEY=Zx9fLq2mTn8bVc4d\n") != [], path
+
+
+# --- N-I2: kontrola sesyjna działa także wtedy, gdy `data/` powstaje w trakcie przebiegu -----------------------------------
+
+CHECK_TEST = """
+import os
+from pathlib import Path
+
+DATA = Path(__file__).resolve().parents[2] / "data"
+
+
+def test_noop():
+    assert True
+
+
+def test_{case}():
+    {body}
+"""
+
+
+def run_session_check(tmp_path: Path, *, owner_file: str | None, body: str, data_exists: bool) -> subprocess.CompletedProcess:
+    """Kopia projektu z PRAWDZIWYM tests/conftest.py i jednym testem; sprawdza kontrolę plików uzbrojenia na końcu sesji."""
+    proj = tmp_path / "proj"
+    shutil.copytree(ROOT / "src", proj / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(ROOT / "config", proj / "config")
+    (proj / "tests" / "unit").mkdir(parents=True)
+    for rel in ("tests/__init__.py", "tests/conftest.py", "tests/unit/__init__.py", "tests/unit/fake_capital_server.py"):
+        shutil.copy(ROOT / rel, proj / rel)
+    shutil.copy(ROOT / "pyproject.toml", proj / "pyproject.toml")
+    (proj / "tests" / "unit" / "test_session.py").write_text(CHECK_TEST.format(case="body", body=body), encoding="utf-8")
+    if data_exists:
+        (proj / "data").mkdir()
+        if owner_file:
+            (proj / "data" / owner_file).write_text("")
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/unit/test_session.py", "-q", "-p", "no:cacheprovider", "-W", "error"],
+        cwd=proj, capture_output=True, text=True, timeout=120, check=False,
+    )
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_session_check_fails_when_a_test_creates_data_and_the_arming_file(tmp_path, name):
+    body = f"DATA.mkdir(exist_ok=True); (DATA / '{name}').write_text('')"
+    done = run_session_check(tmp_path, owner_file=None, body=body, data_exists=False)
+    assert done.returncode != 0 and name in done.stdout + done.stderr, done.stdout + done.stderr
+    assert (tmp_path / "proj" / "data" / name).exists()  # to jest dokładnie to, co kontrola ma wyłapać
+
+
+def test_session_check_fails_when_data_exists_and_a_test_adds_the_arming_file(tmp_path):
+    body = "(DATA / 'L1_PASSED').write_text('')"
+    done = run_session_check(tmp_path, owner_file=None, body=body, data_exists=True)
+    assert done.returncode != 0 and "L1_PASSED" in done.stdout + done.stderr
+
+
+def test_session_check_passes_for_a_clean_run_with_or_without_data(tmp_path):
+    for data_exists in (False, True):
+        done = run_session_check(tmp_path / str(data_exists), owner_file=None, body="assert 1 + 1 == 2", data_exists=data_exists)
+        assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_session_check_ignores_a_file_the_owner_created_before_the_run(tmp_path, name):
+    done = run_session_check(tmp_path, owner_file=name, body="assert (DATA / '%s').exists()" % name, data_exists=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+# --- m1: wartości, które ewidentnie nie są sekretami ---------------------------------------------------------------------------
+
+NOT_SECRET_VALUES = [
+    '{"password": "see ~/.config/gw/capitalcom.json for the real value"}',
+    '{"password": "required, at least 12 characters"}',
+    '{"password": "string with the account password"}',
+    "password: /run/secrets/capitalcom_password",
+    "secret: /run/secrets/capitalcom",
+    "PASSWORD=`/usr/local/bin/get-password`",
+    'PASSWORD="$(/usr/local/bin/get-password)"',
+    'password = "./secrets/password-file-path"',
+    'password = "~/secrets/password-file"',
+    'password = "/run/secrets/capitalcom_password"',
+    'getpass.getpass("API password: ", stream=sys.stderr)',
+    'prompt("Password: ", hide_input=True, confirmation_prompt=True)',
+    'read -r -s -p "API password: " API_PASSWORD_INPUT',
+    "label = 'api_password: ' + hint",
+]
+
+
+@pytest.mark.parametrize("text", NOT_SECRET_VALUES)
+def test_paths_prose_substitutions_and_prompts_are_not_secrets(text):
+    assert not violates(text)
+
+
+def test_natural_wrong_values_are_forgiven_only_under_tests():
+    g = guard()
+    for text in ('make(password="wrong-password-123")\n', 'server.password = "rotated-by-owner"\n'):
+        assert g.violates_in("tests/unit/test_x.py", text) == [], text
+        assert g.violates_in("src/gwstock/x.py", text) != [], text
+    assert g.violates_in("tests/unit/test_x.py", 'make(password="Tr0ub4dor&3xKcdQ")\n') != []
+
+
+def test_the_credential_message_tells_how_to_proceed():
+    [reason] = guard().violates_in("src/gwstock/x.py", "api_key = 'Zx9fLq2mTn8bVc4d'\n")
+    assert "test-" in reason and "fake-" in reason and "tests/" in reason
+    assert "użyj wartości z prefiksem test-/fake-" in reason and "use test-/fake- prefixed values" in reason  # PL i EN
+    done = run_hook(write_event("/work/src/gwstock/x.py", "api_key = 'Zx9fLq2mTn8bVc4d'\n"))
+    assert done.returncode == 2 and "test-" in done.stderr and "Zx9fLq2mTn8bVc4d" not in done.stderr
+
+
+# --- m2: polecenia ze ścieżką bezwzględną w listach argv ------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "subprocess.run(['/usr/bin/touch', 'data/@N@'])",
+        "subprocess.run(['/bin/cp', 'a', 'data/@N@'])",
+        "subprocess.run(['/usr/bin/tee', 'data/@N@'], input=b'')",
+        "subprocess.run(['/bin/ln', '-s', 'x', 'data/@N@'])",
+        "subprocess.check_call(['sudo', '/usr/bin/install', '-m', '600', '/dev/null', 'data/@N@'])",
+        "os.system('/usr/bin/tee data/@N@ < /dev/null')",
+        "/bin/ln -s x data/@N@",
+        "sudo /usr/bin/touch data/@N@",
+    ],
+)
+@pytest.mark.parametrize("name", NAMES)
+def test_absolute_path_verbs_count_like_bare_verbs(text, name):
+    assert violates(text.replace("@N@", name))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "subprocess.run(['/usr/bin/rm', '-f', 'data/@N@'])",
+        "subprocess.run(['/usr/bin/ls', 'data/@N@'])",
+        "subprocess.run(['/usr/bin/touch', 'data/STOP'])",
+        "subprocess.run(['/usr/bin/stat', 'data/@N@'])",
+    ],
+)
+@pytest.mark.parametrize("name", NAMES)
+def test_absolute_path_commands_that_do_not_write_stay_clean(text, name):
+    assert not violates(text.replace("@N@", name))
+
+
+# --- m3: wyjątek reguły kluczy jest kotwiczony do ścieżki względnej --------------------------------------------------------------
+
+@pytest.mark.parametrize("rel", sorted(("scripts/hooks/guard_live.py", "tests/unit/test_guard_live.py")))
+def test_the_key_exemption_is_an_anchored_repo_relative_match(rel):
+    g = guard()
+    text = "api_key = 'Zx9fLq2mTn8bVc4d'\n"
+    assert g.violates_in(rel, text) == []
+    assert g.violates_in(str(ROOT / rel), text) == []
+    assert g.violates_in("src/" + rel, text) != []  # ta sama końcówka pod innym katalogiem
+    assert g.violates_in("/x/" + rel, text) != []  # plik spoza repozytorium
+    assert g.violates_in("C:\\x\\" + rel.replace("/", "\\"), text) != []
+
+
+# --- m4: --scan pomija tylko katalog `data` u korzenia ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["database", "data_tools", "datasets", "data.export", "data-old"])
+def test_scan_reads_top_level_directories_that_merely_start_with_data(tmp_path, name):
+    (tmp_path / name).mkdir()
+    (tmp_path / name / "run.sh").write_text("touch data/ARM_LIVE\n")
+    done = run_scan(str(tmp_path))
+    assert done.returncode == 1 and name in done.stdout, done.stdout + done.stderr
+
+
+def test_scan_still_skips_the_root_data_directory_only(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "run.sh").write_text("touch data/ARM_LIVE\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "data").mkdir()
+    (tmp_path / "src" / "data" / "run.sh").write_text("touch data/ARM_LIVE\n")  # `data` głębiej to zwykły katalog
+    done = run_scan(str(tmp_path))
+    assert done.returncode == 1
+    assert "src" in done.stdout and not re.search(r"(^|[/\\])data[/\\]run\.sh", done.stdout.replace("src/data", "").replace("src\\data", ""))

@@ -45,9 +45,11 @@ awarii samego hooka `onFailure: "block"`), gdy zapis:
   `shutil.copy`, `>`, `tee`, `cp`, `ln -s`, także przez zmienną-alias) albo jest zapisem pliku o takiej nazwie. Sprawdzanie
   (`.exists()`), odczyt i usuwanie są dozwolone;
 - zaszywa klucz lub hasło (`X-CAP-API-KEY`, `api_key`, `api_password`, `password`, `secret` z literałem; `export X_API_KEY=...`,
-  `ENV`, `- X_API_KEY=...`, `X_API_KEY: ...`; `os.environ[...] = ...`, `monkeypatch.setenv`). Klucz: od 12 znaków `[A-Za-z0-9]`
-  z rzędu, hasło: od 12 znaków. Wypełniacze (`<...>`, `xxxx`, `changeme`, `${VAR}`, `${{ secrets.X }}`) są dozwolone, w
-  `tests/` także wartości zaczynające się od `test-`/`fake-` i identyfikatory `TEST_...`;
+  `ENV`, `- X_API_KEY=...`, `- "X_API_KEY=..."`, `Environment=X_API_KEY=...`, `-e "X_API_KEY=..."`, `["X_API_KEY=..."]`,
+  `X_API_KEY: ...`; `os.environ[...] = ...`, `monkeypatch.setenv`). Klucz: od 12 znaków `[A-Za-z0-9]` z rzędu, hasło: od 12
+  znaków bez spacji (wartość ze spacją to opis, a zaczynająca się od `/`, `./`, `~/` to ścieżka). Wypełniacze (`<...>`,
+  `xxxx`, `changeme`, `${VAR}`, `${{ secrets.X }}`) są dozwolone, w `tests/` także wartości zaczynające się od
+  `test-`/`fake-`/`wrong-`/`rotated-` i identyfikatory `TEST_...`;
 - wpisuje `live_allowed = true` do `config/runtime.toml` (też skrypt `.py`, `.sh`, `.yml`, który to robi).
 
 `data/ARM_LIVE`, `data/L1_PASSED` i `live_allowed = true` tworzy lub ustawia **wyłącznie właściciel**; agent i kod nigdy,

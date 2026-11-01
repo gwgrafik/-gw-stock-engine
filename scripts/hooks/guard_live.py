@@ -107,7 +107,7 @@ MAX_SHELL_SPAN = 300  # ile znaków wolno między poleceniem (`touch`, `cp`, `>`
 MAX_ALIASES = 128  # ile aliasów nazwy pliku (zmiennych) śledzimy naraz; najstarsze wypadają (ochrona czasu)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCAN_SKIP_TOP = ("data", ".git", ".superpowers")  # tylko na pierwszym poziomie skanowanego korzenia (`data*`)
+SCAN_SKIP_TOP = ("data", ".git", ".superpowers")  # tylko na pierwszym poziomie skanowanego korzenia (dokładne nazwy)
 SCAN_SKIP_ANYWHERE = frozenset({"__pycache__", ".pytest_cache", "node_modules", ".mypy_cache", ".ruff_cache", ".tox"})
 
 @dataclass(frozen=True)
@@ -320,7 +320,7 @@ _CALL = re.compile(r"(?<!\w)(?P<name>[A-Za-z_]\w*)\s*\(")
 _PURE_DOTTED = re.compile(r"^[A-Za-z_][\w.]*$")
 _LITERAL = re.compile(r"""(["'])([^"'\n]*)\1""")
 _OS_FLAGS = re.compile(r"\bO_(?:CREAT|WRONLY|RDWR|APPEND|TRUNC|EXCL)\b")
-_LIST_VERB = re.compile(r"""["'](?:touch|tee|cp|mv|install|ln|dd|truncate|rsync)["']""")
+_LIST_VERB = re.compile(r"""["'](?:[^"'\s]*/)?(?:touch|tee|cp|mv|install|ln|dd|truncate|rsync)["']""")
 
 _PATH_WRITE_METHODS = frozenset({"touch", "write_text", "write_bytes", "mkdir", "symlink_to", "hardlink_to", "link_to"})
 _OS_FIRST_ARG = frozenset({"mknod", "mkfifo", "mkdir", "makedirs", "truncate"})
@@ -415,9 +415,11 @@ def _shell_hit(statement: str, mark: _Marker) -> re.Match[str] | None:
 
 _Q = r"""\\?["']"""
 _NAME_KEYS = r"api[_-]?key|api[_-]?password|api[_-]?secret|password|passwd|secret(?:[_-]?key)?"
-_KEY_HEADER_QUOTED = re.compile(rf"""(?P<k>X-CAP-API-KEY){_Q}?\s*\]?\s*[:=,]\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)""", re.I)
+_KEY_HEADER_QUOTED = re.compile(rf"""(?P<k>X-CAP-API-KEY)(?P<kq>{_Q})?\s*\]?\s*[:=,]\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)""", re.I)
 _KEY_HEADER_RAW = re.compile(r"""(?P<k>X-CAP-API-KEY):\s*(?P<v>[^\s"'\\]+)""", re.I)
-_KEY_NAMED = re.compile(rf"""(?P<k>{_NAME_KEYS}){_Q}?\s*[:=]\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)""", re.I)
+_KEY_NAMED = re.compile(rf"""(?P<k>{_NAME_KEYS})(?P<kq>{_Q})?\s*[:=]\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)""", re.I)
+# wpis w cudzysłowie: `"KEY=wartość"` (lista compose, `Environment="KEY=v"`, `-e "KEY=v"`, `["KEY=v"]` w Pythonie)
+_KEY_QENTRY = re.compile(rf"""{_Q}(?P<n>[A-Za-z0-9_.-]{{1,80}})=(?P<v>[^"'\\\n]*)""")
 _ENV_SET = re.compile(
     rf"""(?:environ\s*\[\s*{_Q}(?P<n>[^"'\\\n]{{1,80}}){_Q}\s*\]\s*=|(?:setenv|setdefault|putenv)\s*\(\s*{_Q}"""
     rf"""(?P<n2>[^"'\\\n]{{1,80}}){_Q}\s*,)\s*[rRbBuU]{{0,2}}{_Q}(?P<v>[^"'\\\n]*)"""
@@ -425,18 +427,18 @@ _ENV_SET = re.compile(
 # wartości bez cudzysłowu: `export X=v`, `ENV X=v`, `- X=v`, `X: v`, `X := v`, `-e X=v`, `--api-key v` (tylko pliki nie-Pythonowe)
 _UNQ_START = re.compile(
     r"""^\s*(?:-\s+)?(?:(?:export|ENV|ARG|set|setx|local|readonly|declare(?:\s+-\w+)*)\s+)?"""
-    r"""(?P<n>[A-Za-z0-9_.-]{1,80})\s*(?::=|=|:)\s*(?P<v>[^\s"'#][^\s"'#]*)"""
+    r"""(?P<n>[A-Za-z0-9_.-]{1,80})\s*(?::=|=|:)\s*(?P<v>[^\s"'#][^\s"'#]{0,255})"""
 )
-_UNQ_TOKEN = re.compile(r"""(?:^|[\s;&|(])(?P<n>[A-Za-z0-9_.-]{1,80})(?::=|=)(?P<v>[^\s"'#][^\s"'#]*)""")
-_UNQ_ENV_SPACE = re.compile(r"""^\s*ENV\s+(?P<n>[A-Za-z0-9_.-]{1,80})\s+(?P<v>[^\s"'#=][^\s"'#]*)""")
-_UNQ_FLAG = re.compile(r"""(?:^|\s)--(?P<n>[A-Za-z][A-Za-z0-9-]{0,40})\s+(?P<v>[^\s"'#-][^\s"'#]*)""")
+_UNQ_TOKEN = re.compile(r"""(?<![A-Za-z0-9_.-])(?P<n>[A-Za-z0-9_.-]{1,80})(?::=|=)(?=(?P<v>[^\s"'#][^\s"'#]{0,255}))""")  # `Environment=KEY=v`
+_UNQ_ENV_SPACE = re.compile(r"""^\s*ENV\s+(?P<n>[A-Za-z0-9_.-]{1,80})\s+(?P<v>[^\s"'#=][^\s"'#]{0,255})""")
+_UNQ_FLAG = re.compile(r"""(?:^|\s)--(?P<n>[A-Za-z][A-Za-z0-9-]{0,40})\s+(?P<v>[^\s"'#-][^\s"'#]{0,255})""")
 _CODE_LIKE = re.compile(r"[()\[\]]|\.[A-Za-z_]")  # wywołanie, indeksowanie, atrybut: to odczyt, nie literał
 _PLACEHOLDER = re.compile(
-    r"<|>|…|\.\.\.|\$\{|\$[A-Za-z_(]|\{\{|\}\}|%\(|%[sd]|x{4,}|\*{3,}|change[-_ ]?me|placeholder|redacted|your[-_ ]"
-    r"|example|dummy|todo",
+    r"<|>|…|\.\.\.|`|\$\{|\$[A-Za-z_(]|\{\{|\}\}|\{[A-Za-z_][^{}]*\}|%\(|%[sd]|x{4,}|\*{3,}|change[-_ ]?me"
+    r"|placeholder|redacted|your[-_ ]|example|dummy|todo",
     re.I,
 )
-_TEST_VALUE = re.compile(r"^(?:test|fake|dummy|mock)[-_]", re.I)
+_TEST_VALUE = re.compile(r"^(?:test|fake|dummy|mock|wrong|rotated)[-_]", re.I)  # tylko pod tests/
 
 
 def _secret_kind(name: str) -> str | None:
@@ -449,7 +451,27 @@ def _secret_kind(name: str) -> str | None:
     return None
 
 
+def _in_string(statement: str, pos: int) -> bool:
+    """Czy pozycja leży wewnątrz literału napisu (liczymy niezmaskowane cudzysłowy od początku instrukcji)."""
+    quote = ""
+    i = 0
+    while i < pos:
+        ch = statement[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        i += 1
+    return bool(quote)
+
+
 def _secret_literal(kind: str, value: str, test_values_ok: bool) -> bool:
+    value = value.strip()[:1000]  # sekret dłuższy niż to nie istnieje, a limit utrzymuje czas liniowy
+    if re.search(r"\s", value) or value.startswith(("/", "./", "../", "~/")):
+        return False  # opis słowny albo ścieżka (odwołanie do pliku z sekretem), nie sam sekret
     if _PLACEHOLDER.search(value) or (test_values_ok and _TEST_VALUE.match(value)):
         return False
     if kind == "key":
@@ -458,6 +480,11 @@ def _secret_literal(kind: str, value: str, test_values_ok: bool) -> bool:
 
 
 _TEST_NAME = re.compile(r"^(?:test|fake|dummy|mock)_", re.I)
+
+
+def _prompt_like(statement: str, m: re.Match[str]) -> bool:
+    """`getpass("API password: ", ...)`: nazwa i separator leżą w jednym napisie, a cudzysłów po nich go zamyka (to nie wartość)."""
+    return m.group("kq") is None and _in_string(statement, m.start("k"))
 
 
 def _is_test_name(statement: str, start: int, test_values_ok: bool) -> bool:
@@ -469,14 +496,21 @@ def _is_test_name(statement: str, start: int, test_values_ok: bool) -> bool:
 
 def _key_hit(statement: str, *, test_values_ok: bool, unquoted: bool) -> str | None:
     """Nazwa pola z zaszytym sekretem w instrukcji (bez wartości) albo None."""
-    for pattern in (_KEY_HEADER_QUOTED, _KEY_HEADER_RAW):
-        for m in pattern.finditer(statement):
-            if _secret_literal("key", m.group("v"), test_values_ok):
-                return m.group("k")
+    for m in _KEY_HEADER_QUOTED.finditer(statement):
+        if _secret_literal("key", m.group("v"), test_values_ok) and not _prompt_like(statement, m):
+            return m.group("k")
+    for m in _KEY_HEADER_RAW.finditer(statement):
+        if _secret_literal("key", m.group("v"), test_values_ok):
+            return m.group("k")
     for m in _KEY_NAMED.finditer(statement):
         kind = _secret_kind(m.group("k")) or "password"
-        if _secret_literal(kind, m.group("v"), test_values_ok) and not _is_test_name(statement, m.start("k"), test_values_ok):
-            return m.group("k")
+        if _secret_literal(kind, m.group("v"), test_values_ok) and not _prompt_like(statement, m):  # tanie sprawdzenie najpierw
+            if not _is_test_name(statement, m.start("k"), test_values_ok):
+                return m.group("k")
+    for m in _KEY_QENTRY.finditer(statement):
+        kind = _secret_kind(m.group("n"))
+        if kind and _secret_literal(kind, m.group("v"), test_values_ok):
+            return m.group("n")
     for m in _ENV_SET.finditer(statement):
         name = m.group("n") or m.group("n2")
         kind = _secret_kind(name)
@@ -588,8 +622,9 @@ def scan_text(
                     Finding(
                         line,
                         "key",
-                        f"zaszyty klucz lub hasło ({what}); klucz leży poza repozytorium, w ~/.config/gw/capitalcom.json "
-                        f"(hard-coded secret in {what}: the repo is public)",
+                        f"zaszyty klucz lub hasło ({what}); klucz leży poza repozytorium, w ~/.config/gw/capitalcom.json; "
+                        f"w tests/ użyj wartości z prefiksem test-/fake-, a ścieżki i opisy pól zapisz bez słowa password: w literale "
+                        f"(hard-coded secret in {what}: the repo is public; in tests/ use test-/fake- prefixed values)",
                     )
                 )
     return findings
@@ -821,7 +856,7 @@ def _iter_files(top: Path):
             and not d.endswith(".egg-info")
             and d != ".venv"
             and not d.startswith("venv")
-            and not (at_top and (d in SCAN_SKIP_TOP or d.startswith("data")))
+            and not (at_top and d in SCAN_SKIP_TOP)
         )
         for name in sorted(files):
             yield here / name
