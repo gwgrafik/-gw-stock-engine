@@ -9,6 +9,7 @@ from decimal import Decimal
 import pytest
 
 from gwstock.journal import (
+    APPLICATION_ID,
     Journal,
     JournalCorruptError,
     JournalError,
@@ -146,6 +147,62 @@ def test_open_refuses_foreign_non_empty_database(tmp_path):
     raw.close()
     with pytest.raises(JournalSchemaError):
         Journal.open(str(path))
+
+
+def raw_pragmas(path) -> tuple:
+    raw = sqlite3.connect(path)
+    try:
+        return tuple(raw.execute(f"PRAGMA {n}").fetchone()[0] for n in ("user_version", "application_id", "journal_mode"))
+    finally:
+        raw.close()
+
+
+def test_open_stamps_the_application_id_on_a_new_journal(tmp_path):
+    p = tmp_path / "j.sqlite"
+    open_journal(p).close()
+    assert raw_pragmas(p) == (1, APPLICATION_ID, "wal")
+    assert APPLICATION_ID not in (0, 1)
+
+
+def test_open_accepts_and_stamps_an_existing_v1_journal_without_application_id(tmp_path):
+    p = tmp_path / "j.sqlite"
+    j = open_journal(p)
+    j.append_raw("broker", "kept", T0)
+    j.close()
+    raw = sqlite3.connect(p)
+    raw.execute("PRAGMA application_id = 0")  # dziennik utworzony przez wcześniejszą wersję kodu
+    raw.commit()
+    raw.close()
+    j2 = open_journal(p)
+    assert [e.payload for e in j2.events()] == ["kept"]
+    j2.close()
+    assert raw_pragmas(p) == (1, APPLICATION_ID, "wal")
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_open_refuses_a_database_of_another_application_and_leaves_it_untouched(tmp_path, version):
+    p = tmp_path / "other.sqlite"
+    raw = sqlite3.connect(p)
+    raw.execute("PRAGMA application_id = 1234")
+    raw.execute(f"PRAGMA user_version = {version}")
+    raw.commit()
+    raw.close()
+    with pytest.raises(JournalSchemaError, match="application_id"):
+        Journal.open(str(p))
+    assert raw_pragmas(p) == (version, 1234, "delete")  # bez schematu, bez WAL
+
+
+@pytest.mark.parametrize("version", [-1, -99])
+def test_open_refuses_a_negative_schema_version_and_leaves_it_untouched(tmp_path, version):
+    p = tmp_path / "odd.sqlite"
+    raw = sqlite3.connect(p)
+    raw.execute(f"PRAGMA user_version = {version}")
+    raw.execute("CREATE TABLE something(x)")
+    raw.commit()
+    raw.close()
+    with pytest.raises(JournalSchemaError):
+        Journal.open(str(p))
+    assert raw_pragmas(p) == (version, 0, "delete")
 
 
 def test_open_refuses_memory_database_because_wal_cannot_be_enabled():

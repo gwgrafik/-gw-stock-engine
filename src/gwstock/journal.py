@@ -38,6 +38,9 @@ from gwstock.types import (
 )
 
 SCHEMA_VERSION = 1
+# `PRAGMA application_id` dziennika: ASCII "gwsj" (int ze znakiem, 32 bity). Plik z innym niezerowym znacznikiem
+# należy do innej aplikacji i nie jest otwierany; dziennik v1 sprzed znacznika (0) jest przyjmowany i oznaczany.
+APPLICATION_ID = int.from_bytes(b"gwsj", "big")
 
 T = TypeVar("T")
 
@@ -448,10 +451,11 @@ class Journal:
 
     @classmethod
     def open(cls, path: str) -> Journal:
-        """Otwiera (lub tworzy) dziennik: WAL, synchronous=FULL, schemat v1.
+        """Otwiera (lub tworzy) dziennik: WAL, synchronous=FULL, schemat v1, `application_id` = `APPLICATION_ID`.
 
-        Odmawia (bez zmiany pliku) bazy z nowszą wersją schematu lub nie będącej dziennikiem gwstock oraz sytuacji,
-        w której nie da się włączyć WAL (np. `:memory:`): dziennik bez trwałości nie ma sensu.
+        Odmawia (bez zmiany pliku) bazy z nowszą lub nieprawidłową (np. ujemną) wersją schematu, z cudzym
+        `application_id` albo nie będącej dziennikiem gwstock oraz sytuacji, w której nie da się włączyć WAL
+        (np. `:memory:`): dziennik bez trwałości nie ma sensu. Dziennik v1 bez znacznika (0) dostaje znacznik.
         """
         try:
             conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)  # transakcje: ręcznie
@@ -517,8 +521,16 @@ class Journal:
                     f"{path!r} is no longer a gwstock journal of schema version {SCHEMA_VERSION} (found {version}); "
                     "refusing to recreate it"
                 )
+            # każda odmowa przed jakąkolwiek zmianą pliku (tryb WAL, schemat, znacznik)
+            app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+            if app_id not in (0, APPLICATION_ID):
+                raise JournalSchemaError(
+                    f"{path!r} belongs to another application (application_id {app_id}), not a gwstock journal"
+                )
             if version > SCHEMA_VERSION:
                 raise JournalSchemaError(f"{path!r} has schema version {version}, this build supports {SCHEMA_VERSION}")
+            if version not in (0, SCHEMA_VERSION):
+                raise JournalSchemaError(f"{path!r} has an invalid schema version {version}, not a gwstock journal")
             if version == 0 and conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] > 0:
                 raise JournalSchemaError(f"{path!r} is a non-empty database that is not a gwstock journal")
             mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
@@ -527,16 +539,19 @@ class Journal:
             conn.execute("PRAGMA synchronous=FULL")
             if conn.execute("PRAGMA synchronous").fetchone()[0] != 2:
                 raise JournalError(f"{path!r}: could not set synchronous=FULL")
-            if version == 0:  # nowa baza: schemat i wersja w jednej transakcji
+            if version == 0:  # nowa baza: schemat, wersja i znacznik aplikacji w jednej transakcji
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     for statement in _SCHEMA:
                         conn.execute(statement)
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
                     conn.execute("COMMIT")
                 except BaseException:
                     Journal._rollback(conn)
                     raise
+            elif app_id == 0:  # dziennik v1 sprzed znacznika aplikacji: przyjęty i oznaczony
+                conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
         except sqlite3.Error as exc:
             raise JournalError(f"cannot initialise journal {path!r}: {exc}") from exc
 
