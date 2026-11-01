@@ -1156,6 +1156,28 @@ def test_report_refuses_a_database_that_is_not_a_journal_of_this_schema(capsys, 
         assert [p.name for p in tmp_path.iterdir() if p.name.startswith(path.name)] == [path.name]  # bez śladów
 
 
+def test_report_uses_the_journal_read_only_opener_and_refuses_another_application(
+    capsys, config_env, tmp_path, monkeypatch
+):
+    import sqlite3
+
+    opened = []
+    real = Journal.open_readonly
+    monkeypatch.setattr(Journal, "open_readonly", classmethod(lambda cls, p: opened.append(p) or real(p)))
+    path = tmp_path / "journal.sqlite"
+    j = Journal.open(str(path))
+    book_session(j, D1)
+    j.close()
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA application_id = 1234")  # cudza baza ze schematem dziennika
+    raw.commit()
+    raw.close()
+    code, out, err = run(["--journal", str(path)], capsys)
+    assert code == 1 and out == "" and "application_id 1234" in err
+    assert opened == [str(path)]  # jeden otwieracz tylko do odczytu dla `status` i raportu
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("journal")) == ["journal.sqlite"]
+
+
 def test_format_ratio_rounds_half_up_to_two_places_and_names_infinity():
     assert gates.format_ratio(Decimal("1.4")) == "1.40"
     assert gates.format_ratio(Decimal("2.005")) == "2.01"

@@ -219,6 +219,63 @@ def test_open_refuses_a_negative_schema_version_and_leaves_it_untouched(tmp_path
     assert raw_pragmas(p) == (version, 0, "delete")
 
 
+def test_open_readonly_on_a_closed_wal_journal_leaves_no_new_files(tmp_path):
+    # L26-c: `status`/raport na zamkniętym dzienniku nie mogą zostawić -wal/-shm (innego właściciela niż silnik)
+    p = tmp_path / "j.sqlite"
+    j = open_journal(p)
+    j.append_raw("broker", "kept", T0)
+    j.close()
+    before = sorted(x.name for x in tmp_path.iterdir())
+    assert before == ["j.sqlite"]
+    ro = Journal.open_readonly(str(p))
+    try:
+        assert [e.payload for e in ro.events()] == ["kept"]
+        with pytest.raises(JournalWriteError):
+            ro.set_meta("x", "y")
+    finally:
+        ro.close()
+    assert sorted(x.name for x in tmp_path.iterdir()) == before
+    assert raw_pragmas(p) == (1, APPLICATION_ID, "wal")
+
+
+def test_open_readonly_sees_committed_rows_of_a_running_writer(tmp_path):
+    p = tmp_path / "j.sqlite"
+    writer = open_journal(p)
+    writer.append_raw("broker", "first", T0)
+    ro = Journal.open_readonly(str(p))
+    try:
+        assert [e.payload for e in ro.events()] == ["first"]
+        writer.append_raw("broker", "second", T0)  # silnik pisze dalej: czytelnik widzi zatwierdzone wiersze
+        assert [e.payload for e in ro.events()] == ["first", "second"]
+        with pytest.raises(JournalWriteError):
+            ro.append_raw("broker", "never", T0)
+    finally:
+        ro.close()
+    writer.append_raw("broker", "third", T0)  # czytelnik niczego nie zablokował
+    assert len(writer.events()) == 3
+    writer.close()
+
+
+@pytest.mark.parametrize(("app_id", "accepted"), [(0, True), (1234, False)])
+def test_open_readonly_checks_the_application_id_and_never_stamps(tmp_path, app_id, accepted):
+    p = tmp_path / "j.sqlite"
+    j = open_journal(p)
+    j.append_raw("broker", "kept", T0)
+    j.close()
+    raw = sqlite3.connect(p)
+    raw.execute(f"PRAGMA application_id = {app_id}")  # 0: dziennik v1 sprzed znacznika; inny: cudza baza
+    raw.commit()
+    raw.close()
+    if accepted:
+        ro = Journal.open_readonly(str(p))
+        assert [e.payload for e in ro.events()] == ["kept"]
+        ro.close()
+    else:
+        with pytest.raises(JournalSchemaError, match="application_id"):
+            Journal.open_readonly(str(p))
+    assert raw_pragmas(p) == (1, app_id, "wal")  # tylko odczyt: znacznika nie dopisuje
+
+
 def test_open_refuses_memory_database_because_wal_cannot_be_enabled():
     with pytest.raises(JournalError):
         Journal.open(":memory:")

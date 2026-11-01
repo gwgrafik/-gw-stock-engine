@@ -7,10 +7,11 @@ Kody wyjścia: 0 raport wypisany, 1 błąd (brak/uszkodzony dziennik, brak konfi
 wartości poza zakresem arytmetyki; to ostatnia deska ratunku, a pojedynczy dziwny zapis nie przerywa raportu:
 liczby, których nie da się wydrukować, wychodzą jako `n/a`), 2 błąd użycia.
 
-Dziennik otwieramy TYLKO DO ODCZYTU (URI `mode=ro` + `query_only`): raport można puścić, gdy silnik pracuje, a plik
-nie zmienia się ani o bajt. Raport nie drukuje identyfikatorów rachunku, deali ani zleceń, tylko liczby i kody zdarzeń.
-Dzień zdarzenia i transakcji to dzień LOKALNY giełdy (Europe/Berlin). Raport nie przesądza o opłacalności: wynik
-netto po kosztach jest pomiarem, a ocena bramki L1 należy do właściciela.
+Dziennik otwieramy TYLKO DO ODCZYTU (`Journal.open_readonly`, ten sam otwieracz co `status`): raport można puścić, gdy
+silnik pracuje, a plik nie zmienia się ani o bajt (na zamkniętym dzienniku nie powstaje też `-wal` ani `-shm`). Raport
+nie drukuje identyfikatorów rachunku, deali ani zleceń, tylko liczby i kody zdarzeń. Dzień zdarzenia i transakcji to
+dzień LOKALNY giełdy (Europe/Berlin). Raport nie przesądza o opłacalności: wynik netto po kosztach jest pomiarem,
+a ocena bramki L1 należy do właściciela.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from pathlib import Path
 
 from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.config import CostConfig, load_config
-from gwstock.journal import SCHEMA_VERSION, Journal, JournalError, TradeRecord
+from gwstock.journal import Journal, JournalError, TradeRecord
 from gwstock.report import gates
 from gwstock.report.gates import L1Details, format_ratio, read_events
 from gwstock.report.ledger import decimal_text, exact_sum, export_csv, local_day, trade_day, trades_summary
@@ -78,42 +79,15 @@ _DAY_FORMAT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _CALENDAR = ExchangeCalendar(XETRA)
 
 
-class ReportError(Exception):
-    """Błąd, po którym raportu nie da się wypisać (komunikat idzie na stderr, kod wyjścia 1)."""
-
-
 # --- dziennik tylko do odczytu --------------------------------------------------------------------------------------
 
 
 def open_journal_readonly(path: Path) -> Journal:
-    """Otwiera istniejący dziennik bez prawa zapisu (URI `mode=ro`, `query_only`); każdy zapis to błąd.
-
-    Nie uruchamia pragm zapisujących, nie tworzy schematu i nie zmienia trybu pliku. Brak pliku, plik spoza gwstock
-    albo inna wersja schematu: `ReportError`.
+    """Ten sam otwieracz co `status`: `Journal.open_readonly` (bez pliku `-wal` `immutable=1`, więc na zamkniętym
+    dzienniku nie zostaje żaden nowy plik; przy działającym silniku `mode=ro`; `query_only`; sprawdzenie wersji schematu
+    i `application_id`, bez oznaczania). Każdy zapis to błąd; brak pliku albo baza spoza gwstock: `JournalError`.
     """
-    target = Path(path).resolve()
-    if not target.is_file():
-        raise ReportError(f"journal not found: {path}")
-    # Bez pliku -wal nikt nie ma dziennika otwartego (czyste zamknięcie scala i usuwa WAL), więc cały stan jest w pliku
-    # bazy: `immutable=1` czyta go bez tworzenia -wal/-shm (które, utworzone przez innego użytkownika, mogłyby
-    # zablokować późniejsze otwarcie przez silnik). Przy działającym silniku (-wal istnieje) czytamy zwykłym `mode=ro`.
-    options = "mode=ro" if target.with_name(target.name + "-wal").exists() else "mode=ro&immutable=1"
-    try:
-        conn = sqlite3.connect(f"{target.as_uri()}?{options}", uri=True, check_same_thread=False, isolation_level=None)
-    except sqlite3.Error as exc:
-        raise ReportError(f"cannot open journal {path}: {exc}") from exc
-    try:
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version != SCHEMA_VERSION:
-            raise ReportError(f"{path} is not a gwstock journal of schema version {SCHEMA_VERSION} (found {version})")
-        conn.execute("PRAGMA query_only = ON")
-    except sqlite3.Error as exc:
-        conn.close()
-        raise ReportError(f"cannot read journal {path}: {exc}") from exc
-    except BaseException:
-        conn.close()
-        raise
-    return Journal(conn)
+    return Journal.open_readonly(str(path))
 
 
 # --- zebrane dane dnia ------------------------------------------------------------------------------------------------
@@ -459,7 +433,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             lines, csv_error = _report(args, journal_path, journal, strat.fixed_min_size_sessions, costs)
         finally:
             journal.close()
-    except (ReportError, JournalError, sqlite3.Error, ArithmeticError) as exc:
+    except (JournalError, sqlite3.Error, ArithmeticError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print("\n".join(lines))

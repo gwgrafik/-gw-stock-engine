@@ -510,16 +510,22 @@ class Journal:
 
     @classmethod
     def open_readonly(cls, path: str) -> Journal:
-        """Otwiera istniejący dziennik TYLKO DO ODCZYTU (`status`): URI `mode=ro`, bez zmiany schematu i trybu.
+        """Otwiera istniejący dziennik TYLKO DO ODCZYTU (`status`, raport): bez zmiany schematu, trybu i znacznika.
 
-        Każdy zapis to `JournalWriteError`. Nieistniejący plik, inna wersja schematu albo baza spoza gwstock: błąd.
+        Bez pliku `-wal` nikt nie ma dziennika otwartego (czyste zamknięcie scala i usuwa WAL), więc cały stan jest
+        w pliku bazy: `immutable=1` czyta go bez tworzenia `-wal`/`-shm` (utworzone przez innego użytkownika niż
+        silnik mogłyby zablokować jego późniejsze otwarcie). Przy działającym silniku (`-wal` istnieje) zwykłe
+        `mode=ro`, które widzi zatwierdzone wiersze piszącego. Do tego `query_only`: każdy zapis to
+        `JournalWriteError`. Nieistniejący plik, inna wersja schematu albo cudzy `application_id` (0, dziennik v1
+        sprzed znacznika, jest przyjmowany bez oznaczania): błąd.
         """
         target = Path(path).resolve()
         if not target.is_file():
             raise JournalError(f"cannot open journal {path!r} read-only: no such file")
+        options = "mode=ro" if target.with_name(target.name + "-wal").exists() else "mode=ro&immutable=1"
         try:
             conn = sqlite3.connect(
-                f"{target.as_uri()}?mode=ro", uri=True, check_same_thread=False, isolation_level=None
+                f"{target.as_uri()}?{options}", uri=True, check_same_thread=False, isolation_level=None
             )
         except sqlite3.Error as exc:
             raise JournalError(f"cannot open journal {path!r} read-only: {exc}") from exc
@@ -527,6 +533,12 @@ class Journal:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 raise JournalSchemaError(f"{path!r} has schema version {version}, expected {SCHEMA_VERSION}")
+            app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+            if app_id not in (0, APPLICATION_ID):
+                raise JournalSchemaError(
+                    f"{path!r} belongs to another application (application_id {app_id}), not a gwstock journal"
+                )
+            conn.execute("PRAGMA query_only = ON")
         except sqlite3.Error as exc:
             conn.close()
             raise JournalError(f"cannot read journal {path!r}: {exc}") from exc
