@@ -160,3 +160,10 @@ Tych pozycji nie zamyka żaden kod ani agent; część to wyłącznie decyzje w�
 - **Próba `smoke` na prawdziwym koncie** (L0.8) z oględzinami pozycji i stopu w aplikacji, drugim zamknięciem odrzuconym jako „nie znaleziono” (C29) i brakiem adopcji po `UNKNOWN` przy czystym wejściu (C15).
 - **Odczyty live do fixtures** (`tests/integration_live_readonly/fixtures/`) i uzupełnienie statusów w `docs/ops/capitalcom-api-notes.md` (plan, zadanie 18, krok 2): wymagają odczytów z VPS.
 - **Utworzenie plików `data/ARM_LIVE` i `data/L1_PASSED` oraz ustawienie `live_allowed = true` w `config/runtime.toml`: wyłącznie właściciel**, świadomie i dopiero po spełnieniu warunków bramek L0 (uzbrojenie) i L1 (wielkość według reguł). Żaden agent ani kod ich nie tworzy ani nie ustawia, także „tylko na chwilę”.
+
+## Granice zabezpieczeń i zakres dry_run (korekta z 2026-11-01)
+
+- **Limity strat nie gwarantują maksymalnej straty.** Limity 1,00 € na transakcję, 1,50 € dziennie i 12 € łącznie blokują DALSZE wejścia i uruchamiają kill switch po zaksięgowaniu straty. Nie ograniczają straty już otwartej pozycji przy luce cenowej: zwykły stop nie jest gwarantowany, a strata może przekroczyć każdy z progów, zanim zostanie zaksięgowana. Straż poślizgu po wypełnieniu zamyka pozycję, ale nie cofa poniesionej straty. Rachunek ma 40 €; traktujemy go jako eksperyment wykonania.
+- **Wcześniejsze badania a ta strategia.** Stwierdzenie "przewaga netto bliska zera" pochodzi z badań, które nie dotyczyły dokładnie `orb_index_cfd` v1 po kosztach Capital.com. Poprawne sformułowanie: **przewaga nie została wykazana**.
+- **Co daje tydzień dry_run.** Sprawdza działanie programu i zbieranie danych: dostępność danych, poprawność świec i godzin, sygnały, przyczyny blokad, obserwowany spread, restarty i błędy. Nie wystarcza do oceny rentowności i bez prawdziwych zleceń nie mierzy rzeczywistego poślizgu wykonania. Ceny obserwowane i symulowane wykonania trzeba odróżniać od rzeczywistych transakcji.
+- **Alternatywne strategie** (wybicie z filtrem trendu, powrót do średniej, porównanie instrumentów) są osobnym zadaniem; dry_run nie jest testem ich rentowności.
