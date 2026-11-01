@@ -1051,7 +1051,8 @@ async def test_unexpected_delay_or_scaling_is_logged_once(server, broker, caplog
     server.markets["US100"] = de40_market()
 
     def warnings() -> list[str]:
-        return [r.getMessage() for r in caplog.records if r.name == "gwstock.broker.capitalcom" and r.levelno == logging.WARNING]
+        ours = [r for r in caplog.records if r.name == "gwstock.broker.capitalcom" and r.levelno == logging.WARNING]
+        return [r.getMessage() for r in ours]
 
     await broker.login()
     await broker.quote("DE40")
@@ -1130,7 +1131,8 @@ async def test_candles_5m_request_uses_utc_window_without_zone_suffix(server, br
     await broker.candles_5m("DE40", start, start + 2 * M5)
     [req] = server.requests("GET", "/prices/DE40")
     # `to` = min(end + przesunięcie, teraz − 5 s): nigdy w przyszłości; `max` z obciętego okna (1 pełny slot + zapas)
-    assert req.query == {"resolution": "MINUTE_5", "from": "2026-11-02T08:00:00", "to": "2026-11-02T08:09:55", "max": "3"}
+    window = {"from": "2026-11-02T08:00:00", "to": "2026-11-02T08:09:55"}
+    assert req.query == {"resolution": "MINUTE_5", **window, "max": "3"}
 
 
 async def test_candles_use_snapshot_time_utc_only(server, broker, clock):
