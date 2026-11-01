@@ -141,7 +141,10 @@ class OrderManager:
 
         `EntryBlocked` i `ValueError` (brak stopu): nic nie zapisano i nic nie wysłano. `JournalWriteError` przed
         wysyłką: nic nie wysłano; po wysyłce: zlecenie zostaje w dzienniku SUBMITTING/UNKNOWN i rozstrzyga je
-        uzgadnianie. W żadnym przypadku wywołujący nie ponawia wejścia.
+        uzgadnianie. Tak samo KAŻDY inny wyjątek po wysyłce, także błąd interpretacji odpowiedzi brokera (np. migawka,
+        której nie da się porównać ani zapisać): zlecenie zostaje SUBMITTING/UNKNOWN, wyjątek idzie do wywołującego,
+        a dla wykonawcy oznacza kill switch miękki (`JOURNAL_WRITE_FAILED` przy błędzie zapisu, inaczej
+        `ENTRY_EXCEPTION`). W żadnym przypadku wywołujący nie ponawia wejścia.
 
         `RuntimeError`, gdy inne `submit_entry` / `resolve_unknown` jest w toku (także na innym instrumencie): przed
         jakimkolwiek odczytem i zapisem, bez zmiany flagi `in_flight` trwającego wywołania.
