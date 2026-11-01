@@ -221,8 +221,10 @@ class OrderManager:
     async def resolve_unknown(self, order: OrderRecord) -> OrderRecord:
         """Rozstrzyga zlecenie UNKNOWN wyłącznie odczytami brokera (nigdy ponowną wysyłką).
 
-        Warunek wstępny (sprawdzany przed jakimkolwiek czekaniem i wywołaniem brokera): zlecenie UNKNOWN, a pozycja
-        jego instrumentu w dzienniku ENTERING; inaczej `ValueError`. W trakcie innego wejścia w toku: `RuntimeError`.
+        Warunek wstępny (sprawdzany przed jakimkolwiek czekaniem i wywołaniem brokera): zlecenie UNKNOWN W DZIENNIKU
+        (rekord jest czytany ponownie, przekazana kopia służy tylko do identyfikacji, a rozstrzyganie pracuje na
+        rekordzie z dziennika), a pozycja jego instrumentu w dzienniku ENTERING; inaczej `ValueError`. W trakcie innego
+        wejścia w toku: `RuntimeError`.
 
         Wynik: CONFIRMED (pozycja OPEN z faktycznymi danymi brokera), NOT_PLACED (pozycja FLAT) albo UNKNOWN z notatką
         AMBIGUOUS_MATCH / CONFIRM_MISMATCH / CONFIRM_UNVERIFIED / REJECTED_BUT_LISTED / UNMATCHED_CLOSED_DEAL (pozycja
@@ -232,8 +234,11 @@ class OrderManager:
         """
         if self._in_flight:
             raise RuntimeError(f"resolve_unknown: an entry is already in flight, refusing {order.order_id!r}")
-        if order.state is not OrderState.UNKNOWN:
-            raise ValueError(f"resolve_unknown: order {order.order_id!r} is {order.state.value}, expected UNKNOWN")
+        stored = self._journal.get_order(order.order_id)  # przekazana kopia może być nieaktualna: liczy się dziennik
+        if stored is None or stored.state is not OrderState.UNKNOWN:
+            found = "missing from the journal" if stored is None else f"{stored.state.value} in the journal"
+            raise ValueError(f"resolve_unknown: order {order.order_id!r} is {found}, expected UNKNOWN")
+        order = stored
         pos = self._journal.current_position(order.epic)
         if pos is None or pos.state is not PositionState.ENTERING:
             found = "missing" if pos is None else pos.state.value

@@ -427,6 +427,37 @@ async def test_resolve_unknown_requires_an_entering_position(journal, fake, mgr,
     assert not mgr.in_flight
 
 
+@pytest.mark.parametrize("stored", [OrderState.NOT_PLACED, OrderState.CONFIRMED, None], ids=str)
+async def test_resolve_unknown_rereads_the_order_and_refuses_a_stale_record(journal, fake, mgr, clock, stored):
+    # wywołujący trzyma kopię UNKNOWN, a dziennik już ją rozstrzygnął (albo nie zna): nie wolno pisać po starym stanie
+    stale = unresolved(OrderState.UNKNOWN)
+    if stored is not None:
+        journal.insert_order(replace(stale, state=stored))
+    journal.upsert_position(PositionRecord("DE40", PositionState.ENTERING))
+    before = journal.get_order(stale.order_id), journal.current_position("DE40")
+    with pytest.raises(ValueError, match="expected UNKNOWN"):
+        await mgr.resolve_unknown(stale)
+    assert clock.elapsed_since_start() == 0 and fake.calls == []  # ani czekania, ani brokera
+    assert (journal.get_order(stale.order_id), journal.current_position("DE40")) == before
+    assert not mgr.in_flight
+
+
+async def test_resolve_unknown_works_on_the_journal_record_not_on_the_passed_copy(journal, fake, mgr, req):
+    for _ in range(4):  # potwierdzenie przy wysyłce i w trzech rundach
+        fake.fail_next("confirm", BrokerTimeout())
+    for _ in range(3):
+        fake.fail_next("list_positions", BrokerTimeout())
+    first = await mgr.submit_entry(req)  # UNKNOWN CHECKS_INCOMPLETE z referencją REF-1, pozycja ENTERING
+    assert first.state == OrderState.UNKNOWN and first.deal_reference == "REF-1"
+    assert first.note == "CHECKS_INCOMPLETE CAUSE=confirm:BrokerTimeout"
+    assert position(journal).state == PositionState.ENTERING
+    fake.calls.clear()
+    old_copy = replace(first, deal_reference=None, note="CAUSE=open_position:BrokerTimeout")  # kopia sprzed odpowiedzi
+    rec = await mgr.resolve_unknown(old_copy)
+    assert rec.state == OrderState.CONFIRMED and rec.note == "ADOPTED_AFTER_UNKNOWN VIA=confirm CAUSE=confirm:BrokerTimeout"
+    assert fake.calls[0] == "confirm"  # referencja z dziennika, nie z przekazanej kopii
+
+
 async def test_second_resolve_after_ambiguous_match_is_refused(journal, fake, mgr, req, clock):
     _ambiguous(fake)
     rec = await mgr.submit_entry(req)
