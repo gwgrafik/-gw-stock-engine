@@ -934,10 +934,20 @@ async def test_min_stop_distance_in_points_is_taken_as_is(server, broker):
     assert (await broker.instrument_rules("DE40")).min_stop_distance == Decimal("5")
 
 
-async def test_zero_step_distance_means_no_stop_rounding(server, broker):
+async def test_instrument_rules_with_zero_step_gives_stop_step_zero(server, broker):
+    # krok 0 = brak zaokrąglania stopu (dozwolone: `>= 0`); pozostałe reguły bez zmian, krok nie jest zgadywany
     await broker.login()
     dealing(server, "minStepDistance")["value"] = Decimal("0")
-    assert (await broker.instrument_rules("DE40")).stop_step == Decimal("0")
+    rules = await broker.instrument_rules("DE40")
+    assert rules == InstrumentRules(
+        epic="DE40",
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.001"),
+        value_per_point=Decimal("1"),
+        margin_rate=Decimal("0.05"),
+        min_stop_distance=Decimal("2.57813"),
+        stop_step=Decimal("0"),
+    )
 
 
 @pytest.mark.parametrize(
