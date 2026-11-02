@@ -59,14 +59,16 @@ async def main():
                 t = p["snapshotTimeUTC"][:19]
                 o, h, l, c = (p[k] for k in ("openPrice", "highPrice", "lowPrice", "closePrice"))
                 sp = float(c["ask"]) - float(c["bid"])
-                rows[t] = (t, mid(o), mid(h), mid(l), mid(c), round(sp, 2))
+                rows[t] = (t, mid(o), mid(h), mid(l), mid(c), round(sp, 2),
+                           *(float(x[side]) for x in (o, h, l, c) for side in ("bid", "ask")))
             empty = empty + 1 if len(rows) == n0 else 0
             end = start
         async with s.delete(base + "/session", headers=hdr):
             pass
     OUT.parent.mkdir(parents=True, exist_ok=True)
     with OUT.open("w", newline="") as f:
-        w = csv.writer(f); w.writerow(["ts_utc", "open", "high", "low", "close", "spread"])
+        w = csv.writer(f); w.writerow(["ts_utc", "open", "high", "low", "close", "spread", "bid_o", "ask_o", "bid_h", "ask_h",
+                    "bid_l", "ask_l", "bid_c", "ask_c"])
         for t in sorted(rows):
             w.writerow(rows[t])
     ts = sorted(rows)
