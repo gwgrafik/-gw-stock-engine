@@ -47,7 +47,9 @@ def run(bars, n=15, cost_mult=1.0):
                 half = sp * cost_mult / 2
                 exit_px = reason = None
                 if (kind == 1 and l <= stop) or (kind == -1 and h >= stop):
-                    exit_px = stop - kind * (STOP_EXTRA * cost_mult) - kind * half; reason = "STOP"
+                    # luka: świeca otwarta już za stopem wypełnia się po otwarciu, nie po lepszej cenie stopu
+                    fill = min(stop, o) if kind == 1 else max(stop, o)
+                    exit_px = fill - kind * (STOP_EXTRA * cost_mult) - kind * half; reason = "STOP"
                 elif tl >= time(17, 25):
                     exit_px = o - kind * half; reason = "FLAT"
                 if exit_px is None:
@@ -58,6 +60,10 @@ def run(bars, n=15, cost_mult=1.0):
                 if exit_px is not None:
                     trades.append((day, et, kind, entry, exit_px, reason, kind * (exit_px - entry)))
                     pos = None
+                if pos is not None and pos_i == len(idx) - 1:  # koniec danych dnia przed 17:25: wyjście po ostatnim zamknięciu
+                    kind, entry, stop, level, et = pos
+                    px = c - kind * (sp * cost_mult / 2)
+                    trades.append((day, et, kind, entry, px, "END_OF_DATA", kind * (px - entry))); pos = None
                 continue
             if count >= MAX_PER_DAY or pos_i < n + ATR_N or not (time(9, 15) <= tl < time(17, 0)):
                 continue
