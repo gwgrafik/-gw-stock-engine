@@ -21,10 +21,13 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-CSV = Path(os.environ.get("GW_M1_CSV", "/data/m1_de40.csv"))
-OUT = Path(os.environ.get("GW_TRADES_CSV", "/data/candle_trades.csv"))
+CSV = Path(os.environ.get("GW_M1_CSV", f"/data/m1_{os.environ.get('GW_EPIC', 'DE40').lower()}.csv"))
+OUT = Path(os.environ.get("GW_TRADES_CSV", f"/data/candle_trades_{os.environ.get('GW_EPIC', 'DE40').lower()}.csv"))
 BER = ZoneInfo("Europe/Berlin")
-SLIP, STOP_EXTRA, STEP = 0.5, 1.0, 0.1
+SLIP, STOP_EXTRA, STEP = (float(os.environ.get(k, d)) for k, d in (("GW_SLIP", "0.5"), ("GW_STOP_EXTRA", "1.0"), ("GW_STEP", "0.1")))
+EPIC = os.environ.get("GW_EPIC", "DE40")
+if EPIC != "DE40" and "GW_SLIP" not in os.environ:
+    raise SystemExit("inny instrument niż DE40: ustaw GW_SLIP, GW_STOP_EXTRA i GW_STEP (punkty tego instrumentu), bo koszty z config/costs_v1.toml dotyczą DE40")
 ATR_N, N_RANGE, MAX_DAY, DAY_STOP_R = 14, 15, 10, -3.0
 POINT_EUR = 0.001
 Bar = namedtuple("Bar", "t bo bh bl bc ao ah al ac")

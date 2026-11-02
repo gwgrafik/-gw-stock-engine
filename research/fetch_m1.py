@@ -1,7 +1,8 @@
 """Pobiera świece MINUTE DE40 z Capital.com (tylko odczyt) do /data/m1_de40.csv. Jedno logowanie.
 
 Uruchomienie (z korzenia repozytorium, silnik może działać obok):
-  docker compose -f docker/compose.yml run --rm -T gw-stock-engine python - < research/fetch_m1.py
+  docker compose -f docker/compose.yml run --rm -T -e GW_EPIC=DE40 gw-stock-engine python - < research/fetch_m1.py
+(inny instrument: GW_EPIC=US100 itd.; plik /data/m1_<epic>.csv; nazwę epica sprawdź w aplikacji/API, zły daje 404)
 Klucz jest czytany z pliku sekretów kontenera; nic z niego nie trafia do wyjścia ani do CSV.
 """
 import asyncio, csv, os, sys
@@ -12,10 +13,10 @@ import aiohttp
 
 from gwstock.broker.capitalcom import LIVE_BASE_URL, load_credentials
 
-EPIC = "DE40"
+EPIC = os.environ.get("GW_EPIC", "DE40")
 MAX_DAYS = int(os.environ.get("GW_FETCH_DAYS", "120"))
 WINDOW = timedelta(minutes=960)  # < 1000 punktów
-OUT = Path("/data/m1_de40.csv")
+OUT = Path(f"/data/m1_{EPIC.lower()}.csv")
 FMT = "%Y-%m-%dT%H:%M:%S"
 
 
