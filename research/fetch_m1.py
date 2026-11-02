@@ -38,7 +38,7 @@ async def main():
         end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         floor = end - timedelta(days=MAX_DAYS)
         empty = 0
-        while end > floor and empty < 8:
+        while end > floor and empty < 12:
             start = end - WINDOW
             q = {"resolution": "MINUTE", "from": start.strftime(FMT), "to": end.strftime(FMT), "max": 1000}
             await asyncio.sleep(0.4)
@@ -46,6 +46,10 @@ async def main():
                 if r.status == 429:
                     await asyncio.sleep(5)
                     continue
+                if r.status in (401, 403):
+                    print("odmowa dostępu, kod", r.status, "- przerywam bez ponawiania"); break
+                if r.status in (400, 404):  # weekend, święto albo okno poza zakresem: puste, idziemy wcześniej
+                    empty += 1; end = start; continue
                 if r.status != 200:
                     print("błąd odczytu cen, kod", r.status, "okno", q["from"]); break
                 data = await r.json()
