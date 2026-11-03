@@ -16,6 +16,7 @@ CSV = Path(os.environ.get("GW_M1_CSV", "/data/m1_de40.csv"))
 OUT = Path(os.environ.get("GW_TRADES_CSV", "/data/orb_daily_trades.csv"))
 BER = ZoneInfo("Europe/Berlin")
 SLIP, STOP_EXTRA, STEP, POINT_EUR = 0.5, 1.0, 0.1, 0.001
+STOP_ATRS = [float(x) for x in os.environ.get("GW_STOP_ATR", "0.10").split(",")]  # 0,10 = strategia silnika; inne = NOWE warianty (K+1)
 Bar = namedtuple("Bar", "t bo bh bl bc ao ah al ac")
 
 
@@ -93,7 +94,7 @@ def main():
         by_day.setdefault(b.t.astimezone(BER).date(), []).append(b)
     atr = daily_atr(by_day)
     print(f"świece M1: {len(raw)}, dni: {len(by_day)}; bid/ask z danych: {'TAK' if real else 'NIE (rekonstrukcja, wynik przybliżony)'}")
-    res = {"ORB": [], "ZAWSZE_LONG": [], "ZAWSZE_SHORT": []}; skips = {}
+    res = {}; skips = {}
     for d in sorted(by_day):
         day = by_day[d]
         first = [b for b in day if time(9, 0) <= b.t.astimezone(BER).time() < time(9, 5)]
@@ -103,12 +104,15 @@ def main():
         if atr[d] is None:
             skips["BRAK_ATR14"] = skips.get("BRAK_ATR14", 0) + 1; continue
         o, c = mid(first[0])[0], mid(first[-1])[3]
-        stop_dist = math.ceil(round(0.10 * atr[d] / STEP, 6)) * STEP
-        for name, side in (("ORB", 1 if c > o else -1 if c < o else 0), ("ZAWSZE_LONG", 1), ("ZAWSZE_SHORT", -1)):
-            if side == 0:
-                skips["DOJI"] = skips.get("DOJI", 0) + 1; continue
-            e, x, why, cost = simulate(after, side, stop_dist)
-            res[name].append(dict(day=d, side=side, entry=e, exit=x, why=why, pnl=side * (x - e), cost=cost, stop=stop_dist))
+        for k_atr in STOP_ATRS:
+            stop_dist = math.ceil(round(k_atr * atr[d] / STEP, 6)) * STEP
+            for base, side in (("ORB", 1 if c > o else -1 if c < o else 0), ("ZAWSZE_LONG", 1), ("ZAWSZE_SHORT", -1)):
+                name = f"{base} stop={k_atr:.2f}ATR"
+                res.setdefault(name, [])
+                if side == 0:
+                    skips["DOJI"] = skips.get("DOJI", 0) + 1; continue
+                e, x, why, cost = simulate(after, side, stop_dist)
+                res[name].append(dict(day=d, side=side, entry=e, exit=x, why=why, pnl=side * (x - e), cost=cost, stop=stop_dist))
     print("pominięte dni:", skips)
     with OUT.open("w", newline="") as f:
         w = csv.writer(f); w.writerow(["wariant", "dzien", "kierunek", "cena_wej", "cena_wyj", "powod", "wynik_pkt", "stop_pkt"])
@@ -121,13 +125,15 @@ def main():
         for r in rows:
             reasons[r["why"]] = reasons.get(r["why"], 0) + 1
         print("  wyjścia:", reasons)
-        if k == "ORB":
+        if k.startswith("ORB"):
             for side, nm in ((1, "LONG"), (-1, "SHORT")):
                 print(f"  tylko {nm}:", stats([r for r in rows if r["side"] == side]))
             months = {}
             for r in rows:
                 months.setdefault(r["day"].strftime("%Y-%m"), []).append(r["pnl"])
             print("  miesięcznie (netto pkt):", {m: round(sum(v)) for m, v in sorted(months.items())})
+    if len(STOP_ATRS) > 1:
+        print(f"\nUWAGA: sprawdzono {len(STOP_ATRS)} szerokości stopu; poza 0,10 ATR to nowe warianty, a przy ok. 70 dniach wynik może być przypadkiem.")
     print("\nOdczyt: jeśli ORB nie jest wyraźnie lepsze od ZAWSZE_LONG/ZAWSZE_SHORT, kolor pierwszej świecy nic nie wnosi.")
     print("Ok. 87 transakcji nie dowodzi niczego: odchylenie wyniku dziennego przekracza zwykle sam średni wynik.")
 
