@@ -777,3 +777,24 @@ async def test_the_probe_logs_carry_no_deal_identifiers(engine, broker, clock, m
         assert token not in caplog.text, caplog.text
         assert token not in err
     no_identifiers(lines)
+
+
+async def test_a_restore_without_the_target_at_the_broker_never_claims_the_target(engine, broker, monkeypatch):
+    real = broker.set_protection
+    seen = {"n": 0}
+
+    async def restore_ignored(deal_id, stop, target):  # przywrócenie przyjęte, ale celu u brokera nie ma
+        seen["n"] += 1
+        if seen["n"] == 2:
+            broker.calls.append("set_protection")
+            return None
+        return await real(deal_id, stop, target)
+
+    broker.set_stop_clears_target = True
+    monkeypatch.setattr(broker, "set_protection", restore_ignored)
+    broker.on_call("close_position", lambda: broker.set_market_closed(True, epic=US), once=True)
+    code, lines = await run(engine)
+    assert code == 1
+    assert any(x.startswith("FAIL [6]") and "target after it: removed" in x for x in lines), "\n".join(lines)
+    [loud] = [x for x in lines if x.startswith("FAIL [7] LOUD")]
+    assert "its target may be gone" in loud, loud
