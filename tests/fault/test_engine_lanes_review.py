@@ -18,7 +18,7 @@ import pytest
 from gwstock.app import Engine, Mode
 from gwstock.broker.fake import FakeBroker
 from gwstock.config import LANES_FILE, load_lanes
-from gwstock.journal import TradeRecord
+from gwstock.journal import JournalReadError, PositionRecord, TradeRecord
 from gwstock.risk import KILL, LOSS_PER_TRADE
 from gwstock.types import BrokerRejected, KillLevel, OpenPosition, PositionState, Side
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
@@ -33,9 +33,11 @@ from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     build_lane_broker,
     cfgs,
     config_dir,
+    daily_candles,
     data_dir,
     day_rules,
     engine_events,
+    five_minute_candles,
     journal_path,
     lane_armed,
     lane_decisions,
@@ -344,3 +346,98 @@ async def test_a_signal_candle_whose_tick_came_after_the_next_candle_is_recorded
     assert stale["signal_candle_start_utc"] == SIGNAL_START.isoformat() and stale["why"] is None
     nxt = (SIGNAL_START + timedelta(minutes=5)).isoformat()
     assert [d["outcome"] for d in lane_decisions(j) if d["signal_candle_start_utc"] == nxt] == ["NO_SIGNAL"]
+
+
+# --- F5: pasmo dry_run nie zatrzymuje wejść live DE40 przez wspólny kill switch --------------------------------------
+
+TUESDAY = date(2026, 11, 3)
+
+
+def watchdog_events(journal, code: str) -> list[dict]:
+    return [p for p in payloads(journal, "watchdog") if p.get("event") == code]
+
+
+def freeze_us500(us_market: UsMarket, broker: FakeBroker, when: datetime) -> None:
+    us_market.frozen_from = when  # notowanie US500 przestaje się zmieniać (cisza notowań pasma)
+
+
+@pytest.fixture
+def dry_lane_engine(make_engine, lanes) -> Engine:
+    """Proces live (uzbrojony przez fabrykę), pasmo US500 bez warunku uzbrojenia pasma: dry_run, tylko mierzy."""
+    engine = make_engine(Mode.LIVE, lanes=lanes)
+    assert engine.executor.live and not engine.lanes[0].executor.live
+    return engine
+
+
+async def test_quote_silence_of_a_dry_run_lane_alarms_and_de40_still_enters_live(
+    dry_lane_engine, make_engine, lanes, broker, clock, us_market, notifier
+):
+    """F5 (rozstrzygnięcie kontrolera). Oczekiwane: pasmo US500 w dry_run ma ciszę notowań w swojej sesji (notowanie
+    zamrożone od 14:40 UTC) → alarm QUOTE_SILENCE z nazwą US500 i zdarzenie nadzoru (`kill` = False), ale kill switch
+    procesu zostaje NONE; następnego dnia (wtorek) DE40 live wchodzi o 09:05 (`open_position` DE40), czego kill SOFT
+    z poniedziałku by zabronił."""
+    freeze_us500(us_market, broker, datetime(2026, 11, 2, 14, 40, tzinfo=UTC))
+    stop_engine_at(dry_lane_engine, clock, datetime(2026, 11, 2, 15, 10, tzinfo=UTC))
+    await dry_lane_engine.run_day(DAY)
+    j = dry_lane_engine.journal
+    assert dry_lane_engine.kill.level() is KillLevel.NONE and j.kill_state().level is KillLevel.NONE
+    assert any(f"QUOTE_SILENCE ({US})" in m for _, m in notifier.alerts)
+    events = watchdog_events(j, "QUOTE_SILENCE")
+    assert events and all(e["epic"] == US and e["kill"] is False for e in events)
+    clock.hooks.clear()
+    broker.set_daily_candles(daily_candles(TUESDAY), epic=EPIC)
+    broker.set_candles_5m(five_minute_candles(TUESDAY, D("25780"), D("25790")), epic=EPIC)
+    clock.advance((berlin(TUESDAY, 8, 45) - clock.now_utc()).total_seconds())
+    engine = make_engine.restart(dry_lane_engine, Mode.LIVE, lanes=lanes)  # nowy proces: kill switch z dziennika
+    stop_engine_at(engine, clock, berlin(TUESDAY, 9, 8))
+    opens = broker_calls(broker, clock, ("open_position",))
+    await engine.run_day(TUESDAY)
+    assert [arg for _, _, arg in opens] == [EPIC] and engine.journal.count_entry_orders(TUESDAY, EPIC) == 1
+
+
+async def test_reconcile_failing_of_a_dry_run_lane_alarms_without_the_kill_switch(dry_lane_engine, clock, notifier):
+    """F5. Oczekiwane: każde uzgadnianie pasma US500 (dry_run, bez pozycji) rzuca od 14:00 UTC → po trzech przebiegach
+    alarm RECONCILE_FAILING z nazwą US500 i zdarzenie nadzoru, bez kill switcha procesu."""
+    lane = dry_lane_engine.lanes[0]
+
+    async def broken() -> None:
+        raise RuntimeError("lane reconciliation bug")
+
+    lane.reconciler.run_once = broken
+    stop_engine_at(dry_lane_engine, clock, datetime(2026, 11, 2, 8, 20, tzinfo=UTC))
+    await dry_lane_engine.run_day(DAY)
+    assert dry_lane_engine.kill.level() is KillLevel.NONE
+    assert any(f"RECONCILE_FAILING ({US})" in m for _, m in notifier.alerts)
+    assert watchdog_events(dry_lane_engine.journal, "RECONCILE_FAILING")
+
+
+async def test_quote_silence_of_a_live_lane_still_soft_kills(lane_engine, broker, clock, us_market, notifier):
+    """F5: pasmo live bez zmian. Oczekiwane: cisza notowań US500 (pasmo uzbrojone) → kill SOFT QUOTE_SILENCE."""
+    freeze_us500(us_market, broker, datetime(2026, 11, 2, 14, 0, tzinfo=UTC))
+    stop_engine_at(lane_engine, clock, datetime(2026, 11, 2, 14, 40, tzinfo=UTC))
+    await lane_engine.run_day(DAY)
+    assert lane_engine.kill.level() is KillLevel.SOFT and lane_engine.journal.kill_state().reason == "QUOTE_SILENCE"
+
+
+async def test_a_dry_run_lane_with_a_real_position_is_not_measure_only(dry_lane_engine):
+    """F5, strona ostrożna. Oczekiwane: pasmo dry_run z pozycją inną niż FLAT w dzienniku (np. po rozbrojeniu pasma
+    z otwartą pozycją) nie jest „tylko mierzące”: jego cisza i awarie uzgadniania dalej włączają kill SOFT."""
+    assert dry_lane_engine._lane_measure_only(US) is True
+    assert dry_lane_engine._lane_measure_only(EPIC) is False
+    dry_lane_engine.journal.upsert_position(PositionRecord(US, P.OPEN, "DEAL-X", Side.BUY, D("0.01"), D("7590"),
+                                                           D("7580"), datetime(2026, 11, 2, 7, 0, tzinfo=UTC)))
+    assert dry_lane_engine._lane_measure_only(US) is False
+
+
+async def test_journal_unreadable_in_a_dry_run_lane_still_soft_kills(dry_lane_engine, clock, monkeypatch):
+    """F5: wspólny dziennik. Oczekiwane: błąd odczytu dziennika w kroku pasma dry_run → kill SOFT JOURNAL_UNREADABLE
+    jak dotąd."""
+
+    async def unreadable(*_a, **_k):
+        raise JournalReadError("database disk image is malformed")
+
+    monkeypatch.setattr(dry_lane_engine, "_bar_quote_step", unreadable)
+    stop_engine_at(dry_lane_engine, clock, datetime(2026, 11, 2, 8, 0, tzinfo=UTC))
+    await dry_lane_engine.run_day(DAY)
+    assert dry_lane_engine.kill.level() is KillLevel.SOFT
+    assert dry_lane_engine.journal.kill_state().reason == "JOURNAL_UNREADABLE"

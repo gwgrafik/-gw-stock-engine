@@ -544,3 +544,73 @@ def test_reconcile_skips_are_counted_per_lane(wd, notifier):
         wd.note_reconcile_ok()
     starved = alerts_with(notifier, "RECONCILE_STARVED")
     assert starved and "US500" in starved[0][1]
+
+
+# --- pasmo tylko mierzące (dry_run): alarm bez kill switcha procesu (przegląd zadania 12, F5) -------------------
+
+
+def watchdog_events(journal, code):
+    return [p for p in (json.loads(e.payload) for e in journal.events("watchdog")) if p.get("event") == code]
+
+
+async def test_quote_silence_of_a_measure_only_lane_alarms_without_killing(wd, clock, kill, notifier, journal):
+    """F5: cisza notowań pasma tylko mierzącego (`set_measure_only`) → alarm z nazwą instrumentu i JEDNO zdarzenie na
+    epizod, bez kill switcha; to samo pasmo, gdy przestaje być tylko mierzące (live), włącza kill SOFT jak dotąd."""
+    measure = {"US500": True}
+    wd.set_measure_only(lambda epic: measure.get(epic, False))
+    wd.set_session_window(T0, CLOSE, epic="US500")
+    wd.note_quote(T0, epic="US500")
+    for _ in range(13):
+        clock.advance(5)
+        wd.note_quote(clock.now_utc())  # pasmo dotychczasowe świeże
+    await wd.tick()
+    await wd.tick()
+    assert kill.level() is KillLevel.NONE
+    assert alerts_with(notifier, f"{QUOTE_SILENCE} (US500)")
+    (event,) = watchdog_events(journal, QUOTE_SILENCE)
+    assert event["epic"] == "US500" and event["kill"] is False
+    measure["US500"] = False
+    await wd.tick()
+    assert kill.level() is KillLevel.SOFT and kill.reason() == QUOTE_SILENCE
+
+
+async def test_quote_silence_of_the_v1_lane_ignores_the_measure_only_view(wd, clock, kill):
+    wd.set_measure_only(lambda epic: True)
+    wd.note_quote(T0)
+    clock.advance(61)
+    await wd.tick()
+    assert kill.level() is KillLevel.SOFT and kill.reason() == QUOTE_SILENCE
+
+
+def test_reconcile_failing_of_a_measure_only_lane_alarms_without_killing(wd, kill, notifier, journal):
+    """F5: RECONCILE_FAILING pasma tylko mierzącego → alarm i zdarzenie (raz do udanego przebiegu), bez kill switcha;
+    pasmo live (tu US100) jak dotąd: kill SOFT."""
+    wd.set_measure_only(lambda epic: epic == "US500")
+    for _ in range(5):
+        wd.note_reconcile_error("BrokerError", "x", epic="US500")
+    assert kill.level() is KillLevel.NONE
+    assert alerts_with(notifier, f"{RECONCILE_FAILING} (US500)")
+    assert len(watchdog_events(journal, RECONCILE_FAILING)) == 1
+    wd.note_reconcile_ok(epic="US500")
+    for _ in range(3):
+        wd.note_reconcile_error("BrokerError", "x", epic="US500")
+    assert len(watchdog_events(journal, RECONCILE_FAILING)) == 2 and kill.level() is KillLevel.NONE
+    for _ in range(3):
+        wd.note_reconcile_error("BrokerError", "x", epic="US100")
+    assert kill.level() is KillLevel.SOFT and kill.reason() == RECONCILE_FAILING
+
+
+async def test_a_failing_measure_only_view_counts_as_live(wd, clock, kill):
+    """F5: widok, który rzuca, nie może wyłączyć kill switcha (strona ostrożna)."""
+
+    def broken(_epic):
+        raise RuntimeError("view failed")
+
+    wd.set_measure_only(broken)
+    wd.set_session_window(T0, CLOSE, epic="US500")
+    wd.note_quote(T0, epic="US500")
+    for _ in range(13):
+        clock.advance(5)
+        wd.note_quote(clock.now_utc())
+    await wd.tick()
+    assert kill.level() is KillLevel.SOFT and kill.reason() == QUOTE_SILENCE

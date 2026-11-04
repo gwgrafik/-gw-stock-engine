@@ -489,6 +489,8 @@ class Engine:
         self.reconciler = reconciler if reconciler is not None else self._build_reconciler()
         for loaded in extra:
             self._add_lane(loaded)
+        if lanes_mode:  # pasmo dry_run tylko mierzy: jego cisza i awarie uzgadniania bez kill switcha procesu (F5)
+            self.watchdog.set_measure_only(self._lane_measure_only)
         self._lock = lock if lock is not None else InstanceLock(self.data_dir / LOCK_FILE)
         self._shutdown = False
         self._stop_logged = False
@@ -656,6 +658,16 @@ class Engine:
         if lane.executor is None or not lane.executor.live:
             return "LANE_DRY_RUN_NO_ORDERS"
         return None
+
+    def _lane_measure_only(self, epic: str) -> bool:
+        """Czy kolejne pasmo `epic` tylko mierzy (rozstrzygnięcie kontrolera, F5): wykonawca dry_run (nieuzbrojone
+        albo zdegradowane pasmo, albo proces dry_run) I brak pozycji innej niż FLAT oraz nierozstrzygniętego zlecenia
+        tego instrumentu (nieczytelny dziennik: nie). Takie pasmo nie włącza kill switcha procesu z powodu własnej
+        ciszy notowań ani awarii uzgadniania (tylko alarm); pasmo DE40 i pasmo live bez zmian."""
+        lane = self._lane_by_epic.get(epic)
+        if lane is None or lane.executor is None or lane.executor.live:
+            return False
+        return not self._epic_needs_management(epic)
 
     def _close_key(self, deal_id: str) -> str | None:
         """Klucz zamkniętego rynku dla zamykanego deala: None dla DE40 v1, `epic` kolejnego pasma, "?" nieznany."""

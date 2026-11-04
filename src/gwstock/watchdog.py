@@ -28,6 +28,10 @@ Wiele pasm (projekt §2.8): okno sesji, ostatnie notowanie i liczniki uzgadniani
 instrument (`epic=...`; bez niego pasmo dotychczasowe DE40 v1, zachowanie jak dotąd). Notowanie jednego instrumentu
 nie karmi straży ciszy innego (A7), a udany przebieg uzgadniania jednego pasma nie zeruje awarii drugiego (A8).
 Przyczyny kill switcha są wspólne (portfel, R3); alarmy kolejnych pasm mają nazwę instrumentu w treści i w kluczu.
+Wyjątek (przegląd zadania 12, F5): kolejne pasmo „tylko mierzące” (`set_measure_only`: dry_run bez pozycji i zleceń)
+nie zatrzymuje wejść live innych pasm przez wspólny kill switch z powodu WŁASNEJ ciszy notowań (QUOTE_SILENCE) ani
+awarii uzgadniania (RECONCILE_FAILING): wtedy tylko alarm i zdarzenie nadzoru (`kill` = False, raz na epizod). Pasmo
+dotychczasowe (DE40) i pasmo live bez zmian; widok, który rzuca, to pasmo live (kill SOFT).
 
 Tętno: JSON `{ts, mode, state, last_quote_ts, kill_level}` (z kolejnymi pasmami także `lanes`) zapisywany atomowo (plik tymczasowy w tym samym katalogu
 + `os.replace`); nieudany zapis zostawia poprzedni plik i nie przerywa pracy. `health` sprawdza świeżość po `ts`.
@@ -42,6 +46,7 @@ import fcntl
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -233,6 +238,8 @@ class Watchdog:
         self._last_quotes: dict[str | None, datetime] = {}
         self._reconcile_errors_by: dict[str | None, int] = {}
         self._reconcile_skips_by: dict[str | None, int] = {}
+        self._measure_only: Callable[[str], bool] | None = None
+        self._measure_reported: set[tuple[str, str]] = set()  # (przyczyna, epic) z wpisem w bieżącym epizodzie
         self._mode = ""
         self._state = ""
         self._login_failures = 0  # porażki z rzędu (dowolne): kill miękki przy limicie
@@ -273,6 +280,29 @@ class Watchdog:
             self._windows.pop(epic, None)
             return
         self._windows[epic] = _Window(start, end, self._now())
+
+    def set_measure_only(self, view: Callable[[str], bool] | None) -> None:
+        """Widok silnika: czy kolejne pasmo `epic` tylko mierzy (dry_run bez pozycji i zleceń). Dla takiego pasma
+        QUOTE_SILENCE i RECONCILE_FAILING to alarm i zdarzenie bez kill switcha (F5). None: każde pasmo jak live."""
+        self._measure_only = view
+
+    def _is_measure_only(self, epic: str | None) -> bool:
+        if epic is None or self._measure_only is None:
+            return False
+        try:
+            return self._measure_only(epic) is True
+        except Exception as exc:  # nie wiadomo: strona ostrożna (kill jak dla pasma live)
+            _LOG.warning("measure-only view failed for %s: %s: %s", epic, type(exc).__name__, exc)
+            return False
+
+    def _measure_only_alarm(self, code: str, epic: str, message: str, **details: Any) -> None:
+        """Pasmo tylko mierzące: alarm (ograniczany) i zdarzenie nadzoru raz na epizod, bez kill switcha."""
+        self._alert_keyed(
+            _keyed(code, epic), "WARN", f"{message}; the lane is dry_run (measuring only): alarm only, no kill switch"
+        )
+        if (code, epic) not in self._measure_reported:
+            self._measure_reported.add((code, epic))
+            self._event(code, epic=epic, kill=False, **details)
 
     def rearm_silence(self) -> None:
         """Cisza notowań liczona od teraz we WSZYSTKICH oknach (po długim wejściu, w trakcie którego pętla nie
@@ -361,14 +391,19 @@ class Watchdog:
                     "cannot be booked until it can; the owner checks the Capital.com activity",
                 )
         if n >= RECONCILE_FAILURE_LIMIT:
-            self._kill.soft(RECONCILE_FAILING)
             message = f"{RECONCILE_FAILING}{lane}: {n} reconciliation passes failed in a row ({exc_type})"
+            if epic is not None and self._is_measure_only(epic):
+                self._measure_only_alarm(RECONCILE_FAILING, epic, message, failures=n, error=exc_type)
+                return
+            self._kill.soft(RECONCILE_FAILING)
             self._alert_keyed(_keyed(RECONCILE_FAILING, epic), "ERROR", message)
 
     def note_reconcile_ok(self, *, epic: str | None = None) -> None:
         """Udany przebieg uzgadniania pasma `epic` (None: dotychczasowe): zeruje liczniki TYLKO tego pasma."""
         self._reconcile_errors_by[epic] = 0
         self._reconcile_skips_by[epic] = 0
+        if epic is not None:
+            self._measure_reported.discard((RECONCILE_FAILING, epic))
 
     def note_reconcile_skipped(self, *, epic: str | None = None) -> None:
         n = self._reconcile_skips_by.get(epic, 0) + 1
@@ -407,12 +442,17 @@ class Watchdog:
                 ref = last
             silent = (now - ref).total_seconds()
             if silent > self._risk.stale_quote_s:
-                self._kill.soft(QUOTE_SILENCE)
                 message = (
                     f"{QUOTE_SILENCE}{_lane_text(epic)}: no fresh quote for {silent:.0f} s "
                     f"(limit {self._risk.stale_quote_s} s)"
                 )
+                if epic is not None and self._is_measure_only(epic):
+                    self._measure_only_alarm(QUOTE_SILENCE, epic, message, silent_s=int(silent))
+                    continue
+                self._kill.soft(QUOTE_SILENCE)
                 self._alert_keyed(_keyed(QUOTE_SILENCE, epic), "ERROR", message)
+            elif epic is not None:
+                self._measure_reported.discard((QUOTE_SILENCE, epic))
 
     def _check_unknown_sources(self) -> None:
         count = getattr(self._broker, "unknown_close_sources", None)
