@@ -13,6 +13,7 @@ from decimal import Decimal
 
 import pytest
 
+from gwstock.broker.capitalcom import CapitalComBroker
 from gwstock.broker.diagnostics import FieldsRead, SettlementRow
 from gwstock.types import BrokerError, Side, TargetedEntryRequest
 
@@ -27,8 +28,12 @@ def server(fake_capital_server):
 
 
 @pytest.fixture
-def broker(capital_broker):
-    return capital_broker
+def broker(fake_capital_server, capital_credentials, capital_http, clock):
+    """Adapter z `target_epics={"DE40"}`: DE40 gra tu rolę instrumentu pasma z celem (jak w prawdziwej próbie pasma, w której
+    `build_engine` przekazuje adapterowi epiki pasm z celem; dla epików spoza zbioru adapter nie otwiera pozycji z celem)."""
+    return CapitalComBroker(
+        capital_credentials, capital_http, clock, base_url=fake_capital_server.base_url, target_epics=frozenset({"DE40"})
+    )
 
 
 async def open_targeted(broker) -> tuple[str, str]:
