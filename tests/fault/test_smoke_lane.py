@@ -568,3 +568,62 @@ async def test_a_hard_kill_during_the_hold_skips_the_diagnostics_and_flattens_at
         assert method not in broker.calls, method
     assert broker.positions == {}
     assert any(x.startswith("FAIL [4] diagnostics skipped: hold stopped (kill switch HARD") for x in lines), lines
+
+
+# --- uczciwość ustalenia C5d (przegląd S3) ---------------------------------------------------------------------------
+#
+# OCZEKIWANE: `set_stop` w [6] wysyła stop o jeden krok BLIŻEJ ceny (prawdziwa zmiana dla PUT; nie dalej od ceny), gdy
+# nadal spełnia minimalną odległość brokera, a przywrócenie wraca do odczytanego poziomu; bez przesunięcia ustalenie
+# mówi wprost „dla PUT bez zmiany stopu”. Punkt odniesienia celu to świeży odczyt tuż przed `set_stop`; po nieudanym
+# [5] C5d to NIE USTALONO. Nieudane przywrócenie celu: [7] i tak zamyka, a linia LOUD nie twierdzi, że cel został.
+
+
+def recording(monkeypatch, broker, method):
+    """Zapisuje argumenty wywołań `method` brokera (`calls` trzyma tylko nazwy)."""
+    real = getattr(broker, method)
+    seen: list[tuple] = []
+
+    async def wrapper(*args):
+        seen.append(args)
+        return await real(*args)
+
+    monkeypatch.setattr(broker, method, wrapper)
+    return seen
+
+
+async def test_set_stop_moves_the_stop_one_step_closer_and_the_restore_puts_it_back(engine, broker, monkeypatch):
+    stops = recording(monkeypatch, broker, "set_stop")
+    protections = recording(monkeypatch, broker, "set_protection")
+    code, lines = await run(engine)
+    assert code == 0, "\n".join(lines)
+    [(_, moved)] = stops
+    assert moved == D("7587.9")  # stop 7587,8 o krok 0,1 bliżej ceny (BUY: w górę)
+    assert protections[-1][1] == D("7587.8")  # przywrócony odczytany poziom
+    assert finding(lines, "C5d") == "C5d POTWIERDZONE: PUT z samym stopLevel ZACHOWAŁ cel (stop zmieniony o krok)"
+    assert any(x.startswith("PASS [6] set_stop with the stop only 7587.9 (one step closer than 7587.8)")
+               for x in lines), "\n".join(lines)  # fmt: skip
+
+
+async def test_an_unchanged_stop_is_named_in_the_c5d_finding(engine, broker, monkeypatch):
+    monkeypatch.setattr(smoke_lane_mod._Probe, "_closer_stop", lambda self, stop, rules, quote: stop)
+    stops = recording(monkeypatch, broker, "set_stop")
+    code, lines = await run(engine)
+    assert code == 0, "\n".join(lines)
+    assert stops[0][1] == D("7587.8")
+    assert finding(lines, "C5d") == "C5d POTWIERDZONE: dla PUT bez zmiany stopu: PUT z samym stopLevel ZACHOWAŁ cel"
+    assert any(x.startswith("PASS [6] set_stop with the stop only 7587.8 (unchanged") for x in lines)
+
+
+async def test_the_stop_is_not_moved_closer_than_the_broker_minimum(engine, broker, monkeypatch):
+    from gwstock.types import Side
+
+    rules = await broker.instrument_rules(US)
+    probe = smoke_lane_mod._Probe(engine, US, lambda _: None)
+    probe.side = Side.BUY
+    q = Quote(US, D("7589.2"), D("7589.8"), PROBE_AT)
+    assert probe._closer_stop(D("7587.8"), rules, q) == D("7587.9")
+    assert probe._closer_stop(D("7588.6"), rules, q) == D("7588.6")  # 7588,7 byłoby 0,5 od bid: za blisko
+    assert probe._closer_stop(D("7588.5"), rules, q) == D("7588.6")  # 0,6 od bid: minimum 0,5 + krok
+    probe.side = Side.SELL
+    assert probe._closer_stop(D("7591.8"), rules, q) == D("7591.7")
+    assert probe._closer_stop(D("7590.4"), rules, q) == D("7590.4")

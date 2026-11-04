@@ -17,8 +17,8 @@ Kroki (PASS/FAIL/INFO w stylu próby DE40, bez identyfikatorów deali i rachunk�
  `check_smoke` i bramka portfelowa jak przy wejściu pasma (brak kursu pary walutowej = brak próby, nic nie wysłano);
  [3] pozycja widoczna ze stopem i celem, potem wstrzymanie `--hold` (domyślnie `LANE_HOLD_DEFAULT_S`, najmniej
  `LANE_HOLD_MIN_S`) pod zwykłym nadzorem; [4] surowe pola celu z `GET /positions/{dealId}` i `GET /confirms` (C5);
- [5] `set_protection` z obu poziomami (cel o krok bliżej, gdy wolno) i ich weryfikacja; [6] `set_stop` z samym stopem,
- odczyt, czy cel przetrwał (C5d), i przywrócenie `set_protection`; [7] spłaszczenie przez silnik; [8] pozycja znikła,
+ [5] `set_protection` z obu poziomami (cel o krok bliżej, gdy wolno) i ich weryfikacja; [6] `set_stop` z samym stopem
+ o krok bliżej ceny (gdy wolno), odczyt, czy cel przetrwał (C5d), i przywrócenie `set_protection` z odczytanym stopem; [7] spłaszczenie przez silnik; [8] pozycja znikła,
  transakcja zaksięgowana w walucie instrumentu, przyczyna zamknięcia z historii (C7); [9] faza 2 w EUR (szacunek
  `ESTIMATED_FX`); [10] drugie zamknięcie odrzucone `POSITION_NOT_FOUND`; [11] historia transakcji i saldo (C8). Na
  końcu blok `USTALENIA O BROKERZE` z POTWIERDZONE / ROZBIEŻNE / NIE USTALONO dla C5, C5d, C7, C8.
@@ -572,6 +572,20 @@ class _Probe:
             return target
         return closer
 
+    def _closer_stop(self, stop: Decimal, rules: Any, quote: Any) -> Decimal:
+        """Stop o jeden krok bliżej bieżącej ceny (nigdy dalej od niej), gdy nadal leży co najmniej minimum brokera plus
+        krok od ceny, po której by zadziałał (BUY: bid, SELL: ask); inaczej ten sam poziom."""
+        step = rules.stop_step
+        if step <= 0:
+            return stop
+        if self.side is Side.BUY:
+            closer = stop + step
+            room = quote.bid - closer
+        else:
+            closer = stop - step
+            room = closer - quote.ask
+        return closer if room >= rules.min_stop_distance + step else stop
+
     async def _protection_step(self, report: TargetFieldsReport | None) -> bool:
         engine, plan = self.engine, self.plan
         assert plan is not None and self.open_level is not None
@@ -636,9 +650,15 @@ class _Probe:
             self.finding("C5d", UNKNOWN, "nie sprawdzono (brak pozycji ze stopem i znanym celem)")
             return
         stop, target = at_broker.stop_level, self.target_now
+        try:  # stop o krok bliżej ceny: prawdziwa zmiana dla PUT (ten sam poziom broker mógłby uznać za „nic do zmiany”)
+            rules = await engine.broker.instrument_rules(self.epic)
+            sent = self._closer_stop(stop, rules, await engine.broker.quote(self.epic))
+        except Exception:
+            sent = stop
+        moved = sent != stop
         set_stop_error = None
         try:
-            await engine.probe(engine.raw_broker.set_stop, self.deal_id, stop)
+            await engine.probe(engine.raw_broker.set_stop, self.deal_id, sent)
         except Exception as exc:
             set_stop_error = self.error(exc)
         after = None
@@ -651,24 +671,26 @@ class _Probe:
         was_shown, _ = _shown_target(before.position if before is not None else None, self.side, self.open_level)
         shown, level = _shown_target(after.position if after is not None else None, self.side, self.open_level)
         keys_now = after is not None and after.position.found and bool(after.position.target)
+        how = "" if moved else "dla PUT bez zmiany stopu: "  # bez przesunięcia: ustalenie tylko dla takiego PUT
         if set_stop_error is not None:
             kept = "unknown"
             self.finding("C5d", UNKNOWN, f"set_stop z samym stopem nieudane ({set_stop_error})")
         elif shown and level == target:
             kept = "kept"
-            self.finding("C5d", CONFIRMED, "PUT z samym stopLevel ZACHOWAŁ cel",
+            self.finding("C5d", CONFIRMED, f"{how}PUT z samym stopLevel ZACHOWAŁ cel"
+                         + (" (stop zmieniony o krok)" if moved else ""),
                          [f"cel po zmianie stopu: {level} (przed: {target})"])  # fmt: skip
         elif (shown and level is None) or (was_shown and not keys_now and after is not None and after.position.found):
             kept = "removed"
-            self.finding("C5d", DIVERGENT, "PUT z samym stopLevel SKASOWAŁ cel",
+            self.finding("C5d", DIVERGENT, f"{how}PUT z samym stopLevel SKASOWAŁ cel",
                          ["silnik dla pasm z celem i tak zawsze wysyła stop razem z celem (set_protection)"])  # fmt: skip
         elif shown:
             kept = f"changed to {level}"
-            self.finding("C5d", DIVERGENT, f"PUT z samym stopLevel ZMIENIŁ cel z {target} na {level}")
+            self.finding("C5d", DIVERGENT, f"{how}PUT z samym stopLevel ZMIENIŁ cel z {target} na {level}")
         else:
             kept = "not shown by the API"
-            self.finding("C5d", UNKNOWN, "API nie pokazuje celu: sprawdź w aplikacji (historia: EDIT_STOP_AND_LIMIT), "
-                                         "czy po zmianie stopu cel został")  # fmt: skip
+            self.finding("C5d", UNKNOWN, f"{how}API nie pokazuje celu: sprawdź w aplikacji (historia: "
+                                         "EDIT_STOP_AND_LIMIT), czy po zmianie stopu cel został")  # fmt: skip
         restored, text = False, "not attempted"
         try:
             await engine.probe(engine.raw_broker.set_protection, self.deal_id, stop, target)
@@ -677,7 +699,9 @@ class _Probe:
         else:
             restored, text = await self._verify(stop, target)
         ok = set_stop_error is None and restored
-        first = f"set_stop with the stop only {stop}" + (f" failed ({set_stop_error})" if set_stop_error else "")
+        change = f"one step closer than {stop}" if moved else "unchanged: no closer level within the broker minimum"
+        first = f"set_stop with the stop only {sent} ({change})" + (f" failed ({set_stop_error})" if set_stop_error
+                                                                     else "")  # fmt: skip
         self.step(6, ok, f"{first}; target after it: {kept}; set_protection restored: {text}")
 
     # --- [7] spłaszczenie ---
