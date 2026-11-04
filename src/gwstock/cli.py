@@ -11,6 +11,8 @@ Kolejne pasma (`config/lanes.toml`, projekt wielu pasm §6): pasmo jest live tyl
 warunki wyżej) ORAZ zamrożonym przez właściciela i zgodnym odcisku pasma (`python -m gwstock.prereg --lane EPIC
 --write`; `lane_arming_problem`), inaczej `dry_run` z powodem w `status`. Wielkość pasma zawsze minimalna. Polecenia
 `status`, `clear-kill`, `reset-position` i `resolve-lost-trade` przyjmują `--epic` (domyślnie pasmo DE40).
+`smoke --epic EPIC` to próba akceptacyjna pasma z celem (`gwstock.smoke_lane`, zadanie 17): proces live i pasmo
+włączone, bez zamrożonego odcisku pasma i bez zmiany jego trybu; `smoke` bez `--epic` działa dokładnie jak dotąd.
 
 Zmienne środowiskowe: `GW_CONFIG_DIR` (domyślnie `config`), `GW_DATA_DIR` (domyślnie `data`),
 `GW_CAPITALCOM_KEY_FILE` (domyślnie `/secrets/capitalcom.json`). Sekretów nie ma w logu ani w wyjściu poleceń;
@@ -31,7 +33,7 @@ import os
 import re
 import signal
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -562,9 +564,23 @@ async def smoke(engine: Engine, out: Callable[[str], None] = print, hold_s: int 
     return 0 if passed else 1
 
 
-async def _hold(engine: Engine, deal_id: str | None, hold_s: int, info: Callable[[int, str], None]) -> None:
-    """Wstrzymanie z otwartą pozycją próby: zwykły nadzór; wątpliwość → koniec wstrzymania (spłaszczenie od razu)."""
-    clock, epic = engine.clock, engine.strat.instrument
+async def _hold(
+    engine: Engine,
+    deal_id: str | None,
+    hold_s: int,
+    info: Callable[[int, str], None],
+    *,
+    epic: str | None = None,
+    reconcile: Callable[[], Awaitable[Any]] | None = None,
+    what: str = "its stop",
+) -> None:
+    """Wstrzymanie z otwartą pozycją próby: zwykły nadzór; wątpliwość → koniec wstrzymania (spłaszczenie od razu).
+
+    Domyślnie próba DE40 (instrument v1, `engine.reconcile_once`); próba pasma podaje `epic`, uzgadnianie pasma
+    (`reconcile`) i to, co właściciel ogląda w aplikacji (`what`)."""
+    clock = engine.clock
+    epic = engine.strat.instrument if epic is None else epic
+    reconcile = engine.reconcile_once if reconcile is None else reconcile
     start = clock.now_utc()
     end = start + timedelta(seconds=hold_s)
     next_print, next_reconcile = start, start
@@ -575,13 +591,13 @@ async def _hold(engine: Engine, deal_id: str | None, hold_s: int, info: Callable
             info(3, "hold finished: flattening now")
             return
         if now >= next_print:
-            info(3, f"holding {remaining:.0f} s more: look at the position and its stop in the Capital.com app")
+            info(3, f"holding {remaining:.0f} s more: look at the position and {what} in the Capital.com app")
             next_print += timedelta(seconds=SMOKE_HOLD_COUNTDOWN_S)
         doubt = None
         engine.kill.scan_files()
         if now >= next_reconcile:
             next_reconcile += timedelta(seconds=engine.risk.reconcile_interval_s)
-            result = await engine.reconcile_once()
+            result = await reconcile()
             if result is None or result.skipped or result.blocked:
                 doubt = "reconciliation failed or blocked"
         try:
@@ -611,7 +627,16 @@ async def _still_at_broker(engine: Engine, deal_id: str | None) -> bool | None:
     return any(p.deal_id == deal_id for p in positions)
 
 
-async def _close_after_interrupt(engine: Engine, deal_id: str | None, out: Callable[[str], None]) -> None:
+async def _close_after_interrupt(
+    engine: Engine,
+    deal_id: str | None,
+    out: Callable[[str], None],
+    *,
+    executor: Any = None,
+    step: int = 4,
+    name: str | None = None,
+    hint: str = LEFT_OPEN_HINT,
+) -> None:
     """Po przerwaniu wstrzymania: zamknięcie pozycji próby osłonięte przed kolejnym anulowaniem (biegnie jako osobne
     zadanie, a kolejne przerwania nie kończą czekania na nie, najwyżej `SMOKE_CLOSE_WAIT_SUBMITS` × submit_timeout_s);
     dopiero potem linia wyniku, a gdy się nie udało, głośna linia, co zostało u brokera i co zrobić.
@@ -619,11 +644,16 @@ async def _close_after_interrupt(engine: Engine, deal_id: str | None, out: Calla
     Najpierw procedura awaryjna wykonawcy (dziennik wg możliwości); jeśli broker nadal pokazuje deal (na przykład
     dziennik leży), jedno bezpośrednie zamknięcie po dealId: to nasza pozycja próby, a zamknięcie bez dziennika
     uzgadnianie silnika zaksięguje później z historii. Bez czytelnej listy pozycji nic nie wysyłamy na ślepo.
+
+    Domyślnie próba DE40 (wykonawca v1, krok 4, deal po identyfikatorze); próba pasma podaje wykonawcę próby, numer
+    kroku spłaszczenia, nazwę pozycji bez identyfikatora (`name`) i podpowiedź dla właściciela (`hint`).
     """
+    executor = engine.executor if executor is None else executor
+    name = f"deal {deal_id}" if name is None else name
 
     async def attempt() -> None:
         try:
-            await engine.executor.emergency_flatten()
+            await executor.emergency_flatten()
         except Exception as exc:
             _LOG.warning("smoke emergency close via the executor failed: %s: %s", type(exc).__name__, exc)
         if await _still_at_broker(engine, deal_id):
@@ -650,9 +680,9 @@ async def _close_after_interrupt(engine: Engine, deal_id: str | None, out: Calla
             _LOG.warning("smoke close after an interrupt was itself interrupted: %s; still waiting for the close",
                          type(exc).__name__)  # fmt: skip
     if await _still_at_broker(engine, deal_id) is not False:
-        out(f"FAIL [4] LOUD: deal {deal_id} {LEFT_OPEN_HINT}")
+        out(f"FAIL [{step}] LOUD: {name} {hint}")
     else:
-        out(f"INFO [4] deal {deal_id} closed after the interrupt; the engine's reconciliation books it if needed")
+        out(f"INFO [{step}] {name} closed after the interrupt; the engine's reconciliation books it if needed")
 
 
 @contextlib.contextmanager
@@ -1997,10 +2027,16 @@ def _engine_stopped(paths: Paths):
         lock.release()
 
 
-async def _smoke_engine(paths: Paths, hold_s: int = 0) -> int:
+async def _smoke_engine(paths: Paths, hold_s: int | None = 0, epic: str | None = None) -> int:
+    """`smoke` (DE40, bez `epic`: dokładnie jak dotąd) albo próba pasma `smoke --epic` (`gwstock.smoke_lane`)."""
+
     async def run(engine: Engine) -> int:
         with _stop_on_signals(engine):  # Ctrl-C/SIGTERM w trakcie wstrzymania: zamknięcie zamiast porzucenia pozycji
-            return await smoke(engine, hold_s=hold_s)
+            if epic is None:
+                return await smoke(engine, hold_s=hold_s)
+            from gwstock.smoke_lane import smoke_lane
+
+            return await smoke_lane(engine, epic, hold_s=hold_s)
 
     with _engine_stopped(paths) as lock:  # nigdy obok działającego silnika: blokada najpierw
         return await _with_engine(paths, run, lock=lock)
@@ -2055,7 +2091,10 @@ def _cmd_run(paths: Paths, args: argparse.Namespace) -> int:
 
 
 def _cmd_smoke(paths: Paths, args: argparse.Namespace) -> int:
-    return asyncio.run(_smoke_engine(paths, getattr(args, "hold", 0)))
+    hold, epic = getattr(args, "hold", None), getattr(args, "epic", None)
+    if epic is None:  # próba DE40: dokładnie jak dotąd
+        return asyncio.run(_smoke_engine(paths, 0 if hold is None else hold))
+    return asyncio.run(_smoke_engine(paths, hold, epic=epic))
 
 
 def _cmd_clear_kill(paths: Paths, args: argparse.Namespace) -> int:
@@ -2097,7 +2136,8 @@ COMMANDS: dict[str, Callable[[Paths, argparse.Namespace], int]] = {
 _HELP = {
     "run": "run the engine (default without a command)",
     "bind-account": "choose the trading account (owner, interactive)",
-    "smoke": "L0 acceptance probe: one minimal entry with a stop, closed at once (live only)",
+    "smoke": "L0 acceptance probe: one minimal entry with a stop, closed at once (live only); --epic: the lane probe "
+    "with a profit target (findings C5, C5d, C7, C8)",
     "status": "read-only state: mode, kill switch, position, orders, heartbeat, last decision, today's trades",
     "health": "exit 0 if the heartbeat is fresher than 120 s (Docker healthcheck)",
     "clear-kill": "owner: clear the kill switch (engine stopped; asks for CLEAR)",
@@ -2134,8 +2174,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", metavar="command")
     parsers = {name: sub.add_parser(name, help=_HELP[name]) for name in COMMANDS}
     parsers["smoke"].add_argument(
-        "--hold", type=_hold_seconds, default=0, metavar="SECONDS",
-        help=f"keep the probe position open for 0-{SMOKE_HOLD_MAX_S} s under normal supervision before closing it",
+        "--hold", type=_hold_seconds, default=None, metavar="SECONDS",
+        help=f"keep the probe position open for 0-{SMOKE_HOLD_MAX_S} s under normal supervision before closing it "
+        "(default 0; with --epic 20, at least 15)",
+    )  # fmt: skip
+    parsers["smoke"].add_argument(
+        "--epic", type=_epic_name, default=None, metavar="EPIC",
+        help="lane probe on this instrument (an enabled lane in config/lanes.toml, e.g. US500); default: the DE40 probe",
     )  # fmt: skip
     for name in ("clear-kill", "reset-position", "resolve-lost-trade"):
         parsers[name].add_argument("--by", type=_owner_name, required=True, help="who does it (audit trail)")
