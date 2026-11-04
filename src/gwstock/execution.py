@@ -62,6 +62,12 @@ Niezmienniki (prawdziwe pieniądze):
   dziennik → tylko ostatni NASZ deal tego procesu na instrumencie pasma (nigdy deal innego pasma), który lista
   brokera właśnie pokazuje (EMERGENCY_FLATTEN_JOURNAL_UNREADABLE); bez FLAT → alarm EMERGENCY_FLATTEN_INCOMPLETE (pozycja pod nadzorem, kill switch zostaje HARD do
   decyzji właściciela); alarm JOURNAL_WRITE_FAILED po procedurze zamknięcia mówi, czy zamknięcie poszło do brokera;
+- pasmo (`LaneSpec`): instrument, straż poślizgu, limit straty transakcji i kalendarz dnia księgowania; pasmo DE40 v1
+  (`LaneSpec.from_v1`, także domyślnie z konfiguracji v1) zachowuje się bajt w bajt jak dotąd; pasmo z celem zysku
+  wchodzi wyłącznie `TargetedEntryRequest` i zabezpiecza stop razem z celem (`set_protection`);
+- pasmo w walucie obcej (`FxView`, projekt §7.3): bramka, straż wielkości i odległość stopu z limitu straty liczą w
+  walucie rachunku po kursie niekorzystnym; bez ważnego kursu wejście jest zablokowane (FX_UNAVAILABLE), straż
+  wielkości przyjmuje kwotę w walucie instrumentu tylko jako górne ograniczenie (parytet), inaczej zamyka pozycję;
 - wyjść nie blokuje ani bramka, ani kill switch; awaria notyfikatora nie przerywa przebiegu; każda surowa odpowiedź
   brokera trafia do dziennika przed interpretacją, a każda zmiana stanu pozycji przechodzi przez automat stanów.
 
@@ -162,6 +168,12 @@ ENTRY_UNRESOLVED = "ENTRY_UNRESOLVED"
 # plan bez celu (nigdy cicho pozycja bez celu) albo pasmo bez celu plan z celem.
 TARGET_MISSING = "TARGET_MISSING"
 TARGET_NOT_SUPPORTED = "TARGET_NOT_SUPPORTED"
+# Pasmo w walucie obcej bez ważnego kursu z `FxView`: wejście zablokowane (`gate_block`, nic do brokera).
+FX_UNAVAILABLE = "FX_UNAVAILABLE"
+# Skąd kwota ryzyka straży wielkości pasma w walucie obcej (pole `fx` zdarzenia SIZE_MISMATCH_RISK).
+FX_RATE = "RATE"  # ważny kurs, strona niekorzystna
+FX_PAR_BOUND = "PAR_BOUND"  # bez kursu; kwota w walucie instrumentu jest górnym ograniczeniem (parytet)
+FX_NONE = "UNAVAILABLE"  # bez kursu i bez ograniczenia: straż zamyka
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 GUARD_EXIT_UNPERSISTED = "GUARD_EXIT_UNPERSISTED"  # straż chce zamknąć, a dziennik nie zapisze EXITING: HARD i awaryjne
 DAILY_LOSS = "DAILY_LOSS"
@@ -446,13 +458,20 @@ class Executor:
             self._refuse(TARGET_MISSING if self._lane.uses_target else TARGET_NOT_SUPPORTED, day)
             return None
         quote = signal.decision_quote
+        vpp_account = rules.value_per_point
+        if self._foreign:  # bramka liczy w walucie rachunku: wartość punktu po kursie niekorzystnym (projekt §7.3)
+            converted = self._to_account(rules.value_per_point)
+            if converted is None:
+                self._fx_unavailable(day, smoke)
+                return None
+            vpp_account = converted
         candidate = EntryCandidate(
             epic=self._epic,
             side=signal.side,
             size=signal.size,
             stop_distance=signal.stop_distance,
             entry_price=quote.mid,  # ta sama baza co wielkość strategii (dźwignia od mid)
-            value_per_point=rules.value_per_point,
+            value_per_point=vpp_account,
             margin_rate=rules.margin_rate,
             quote_age_s=(signal_ts - quote.ts).total_seconds(),
         )
@@ -506,9 +525,50 @@ class Executor:
         }
         if target is not None:  # tylko pasma z celem: kontekst DE40 v1 bajt w bajt
             context["target_distance"] = target
+        if self._foreign:  # `value_per_point` zostaje w walucie instrumentu (księga), obok wartość w walucie rachunku
+            context["currency"] = self._lane.currency
+            context["value_per_point_account"] = vpp_account
         self._journal.set_meta(ctx_key, dump(context))
         self._journal.set_meta(META_ENTRY_LAST.format(self._epic), client_id)
         return request
+
+    def _fx_unavailable(self, day: date, smoke: bool) -> None:
+        """Wejście pasma w walucie obcej bez ważnego kursu: blokada (jak bramka), nic do brokera, bez zgadywania."""
+        self._alert("WARN", f"{FX_UNAVAILABLE}: no valid {self._lane.currency} rate for {self._epic}; no entry")
+        block: dict[str, Any] = {
+            "reasons": [FX_UNAVAILABLE], "epic": self._epic, "currency": self._lane.currency, "day": day.isoformat()
+        }
+        if smoke:
+            block["smoke"] = True
+        self._append(SOURCE_GATE_BLOCK, block)
+
+    def _to_account(self, amount: Decimal) -> Decimal | None:
+        """Kwota w walucie instrumentu → waluta rachunku po kursie niekorzystnym (`FxView.to_account`); pasmo w
+        walucie rachunku: bez zmian. None: brak ważnego kursu (także wyjątek albo wartość, która nie jest skończonym
+        `Decimal` >= 0, i zero za kwotę dodatnią)."""
+        if not self._foreign:
+            return amount
+        assert self._fx is not None and self._lane.currency is not None  # konstruktor (`_foreign`)
+        try:
+            value = self._fx.to_account(amount, self._lane.currency)
+        except Exception:
+            return None
+        if not isinstance(value, Decimal) or not value.is_finite() or value < 0 or (amount > 0 and value == 0):
+            return None
+        return value
+
+    def _to_account_bound(self, amount: Decimal) -> tuple[Decimal | None, str]:
+        """Jak `_to_account`, ale bez kursu kwota w walucie instrumentu, gdy jest górnym ograniczeniem (parytet,
+        `FxView.par_is_upper_bound`); inaczej None. Zwraca też źródło (FX_RATE, FX_PAR_BOUND, FX_NONE)."""
+        value = self._to_account(amount)
+        if value is not None:
+            return value, FX_RATE
+        assert self._fx is not None and self._lane.currency is not None
+        try:
+            par = self._fx.par_is_upper_bound(self._lane.currency) is True
+        except Exception:
+            par = False
+        return (amount, FX_PAR_BOUND) if par else (None, FX_NONE)
 
     def _refuse(self, reason: str, day: date) -> None:
         """Plan niezgodny z pasmem: alarm i zdarzenie, nic do brokera (także bez odczytu konta)."""
@@ -784,8 +844,14 @@ class Executor:
             distance = stop_distance
         else:  # wywołujący gwarantuje stop albo odległość: straży ryzyka nigdy nie pomijamy po cichu
             raise ValueError(f"fill guard of {position.deal_id}: neither a stop level nor a stop distance")
-        risk = position.size * distance * value_per_point
-        if risk > self._lane.max_loss_per_trade:
+        risk: Decimal | None = position.size * distance * value_per_point
+        if self._foreign:
+            # ryzyko w walucie instrumentu → waluta rachunku; bez kursu parytet tylko jako górne ograniczenie,
+            # inaczej straż zamyka (wyjście nie czeka na kurs, projekt §7.3)
+            assert risk is not None
+            extra = {**extra, "currency": self._lane.currency, "risk_instrument": risk}
+            risk, extra["fx"] = self._to_account_bound(risk)
+        if risk is None or risk > self._lane.max_loss_per_trade:
             causes.append(SIZE_MISMATCH_RISK)
             self._event(
                 SIZE_MISMATCH_RISK, best_effort=failures, deal_id=position.deal_id, size=position.size,
@@ -1423,7 +1489,10 @@ class Executor:
             self._raw_error(SOURCE_RULES, exc, best_effort=failures, deal_id=position.deal_id, context="protection")
             return None
         self._raw(SOURCE_RULES, best_effort=failures, deal_id=position.deal_id, context="protection", response=rules)
-        return _max_loss_distance(self._lane.max_loss_per_trade, position.size, position.open_level, rules)
+        vpp, _ = self._to_account_bound(rules.value_per_point)  # bez kursu i parytetu: brak odległości (HARD)
+        if vpp is None:
+            return None
+        return _max_loss_distance(self._lane.max_loss_per_trade, position.size, position.open_level, rules, vpp)
 
     # --- księgowanie --------------------------------------------------------------------------------------
 
@@ -1831,10 +1900,14 @@ def _ctx_time(ctx: dict[str, Any], key: str) -> datetime:
     return value
 
 
-def _max_loss_distance(max_loss: Decimal, size: Decimal, open_level: Decimal, rules: InstrumentRules) -> Decimal | None:
+def _max_loss_distance(
+    max_loss: Decimal, size: Decimal, open_level: Decimal, rules: InstrumentRules, vpp: Decimal | None = None
+) -> Decimal | None:
     """Odległość stopu, przy której strata to najwyżej `max_loss`: w dół (dokładnie, na ułamkach) do kroku stopu
-    brokera, a bez kroku do dokładności ceny otwarcia. None, gdy nie da się jej wyznaczyć."""
-    vpp = rules.value_per_point
+    brokera, a bez kroku do dokładności ceny otwarcia. `vpp`: wartość punktu w walucie `max_loss` (pasmo w walucie
+    obcej: po przeliczeniu), domyślnie z reguł brokera. None, gdy nie da się jej wyznaczyć."""
+    if vpp is None:
+        vpp = rules.value_per_point
     if not (size > 0 and vpp > 0 and max_loss > 0):
         return None
     step = rules.stop_step if rules.stop_step > 0 else Decimal(1).scaleb(open_level.as_tuple().exponent)

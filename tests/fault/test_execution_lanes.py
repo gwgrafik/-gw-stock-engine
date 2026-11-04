@@ -590,3 +590,115 @@ async def test_ensure_target_failure_is_an_alarm_never_a_kill(ut, fake, journal,
     assert len(alerts(notifier, "TARGET_ATTACH_FAILED")) == 1  # raz na deal
     assert len(events(journal, "TARGET_ATTACH_FAILED")) == 2
     assert kill.level() is KillLevel.NONE
+
+
+# --- waluta obca: przeliczenia przez FxView (projekt §7.3) -------------------------------------------------
+
+
+async def test_foreign_entry_is_judged_in_the_account_currency_and_keeps_both_values(us, fx, fake, journal, plan):
+    rec = await us.enter(plan, US_RULES, DAY)
+    assert rec.state is O.CONFIRMED and fake.calls == ["account", "open_position", "confirm"]
+    assert (D("1"), "USD") in fx.asked  # wartość punktu przeliczona przed bramką
+    ctx = json.loads(journal.get_meta(f"entry_ctx:{US_CID}"))
+    assert ctx["value_per_point"] == "1" and ctx["currency"] == "USD"  # księga w walucie instrumentu
+    assert ctx["value_per_point_account"] == "0.95"
+
+
+async def test_foreign_entry_over_the_loss_limit_only_after_conversion_is_blocked(us, fx, fake, journal, us_quote):
+    fx.factor = D("2")  # 1 USD = 2 EUR (kurs niekorzystny): 0,60 USD ryzyka to 1,20 EUR > 1,00 EUR
+    plan = BarEntryPlan(Side.BUY, D("0.01"), D("60"), US_TARGET_D, us_quote)  # nominał 151,67 EUR < 200 EUR
+    assert await us.enter(plan, US_RULES, DAY) is None
+    assert fake.calls == ["account"]
+    [block] = payloads(journal, "gate_block")
+    assert block["reasons"] == ["LOSS_PER_TRADE"] and block["candidate"]["value_per_point"] == "2"
+
+
+@pytest.mark.parametrize("par_upper", [True, False])
+async def test_foreign_entry_without_a_valid_rate_is_blocked_before_any_broker_call(
+    us, fx, fake, journal, plan, notifier, kill, par_upper
+):
+    fx.factor, fx.par_upper = None, par_upper  # parytet nigdy nie wystarcza do wejścia
+    assert await us.enter(plan, US_RULES, DAY) is None
+    assert fake.calls == [] and journal.count_orders(DAY) == 0
+    [block] = payloads(journal, "gate_block")
+    assert block["reasons"] == ["FX_UNAVAILABLE"] and block["currency"] == "USD" and block["epic"] == "US500"
+    assert alerts(notifier, "FX_UNAVAILABLE") and kill.level() is KillLevel.NONE
+
+
+@pytest.mark.parametrize("bad", [D("-1"), D("NaN"), 1.0, "0.95", RuntimeError("feed down")], ids=repr)
+async def test_a_broken_fx_view_counts_as_no_rate(us, fx, fake, journal, plan, monkeypatch, bad):
+    def broken(amount, currency):
+        if isinstance(bad, Exception):
+            raise bad
+        return bad
+
+    monkeypatch.setattr(fx, "to_account", broken)
+    assert await us.enter(plan, US_RULES, DAY) is None
+    assert payloads(journal, "gate_block")[0]["reasons"] == ["FX_UNAVAILABLE"] and fake.calls == []
+
+
+async def test_size_guard_in_usd_closes_when_the_eur_risk_is_over_the_limit(us, fx, fake, journal, plan, notifier):
+    fx.factor = D("1.2")
+    fake.fill_size_factor = D("9")  # broker wypełnił 0,09 zamiast 0,01: 0,90 USD ryzyka = 1,08 EUR > 1,00 EUR
+    rec = await us.enter(plan, US_RULES, DAY)
+    assert rec.state is O.CONFIRMED
+    [risk] = events(journal, "SIZE_MISMATCH_RISK")
+    assert D(risk["risk"]) == D("1.080") and D(risk["risk_instrument"]) == D("0.90") and risk["currency"] == "USD"
+    assert risk["fx"] == "RATE" and D(risk["limit"]) == D("1.00")
+    assert fake.positions == {} and fake.calls.count("close_position") == 1
+    assert journal.get_meta("fill_guarded:DEAL-1") == "SIZE_MISMATCH_RISK"
+
+
+async def test_size_guard_in_usd_passes_when_the_eur_risk_is_within_the_limit(us, fx, fake, journal, plan):
+    fake.fill_size_factor = D("9")  # 0,90 USD × 0,95 = 0,855 EUR ≤ 1,00 EUR (bez przeliczenia też przechodzi)
+    await us.enter(plan, US_RULES, DAY)
+    assert events(journal, "SIZE_MISMATCH_RISK") == [] and "DEAL-1" in fake.positions
+    assert journal.get_meta("fill_guarded:DEAL-1") == "PASS"
+
+
+@pytest.mark.parametrize(("par_upper", "closed"), [(True, False), (False, True)])
+async def test_size_guard_without_a_rate_uses_par_only_as_an_upper_bound_else_closes(
+    us, fx, fake, journal, plan, par_upper, closed
+):
+    fake.fill_size_factor = D("9")  # 0,90 USD: w parytecie poniżej 1,00 EUR
+    fx.par_upper = par_upper
+    fake.on_call("confirm", lambda: setattr(fx, "factor", None))  # kurs znika po wysłaniu wejścia
+    await us.enter(plan, US_RULES, DAY)
+    assert ("DEAL-1" not in fake.positions) is closed
+    found = events(journal, "SIZE_MISMATCH_RISK")
+    if closed:
+        assert found[0]["fx"] == "UNAVAILABLE" and found[0]["risk"] is None
+    else:
+        assert found == [] and journal.get_meta("fill_guarded:DEAL-1") == "PASS"
+
+
+async def test_adopted_usd_fill_without_context_is_guarded_in_eur(us, fx, fake, journal):
+    fx.factor = D("1.2")
+    hold(fake, journal, "US500", "DEAL-B", Side.BUY, D("0.09"), US_FILL, US_STOP)  # 0,90 USD = 1,08 EUR
+    assert await us.guard_adopted_fill() is True
+    assert fake.calls[0] == "instrument_rules" and "DEAL-B" not in fake.positions
+    assert D(events(journal, "SIZE_MISMATCH_RISK")[0]["risk"]) == D("1.080")
+
+
+@pytest.mark.parametrize(
+    ("factor", "par_upper", "expected"),
+    [
+        (D("1.25"), True, US_FILL - D("80.0")),  # 1,00 EUR / (0,01 × 1,25 EUR/pkt) = 80 pkt
+        (None, True, US_FILL - D("100.0")),  # bez kursu, parytet górnym ograniczeniem: 100 pkt (ciaśniej niż prawda)
+    ],
+)
+async def test_protection_distance_from_the_loss_limit_is_converted(us, fx, fake, kill, factor, par_upper, expected):
+    fx.factor, fx.par_upper = factor, par_upper
+    pos = OpenPosition("DEAL-B", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
+    fake.positions["DEAL-B"] = pos
+    assert await us.protect_unprotected(pos) is True
+    assert fake.positions["DEAL-B"].stop_level == expected and kill.level() is KillLevel.NONE
+
+
+async def test_protection_distance_without_a_rate_or_a_par_bound_goes_hard(us, fx, fake, journal, kill):
+    fx.factor, fx.par_upper = None, False
+    pos = OpenPosition("DEAL-B", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
+    fake.positions["DEAL-B"] = pos
+    journal.upsert_position(PositionRecord("US500", P.OPEN, "DEAL-B", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY))
+    assert await us.protect_unprotected(pos) is False
+    assert kill.level() is KillLevel.HARD and "set_protection" not in fake.calls and fake.positions == {}
