@@ -1,0 +1,111 @@
+{
+ "format": 1,
+ "scenario": "gate_blocked_quote_silence",
+ "config_sha256": {
+  "strategy_v1.toml": "fc3390cc333a04ee97f6773bcb331196fac86ec34b8ac3ba3a1bf0ed304c9a27",
+  "risk_v1.toml": "6f320cf34be9bc76e4f8cc99b7a34f62d7b0af5a18c290873dd3d75f19a08687",
+  "costs_v1.toml": "4e89f918991c20411fa7f45613c6544b6ce1844e263c6245c610e5764702e564"
+ },
+ "runs": [
+  {"label":"day","day":"2026-11-02","started":"2026-11-02T07:45:00+00:00","outcome":"REPORT","report":{"entries":0,"final_position_state":"FLAT","net_pnl":null,"skip_reason":"GATE_BLOCKED","day":"2026-11-02","mode":"live","interrupted":true,"notes":[]},"finished":"2026-11-02T08:20:00+00:00"}
+ ],
+ "clock_end": "2026-11-02T08:20:00+00:00",
+ "counts": {
+  "broker_calls": 736,
+  "raw_events": 365
+ },
+ "call_counts": {
+  "account": 2,
+  "candles_5m": 3,
+  "daily_candles": 1,
+  "instrument_rules": 2,
+  "keepalive": 5,
+  "list_accounts": 1,
+  "list_positions": 180,
+  "list_working_orders": 180,
+  "login": 1,
+  "quote": 361
+ },
+ "broker_calls": [
+  "2026-11-02T07:50:00+00:00 login",
+  "2026-11-02T07:50:00+00:00 list_accounts",
+  "2026-11-02T07:50:00+00:00 account",
+  "2026-11-02T07:50:00+00:00 quote [\"DE40\"]",
+  "2026-11-02T07:50:00+00:00 list_positions",
+  "2026-11-02T07:50:00+00:00 list_working_orders",
+  "2026-11-02T07:50:00+00:00 instrument_rules [\"DE40\"]",
+  "2026-11-02T07:50:00+00:00 daily_candles [\"DE40\",15]",
+  {"repeat":29,"every_s":"10","block":["2026-11-02T07:50:05+00:00 quote [\"DE40\"]","2026-11-02T07:50:10+00:00 quote [\"DE40\"]","2026-11-02T07:50:10+00:00 list_positions","2026-11-02T07:50:10+00:00 list_working_orders"]},
+  "2026-11-02T07:54:55+00:00 quote [\"DE40\"]",
+  "2026-11-02T07:55:00+00:00 quote [\"DE40\"]",
+  "2026-11-02T07:55:00+00:00 keepalive",
+  {"repeat":30,"every_s":"10","block":["2026-11-02T07:55:00+00:00 list_positions","2026-11-02T07:55:00+00:00 list_working_orders","2026-11-02T07:55:05+00:00 quote [\"DE40\"]","2026-11-02T07:55:10+00:00 quote [\"DE40\"]"]},
+  "2026-11-02T08:00:00+00:00 keepalive",
+  {"repeat":30,"every_s":"10","block":["2026-11-02T08:00:00+00:00 list_positions","2026-11-02T08:00:00+00:00 list_working_orders","2026-11-02T08:00:05+00:00 quote [\"DE40\"]","2026-11-02T08:00:10+00:00 quote [\"DE40\"]"]},
+  "2026-11-02T08:05:00+00:00 keepalive",
+  "2026-11-02T08:05:00+00:00 list_positions",
+  "2026-11-02T08:05:00+00:00 list_working_orders",
+  "2026-11-02T08:05:00+00:00 candles_5m [\"DE40\",\"2026-11-02T08:00:00+00:00\",\"2026-11-02T08:05:00+00:00\"]",
+  "2026-11-02T08:05:00+00:00 quote [\"DE40\"]",
+  "2026-11-02T08:05:00+00:00 instrument_rules [\"DE40\"]",
+  "2026-11-02T08:05:00+00:00 candles_5m [\"DE40\",\"2026-11-02T07:55:00+00:00\",\"2026-11-02T08:00:00+00:00\"]",
+  "2026-11-02T08:05:00+00:00 account",
+  {"repeat":29,"every_s":"10","block":["2026-11-02T08:05:05+00:00 quote [\"DE40\"]","2026-11-02T08:05:10+00:00 quote [\"DE40\"]","2026-11-02T08:05:10+00:00 list_positions","2026-11-02T08:05:10+00:00 list_working_orders"]},
+  "2026-11-02T08:09:55+00:00 quote [\"DE40\"]",
+  "2026-11-02T08:10:00+00:00 quote [\"DE40\"]",
+  "2026-11-02T08:10:00+00:00 keepalive",
+  "2026-11-02T08:10:00+00:00 list_positions",
+  "2026-11-02T08:10:00+00:00 list_working_orders",
+  "2026-11-02T08:10:00+00:00 candles_5m [\"DE40\",\"2026-11-02T07:55:00+00:00\",\"2026-11-02T08:10:00+00:00\"]",
+  {"repeat":29,"every_s":"10","block":["2026-11-02T08:10:05+00:00 quote [\"DE40\"]","2026-11-02T08:10:10+00:00 quote [\"DE40\"]","2026-11-02T08:10:10+00:00 list_positions","2026-11-02T08:10:10+00:00 list_working_orders"]},
+  "2026-11-02T08:14:55+00:00 quote [\"DE40\"]",
+  "2026-11-02T08:15:00+00:00 quote [\"DE40\"]",
+  "2026-11-02T08:15:00+00:00 keepalive",
+  {"repeat":29,"every_s":"10","block":["2026-11-02T08:15:00+00:00 list_positions","2026-11-02T08:15:00+00:00 list_working_orders","2026-11-02T08:15:05+00:00 quote [\"DE40\"]","2026-11-02T08:15:10+00:00 quote [\"DE40\"]"]},
+  "2026-11-02T08:19:50+00:00 list_positions",
+  "2026-11-02T08:19:50+00:00 list_working_orders",
+  "2026-11-02T08:19:55+00:00 quote [\"DE40\"]"
+ ],
+ "broker_final": {
+  "positions": []
+ },
+ "journal": {
+  "schema": [
+   ["kill_state","CREATE TABLE kill_state (\n        id INTEGER PRIMARY KEY CHECK (id = 1),\n        level INTEGER NOT NULL,\n        reason TEXT NOT NULL,\n        since TEXT NOT NULL)"],
+   ["meta","CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"],
+   ["orders","CREATE TABLE orders (\n        order_id TEXT PRIMARY KEY,\n        epic TEXT NOT NULL,\n        side TEXT NOT NULL,\n        size TEXT NOT NULL,\n        stop_distance TEXT NOT NULL,\n        state TEXT NOT NULL,\n        deal_reference TEXT,\n        deal_id TEXT,\n        created_at TEXT NOT NULL,\n        updated_at TEXT NOT NULL,\n        note TEXT NOT NULL)"],
+   ["positions","CREATE TABLE positions (\n        epic TEXT PRIMARY KEY,\n        state TEXT NOT NULL,\n        deal_id TEXT,\n        side TEXT,\n        size TEXT,\n        open_level TEXT,\n        stop_level TEXT,\n        opened_at TEXT)"],
+   ["raw_events","CREATE TABLE raw_events (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        source TEXT NOT NULL,\n        payload TEXT NOT NULL,\n        ts TEXT NOT NULL)"],
+   ["raw_events_source","CREATE INDEX raw_events_source ON raw_events (source, id)"],
+   ["realized_pnl","CREATE TABLE realized_pnl (day TEXT PRIMARY KEY, net TEXT NOT NULL)"],
+   ["sqlite_sequence","CREATE TABLE sqlite_sequence(name,seq)"],
+   ["trades","CREATE TABLE trades (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        deal_id TEXT NOT NULL UNIQUE,\n        exit_day TEXT NOT NULL,\n        instrument TEXT NOT NULL,\n        side TEXT NOT NULL,\n        size TEXT NOT NULL,\n        decision_bid TEXT NOT NULL,\n        decision_ask TEXT NOT NULL,\n        entry_fill TEXT NOT NULL,\n        exit_fill TEXT NOT NULL,\n        gross_pnl TEXT NOT NULL,\n        spread_cost TEXT NOT NULL,\n        slippage_penalty TEXT NOT NULL,\n        financing TEXT NOT NULL,\n        fees TEXT NOT NULL,\n        net_pnl TEXT NOT NULL,\n        signal_ts TEXT NOT NULL,\n        submit_ts TEXT NOT NULL,\n        confirm_ts TEXT NOT NULL,\n        exit_ts TEXT NOT NULL,\n        latency_ms INTEGER NOT NULL,\n        exit_reason TEXT NOT NULL)"]
+  ],
+  "kill_state": [
+   {"id":1,"level":1,"reason":"QUOTE_SILENCE","since":"2026-11-02T08:01:05+00:00"}
+  ],
+  "meta": [],
+  "orders": [],
+  "positions": [],
+  "raw_events": [
+   {"repeat":67,"every_s":"10","ids":2,"block":[{"id":1,"source":"broker.list_positions","ts":"2026-11-02T07:50:00+00:00","payload":{"response":[]}},{"id":2,"source":"broker.list_working_orders","ts":"2026-11-02T07:50:00+00:00","payload":{"response":[]}}]},
+   {"id":135,"source":"kill.audit","ts":"2026-11-02T08:01:05+00:00","payload":{"event":"ENGAGE","level":"SOFT","previous_level":"NONE","previous_reason":"","reason":"QUOTE_SILENCE","ts":"2026-11-02T08:01:05+00:00"}},
+   {"repeat":24,"every_s":"10","ids":2,"block":[{"id":136,"source":"broker.list_positions","ts":"2026-11-02T08:01:10+00:00","payload":{"response":[]}},{"id":137,"source":"broker.list_working_orders","ts":"2026-11-02T08:01:10+00:00","payload":{"response":[]}}]},
+   {"id":184,"source":"decision","ts":"2026-11-02T08:05:00+00:00","payload":{"atr":"300","candles_returned":[{"close":"25790","high":"25795","local":"09:00 CET","low":"25775","open":"25780","start":"2026-11-02T08:00:00+00:00"}],"day":"2026-11-02","decided_at":"2026-11-02T08:05:00+00:00","event":"DECISION","first_candle":{"close":"25790","epic":"DE40","high":"25795","low":"25775","open":"25780","start":"2026-11-02T08:00:00+00:00"},"first_candle_start_utc":"2026-11-02T08:00:00+00:00","mode":"live","neighbours":[{"close":"25780","high":"25783","local":"08:55 CET","low":"25777","open":"25779","start":"2026-11-02T07:55:00+00:00"}],"outcome":"SIGNAL","quote":{"ask":"25782.3","bid":"25780.3","epic":"DE40","ts":"2026-11-02T08:00:00+00:00"},"rule_size_allowed":false,"session_index":0,"signal":{"side":"BUY","size":"0.001","stop_distance":"30.0"},"skip_reason":null,"why":null}},
+   {"id":185,"source":"broker.account","ts":"2026-11-02T08:05:00+00:00","payload":{"response":{"account_id":"ACC-1","available":"40","currency":"EUR","equity":"40","margin_used":"0","status":"ENABLED"}}},
+   {"id":186,"source":"gate_block","ts":"2026-11-02T08:05:00+00:00","payload":{"candidate":{"entry_price":"25781.3","epic":"DE40","margin_rate":"0.05","quote_age_s":300.0,"side":"BUY","size":"0.001","stop_distance":"30.0","value_per_point":"1"},"day":"2026-11-02","reasons":["STALE_DATA","KILL"]}},
+   {"repeat":30,"every_s":"10","ids":2,"block":[{"id":187,"source":"broker.list_positions","ts":"2026-11-02T08:05:10+00:00","payload":{"response":[]}},{"id":188,"source":"broker.list_working_orders","ts":"2026-11-02T08:05:10+00:00","payload":{"response":[]}}]},
+   {"id":247,"source":"decision","ts":"2026-11-02T08:10:00+00:00","payload":{"candles":[{"close":"25780","high":"25783","local":"08:55 CET","low":"25777","open":"25779","start":"2026-11-02T07:55:00+00:00"},{"close":"25790","high":"25795","local":"09:00 CET","low":"25775","open":"25780","start":"2026-11-02T08:00:00+00:00"},{"close":"25791","high":"25795","local":"09:05 CET","low":"25785","open":"25790","start":"2026-11-02T08:05:00+00:00"}],"day":"2026-11-02","event":"DECISION_CANDLES","first_candle_start_utc":"2026-11-02T08:00:00+00:00"}},
+   {"repeat":59,"every_s":"10","ids":2,"block":[{"id":248,"source":"broker.list_positions","ts":"2026-11-02T08:10:10+00:00","payload":{"response":[]}},{"id":249,"source":"broker.list_working_orders","ts":"2026-11-02T08:10:10+00:00","payload":{"response":[]}}]}
+  ],
+  "realized_pnl": [],
+  "trades": []
+ },
+ "alerts": [
+  ["SOFT","kill switch SOFT: QUOTE_SILENCE"],
+  ["ERROR","QUOTE_SILENCE: no fresh quote for 65 s (limit 60 s)"],
+  ["ERROR","QUOTE_SILENCE: no fresh quote for 65 s (limit 60 s) (+46 suppressed in 300 s)"],
+  ["ERROR","QUOTE_SILENCE: no fresh quote for 365 s (limit 60 s) (+59 suppressed in 300 s)"],
+  ["ERROR","QUOTE_SILENCE: no fresh quote for 665 s (limit 60 s) (+59 suppressed in 300 s)"]
+ ]
+}
