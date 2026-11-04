@@ -10,7 +10,8 @@ kontekst wejścia, brak konta, zepsuty zegar), BLOKUJE swoim powodem. Gdy zawied
 poza pojedynczą kontrolą), wejście blokuje jedyny powód PORTFOLIO_GATE_ERROR, a wyjątek trafia do logu.
 
 Kwoty są w walucie rachunku (EUR). Kwoty w walucie instrumentu innej niż EUR przelicza wstrzyknięty `FxView`
-(spec §7.3: kurs od brokera, po stronie niekorzystnej); brak kursu blokuje. Iloczyny i sumy są dokładne (pułapka
+(`gwstock.fx`, ten sam protokół co w wykonawcy; spec §7.3: kurs od brokera, po stronie niekorzystnej, `to_account`);
+brak kursu blokuje. Iloczyny i sumy są dokładne (pułapka
 Inexact): zaokrąglenie nie może zamienić „o grosz więcej” w „równo”.
 
 Zajętość (podstawa PORTFOLIO_MAX_POSITIONS): instrumenty z pozycją w stanie innym niż FLAT (każdy stan, także ENTERING
@@ -67,6 +68,7 @@ from typing import Any, Protocol, TypeVar, runtime_checkable
 from gwstock.calendar import ExchangeCalendar
 from gwstock.clock import Clock
 from gwstock.config import PortfolioConfig
+from gwstock.fx import FxView
 from gwstock.journal import Journal, OrderRecord, PositionRecord
 from gwstock.risk import Verdict
 from gwstock.types import AccountInfo, PositionState
@@ -126,14 +128,6 @@ class PortfolioLane:
             raise TypeError(f"PortfolioLane.max_loss_per_trade: expected Decimal, got {type(limit).__name__}")
         if not limit.is_finite() or limit <= 0:
             raise ValueError(f"PortfolioLane.max_loss_per_trade: expected a finite Decimal > 0, got {limit}")
-
-
-@runtime_checkable
-class FxView(Protocol):
-    """Przeliczenie kwoty z waluty instrumentu na EUR (spec §7.3): kurs od brokera, nie starszy niż dozwolony, po
-    stronie niekorzystnej dla nas (wynik nie mniejszy od rzeczywistego). None albo wyjątek: kursu brak."""
-
-    def to_eur(self, amount: Decimal, currency: str) -> Decimal | None: ...
 
 
 @runtime_checkable
@@ -375,7 +369,7 @@ class PortfolioGate:
             return amount
         if self._fx is None:
             raise _Unevaluable(f"no FX view for {currency}")
-        converted = self._fx.to_eur(amount, currency)
+        converted = self._fx.to_account(amount, currency)
         # zero za dodatnią kwotę to też brak kursu: ryzyko kandydata w EUR zawsze > 0, gdy da się je ocenić
         usable = isinstance(converted, Decimal) and converted.is_finite() and converted >= 0
         if not usable or (amount > 0) != (converted > 0):

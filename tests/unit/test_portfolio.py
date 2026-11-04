@@ -72,14 +72,20 @@ def rcfg() -> RiskConfig:
 
 
 class Fx:
-    """Kurs z brokera (atrapa): `to_eur(kwota, waluta)` mnoży przez stały kurs albo zwraca/rzuca, co mu zadano."""
+    """Kurs z brokera (atrapa wspólnego `gwstock.fx.FxView`): `to_account(kwota, waluta)` mnoży przez stały kurs albo
+    zwraca/rzuca, co mu zadano."""
+
+    account_currency = "EUR"
 
     def __init__(self, rate: object = D("0.9"), *, raises: bool = False) -> None:
         self.rate = rate
         self.raises = raises
         self.calls: list[tuple[Decimal, str]] = []
 
-    def to_eur(self, amount: Decimal, currency: str) -> Decimal | None:
+    def par_is_upper_bound(self, currency: str) -> bool:
+        return False
+
+    def to_account(self, amount: Decimal, currency: str) -> Decimal | None:
         self.calls.append((amount, currency))
         if self.raises:
             raise RuntimeError("fx feed down")

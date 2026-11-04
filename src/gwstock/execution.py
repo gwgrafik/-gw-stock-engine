@@ -91,13 +91,14 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any, Protocol, TypeVar
+from typing import Any, TypeVar
 
 from gwstock.broker.base import Broker
 from gwstock.calendar import ExchangeCalendar
 from gwstock.clock import Clock
 from gwstock.config import RiskConfig, StrategyConfig
 from gwstock.costs import CostBreakdown, CostModel, TradeFacts
+from gwstock.fx import FxView
 from gwstock.journal import (
     Journal,
     JournalError,
@@ -273,30 +274,11 @@ class ExitMemory:
     guards_run: set[str] = field(default_factory=set)
 
 
-class FxView(Protocol):
-    """Przeliczenia walut wstrzykiwane wykonawcy pasma w walucie obcej (projekt §7.3). Kurs wyłącznie od brokera (np.
-    notowanie EURUSD, nie starsze niż limit z konfiguracji portfela); wykonawca nie zgaduje kursu.
-
-    - `account_currency`: waluta rachunku (kod ISO 4217);
-    - `to_account(amount, currency)`: kwota w walucie `currency` przeliczona na walutę rachunku po kursie NIEKORZYSTNYM
-      dla nas (większa kwota: ryzyko i wartość punktu nigdy nie wychodzą zaniżone), z ważnego kursu; None: brak
-      ważnego kursu (wykonawca nie zgaduje, patrz niżej);
-    - `par_is_upper_bound(currency)`: czy ostatni znany kurs (także nieaktualny) daje 1 jednostkę `currency` za
-      najwyżej 1 jednostkę waluty rachunku; wtedy kwota w `currency` jest górnym ograniczeniem kwoty w walucie
-      rachunku, więc straże po wypełnieniu i odległość stopu z limitu straty mogą ją przyjąć bez kursu.
-
-    Brak ważnego kursu: wejście zablokowane (FX_UNAVAILABLE); straż wielkości po wypełnieniu przyjmuje kwotę bez
-    przeliczenia tylko przy `par_is_upper_bound`, inaczej zamyka pozycję; odległość stopu z limitu straty tak samo,
-    inaczej brak odległości (kill switch twardy i awaryjne spłaszczenie). Wyjątek albo wartość niebędąca skończonym
-    `Decimal` > 0 z `to_account` znaczy to samo co None.
-    """
-
-    @property
-    def account_currency(self) -> str: ...
-
-    def to_account(self, amount: Decimal, currency: str) -> Decimal | None: ...
-
-    def par_is_upper_bound(self, currency: str) -> bool: ...
+# `FxView` (jeden protokół dla wykonawcy i bramki portfelowej) mieszka w `gwstock.fx`. W wykonawcy: brak ważnego kursu
+# = wejście zablokowane (FX_UNAVAILABLE); straż wielkości po wypełnieniu przyjmuje kwotę bez przeliczenia tylko przy
+# `par_is_upper_bound`, inaczej zamyka pozycję; odległość stopu z limitu straty tak samo, inaczej brak odległości (kill
+# switch twardy i awaryjne spłaszczenie). Wyjątek albo wartość niebędąca skończonym `Decimal` > 0 z `to_account` znaczy
+# to samo co None.
 
 
 async def _with_timeout(call: Awaitable[T], timeout: float) -> T:
