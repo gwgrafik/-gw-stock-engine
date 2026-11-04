@@ -2356,6 +2356,17 @@ def test_the_foreign_currency_epics_are_exactly_the_enabled_lanes_in_another_cur
     assert cli.foreign_currency_epics(()) == ()
 
 
+def test_the_target_epics_are_exactly_the_enabled_lanes_with_a_target(armed_lane):
+    config_dir, _ = armed_lane
+    lane = lane_of(config_dir)
+    assert cli.target_epics((lane,)) == (US,)
+    eur = replace(lane, cfg=replace(lane.cfg, currency="EUR"))
+    assert cli.target_epics((eur,)) == (US,)  # cel nie zależy od waluty instrumentu
+    no_target = replace(lane, bar=replace(lane.bar, target_r=Decimal("0")))
+    assert cli.target_epics((no_target,)) == ()
+    assert cli.target_epics(()) == ()
+
+
 # --- silnik złożony z warunkiem uzbrojenia pasm z cli -------------------------------------------------------------
 
 
@@ -2470,6 +2481,26 @@ async def test_build_engine_without_lanes_is_the_v1_composition(armed_dirs, tmp_
     ctx, engine, journal = await _built(config_dir, data, tmp_path, clock)
     try:
         assert engine.lanes == [] and engine.raw_broker._foreign_currency_epics == frozenset()
+    finally:
+        journal.close()
+
+
+async def test_build_engine_without_lanes_gives_the_adapter_no_target_epics(armed_dirs, tmp_path, clock):
+    config_dir, data = armed_dirs
+    ctx, engine, journal = await _built(config_dir, data, tmp_path, clock)
+    try:
+        assert engine.lanes == [] and engine.raw_broker._target_epics == frozenset()
+    finally:
+        journal.close()
+
+
+async def test_build_engine_gives_the_adapter_target_epics_only_from_the_enabled_lanes(armed_dirs, tmp_path, clock):
+    config_dir, data = armed_dirs
+    enable_lanes(config_dir)
+    ctx, engine, journal = await _built(config_dir, data, tmp_path, clock)
+    try:
+        assert engine.raw_broker._target_epics == frozenset({US})  # DE40 v1 NIE jest w zbiorze: pola celu ignorowane
+        assert "DE40" not in engine.raw_broker._target_epics
     finally:
         journal.close()
 

@@ -214,6 +214,13 @@ def foreign_currency_epics(lanes: Any) -> tuple[str, ...]:
     return tuple(lane.epic for lane in lanes if lane.cfg.currency != ACCOUNT_CURRENCY)
 
 
+def target_epics(lanes: Any) -> tuple[str, ...]:
+    """Epiki włączonych pasm Z CELEM zysku (jak `LaneSpec.uses_target` silnika: pasmo świecowe ma `target_r` > 0): tylko
+    dla nich adapter czyta i ściśle waliduje pola celu pozycji i potwierdzeń (`CapitalComBroker(target_epics=...)`).
+    DE40 v1 i ręczne pozycje właściciela nie są w tym zbiorze, więc ich pola celu adapter pomija jak kod sprzed celu."""
+    return tuple(lane.epic for lane in lanes if lane.bar.target_r > 0)
+
+
 def lane_arming_problem(
     config_dir: Path, data_dir: Path, loaded: Any, *, bound_account: str | None, foreign_epics: Any
 ) -> str | None:
@@ -1905,8 +1912,9 @@ def build_engine(
     `lock`: blokada instancji wzięta już przez polecenie (przed dziennikiem i siecią).
 
     Kolejne pasma (`config_dir/lanes.toml`, wczytane RAZ tutaj): adapter dostaje `foreign_currency_epics` wyłącznie z
-    epików włączonych pasm w walucie innej niż EUR, a silnik warunek uzbrojenia pasm z `make_lane_arming` (pasmo live
-    tylko przy uzbrojonym procesie i zamrożonym, zgodnym odcisku pasma). Bez pliku pasm: dokładnie złożenie v1.
+    epików włączonych pasm w walucie innej niż EUR i `target_epics` wyłącznie z epików włączonych pasm z celem zysku
+    (tylko dla nich czyta pola celu), a silnik warunek uzbrojenia pasm z `make_lane_arming` (pasmo live tylko przy
+    uzbrojonym procesie i zamrożonym, zgodnym odcisku pasma). Bez pliku pasm: dokładnie złożenie v1.
     """
     from gwstock.app import EngineMisconfigured
     from gwstock.broker.capitalcom import LIVE_BASE_URL, CapitalComBroker
@@ -1926,7 +1934,9 @@ def build_engine(
             config_dir=config_dir, lock=lock,
         )  # fmt: skip
     foreign = foreign_currency_epics(lanes)
-    broker = CapitalComBroker(ctx.creds, http, clock, base_url=LIVE_BASE_URL, foreign_currency_epics=foreign)
+    broker = CapitalComBroker(
+        ctx.creds, http, clock, base_url=LIVE_BASE_URL, foreign_currency_epics=foreign, target_epics=target_epics(lanes)
+    )
     arming = make_lane_arming(
         Path(config_dir), Path(data_dir), bound_account=ctx.runtime.account_id, foreign_epics=foreign
     )  # fmt: skip
