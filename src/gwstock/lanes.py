@@ -203,7 +203,8 @@ class DayState:
 
     - `day`: dzień lokalny kalendarza pasma (musi zgadzać się z `LaneSession.day`);
     - `entries`: liczba wejść tego dnia (limit `max_entries_per_day`);
-    - `result_r`: suma wyników ZAMKNIĘTYCH transakcji dnia w R (strata ujemna; limit `-day_stop_r`);
+    - `result_r`: suma wyników ZAMKNIĘTYCH transakcji dnia w R (strata ujemna; limit `-day_stop_r`); R transakcji to
+      zrealizowany wynik w punktach podzielony przez odległość stopu w punktach z wejścia (jak `pnl / r_pts` w badaniach);
     - `position_open`: trwa pozycja pasma (najwyżej jedna naraz, R1);
     - `last_exit_at`: chwila ostatniego wyjścia z pozycji pasma tego dnia (UTC) albo None. Świeca sygnału, która
       zaczęła się nie później niż ta chwila, nakładałaby się na poprzednią transakcję (jak w badaniach).
