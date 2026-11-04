@@ -1405,6 +1405,9 @@ class Engine:
             return
         if self._shutdown:
             return
+        if lane.entry_ordered_for(self.journal, start):  # po restarcie: ta świeca już dała zlecenie (także odrzucone)
+            d.decided.add(start)
+            return
         executor = lane.executor
         state = lane.day_state(self.journal, executor, now)
         session_index = lane.session_index(self.journal)

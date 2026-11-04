@@ -37,9 +37,10 @@ from typing import Any
 from gwstock.calendar import ExchangeCalendar
 from gwstock.config import LoadedLane
 from gwstock.costs import CostModel
-from gwstock.execution import Executor
+from gwstock.execution import ROLE_ENTRY, Executor
 from gwstock.journal import JournalError
 from gwstock.lanes import DayState, LaneSession, exit_due, lane_session
+from gwstock.orders.ids import make_client_id
 from gwstock.reconcile import Reconciler
 from gwstock.risk import BarLaneRiskGate
 from gwstock.types import Candle, PositionState, Side
@@ -184,6 +185,21 @@ class BarLane:
         if trade.side is Side.SELL:
             points = -points
         return points / stop
+
+    def entry_ordered_for(self, journal: Any, start: datetime) -> bool:
+        """Czy świeca sygnału `start` już dała zlecenie wejścia pasma (w dowolnym stanie, także odrzucone): zlecenie
+        wejścia instrumentu z dnia pasma utworzone nie wcześniej niż koniec świecy (decyzja wcześniejszej świecy zapada
+        przed tą chwilą, `due_candle`). Po restarcie pamięć `BarDay.decided` jest pusta, a odrzucone wejście nie
+        zostawia pozycji ani transakcji: bez tej kontroli ta sama świeca dałaby drugie zlecenie (S3: wejście zużyte).
+        Błąd odczytu dziennika: wyjątek (wywołujący nie decyduje)."""
+        d = self.day
+        assert d is not None
+        end = start + self.span
+        for seq in range(1, journal.count_orders(d.day) + 1):
+            order = journal.get_order(make_client_id(d.day, self.epic, seq, ROLE_ENTRY))
+            if order is not None and order.created_at >= end:
+                return True
+        return False
 
     def session_index(self, journal: Any) -> int:
         """Zakończone sesje pasma dla polityki wielkości: transakcje instrumentu bez prób smoke."""
