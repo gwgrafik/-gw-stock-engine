@@ -331,6 +331,108 @@ def load_portfolio(config_dir: Path, risk: RiskConfig | None = None) -> Portfoli
     return cfg
 
 
+LANES_FILE = "lanes.toml"
+LANE_RULES = frozenset({"bar_b1_m5"})  # wtyki kolejnych pasm; pasmo DE40 orb_index_cfd v1 jest zawsze i nie ma wpisu
+LANE_EXCHANGES = frozenset({"NYSE", "XETRA"})  # nazwy profili `gwstock.calendar`
+_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.toml")
+_CURRENCY = re.compile(r"[A-Z]{3}")
+
+
+@dataclass(frozen=True)
+class LaneConfig:
+    """Wpis `[[lane]]` w `config/lanes.toml`: kolejne pasmo obok DE40 v1 (projekt wielu pasm §1, R1, R5).
+
+    - `rule`: wtyk reguły (`bar_b1_m5`); `rule_file`: plik reguły w `config/` (instrument pasma pochodzi z niego);
+    - `exchange_profile`: kalendarz pasma (`NYSE`, `XETRA`); `currency`: waluta instrumentu (ISO 4217);
+    - `slippage_guard_fraction`: straż poślizgu wejścia; `max_loss_per_trade`: limit straty transakcji w EUR (nie
+      łagodniejszy od `risk_v1.toml`); `costs_file`: model kosztów pasma w `config/` (format `costs_v1.toml`).
+    """
+
+    rule: str
+    rule_file: str
+    exchange_profile: str
+    currency: str
+    slippage_guard_fraction: Decimal
+    max_loss_per_trade: Decimal
+    costs_file: str
+
+
+@dataclass(frozen=True)
+class LoadedLane:
+    """Pasmo z `lanes.toml` z wczytanymi plikami reguły i kosztów."""
+
+    cfg: LaneConfig
+    bar: BarRuleConfig
+    costs: CostConfig
+
+    @property
+    def epic(self) -> str:
+        return self.bar.instrument
+
+
+def load_lanes(config_dir: Path) -> tuple[LoadedLane, ...] | None:
+    """Kolejne pasma z `config_dir/lanes.toml` albo None (brak pliku albo `enabled = false`): wtedy silnik pracuje
+    wyłącznie z pasmem DE40 v1, dokładnie jak dotąd. Plik leży POZA odciskiem pre-rejestracji v1.
+
+    Ściśle jak pliki v1: klucze najwyższego poziomu `enabled` (bool) i `lane` (tablica tabel), każdy wpis z kluczami
+    `LaneConfig`; nazwy plików tylko w `config_dir` (bez ścieżek); `max_loss_per_trade` nie większy od
+    `risk_v1.toml`; instrument różny od DE40 v1 i niepowtarzalny (R1). Błąd to ValueError z nazwą pliku i klucza.
+    Włączenie pasma NIE uzbraja go: pasmo bez zamrożonej pre-rejestracji pracuje najwyżej jako dry_run (silnik).
+    """
+    config_dir = Path(config_dir)
+    path = config_dir / LANES_FILE
+    if not path.exists():
+        return None
+    raw = _read_toml(path)
+    unknown = sorted(set(raw) - {"enabled", "lane"})
+    if unknown:
+        raise ValueError(f"{LANES_FILE}: unknown key(s): {', '.join(unknown)}")
+    if "enabled" not in raw:
+        raise ValueError(f"{LANES_FILE}: missing key(s): enabled")
+    if not _convert(LANES_FILE, "enabled", raw["enabled"], bool):
+        return None
+    entries = raw.get("lane")
+    if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
+        raise ValueError(f"{LANES_FILE}: lane: expected at least one [[lane]] table when enabled = true")
+    strat, risk, _ = load_config(config_dir)
+    hints = get_type_hints(LaneConfig)
+    names = [f.name for f in fields(LaneConfig)]
+    lanes: list[LoadedLane] = []
+    for n, entry in enumerate(entries, start=1):
+        where = f"{LANES_FILE} lane {n}"
+        extra = sorted(set(entry) - set(names))
+        if extra:
+            raise ValueError(f"{where}: unknown key(s): {', '.join(extra)}")
+        missing = [k for k in names if k not in entry]
+        if missing:
+            raise ValueError(f"{where}: missing key(s): {', '.join(missing)}")
+        cfg = LaneConfig(**{k: _convert(where, k, entry[k], hints[k]) for k in names})
+        if cfg.rule not in LANE_RULES:
+            raise ValueError(f"{where}: rule: {cfg.rule!r} is not one of {sorted(LANE_RULES)}")
+        if cfg.exchange_profile not in LANE_EXCHANGES:
+            raise ValueError(f"{where}: exchange_profile: {cfg.exchange_profile!r} is not one of {sorted(LANE_EXCHANGES)}")
+        if not _CURRENCY.fullmatch(cfg.currency):
+            raise ValueError(f"{where}: currency: expected a 3-letter ISO 4217 code, got {cfg.currency!r}")
+        if cfg.slippage_guard_fraction <= 0:
+            raise ValueError(f"{where}: slippage_guard_fraction: must be > 0")
+        if cfg.max_loss_per_trade > risk.max_loss_per_trade:
+            raise ValueError(
+                f"{where}: max_loss_per_trade: {cfg.max_loss_per_trade} is more lenient than {RISK_FILE} "
+                f"max_loss_per_trade = {risk.max_loss_per_trade}"
+            )
+        for key in ("rule_file", "costs_file"):
+            if not _FILE_NAME.fullmatch(getattr(cfg, key)) or getattr(cfg, key).startswith("."):
+                raise ValueError(f"{where}: {key}: expected a .toml file name in the config directory")
+        bar = load_bar_rule_config(config_dir / cfg.rule_file)
+        costs = _load_table(config_dir / cfg.costs_file, CostConfig)
+        if bar.instrument == strat.instrument:
+            raise ValueError(f"{where}: instrument {bar.instrument} is the v1 lane ({strat.instrument}); one lane each")
+        if any(other.epic == bar.instrument for other in lanes):
+            raise ValueError(f"{where}: duplicate lane for {bar.instrument} (R1: at most one lane per instrument)")
+        lanes.append(LoadedLane(cfg, bar, costs))
+    return tuple(lanes)
+
+
 def _load_live_allowed(path: Path) -> bool:
     if not path.exists():
         return False
