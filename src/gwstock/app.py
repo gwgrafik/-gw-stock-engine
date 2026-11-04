@@ -1402,7 +1402,13 @@ class Engine:
     def _settle_foreign(self, lane: BarLane) -> None:
         """Faza 2 księgowania pasma w walucie obcej (projekt §7.4, wariant z szacunkiem): wynik w EUR z kursu pary
         brokera po stronie niekorzystnej (`QuoteFxView.estimate`), źródło ESTIMATED_FX; brak ważnego kursu → zostaje
-        `pnl_pending` (wejścia zablokowane) i alarm. Kursu nigdy nie zgadujemy."""
+        `pnl_pending` (wejścia zablokowane) i alarm. Kursu nigdy nie zgadujemy.
+
+        Uwaga (świadome uproszczenie, bez zmiany zachowania): kurs ESTIMATED_FX to notowanie pary z chwili
+        ROZLICZENIA, nie z chwili zamknięcia pozycji (zwykle ten sam przebieg uzgadniania, ale przy braku kursu
+        rozliczenie przychodzi później, po kursie z tamtej chwili). Rozliczenie wyniku USD zamkniętego po końcu pętli
+        dnia portfela (np. w spoczynku po 22:00 albo w nocy) następuje dopiero przy przygotowaniu następnej sesji, bo
+        spoczynek bez pozycji niczego nie uzgadnia; do tego czasu wejścia blokuje znacznik `pnl_pending`."""
         fx = self._fx
         pending = self.journal.pnl_pending_deals()
         if fx is None or not pending:

@@ -552,3 +552,96 @@ async def test_run_forever_started_at_night_waits_for_the_next_session_and_trade
     idle = [(ts, m) for ts, m in seen if start + timedelta(minutes=1) < ts < berlin(TUESDAY, 8, 50)]
     assert idle == [] and any(ts >= berlin(TUESDAY, 8, 50) for ts, _ in seen)
 
+
+# --- F6: rozliczenie ESTIMATED_FX na końcu łańcucha silnika -----------------------------------------------------------
+
+
+def settle_spy(engine: Engine) -> list[tuple[KillLevel, KillLevel, Decimal]]:
+    """Poziom kill switcha tuż przed i tuż po rozliczeniu fazy 2 (oraz kwota EUR) przy każdym `settle_foreign_pnl`."""
+    seen: list[tuple[KillLevel, KillLevel, Decimal]] = []
+    lane = engine.lanes[0]
+    real = lane.executor.settle_foreign_pnl
+
+    def spy(deal_id, net_eur, **kw):
+        before = engine.kill.level()
+        out = real(deal_id, net_eur, **kw)
+        seen.append((before, engine.kill.level(), net_eur))
+        return out
+
+    lane.executor.settle_foreign_pnl = spy  # type: ignore[method-assign]
+    return seen
+
+
+def floor_cents(amount: Decimal) -> Decimal:
+    from decimal import ROUND_FLOOR
+
+    return amount.quantize(D("0.01"), rounding=ROUND_FLOOR)
+
+
+async def test_a_usd_loss_is_settled_by_the_bid_rounded_down_and_then_triggers_the_daily_loss(
+    lane_engine, broker, clock, journal_path
+):
+    """F6. Oczekiwane: DE40 wybity stopem z luką (strata pod limitem dnia), potem US500 wybity stopem z luką (strata w
+    USD). Faza 1: wiersz w USD, licznik EUR bez zmian, kill switch NONE. Faza 2 (ten sam przebieg uzgadniania, kurs
+    EURUSD świeży): kwota EUR = wynik USD / bid (strata po stronie niekorzystnej) zaokrąglona do centa W DÓŁ (strata
+    nie mniejsza), ujemna, kurs = bid, źródło ESTIMATED_FX; dopiero po rozliczeniu suma dnia ≤ −1,50 EUR → kill SOFT
+    DAILY_LOSS (przed rozliczeniem NONE). Kurs jest z chwili rozliczenia (tu: chwila zamknięcia, ten sam takt)."""
+    from tests.fault.engine_sim import FX_BID
+
+    def gap(epic: str, points: int) -> None:
+        deal = next(d for d, p in broker.positions.items() if p.epic == epic)
+        broker.trigger_stop(deal, broker.positions[deal].open_level - points)
+
+    hooks = [(datetime(2026, 11, 2, 14, 55, tzinfo=UTC), EPIC, 900), (datetime(2026, 11, 2, 15, 0, tzinfo=UTC), US, 97)]
+    done: list[str] = []
+
+    def gaps() -> None:
+        for when, epic, points in hooks:
+            if epic not in done and clock.now_utc() >= when:
+                done.append(epic)
+                gap(epic, points)
+
+    clock.hooks.append(gaps)
+    seen = settle_spy(lane_engine)
+    stop_engine_at(lane_engine, clock, datetime(2026, 11, 2, 15, 2, tzinfo=UTC))
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    (us_deal, us_trade), = j.trades_by_deal(US)
+    fx = j.trade_fx(us_deal)
+    assert us_trade.net_pnl < 0 and fx is not None and fx.source == "ESTIMATED_FX" and fx.rate == FX_BID
+    assert fx.net_eur == floor_cents(us_trade.net_pnl / FX_BID) < 0
+    assert fx.net_eur <= us_trade.net_pnl / FX_BID
+    assert seen == [(KillLevel.NONE, KillLevel.SOFT, fx.net_eur)]
+    (de,) = trades_by_epic(j)[EPIC]
+    assert D("-1.50") < de.net_pnl < 0 and j.realized_pnl(DAY) == de.net_pnl + fx.net_eur <= D("-1.50")
+    assert j.kill_state().reason == "DAILY_LOSS"
+    (settled,) = engine_events(j, "TRADE_SETTLED")
+    assert settled["source"] == "ESTIMATED_FX" and D(settled["net_eur"]) == fx.net_eur
+    assert_portfolio_books_balance(journal_path)
+
+
+async def test_a_usd_gain_is_settled_by_the_ask_rounded_down(lane_engine, broker, clock, journal_path):
+    """F6. Oczekiwane: US500 zamknięta celem (TARGET) z zyskiem w USD; kwota EUR = wynik USD / ask (zysk po stronie
+    niekorzystnej) zaokrąglona do centa W DÓŁ (zysk nie większy), dodatnia, kurs = ask; kill switch bez zmian."""
+    from tests.fault.engine_sim import FX_ASK
+
+    hit: list[bool] = []
+
+    def target() -> None:
+        if not hit and clock.now_utc() >= US_ENTRY + timedelta(minutes=3):
+            hit.append(True)
+            broker.trigger_target(next(d for d, p in broker.positions.items() if p.epic == US))
+
+    clock.hooks.append(target)
+    seen = settle_spy(lane_engine)
+    stop_engine_at(lane_engine, clock, US_ENTRY + timedelta(minutes=5))
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    (us_deal, us_trade), = j.trades_by_deal(US)
+    fx = j.trade_fx(us_deal)
+    assert us_trade.exit_reason == "TARGET" and us_trade.net_pnl > 0
+    assert fx is not None and fx.rate == FX_ASK and fx.net_eur == floor_cents(us_trade.net_pnl / FX_ASK) > 0
+    assert fx.net_eur <= us_trade.net_pnl / FX_ASK
+    assert seen == [(KillLevel.NONE, KillLevel.NONE, fx.net_eur)]
+    assert_portfolio_books_balance(journal_path)
+
