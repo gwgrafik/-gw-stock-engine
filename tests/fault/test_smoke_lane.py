@@ -331,7 +331,11 @@ async def test_an_unexpected_error_mid_probe_flattens_and_fails(engine, broker, 
     assert code == 1 and broker.positions == {}
     assert any("probe interrupted (RuntimeError)" in x for x in lines)
     assert any(x.startswith("INFO [7] the probe position closed after the interrupt") for x in lines)
-    assert lines[-1].startswith("C8") or any(x.startswith("USTALENIA") for x in lines)
+    tail = block(lines)
+    # [1]-[5] przeszły, błąd w [6] liczy się jako niezaliczony krok: wynik tuż nad blokiem ustaleń
+    assert lines[lines.index(tail[0]) - 1] == "FAIL smoke --epic US500: 5/6 checks passed"
+    assert finding(lines, "C5d") == "C5d NIE USTALONO: nie sprawdzono (próba zatrzymała się przed tym krokiem)"
+    assert tail[-1] == "C8  NIE USTALONO: nie sprawdzono (próba zatrzymała się przed tym krokiem)"
 
 
 @pytest.mark.parametrize("exc", [asyncio.CancelledError, KeyboardInterrupt], ids=["cancelled", "keyboard"])
