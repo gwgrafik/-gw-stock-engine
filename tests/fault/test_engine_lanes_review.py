@@ -223,3 +223,20 @@ async def test_pending_usd_trade_without_lanes_still_manages_and_flattens_the_de
     assert j.realized_pnl(DAY) == de.net_pnl
     assert j.pnl_pending_deals() == [(PENDING_DEAL, PENDING_DAY)]
 
+
+async def test_a_pending_marker_without_a_trade_of_any_lane_is_reported_not_skipped(
+    lane_engine, broker, clock, notifier
+):
+    """F2, pokrewne. Oczekiwane: znacznik `pnl_pending` deala, którego transakcja nie należy do księgi żadnego pasma w
+    walucie obcej (tu: US100, instrument bez pasma), nie jest pomijany po cichu: alarm PNL_PENDING_ORPHAN z numerem
+    deala i JEDNO zdarzenie silnika na deal w procesie (mimo wielu przebiegów uzgadniania); znacznik zostaje (nic nie
+    zgadnięte), wejścia blokuje bramka portfela (PORTFOLIO_PNL_PENDING)."""
+    pending_trade(lane_engine.journal, "GHOST-1", "US100")
+    stop_engine_at(lane_engine, clock, berlin(DAY, 9, 12))
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    assert any("GHOST-1" in m for m in kill_alerts(notifier, "PNL_PENDING_ORPHAN"))
+    (event,) = engine_events(j, "PNL_PENDING_ORPHAN")
+    assert event["deal_id"] == "GHOST-1" and event["exit_day"] == PENDING_DAY.isoformat()
+    assert j.pnl_pending_deals() == [("GHOST-1", PENDING_DAY)]
+    assert j.count_entry_orders(DAY, EPIC) == 0

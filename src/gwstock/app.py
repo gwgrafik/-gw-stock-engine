@@ -481,6 +481,7 @@ class Engine:
         self._unmanaged_seen: set[str] = set()
         self._lane_arming: LaneArming = lane_arming if lane_arming is not None else default_lane_arming
         self._pending_reported: frozenset[str] = frozenset()  # deale PNL_PENDING_WITHOUT_LANES już w zdarzeniu
+        self._orphan_pending_seen: set[str] = set()  # deale PNL_PENDING_ORPHAN już zgłoszone w tym procesie
         if lanes_mode:
             self._setup_portfolio(extra, portfolio)
         self.executor = self._build_executor()
@@ -1389,9 +1390,10 @@ class Engine:
             return
         trades = dict(self.journal.trades_by_deal(lane.epic))
         currency = lane.loaded.cfg.currency
-        for deal_id, _exit_day in pending:
+        for deal_id, exit_day in pending:
             trade = trades.get(deal_id)
             if trade is None:
+                self._check_pending_owner(deal_id, exit_day)
                 continue
             estimate = fx.estimate(trade.net_pnl, currency)
             if estimate is None:
@@ -1403,6 +1405,26 @@ class Engine:
                 continue
             eur, rate = estimate
             lane.executor.settle_foreign_pnl(deal_id, eur, source=ESTIMATED_FX, rate=rate)
+
+    def _check_pending_owner(self, deal_id: str, exit_day: date) -> None:
+        """Znacznik `pnl_pending` bez transakcji w księdze pasma, które właśnie rozlicza: zwykle należy do innego pasma
+        w walucie obcej (ono go rozliczy). Gdy transakcji nie ma w księdze ŻADNEGO takiego pasma (np. pasmo usunięte
+        z `config/lanes.toml` albo instrument bez pasma), nikt go nie rozliczy: alarm PNL_PENDING_ORPHAN i zdarzenie
+        (raz na deal w procesie), nigdy ciche pominięcie. Wejścia i tak blokuje bramka portfelowa (PORTFOLIO_PNL_PENDING);
+        kwoty nie zgadujemy, rozstrzyga właściciel."""
+        if deal_id in self._orphan_pending_seen:
+            return
+        owners = [ln.epic for ln in self.lanes if ln.foreign]
+        if any(deal_id in dict(self.journal.trades_by_deal(epic)) for epic in owners):
+            return
+        self._orphan_pending_seen.add(deal_id)
+        self._alert(
+            f"PNL_PENDING_ORPHAN:{deal_id}", "ERROR",
+            f"PNL_PENDING_ORPHAN {deal_id} (exit day {exit_day}): awaits its settlement in {ACCOUNT_CURRENCY}, but no "
+            f"foreign-currency lane ({', '.join(owners) or 'none'}) has this trade in its ledger, so nothing settles "
+            "it; every entry stays blocked (PORTFOLIO_PNL_PENDING) until the owner resolves it",
+        )  # fmt: skip
+        self._event("PNL_PENDING_ORPHAN", deal_id=deal_id, exit_day=exit_day.isoformat(), lanes=owners)
 
     async def _bar_decision_step(self, st: _DayState, lane: BarLane) -> None:
         """Decyzja pasma B1/M5 po zamknięciu świecy w oknie sygnałów (patrz `engine_lanes`)."""
