@@ -593,7 +593,10 @@ class Engine:
     def _add_lane(self, loaded: LoadedLane) -> None:
         profiles = {NYSE.name: NYSE, XETRA.name: XETRA}
         calendar = ExchangeCalendar(profiles[loaded.cfg.exchange_profile])
-        gate = BarLaneRiskGate(self.risk, loaded.bar, self.journal, calendar, self.clock, kill=self.kill)
+        gate = BarLaneRiskGate(
+            self.risk, loaded.bar, self.journal, calendar, self.clock, kill=self.kill,
+            max_loss_per_trade=loaded.cfg.max_loss_per_trade,
+        )  # fmt: skip
         try:
             problem = self._lane_arming(loaded)
         except Exception as exc:  # nie wiadomo, czy wolno: najwyżej dry_run

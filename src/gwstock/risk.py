@@ -275,7 +275,7 @@ class RiskGate:
 
         def loss_per_trade() -> bool:
             risk = risk_of_candidate()
-            return risk is not None and risk > self._cfg.max_loss_per_trade
+            return risk is not None and risk > self._loss_limit()
 
         def leverage() -> bool:
             if not isinstance(account, AccountInfo):
@@ -372,6 +372,10 @@ class RiskGate:
             _LOG.warning("risk gate cannot determine the trading day: %s: %s", type(exc).__name__, exc)
             return None, None
 
+    def _loss_limit(self) -> Decimal:
+        """Limit LOSS_PER_TRADE: v1 `max_loss_per_trade` z `risk_v1.toml` (zachowanie DE40 v1)."""
+        return self._cfg.max_loss_per_trade
+
     def _entry_count(self, day: object) -> int:
         """Wejścia dnia, do których porównuje się limit: v1 liczy wszystkie instrumenty (zachowanie DE40 v1)."""
         return self._journal.count_entry_orders(day)  # type: ignore[arg-type]
@@ -434,6 +438,11 @@ class BarLaneRiskGate(LaneRiskGate):
 
     `calendar` musi mieć strefę `bar.session_timezone` (ValueError przy budowie). DAILY_LOSS liczy `realized_pnl` dnia
     lokalnego kalendarza pasma; sesja NYSE (15:30-22:00 Berlin) leży w tej samej dacie co dzień portfela (Berlin).
+
+    `max_loss_per_trade`: limit straty transakcji PASMA w walucie rachunku (`LaneSpec.max_loss_per_trade` z
+    `config/lanes.toml`); LOSS_PER_TRADE porównuje ryzyko kandydata z min(limit pasma, limit v1), więc kandydat między
+    nimi jest blokowany PRZED wysyłką (inaczej wszedłby i od razu został zamknięty strażą wielkości po wypełnieniu, za
+    cenę spreadu). Bez limitu pasma: limit v1.
     """
 
     def __init__(
@@ -444,7 +453,12 @@ class BarLaneRiskGate(LaneRiskGate):
         calendar: ExchangeCalendar,
         clock: Clock,
         kill: KillView | None = None,
+        max_loss_per_trade: Decimal | None = None,
     ) -> None:
+        if max_loss_per_trade is not None and not (
+            isinstance(max_loss_per_trade, Decimal) and max_loss_per_trade.is_finite() and max_loss_per_trade > 0
+        ):
+            raise ValueError(f"BarLaneRiskGate: max_loss_per_trade must be a Decimal > 0, got {max_loss_per_trade!r}")
         if bar.session_timezone != calendar.profile.tz:
             raise ValueError(
                 f"BarLaneRiskGate: lane time zone {bar.session_timezone!r} differs from the calendar "
@@ -458,6 +472,12 @@ class BarLaneRiskGate(LaneRiskGate):
         self._calendar = calendar
         self._clock = clock
         self._kill = kill
+        self._lane_loss_limit = max_loss_per_trade
+
+    def _loss_limit(self) -> Decimal:
+        if self._lane_loss_limit is None:
+            return self._cfg.max_loss_per_trade
+        return min(self._lane_loss_limit, self._cfg.max_loss_per_trade)
 
     def _entry_limit(self) -> int:
         return self._bar.max_entries_per_day

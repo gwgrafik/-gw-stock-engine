@@ -17,6 +17,7 @@ from gwstock.journal import OrderRecord
 from gwstock.risk import (
     ENTRIES_PER_DAY,
     FORMAT,
+    LOSS_PER_TRADE,
     NOT_SESSION,
     OUTSIDE_WINDOW,
     BarLaneRiskGate,
@@ -120,3 +121,21 @@ def test_bar_gate_never_blocks_an_exit(bar_gate):
 def test_bar_gate_refuses_a_calendar_of_another_time_zone(journal, risk_cfg, kill):
     with pytest.raises(ValueError):
         BarLaneRiskGate(risk_cfg, BAR, journal, XC, FakeClock(ny(10, 0)), kill)
+
+
+def test_bar_gate_judges_loss_per_trade_against_the_tighter_of_the_lane_and_v1_limits(journal, risk_cfg, kill):
+    """F1: ryzyko 0,50 EUR (0,01 × 50 pkt × 1) jest pod limitem v1 (1,00), ale nad limitem pasma 0,40: blokada przed
+    wysyłką; limit pasma luźniejszy od v1 (nie do zbudowania przez `load_lanes`) nigdy nie poluzowuje v1."""
+    c = cand("US500", stop_distance=D("50"))
+    assert BarLaneRiskGate(risk_cfg, BAR, journal, NC, FakeClock(ny(9, 50)), kill).check_entry(c, ACCT).passed
+    tight = BarLaneRiskGate(risk_cfg, BAR, journal, NC, FakeClock(ny(9, 50)), kill, max_loss_per_trade=D("0.40"))
+    assert tight.check_entry(c, ACCT).reasons == [LOSS_PER_TRADE]
+    assert tight.check_entry(cand("US500", stop_distance=D("40")), ACCT).passed  # 0,40: równo przechodzi
+    loose = BarLaneRiskGate(risk_cfg, BAR, journal, NC, FakeClock(ny(9, 50)), kill, max_loss_per_trade=D("5"))
+    assert loose.check_entry(cand("US500", stop_distance=D("150")), ACCT).reasons == [LOSS_PER_TRADE]  # 1,50 > v1 1,00
+
+
+@pytest.mark.parametrize("bad", [D("0"), D("-1"), D("NaN"), 1])
+def test_bar_gate_refuses_a_bad_lane_loss_limit(journal, risk_cfg, kill, bad):
+    with pytest.raises(ValueError):
+        BarLaneRiskGate(risk_cfg, BAR, journal, NC, FakeClock(ny(9, 50)), kill, max_loss_per_trade=bad)
