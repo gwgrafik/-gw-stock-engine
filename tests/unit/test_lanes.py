@@ -18,16 +18,21 @@ Test krzyżowy z `research/candle_strategies.run` jest w drugiej połowie pliku.
 from __future__ import annotations
 
 import ast
+import collections
 import dataclasses
+import importlib.util
+import random
+import sys
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from gwstock import lanes
 from gwstock.calendar import NYSE, CalendarExpiredError, ExchangeCalendar
-from gwstock.config import BarRuleConfig, RiskConfig, load_bar_rule_config
+from gwstock.config import BarRuleConfig, RiskConfig, load_bar_rule_config, parse_signal_windows
 from gwstock.lanes import (
     COST_OVER_LIMIT,
     DAY_STOP,
@@ -881,3 +886,419 @@ def test_module_has_no_hard_coded_thresholds():
         if isinstance(node.value, str):
             with pytest.raises(ArithmeticError):
                 D(node.value)  # napis w kodzie nie może być liczbą dziesiętną (InvalidOperation to ArithmeticError)
+
+
+# ===============================================================================================================
+# TEST KRZYŻOWY z research/candle_strategies.run (źródłem prawdy hipotezy forward B1/M5/SESJE)
+# ===============================================================================================================
+#
+# CO JEST PORÓWNYWANE. Dla każdej z 360 serii dziennych (jeden dzień sesji NYSE, świece M5 od 08:00 do ~16:10 czasu NY,
+# ziarna deterministyczne, kilka sygnałów w dniu) `run("B1", "M5", "SESJE", ...)` z badań jest uruchamiany pod
+# sys.setprofile, który zapisuje (a) każdą świecę, dla której `run` doszło do `signals`, (b) każdy `skip(...)` z jego
+# przyczyną i świecą, (c) każdą transakcję z indeksem świecy sygnału, wejścia i wyjścia oraz przyczyną wyjścia. Potem
+# KAŻDA świeca dnia (poza ostatnią, która nie ma następnej) jest podawana do `lanes.decide_entry` ze stanem dnia
+# odtworzonym wyłącznie z transakcji `run` (liczba wejść, wynik w R, czy trwa pozycja, ostatnie wyjście). Oczekiwany wynik
+# dla świecy to:
+#   - przyczyna `skip` z badań (STOP_TOO_CLOSE, SLIP_FILTER, COST_OVER_0.20R = COST_OVER_LIMIT, GAPPED_DATA),
+#   - ENTER, gdy `run` zawarło na niej transakcję (ten sam kierunek, poziom stopu i cena wejścia z dokładnością 1e-9),
+#   - NO_SIGNAL, gdy `run` oceniło świecę (doszło do `signals`) i nic z niej nie wyszło,
+#   - w pozostałych przypadkach `run` pomija świecę po cichu, więc oczekiwana przyczyna wynika z faktów niezależnych od
+#     pasma: nakładanie (świeca <= świeca wyjścia poprzedniej transakcji), za mało danych (`i < n + 2 or atr is None`),
+#     okno (`cs.in_window`), limit wejść (`n_day >= MAX_DAY`), dzienny stop (`r_day <= DAY_STOP_R`), w tej kolejności.
+# Do tego dla każdej transakcji `exit_due` na każdej świecy od wejścia do wyjścia ma dać dokładnie to, co `run`: TIME_LIMIT
+# albo FORCED (zaplanowane spłaszczenie) na świecy wyjścia TIME/FLAT i None na pozostałych (także przy STOP, TARGET,
+# END_OF_DATA).
+#
+# CO JEST WYRÓWNANE W DANYCH (różnice z docstringu `lanes`, których nie da się uniknąć): (a) spread w otwarciu następnej
+# świecy równa się spreadowi zamknięcia poprzedniej (ciągłość; pasmo bierze spread z notowania, badania ze świecy
+# sygnału), nawet po dziurze w danych; (b) notowanie z decyzji to otwarcie następnej ISTNIEJĄCEJ świecy, a `now` to koniec
+# świecy sygnału (po dziurze tuż za sygnałem badania wchodzą później niż koniec świecy: liczone osobno jako
+# `hole_after_signal` i sprawdzane tylko `czas wejścia >= koniec świecy`); (c) dni ze skróconą sesją są pominięte (badania
+# mają stałe 15:55, pasmo zamknięcie kalendarza minus 5 min); (d) poślizg: wariant dwójkowy (0.125) porównuje dokładnie,
+# także remisy co do bitu, wariant zamrożonej hipotezy używa 0.15 i kroku 0.1 z pliku pasma (float badań i Decimal pasma
+# mogą różnić się tylko w remisie co do ostatniego bitu, a na stałych ziarnach nie różnią się).
+
+RESEARCH = Path(__file__).resolve().parents[2] / "research" / "candle_strategies.py"
+PREREG = Path(__file__).resolve().parents[2] / "docs" / "preregistration" / "forward-us500-b1-m5-sesje.md"
+needs_research = pytest.mark.skipif(not RESEARCH.exists(), reason="brak katalogu research/ (obraz testowy)")
+
+# Środowisko zamrożonej hipotezy (docs/preregistration/forward-us500-b1-m5-sesje.md) i wariant z poślizgiem
+# dwójkowym, w którym float badań liczy dokładnie to samo co Decimal pasma.
+FORWARD_ENV = {
+    "GW_EPIC": "US500",
+    "GW_SLIP": "0.15",
+    "GW_STOP_EXTRA": "0.3",
+    "GW_STEP": "0.1",
+    "GW_POINT_EUR": "0",
+    "GW_TZ": "America/New_York",
+    "GW_WIN_ALL": "09:45-15:30",
+    "GW_WIN_SESJE": "09:45-11:45,14:00-15:30",
+    "GW_FLAT": "15:55",
+}
+DYADIC_ENV = FORWARD_ENV | {"GW_SLIP": "0.125", "GW_STOP_EXTRA": "0.25", "GW_STEP": "0.125"}
+
+NY = ZoneInfo("America/New_York")
+SERIES = 360  # serie dzienne na wariant
+SLOTS = 99  # świece co 5 min od 08:00 do 16:10 czasu NY
+EIGHTH = D("0.125")
+
+
+def load_research(env: dict[str, str]):
+    """Moduł badań z zadanym środowiskiem (stałe `GW_*` są czytane przy imporcie)."""
+    with pytest.MonkeyPatch.context() as mp:
+        for key, value in env.items():
+            mp.setenv(key, value)
+        spec = importlib.util.spec_from_file_location(f"candle_strategies_lanes_{len(sys.modules)}", RESEARCH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    return module
+
+
+def session_days(count: int) -> list[date]:
+    """`count` kolejnych dni sesji NYSE od 5.01.2026 (obejmują obie zmiany czasu w USA 2026-2027), bez skróconych sesji."""
+    out, day = [], date(2026, 1, 5)
+    while len(out) < count:
+        if CAL.is_session_day(day) and day not in NYSE.early_closes:
+            out.append(day)
+        day += timedelta(days=1)
+    return out
+
+
+REGIMES = {
+    # scale: typowa wielkość świecy w ósemkach punktu; p_imp: szansa świecy z wybiciem; rng: zakres świecy z wybiciem;
+    # p_rev: szansa odwrócenia po wybiciu; hmax: największa połowa spreadu (ósemki); drift: znos trendu na świecę;
+    # follow: mnożniki zakresu wybicia dla świecy kontynuacji; calm: po wybiciu rynek się uspokaja (wyjścia TIME / FLAT)
+    "quiet": dict(scale=10, p_imp=0.10, rng=(16, 40), p_rev=0.4, hmax=3, drift=0, calm=True),
+    "normal": dict(scale=16, p_imp=0.16, rng=(20, 64), p_rev=0.5, hmax=4, drift=0, calm=True),
+    "hot": dict(scale=20, p_imp=0.55, rng=(24, 72), p_rev=0.1, hmax=3, drift=3, follow=(0.25, 1.0)),
+    "burst": dict(scale=16, p_imp=0.85, rng=(32, 72), p_rev=0.0, hmax=3, drift=0, follow=(1.6, 2.6)),  # cel w następnej świecy
+    "loser": dict(scale=16, p_imp=0.35, rng=(24, 72), p_rev=0.9, hmax=4, drift=0),
+    "lowvol": dict(scale=3, p_imp=0.25, rng=(3, 8), p_rev=0.5, hmax=2, drift=0),
+}
+REGIME_WEIGHTS = {"quiet": 2, "normal": 4, "hot": 3, "burst": 4, "loser": 3, "lowvol": 2}
+
+
+class DayData:
+    """Seria dzienna w ósemkach punktu: sloty siatki 5 min (po usunięciu dziur), środki OHLC i połówki spreadu OHLC."""
+
+    def __init__(self, slots: list[int], mids: list[tuple[int, int, int, int]], halves: list[tuple[int, int, int, int]]):
+        self.slots, self.mids, self.halves = slots, mids, halves
+
+
+def generate_day(r: random.Random) -> DayData:
+    regime = r.choices(list(REGIME_WEIGHTS), weights=list(REGIME_WEIGHTS.values()))[0]
+    par = REGIMES[regime]
+    scale, hmax = par["scale"], par["hmax"]
+    mids: list[tuple[int, int, int, int]] = []
+    halves: list[tuple[int, int, int, int]] = []
+    close = 37000 + r.randint(-1500, 1500)  # ok. 4625-4875 pkt
+    half_close = r.randint(0, hmax)
+    direction = r.choice([1, -1])
+    last_impulse: tuple[int, int] | None = None  # (kierunek, zakres) poprzedniej świecy, jeśli była wybiciem
+    calm_left = 0
+    impulses: list[int] = []  # sloty świec z wybiciem (do wyboru miejsca, w którym urywają się dane)
+    for k in range(SLOTS):
+        calm = calm_left > 0
+        calm_left = max(0, calm_left - 1)
+        gap = r.randint(-(scale // (24 if calm else 6)), scale // (24 if calm else 6))
+        if r.random() < 0.04:
+            gap += r.choice([-1, 1]) * r.randint(scale, 3 * scale)
+        o = close + gap + (par["drift"] * direction if par["drift"] else 0)
+        window = mids[-12:]
+        if last_impulse is not None and r.random() < par["p_rev"]:
+            d, rng_prev = last_impulse
+            move = -d * r.randint(max(1, rng_prev // 2), 2 * rng_prev)
+            c = o + move
+            h = max(o, c) + r.randint(0, scale // 4)
+            low = min(o, c) - r.randint(0, scale // 4)
+            last_impulse = None
+        elif last_impulse is not None and "follow" in par:
+            d, rng_prev = last_impulse
+            lo_mult, hi_mult = par["follow"]
+            c = o + d * r.randint(max(1, int(lo_mult * rng_prev)), max(2, int(hi_mult * rng_prev)))
+            h = max(o, c) + r.randint(0, scale // 5)
+            low = min(o, c) - r.randint(0, scale // 5)
+            last_impulse = None
+        elif len(window) == 12 and k >= 14 and r.random() < par["p_imp"] * (4 if 83 <= k <= 89 else 1):
+            d = direction if "follow" in par and r.random() < 0.8 else r.choice([1, -1])
+            upper, lower = max(m[1] for m in window), min(m[2] for m in window)
+            margin = r.randint(-1, 4) if regime == "lowvol" else r.randint(-2, 14)
+            rng_bar = r.randint(*par["rng"])
+            body_frac = r.uniform(0.45, 1.0)
+            close_frac = r.uniform(0.6, 1.0)
+            if d == 1:
+                c = upper + margin
+                low = c - round(close_frac * rng_bar)
+                h = low + rng_bar
+                o = min(h, max(low, c - round(body_frac * rng_bar)))
+            else:
+                c = lower - margin
+                h = c + round(close_frac * rng_bar)
+                low = h - rng_bar
+                o = max(low, min(h, c + round(body_frac * rng_bar)))
+            last_impulse = (d, max(1, rng_bar))
+            impulses.append(k)
+            calm_left = 12 if par.get("calm") else 0
+        else:
+            s_eff = max(1, scale // 5) if calm else scale
+            c = o + r.randint(-s_eff, s_eff)
+            h = max(o, c) + r.randint(0, s_eff // 2)
+            low = min(o, c) - r.randint(0, s_eff // 2)
+            last_impulse = None
+        h, low = max(h, o, c), min(low, o, c)
+        mids.append((o, h, low, c))
+        close = c
+        # połówki spreadu (ósemki): otwarcie = zamknięcie poprzedniej świecy (ciągłość), zamknięcie błądzi, rzadkie skoki
+        h_open = half_close
+        half_close = max(0, min(hmax, half_close + r.randint(-1, 1)))
+        if r.random() < 0.03:
+            half_close = min(3 * hmax, half_close + r.randint(hmax, 2 * hmax))
+        halves.append((h_open, r.randint(0, hmax), r.randint(0, hmax), half_close))
+    slots = list(range(SLOTS))
+    drop: set[int] = set()
+    for _ in range(r.choices([0, 1, 2], weights=[45, 35, 20])[0]):
+        start = r.randint(10, 85)
+        drop |= set(range(start, start + r.choice([1, 2, 3, 4, 6])))
+    if r.random() < 0.4:  # dane urywają się przed końcem dnia, często kilka świec po wybiciu (END_OF_DATA)
+        late = [k for k in impulses if k >= 60]
+        cut = min(SLOTS - 1, r.choice(late) + r.randint(2, 8)) if late and r.random() < 0.7 else r.randint(64, 94)
+        drop |= set(range(cut, SLOTS))
+    keep = [s for s in slots if s not in drop]
+    out_mids, out_halves = [mids[s] for s in keep], [list(halves[s]) for s in keep]
+    for index in range(1, len(keep)):  # ciągłość spreadu także po usuniętej dziurze
+        out_halves[index][0] = out_halves[index - 1][3]
+    return DayData(keep, out_mids, [tuple(h) for h in out_halves])
+
+
+def slot_time(day: date, slot: int) -> datetime:
+    return (datetime(day.year, day.month, day.day, 8, 0, tzinfo=NY) + timedelta(minutes=5 * slot)).astimezone(UTC)
+
+
+def research_bars(cs, day: date, data: DayData):
+    out = []
+    for slot, m, h in zip(data.slots, data.mids, data.halves):
+        out.append(cs.Bar(slot_time(day, slot), *[(x - y) / 8 for x, y in zip(m, h)], *[(x + y) / 8 for x, y in zip(m, h)]))
+    return out
+
+
+def engine_candles(day: date, data: DayData) -> list[Candle]:
+    return [
+        Candle("US500", slot_time(day, slot), *[D(x) * EIGHTH for x in m])  # środek = (bid + ask) / 2 = m / 8
+        for slot, m in zip(data.slots, data.mids)
+    ]
+
+
+def next_open_quote(data: DayData, index: int, ts: datetime) -> Quote:
+    """Notowanie = otwarcie ISTNIEJĄCEJ świecy o indeksie `index` (bid = środek - połowa, ask = środek + połowa)."""
+    mid_open, half_open = data.mids[index][0], data.halves[index][0]
+    return Quote("US500", D(mid_open - half_open) * EIGHTH, D(mid_open + half_open) * EIGHTH, ts)
+
+
+class Traded:
+    """Transakcja z `run` razem z indeksami świec (sygnał, wejście, wyjście) odczytanymi z jego ramki."""
+
+    def __init__(self, signal: int, entry: int, exit_: int, reason: str, tup: tuple):
+        self.signal, self.entry, self.exit, self.reason, self.tup = signal, entry, exit_, reason, tup
+
+
+def traced_run(cs, bars, atr):
+    """`run("B1", "M5", "SESJE", ...)` pod sys.setprofile: (transakcje, pominięcia, oceniane świece, lista Traded)."""
+    source, run_code = cs.run.__code__.co_filename, cs.run.__code__
+    evaluated: list[int] = []
+    skipped: list[tuple[int, str]] = []
+    pending: list[tuple[int, int, int, str]] = []
+
+    def profiler(frame, event, arg):
+        if event == "call":
+            code = frame.f_code
+            if code.co_filename != source:
+                return
+            if code.co_name == "signals":
+                evaluated.append(frame.f_locals["i"])
+            elif code.co_name == "skip":
+                skipped.append((frame.f_back.f_locals["i"], frame.f_locals["why"]))
+        elif event == "c_call" and frame.f_code is run_code and getattr(arg, "__name__", "") == "append":
+            local = frame.f_locals
+            if arg.__self__ is local.get("trades") and "reason" in local:
+                idx = local["idx"]
+                pending.append((local["i"], idx[local["k"]], idx[local["last"]], local["reason"]))
+
+    sys.setprofile(profiler)
+    try:
+        trades, skips = cs.run("B1", "M5", "SESJE", bars, atr, None, None)
+    finally:
+        sys.setprofile(None)
+    assert len(pending) == len(trades), (pending, trades)
+    traded = [Traded(i, e, x, why, tup) for (i, e, x, why), tup in zip(pending, trades)]
+    assert collections.Counter(why for _, why in skipped) == collections.Counter(skips)
+    return trades, skipped, evaluated, traded
+
+
+RESEARCH_TO_LANE = {
+    "STOP_TOO_CLOSE": STOP_TOO_CLOSE,
+    "SLIP_FILTER": SLIP_FILTER,
+    "COST_OVER_0.20R": COST_OVER_LIMIT,
+    "GAPPED_DATA": GAPPED_DATA,
+}
+RESEARCH_EXIT_TO_LANE = {"TIME": EXIT_TIME_LIMIT, "FLAT": EXIT_FLATTEN}
+
+
+def replay_day(cs, cfg: BarRuleConfig, rules: InstrumentRules, day: date, data: DayData, seen: collections.Counter) -> None:
+    """Porównuje decyzje pasma z `run` dla jednej serii dziennej; liczniki pokrycia w `seen`."""
+    bars = research_bars(cs, day, data)
+    candles = engine_candles(day, data)
+    atr = cs.atr_series(bars)
+    session = lane_session(cfg, CAL, day)
+    assert session is not None
+    _, skipped, evaluated, traded = traced_run(cs, bars, atr)
+    skip_of = dict(skipped)
+    evaluated_set = set(evaluated)
+    trade_of = {t.signal: t for t in traded}
+    n = cs.TF["M5"]["n"]
+    assert [b.t for b in bars] == [c.start for c in candles]
+
+    for p in range(len(bars) - 1):  # ostatnia świeca dnia nie ma następnej: `run` jej nie ocenia
+        start, end = bars[p].t, bars[p].t + timedelta(minutes=5)
+        local = start.astimezone(cs.TZ).time()
+        where = f"{day} świeca {p} ({local})"
+        assert session.in_signal_window(start) is cs.in_window(local, "SESJE"), where
+
+        # stan dnia z transakcji `run`: tylko to, co silnik wiedziałby w chwili `end`
+        entered = [t for t in traded if t.signal < p]
+        completed = [t for t in entered if bars[t.exit].t < end]
+        position_open = any(end <= bars[t.exit].t for t in entered)
+        result_r = 0.0
+        for t in completed:  # ta sama kolejność dodawania co `r_day += pnl / r_pts` w badaniach
+            result_r += t.tup[7]
+        last_exit_at = max((bars[t.exit].t for t in completed), default=None)
+        state = DayState(day, len(entered), D(result_r), position_open, last_exit_at)
+
+        # oczekiwana przyczyna
+        if p in skip_of:
+            expected = RESEARCH_TO_LANE[skip_of[p]]
+        elif p in evaluated_set:
+            expected = ENTER if p in trade_of else NO_SIGNAL
+        else:
+            n_day = sum(1 for t in traded if t.exit < p)
+            r_day = 0.0
+            for t in traded:
+                if t.exit < p:
+                    r_day += t.tup[7]
+            facts = [
+                (POSITION_OVERLAP, any(t.signal < p <= t.exit for t in traded)),
+                (INSUFFICIENT_DATA, p < n + 2 or atr[p] is None),
+                (OUTSIDE_WINDOW, not cs.in_window(local, "SESJE")),
+                (MAX_ENTRIES_DAY, n_day >= cs.MAX_DAY),
+                (DAY_STOP, r_day <= cs.DAY_STOP_R),
+            ]
+            true_facts = [name for name, fact in facts if fact]
+            assert true_facts, f"{where}: `run` pominęło świecę po cichu, ale żaden fakt tego nie tłumaczy"
+            expected = true_facts[0]
+        seen[f"reason:{expected}"] += 1
+
+        quote_p = next_open_quote(data, p + 1, end)
+        decision = decide_entry(candles[max(0, p - 39) : p + 1], quote_p, rules, RISK, cfg, session, state, end)
+        assert decision.reason == expected, f"{where}: pasmo {decision.reason}, badania {expected}, stan {state}"
+
+        if expected == ENTER:
+            tup = trade_of[p].tup
+            assert decision.plan is not None and decision.signal is not None
+            assert decision.signal.side is (Side.BUY if tup[2] == 1 else Side.SELL), where
+            stop_from_research = tup[3] - tup[2] * tup[9]  # cena wejścia -/+ odległość stopu
+            assert abs(float(decision.signal.stop_level) - stop_from_research) <= 1e-9, where
+            slip = cfg.assumed_slippage_points
+            entry_price = quote_p.ask + slip if tup[2] == 1 else quote_p.bid - slip
+            assert abs(float(entry_price) - tup[3]) <= 1e-9, where
+            assert decision.signal.signal_candle_end == end
+            assert tup[1] >= end, where
+            if tup[1] != end:  # dziura w danych tuż za świecą sygnału: badania wchodzą na następnej istniejącej świecy
+                seen["hole_after_signal"] += 1
+            ask_distance = quote_p.ask - decision.signal.stop_level if tup[2] == 1 else decision.signal.stop_level - quote_p.bid
+            assert ask_distance <= decision.plan.stop_distance < ask_distance + rules.stop_step, where
+            seen[f"entry:{'BUY' if tup[2] == 1 else 'SELL'}"] += 1
+
+    for t in traded:  # wyjście zaplanowane: limit czasu i spłaszczenie na każdej świecy od wejścia do wyjścia
+        opened_at = bars[t.entry].t
+        for j in range(t.entry, t.exit + 1):
+            want = RESEARCH_EXIT_TO_LANE.get(t.reason) if j == t.exit else None
+            got = exit_due(opened_at, bars[j].t, session, cfg)
+            assert got == want, f"{day} wyjście {t.reason}, świeca {j}: pasmo {got}, badania {want}"
+        seen[f"exit:{t.reason}"] += 1
+        seen["trades"] += 1
+    per_day = len(traded)
+    seen[f"day_entries:{'10' if per_day >= cs.MAX_DAY else '3+' if per_day >= 3 else str(per_day)}"] += 1
+
+
+def run_cross(env: dict[str, str], cfg: BarRuleConfig, rules: InstrumentRules, label: str) -> collections.Counter:
+    cs = load_research(env)
+    assert cs.SLIP == float(cfg.assumed_slippage_points) and cs.STEP == float(rules.stop_step)
+    seen: collections.Counter = collections.Counter()
+    for index, day in enumerate(session_days(SERIES)):
+        data = generate_day(random.Random(f"lanes-cross-{label}-{index}"))
+        replay_day(cs, cfg, rules, day, data, seen)
+        seen["series"] += 1
+    return seen
+
+
+def assert_coverage(seen: collections.Counter) -> None:
+    """Test nie jest pusty: każda przyczyna, oba kierunki, każde wyjście i dni z wieloma wejściami faktycznie wystąpiły."""
+    assert seen["series"] >= 300, seen
+    for reason_ in (
+        ENTER,
+        NO_SIGNAL,
+        INSUFFICIENT_DATA,
+        OUTSIDE_WINDOW,
+        POSITION_OVERLAP,
+        MAX_ENTRIES_DAY,
+        DAY_STOP,
+        GAPPED_DATA,
+        STOP_TOO_CLOSE,
+        SLIP_FILTER,
+        COST_OVER_LIMIT,
+    ):
+        assert seen[f"reason:{reason_}"] >= 20, (reason_, dict(seen))
+    assert seen["entry:BUY"] >= 100 and seen["entry:SELL"] >= 100, dict(seen)
+    for exit_reason, minimum in {"STOP": 50, "TARGET": 50, "TIME": 10, "FLAT": 5, "END_OF_DATA": 5}.items():
+        assert seen[f"exit:{exit_reason}"] >= minimum, (exit_reason, dict(seen))
+    assert seen["day_entries:3+"] >= 60, dict(seen)  # dni z kilkoma wejściami
+    assert seen["day_entries:10"] >= 5, dict(seen)  # dni z limitem 10 wejść
+
+
+@needs_research
+def test_cross_check_with_research_run_on_dyadic_prices_is_exact():
+    """360 serii: ceny i spready w ósemkach punktu, poślizg 0.125 i krok 0.125, więc float badań liczy dokładnie to samo
+    co Decimal pasma (także remisy na progach). Zgodna sekwencja decyzji, przyczyn odrzuceń i wyjść zaplanowanych."""
+    cfg = dataclasses.replace(CFG, assumed_slippage_points=D("0.125"))
+    rules = dataclasses.replace(RULES, min_stop_distance=D("0"), stop_step=D("0.125"))
+    assert_coverage(run_cross(DYADIC_ENV, cfg, rules, "dyadic"))
+
+
+@needs_research
+def test_cross_check_with_research_run_for_the_frozen_hypothesis_parameters():
+    """Te same serie z parametrami zamrożonej hipotezy (poślizg 0.15, krok 0.1) i progami z pliku pasma."""
+    cfg = load_bar_rule_config(Path("config") / "lane_us500_b1_m5.toml")
+    rules = dataclasses.replace(RULES, min_stop_distance=D("0"))
+    assert_coverage(run_cross(FORWARD_ENV, cfg, rules, "frozen"))
+
+
+@needs_research
+def test_research_module_constants_equal_the_lane_config():
+    cs = load_research(FORWARD_ENV)
+    assert cs.MAX_DAY == CFG.max_entries_per_day
+    assert -cs.DAY_STOP_R == float(CFG.day_stop_r)
+    assert cs.MIN_STOP_FRAC == float(CFG.min_stop_fraction)
+    assert cs.ATR_N == CFG.atr_period
+    assert cs.SLIP == float(CFG.assumed_slippage_points)
+    assert cs.TF["M5"]["n"] == CFG.lookback_bars and cs.TF["M5"]["minutes"] == CFG.bar_minutes
+    assert cs.TF["M5"]["limits"]["B1"] == CFG.time_limit_min
+    assert str(cs.TZ) == CFG.session_timezone
+    assert cs.WINDOWS["SESJE"] == [tuple(w) for w in parse_signal_windows(CFG.signal_windows)]
+    assert cs.FLAT == time(15, 55)  # NYSE 16:00 - flatten_before_close_min
+    assert CAL.flatten_time(DAY, CFG.flatten_before_close_min) == cs.FLAT
+
+
+@pytest.mark.skipif(not PREREG.exists(), reason="brak docs/ (obraz testowy)")
+def test_forward_env_pinned_in_this_test_is_the_one_in_the_preregistration():
+    text = PREREG.read_text(encoding="utf-8")
+    for key, value in FORWARD_ENV.items():
+        assert f"{key}={value}" in text, f"{key}={value} nie występuje w {PREREG.name}"
