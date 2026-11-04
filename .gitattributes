@@ -1,3 +1,5 @@
 # Odcisk pre-rejestracji (python -m gwstock.prereg) liczy SUROWE bajty plików konfiguracji: końce linii muszą
 # być stałe (LF), bez BOM, inaczej ten sam tekst dałby inny odcisk na innym systemie.
 config/*.toml text eol=lf
+# Złote ślady DE40 porównywane bajt w bajt: końce linii muszą być stałe (LF), inaczej test padnie na systemie z autocrlf.
+tests/fault/golden/*.json text eol=lf
