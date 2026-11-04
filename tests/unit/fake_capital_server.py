@@ -353,6 +353,7 @@ class FakeCapitalServer:
         self.positions: dict[str, FakePosition] = {}
         self.confirms: dict[str, dict[str, Any]] = {}
         self.activities: list[dict[str, Any]] = []  # kolejność zdarzeń; odpowiedź podaje je od najnowszych
+        self.transactions: list[dict[str, Any]] = []  # `GET /history/transactions` (§2.20, C8): wstawia test
         self.working_orders: list[tuple[str, dict[str, Any]]] = []  # (rachunek, element odpowiedzi)
         # klucze stopu w GET /positions: "absent" (jak w przykładach [S1]) | "present" | "null" | "when-set" (klucz
         # tylko przy pozycji, która ma stop: tak mogłoby wyglądać API, które pomija klucz przy braku stopu)
@@ -385,6 +386,7 @@ class FakeCapitalServer:
         self.route("DELETE", "/positions/{deal_id}", self._close_position)
         self.route("GET", "/confirms/{ref}", self._confirm)
         self.route("GET", "/history/activity", self._activity)
+        self.route("GET", "/history/transactions", self._transactions)
         self.route("GET", "/workingorders", self._working_orders)
 
     # --- cykl życia ---------------------------------------------------------------
@@ -1017,6 +1019,16 @@ class FakeCapitalServer:
         if payload is None:
             return self.reply({"errorCode": "error.not-found.dealReference"}, 404)
         return self.reply(payload)
+
+    async def _transactions(self, request: web.Request, body: Any) -> web.Response:
+        """`GET /history/transactions` (§2.20): wiersze `transactions` (test) z `dateUtc` w [from, to]; oba parametry
+        wymagane w formacie `YYYY-MM-DDTHH:MM:SS` (inne użycie nie jest potrzebne próbie pasma)."""
+        query = request.query
+        if not all(name in query and _STAMP.fullmatch(query[name]) for name in ("from", "to")):
+            return self.reply({"errorCode": "error.invalid.from"}, 400)
+        start, end = parse_stamp(query["from"]), parse_stamp(query["to"])
+        rows = [r for r in self.transactions if start <= parse_stamp(r["dateUtc"][:19]) <= end]
+        return self.reply({"transactions": rows})
 
     async def _activity(self, request: web.Request, body: Any) -> web.Response:
         """`GET /history/activity` (§2.19): filtr po `dateUTC`, zakres najwyżej 1 dzień, od najnowszych."""

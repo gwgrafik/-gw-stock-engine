@@ -55,6 +55,9 @@ Zasady:
   którego otwarcia nie ma w zakresie, jest szukany wstecz z filtrem `dealId` (do 14 dni, wspólny limit zapytań;
   wyniki okien w całości przed `since` i skończonych co najmniej `LOOKBACK_CACHE_MIN_AGE` temu są zapamiętywane,
   najwyżej `LOOKBACK_CACHE_LIMIT` okien);
+- odczyty diagnostyczne próby pasma (`smoke --epic`, poza protokołem `Broker`, tylko GET): `diagnose_target_fields`
+  (surowe klucze celu i `currency`/`upl`/`level`/`stopLevel` pozycji i potwierdzenia, C5, C5d) i
+  `diagnose_transactions` (wiersze `GET /history/transactions` bez `reference`, C8); bez pamięci adaptera;
 - pamięć adaptera (wysłane odległości stopu i celu, stopy i cele deali, strony deali, migawki potwierdzeń) jest
   ograniczona do `RECORD_LIMIT` wpisów na tablicę (najstarsze wypadają).
 """
@@ -69,6 +72,13 @@ from typing import Any
 
 from gwstock.broker import capitalcom_history as history
 from gwstock.broker.capitalcom_history import DealRow
+from gwstock.broker.diagnostics import (
+    FieldsRead,
+    SettlementRow,
+    TargetFieldsReport,
+    parse_transactions,
+    split_fields,
+)
 from gwstock.broker.capitalcom_parse import (
     ALL_EPICS,
     Opening,
@@ -635,6 +645,39 @@ class TradingMixin:
             raise self._error(BrokerTimeout, f"DELETE {path}: close outcome unknown ({problem})")
         self._deal_stops.pop(deal_id, None)
         self._deal_targets.pop(deal_id, None)
+
+    # --- odczyty diagnostyczne próby pasma (`smoke --epic`; poza protokołem `Broker`) ---------------------------
+
+    async def diagnose_target_fields(self, deal_id: str, deal_reference: str | None) -> TargetFieldsReport:
+        """Surowe klucze celu zysku (C5) i pola `currency`, `upl`, `level`, `stopLevel` z `GET /positions/{dealId}`
+        (obiekt `position`) i `GET /confirms/{dealReference}`; tylko odczyt, bez pamięci adaptera i bez interpretacji.
+        Pozycja albo referencja nieznana (404 z właściwym kodem) → `FieldsRead(found=False)`; inny błąd: wyjątek."""
+        position = await self._diagnose_record(
+            f"/positions/{check_ident('deal_id', deal_id)}", NOT_FOUND_DEAL, "position"
+        )  # fmt: skip
+        confirm = FieldsRead(False)
+        if deal_reference is not None:
+            reference = check_ident("deal_reference", deal_reference)
+            confirm = await self._diagnose_record(f"/confirms/{reference}", NOT_FOUND_REFERENCE, None)
+        return TargetFieldsReport(position, confirm)
+
+    async def _diagnose_record(self, path: str, not_found: str, key: str | None) -> FieldsRead:
+        payload = await self._request("GET", path, not_found=not_found)
+        if payload is None:
+            return FieldsRead(False)
+        record = payload.get(key) if key is not None else payload
+        if not isinstance(record, dict):
+            return FieldsRead(False, error="unexpected response")
+        target, other = split_fields(record)
+        return FieldsRead(True, target, other)
+
+    async def diagnose_transactions(self, start: datetime, end: datetime) -> list[SettlementRow]:
+        """Wiersze `GET /history/transactions` z `from`/`to` (UTC, pełne sekundy; `to` nie później niż teraz), bez
+        pola `reference` (C8: waluta i kwota rozliczenia wyniku); tylko odczyt."""
+        low = _since_arg(start).replace(microsecond=0)
+        high = min(_since_arg(end), self._clock.now_utc()).replace(microsecond=0)
+        params = {"from": history.api_time(low), "to": history.api_time(max(low, high))}
+        return parse_transactions(await self._request("GET", "/history/transactions", params=params))
 
     async def _outcome(self, payload: Any) -> tuple[Any, str | None]:
         """Potwierdzenie `PUT`/`DELETE` po referencji z odpowiedzi: (treść, None) przy ACCEPTED, (None, problem) gdy
