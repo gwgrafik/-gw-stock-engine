@@ -91,7 +91,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from gwstock.broker.base import Broker
 from gwstock.calendar import ExchangeCalendar
@@ -113,7 +113,7 @@ from gwstock.notify import Notifier
 from gwstock.orders.fsm import check_position_transition
 from gwstock.orders.ids import make_client_id
 from gwstock.orders.manager import HISTORY_MARGIN, EntryBlocked, OrderManager
-from gwstock.risk import JOURNAL_WRITE_FAILED, EntryCandidate, KillSwitch, RiskGate
+from gwstock.risk import JOURNAL_WRITE_FAILED, EntryCandidate, KillSwitch, RiskGate, Verdict
 from gwstock.serialization import dump
 from gwstock.strategy import EntrySignal
 from gwstock.strategy_bars import BarEntryPlan
@@ -184,6 +184,7 @@ PNL_PENDING = "PNL_PENDING"
 # Obrona w głąb (scenariusz A13): waluta reguł brokera inna niż waluta pasma (np. konfiguracja pasma pominęła walutę
 # instrumentu w USD): wejście zablokowane, a księgowanie odmawia (BookingError) zamiast dopisać obcą kwotę do licznika.
 CURRENCY_MISMATCH = "CURRENCY_MISMATCH"
+PORTFOLIO_GATE_ERROR = "PORTFOLIO_GATE_ERROR"  # jak w `gwstock.portfolio` (zgodność sprawdza test)
 LANE_MISMATCH = "LANE_MISMATCH"  # księgowanie pozycji innego instrumentu niż instrument pasma
 _V1_ACCOUNT_CURRENCY = "EUR"  # waluta rachunku v1 (jak `app.ACCOUNT_CURRENCY`), gdy pasmo nie ma `FxView`
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
@@ -274,6 +275,12 @@ class ExitMemory:
     guards_run: set[str] = field(default_factory=set)
 
 
+class PortfolioCheck(Protocol):
+    """Bramka portfelowa widziana przez wykonawcę (spełnia ją `gwstock.portfolio.PortfolioGate`): werdykt wejścia."""
+
+    def check_entry(self, c: object, account: object) -> Verdict: ...
+
+
 # `FxView` (jeden protokół dla wykonawcy i bramki portfelowej) mieszka w `gwstock.fx`. W wykonawcy: brak ważnego kursu
 # = wejście zablokowane (FX_UNAVAILABLE); straż wielkości po wypełnieniu przyjmuje kwotę bez przeliczenia tylko przy
 # `par_is_upper_bound`, inaczej zamyka pozycję; odległość stopu z limitu straty tak samo, inaczej brak odległości (kill
@@ -318,6 +325,7 @@ class Executor:
         memory: ExitMemory | None = None,
         lane: LaneSpec | None = None,
         fx: FxView | None = None,
+        portfolio: PortfolioCheck | None = None,
     ) -> None:
         if not risk.submit_timeout_s > 0:
             raise ValueError(f"submit_timeout_s must be positive, got {risk.submit_timeout_s!r}")
@@ -339,6 +347,7 @@ class Executor:
         self._clock = clock
         self._lane = lane
         self._fx = fx
+        self._portfolio = portfolio
         self._risk = risk
         self._calendar = lane.calendar
         self._notifier = notifier
@@ -365,11 +374,13 @@ class Executor:
         *,
         memory: ExitMemory | None = None,
         fx: FxView | None = None,
+        portfolio: PortfolioCheck | None = None,
     ) -> Executor:
-        """Wykonawca pasma `lane` (silnik z pasmami); `gate` i `cost_model` to bramka i model kosztów TEGO pasma."""
+        """Wykonawca pasma `lane` (silnik z pasmami); `gate` i `cost_model` to bramka i model kosztów TEGO pasma,
+        `portfolio` to wspólna bramka portfelowa (`gwstock.portfolio.PortfolioGate`) oceniana PO bramce pasma."""
         return cls(
             manager, broker, journal, gate, kill, cost_model, clock, None, risk, None, notifier, live, memory=memory,
-            lane=lane, fx=fx,
+            lane=lane, fx=fx, portfolio=portfolio,
         )  # fmt: skip
 
     @property
@@ -484,10 +495,13 @@ class Executor:
         self._raw(SOURCE_ACCOUNT, response=account)
 
         verdict = self._gate.check_smoke(candidate, account) if smoke else self._gate.check_entry(candidate, account)
-        if not verdict.passed:
-            block = {"reasons": verdict.reasons, "candidate": candidate, "day": day.isoformat()}
+        portfolio_reasons = self._portfolio_reasons(replace(candidate, value_per_point=rules.value_per_point), account)
+        if not verdict.passed or portfolio_reasons:
+            block = {"reasons": [*verdict.reasons, *portfolio_reasons], "candidate": candidate, "day": day.isoformat()}
             if smoke:
                 block["smoke"] = True
+            if portfolio_reasons:  # tylko gdy niepuste: bajty dziennika DE40 bez bramki portfelowej bez zmian
+                block["portfolio_reasons"] = portfolio_reasons
             self._append(SOURCE_GATE_BLOCK, block)
             return None
         role = ROLE_SMOKE if smoke else ROLE_ENTRY
@@ -530,6 +544,16 @@ class Executor:
         self._journal.set_meta(ctx_key, dump(context))
         self._journal.set_meta(META_ENTRY_LAST.format(self._epic), client_id)
         return request
+
+    def _portfolio_reasons(self, candidate: EntryCandidate, account: object) -> list[str]:
+        """Powody bramki portfelowej (spec wielu pasm §4.1) dla kandydata z wartością punktu w WALUCIE INSTRUMENTU
+        (bramka sama przelicza ją przez `FxView`); bez bramki: brak powodów. Nieoczekiwany wyjątek blokuje."""
+        if self._portfolio is None:
+            return []
+        try:
+            return list(self._portfolio.check_entry(candidate, account).reasons)
+        except Exception:  # bramka portfelowa sama nie rzuca; gdyby jednak: wejście zablokowane, nigdy przepuszczone
+            return [PORTFOLIO_GATE_ERROR]
 
     def _lane_currency(self) -> str:
         """Waluta, w której pasmo liczy instrument: `LaneSpec.currency`, a bez niej waluta rachunku (z `FxView`, bez
