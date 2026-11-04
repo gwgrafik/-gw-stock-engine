@@ -1267,7 +1267,7 @@ async def test_distinct_closures_of_one_deal_are_all_kept(server, broker, clock)
     ("source", "reason", "unknown"),
     [
         ("SL", "STOP", 0),
-        ("TP", "STOP", 0),
+        ("TP", "TARGET", 0),  # cel zysku: osobna przyczyna (zadanie 7); NIEPOTWIERDZONE, że TP = zadziałanie celu (C7)
         ("USER", "MANUAL", 0),
         ("CLOSE_OUT", "FORCED", 0),
         ("DEALER", "FORCED", 0),

@@ -22,8 +22,12 @@ Zasady (kompletność albo wyjątek, nigdy lista częściowa):
 - wiersz w kierunku pozycji PO rzekomym zamknięciu (np. otwarcie przez API ze źródłem innym niż `USER`, z którego
   wywnioskowano by odwrotną stronę) → deal sprzeczny (`HISTORY_INCONSISTENT`), nigdy otwarcie zaksięgowane jako
   wyjście;
-- przyczyna: `SL`/`TP` → "STOP", `USER` → "MANUAL", `CLOSE_OUT`/`DEALER`/`SYSTEM` → "FORCED", źródło nieznane →
-  "FORCED" (nigdy "STOP") i licznik alarmowy adaptera (C7);
+- przyczyna: `SL` → "STOP", `TP` → "TARGET" (cel zysku, R4; wcześniej `TP` było księgowane jako "STOP", co dolicza
+  poślizg stopu), `USER` → "MANUAL", `CLOSE_OUT`/`DEALER`/`SYSTEM` → "FORCED", źródło nieznane → "FORCED" (nigdy
+  "STOP" ani "TARGET") i licznik alarmowy adaptera (C7). NIEPOTWIERDZONE, że zadziałanie celu daje właśnie `TP`
+  (dokumentacja wymienia wartość w wyliczeniu, ale nie opisuje przypisania; do sprawdzenia surową historią po
+  pierwszym zamknięciu celem, skrypt research/diag_fx.py pokazuje źródła zamknięć na rachunku). Adapter nie
+  rozstrzyga, czy cel zysku obowiązuje w pasmie: pasmo DE40 bez celu mapuje `TARGET` po swojej stronie (projekt §3.5);
 - identyczne wiersze (np. z nakładki okien) liczą się raz; różne zamknięcia jednego dealId zostają (częściowe
   zamknięcia: uzgadnianie zgłasza AMBIGUOUS_CLOSURE).
 """
@@ -68,7 +72,7 @@ _IGNORED_TYPES = frozenset({"WORKING_ORDER", "EDIT_STOP_AND_LIMIT", "SWAP", "SYS
 _DEAL_DONE = "ACCEPTED"
 _NOTHING_HAPPENED = frozenset({"REJECTED", "MODIFY_REJECT", "CANCEL_REJECT"})
 USER = "USER"
-REASONS = {"SL": "STOP", "TP": "STOP", "USER": "MANUAL", "CLOSE_OUT": "FORCED", "DEALER": "FORCED", "SYSTEM": "FORCED"}
+REASONS = {"SL": "STOP", "TP": "TARGET", "USER": "MANUAL", "CLOSE_OUT": "FORCED", "DEALER": "FORCED", "SYSTEM": "FORCED"}
 UNKNOWN_SOURCE_REASON = "FORCED"
 
 
@@ -181,7 +185,7 @@ def opposite(side: Side) -> Side:
 
 
 def reason_for(source: str) -> tuple[str, bool]:
-    """(przyczyna `ClosedDeal.reason`, czy źródło jest znane); nieznane → "FORCED", nigdy "STOP"."""
+    """(przyczyna `ClosedDeal.reason`, czy źródło jest znane); nieznane → "FORCED", nigdy "STOP" ani "TARGET"."""
     reason = REASONS.get(source)
     return (reason, True) if reason is not None else (UNKNOWN_SOURCE_REASON, False)
 
