@@ -39,7 +39,9 @@ Niezmienniki (prawdziwe pieniądze):
   po deal_id, który sam dolicza wynik dnia) i nie zawodzi na wiarygodnych danych: każdy błąd budowy faktów lub kosztów
   → rekord zdegradowany, ale zaksięgowany (COST_FALLBACK); błąd dziennika propaguje się (pozycja nie jest FLAT, więc
   kolejny przebieg księguje ponownie);
-- przyczyna wyjścia w księdze: STOP, gdy zamknął stop brokera; FORCED, gdy wyjście zainicjował silnik (zapis
+- przyczyna wyjścia w księdze: STOP, gdy zamknął stop brokera; TARGET, gdy cel zysku brokera (pasmo z celem; także
+  w wyścigu z wyjściem silnika, np. limitem czasu `flatten(position, "TIME_LIMIT")`; pasmo bez celu: STOP);
+  FORCED, gdy wyjście zainicjował silnik (zapis
   `exit_intent:<deal_id>` tuż przed wysłaniem zamknięcia, nigdy, gdy nic nie wysłano) albo broker wymusił zamknięcie;
   MANUAL, gdy zamknięto wywołaniem bez zamiaru silnika (właściciel);
 - kontrole limitów strat (`enforce_loss_limits`, także po każdym księgowaniu, również ponownym): dzień ≤
@@ -780,7 +782,9 @@ class Executor:
 
         `position`: rekord z dziennika (albo widok brokera); liczą się wyłącznie `epic` i `deal_id`, a źródłem prawdy
         jest bieżący rekord dziennika (musi być OPEN lub EXITING z tym deal_id, inaczej odmowa; BLOCKED zamyka tylko
-        awaryjne spłaszczenie). `reason` (np. FORCED, MANUAL, EMERGENCY) trafia do zdarzeń i do `exit_intent`.
+        awaryjne spłaszczenie). `reason` (np. FORCED, MANUAL, EMERGENCY, TIME_LIMIT: limit czasu pozycji pasma, R4)
+        trafia do zdarzeń (`flatten_reason`) i do `exit_intent`; w księdze wyjście silnika to FORCED, chyba że w tej
+        samej chwili pozycję zamknął stop albo cel brokera (`_exit_reason`).
         None: rynek zamknięty, zamknięcie niepotwierdzone, pozycja nadal otwarta albo zamknięcie czeka na historię
         (pozycja EXITING; ponowić przy następnym takcie albo zaksięguje uzgadnianie). Ponowienie na pozycji EXITING
         (albo OPEN, gdy zamknięcie tego deala poszło już w tym procesie) najpierw czyta listę pozycji: zniknęła →
@@ -1377,10 +1381,17 @@ class Executor:
         return trade, notes
 
     def _exit_reason(self, closed: ClosedDeal) -> str:
-        """STOP: stop brokera; FORCED: wyjście silnika (zamiar w dzienniku albo w pamięci tego procesu, gdy zapis
-        zawiódł) albo wymuszenie brokera; MANUAL: zamknięcie wywołaniem bez zamiaru silnika (właściciel)."""
+        """Kolejność (projekt §3.3): STOP (stop brokera), TARGET (cel zysku brokera; przyczyny brokera mają
+        pierwszeństwo przed zamiarem silnika, bo w wyścigu „limit czasu wysłał zamknięcie, a w tej chwili zadziałał
+        cel” pozycję zamknął cel), FORCED (wyjście silnika: zamiar w dzienniku albo w pamięci tego procesu, gdy zapis
+        zawiódł; albo wymuszenie brokera), MANUAL (zamknięcie wywołaniem bez zamiaru silnika: właściciel).
+
+        Pasmo bez celu (DE40 v1) księguje zamknięcie celem jak STOP (cel mógł ustawić tylko właściciel ręcznie;
+        projekt §3.5: tak samo jak dotąd, gdy adapter mapował TP na STOP)."""
         if closed.reason == "STOP":
             return "STOP"
+        if closed.reason == "TARGET":
+            return "TARGET" if self._lane.uses_target else "STOP"
         if closed.deal_id in self._memory.exit_intents:
             return "FORCED"
         if self._journal.get_meta(META_EXIT_INTENT.format(closed.deal_id)) is not None:

@@ -44,6 +44,7 @@ from gwstock.types import (
     PositionState,
     Quote,
     Side,
+    TargetedOpenPosition,
 )
 from tests.conftest import RecordingNotifier
 
@@ -335,3 +336,92 @@ async def test_protection_remembers_the_deal_under_its_own_instrument(fake, memo
     fake.positions["DEAL-X"] = pos
     assert await de.protect_unprotected(pos) is True
     assert memory.last_own_deal_by_epic == {"DE40": "DEAL-X"}
+
+
+# --- przyczyna wyjścia: TARGET przed zamiarem silnika; limit czasu pozycji -------------------------------
+
+
+@pytest.fixture
+def ut(lane_build, us_gate, calendar) -> Executor:
+    """Pasmo z celem w walucie rachunku (bez przeliczeń): przyczyna wyjścia i limit czasu bez dwufazowej księgi."""
+    return lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate)
+
+
+def hold_targeted(fake, journal, deal_id="DEAL-T"):
+    pos = TargetedOpenPosition(deal_id, "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY, target_level=US_TARGET)
+    fake.positions[deal_id] = pos
+    journal.upsert_position(PositionRecord("US500", P.OPEN, deal_id, Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY))
+    return pos
+
+
+async def test_time_limit_flatten_racing_the_target_books_target_not_forced(ut, fake, journal, kill):
+    hold_targeted(fake, journal)
+    fake.on_call("close_position", lambda: fake.trigger_target("DEAL-T"), once=True)  # cel zamyka w chwili DELETE
+    closed = await ut.flatten(journal.current_position("US500"), "TIME_LIMIT")
+    assert closed is not None and closed.reason == "TARGET" and closed.exit_level == US_TARGET
+    assert fake.calls.count("close_position") == 1  # po odmowie lista pozycji, nigdy druga wysyłka
+    assert journal.get_meta("exit_intent:DEAL-T") == "TIME_LIMIT"  # zamiar silnika był zapisany
+    [row] = journal.trades()
+    assert row.exit_reason == "TARGET" and row.exit_fill == US_TARGET
+    [flat] = events(journal, "FLATTENED")
+    assert flat["flatten_reason"] == "TIME_LIMIT" and flat["close_reason"] == "TARGET"
+    assert events(journal, "TRADE_BOOKED")[0]["exit_reason"] == "TARGET"
+    assert journal.current_position("US500") == PositionRecord("US500", P.FLAT)
+    assert kill.level() is KillLevel.NONE
+
+
+async def test_time_limit_flatten_is_booked_forced_with_the_time_limit_reason(ut, fake, journal):
+    hold_targeted(fake, journal)
+    closed = await ut.flatten(journal.current_position("US500"), "TIME_LIMIT")
+    assert closed is not None and closed.reason == "MANUAL"  # zamknięcie wywołaniem u brokera
+    assert fake.calls == ["close_position", "closed_since", "instrument_rules"]  # bez kontekstu: reguły brokera
+    [row] = journal.trades()
+    assert row.exit_reason == "FORCED"  # wyjście zainicjował silnik (limit czasu pozycji)
+    [flat] = events(journal, "FLATTENED")
+    assert flat["flatten_reason"] == "TIME_LIMIT" and flat["close_reason"] == "MANUAL"
+    assert journal.get_meta("exit_intent:DEAL-T") == "TIME_LIMIT"
+
+
+async def test_time_limit_flatten_is_never_blocked_by_the_kill_switch(ut, fake, journal, kill):
+    hold_targeted(fake, journal)
+    kill.hard("TEST")
+    assert await ut.flatten(journal.current_position("US500"), "TIME_LIMIT") is not None
+    assert fake.positions == {} and journal.trades()[0].exit_reason == "FORCED"
+
+
+@pytest.mark.parametrize(
+    ("uses_target", "broker_reason", "intent", "expected"),
+    [
+        (True, "STOP", True, "STOP"),
+        (True, "TARGET", True, "TARGET"),  # wyścig limitu czasu z celem: przyczyna brokera przed zamiarem silnika
+        (True, "TARGET", False, "TARGET"),
+        (True, "MANUAL", True, "FORCED"),
+        (True, "MANUAL", False, "MANUAL"),
+        (True, "FORCED", False, "FORCED"),
+        (False, "TARGET", False, "STOP"),  # pasmo bez celu (DE40 v1): cel ustawiony ręcznie księguje się jak STOP
+        (False, "TARGET", True, "STOP"),
+        (False, "STOP", True, "STOP"),
+        (False, "MANUAL", True, "FORCED"),
+        (False, "MANUAL", False, "MANUAL"),
+    ],
+)
+async def test_exit_reason_order_is_stop_then_target_then_engine_intent_then_broker(
+    lane_build, us_gate, calendar, journal, uses_target, broker_reason, intent, expected
+):
+    ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=uses_target), us_gate)
+    record = PositionRecord("US500", P.EXITING, "DEAL-T", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
+    journal.upsert_position(record)
+    if intent:
+        journal.set_meta("exit_intent:DEAL-T", "TIME_LIMIT")
+    await ex.book(record, ClosedDeal("DEAL-T", "US500", US_TARGET, broker_reason, T_ENTRY))
+    assert journal.trades()[0].exit_reason == expected
+
+
+async def test_target_exit_costs_no_extra_stop_slippage_in_the_ledger(lane_build, us_gate, calendar, journal):
+    ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate)
+    record = PositionRecord("US500", P.EXITING, "DEAL-T", Side.BUY, D("1"), US_FILL, US_STOP, T_ENTRY)
+    await ex.book(record, ClosedDeal("DEAL-T", "US500", US_TARGET, "TARGET", T_ENTRY))
+    await ex.book(replace(record, deal_id="DEAL-S"), ClosedDeal("DEAL-S", "US500", US_STOP, "STOP", T_ENTRY))
+    target, stop = journal.trades()
+    assert target.slippage_penalty == D("0.50")  # tylko poślizg wejścia 0,5 pkt × 1
+    assert stop.slippage_penalty == D("1.50")  # wejście 0,5 + stop 1,0
