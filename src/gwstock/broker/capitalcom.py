@@ -37,7 +37,10 @@ Zasady:
   nazwę pola przy złym kształcie odpowiedzi), nigdy danych logowania, tokenów, nagłówków ani treści żądań;
   dodatkowo każdy komunikat jest czyszczony ze znanych sekretów, a wyjątki adaptera nie mają łańcucha
   (`__cause__`/`__context__`) z obcymi obiektami (menedżer zleceń zapisuje tekst wyjątku w dzienniku);
-- JSON wyłącznie z liczbami `Decimal` (`capitalcom_parse.loads`), czas wyłącznie z pól UTC.
+- JSON wyłącznie z liczbami `Decimal` (`capitalcom_parse.loads`), czas wyłącznie z pól UTC;
+- waluta instrumentu (zadanie 7, R8): `instrument_rules` odmawia, gdy waluta instrumentu różni się od waluty rachunku
+  sesji; wyjątek tylko dla epików z `foreign_currency_epics` konstruktora (pasma w USD), które dostają
+  `InstrumentRules(currency=...)` bez przeliczenia. Rozliczenie wyniku w EUR jest NIEPOTWIERDZONE (research/diag_fx.py).
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ import math
 import re
 import stat
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -447,9 +451,15 @@ class CapitalComBroker(TradingMixin):
         base_url: str = LIVE_BASE_URL,
         *,
         request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+        foreign_currency_epics: Iterable[str] = (),
     ) -> None:
         if not isinstance(creds, Credentials):
             raise TypeError(f"creds: expected Credentials, got {type(creds).__name__}")
+        if isinstance(foreign_currency_epics, (str, bytes)):
+            raise TypeError("foreign_currency_epics: expected a collection of epics, not a single string")
+        # epiki, dla których `instrument_rules` zwraca walutę instrumentu zamiast odmawiać przy walucie innej niż
+        # rachunku (pasma w USD, projekt §7); pozostałe instrumenty zachowują się jak w v1
+        self._foreign_currency_epics = frozenset(_check_epic(epic) for epic in foreign_currency_epics)
         self._api = api_root(base_url)
         if (
             isinstance(request_timeout_s, bool)
@@ -769,9 +779,9 @@ class CapitalComBroker(TradingMixin):
             problem = "expected a JSON object"
         raise self._error(BrokerError, f"{where}: malformed response ({problem}; HTTP {resp.status})")
 
-    def _parse(self, where: str, parser, *args: Any) -> Any:
+    def _parse(self, where: str, parser, *args: Any, **kwargs: Any) -> Any:
         try:
-            return parser(*args)
+            return parser(*args, **kwargs)
         except ParseError as exc:
             problem = str(exc)
         except ArithmeticError as exc:  # np. saldo 9E+999999 (decimal.Overflow) albo data poza zakresem
@@ -813,13 +823,19 @@ class CapitalComBroker(TradingMixin):
         """Reguły z `GET /markets/{epic}` (bez pamięci podręcznej: minimum stopu zależy od bieżącej ceny).
 
         Jednostki inne niż udokumentowane, brak pola albo waluta instrumentu różna od waluty rachunku sesji →
-        `BrokerError` (adapter niczego nie zgaduje). Szczegóły mapowania: `capitalcom_parse.parse_instrument_rules`.
+        `BrokerError` (adapter niczego nie zgaduje). Wyjątek: epik wymieniony w `foreign_currency_epics` konstruktora
+        (pasmo w USD) dostaje `InstrumentRules(currency=<waluta instrumentu>)`; `value_per_point` zostaje w walucie
+        instrumentu, a rozliczenie w EUR jest NIEPOTWIERDZONE (do sprawdzenia skryptem research/diag_fx.py na
+        rachunku). Szczegóły mapowania: `capitalcom_parse.parse_instrument_rules`.
         """
         path = f"/markets/{_check_epic(epic)}"
         payload = await self._request("GET", path)
         self._note_snapshot_anomalies(epic, payload)
         currency = self._login_accounts.get(self._session_account_id) if self._session_account_id else None
-        return self._parse(f"GET {path}", parse_instrument_rules, epic, payload, currency)
+        return self._parse(
+            f"GET {path}", parse_instrument_rules, epic, payload, currency,
+            allow_foreign_currency=epic in self._foreign_currency_epics,
+        )  # fmt: skip
 
     async def quote(self, epic: str) -> Quote:
         """Notowanie z `GET /markets/{epic}` (`snapshot.bid`, `snapshot.offer`).

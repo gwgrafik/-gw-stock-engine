@@ -237,6 +237,21 @@ def de40_market() -> dict[str, Any]:
     }
 
 
+def us500_market() -> dict[str, Any]:
+    """`GET /markets/US500`: instrument w USD (waluta INNA niż rachunku w EUR), kształt jak `de40_market()`.
+
+    Liczby są syntetyczne (zadanie 7 nie łączy się z brokerem): kontrakt waluty i pól celu to założenia z notatek API
+    (C8, C16), NIEPOTWIERDZONE na rachunku (research/diag_fx.py). Wielkość minimalna 0,01, krok 0,01 (projekt §7.5).
+    """
+    market = de40_market()
+    instrument, dealing, snapshot = market["instrument"], market["dealingRules"], market["snapshot"]
+    instrument.update(epic="US500", symbol="US500", name="US 500", currency="USD", country="US")
+    dealing["minDealSize"] = {"unit": "POINTS", "value": Decimal("0.01")}
+    dealing["minSizeIncrement"] = {"unit": "POINTS", "value": Decimal("0.01")}
+    snapshot.update(bid=Decimal("6800.0"), offer=Decimal("6800.6"), high=Decimal("6810.0"), low=Decimal("6780.0"))
+    return market
+
+
 def default_accounts() -> list[dict[str, Any]]:
     """Dwa rachunki CFD w EUR, oba ENABLED; preferowany jest ten z saldem (jak w odczycie live)."""
 

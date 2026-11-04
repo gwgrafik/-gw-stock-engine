@@ -21,7 +21,7 @@ import pytest
 from gwstock.broker import capitalcom
 from gwstock.broker.base import Broker, Capabilities
 from gwstock.broker.capitalcom import LIVE_BASE_URL, CapitalComBroker, Credentials, api_root, load_credentials
-from gwstock.broker.capitalcom_parse import ParseError, dec, loads
+from gwstock.broker.capitalcom_parse import ParseError, dec, loads, parse_instrument_rules
 from gwstock.types import (
     AccountInfo,
     BrokerAuthError,
@@ -33,7 +33,15 @@ from gwstock.types import (
     Quote,
     SessionExpired,
 )
-from tests.unit.fake_capital_server import TEST_API_KEY, TEST_IDENTIFIER, TEST_PASSWORD, candle, de40_market, stamp
+from tests.unit.fake_capital_server import (
+    TEST_API_KEY,
+    TEST_IDENTIFIER,
+    TEST_PASSWORD,
+    candle,
+    de40_market,
+    stamp,
+    us500_market,
+)
 
 UTC = timezone.utc
 T0 = datetime(2026, 11, 2, 7, 30, tzinfo=UTC)  # = start fixture `clock`
@@ -1071,6 +1079,131 @@ async def test_unexpected_rule_shapes_or_units_are_broker_errors(server, broker,
         await broker.instrument_rules("DE40")
     assert type(info.value) is BrokerError
     assert str(info.value).startswith("GET /markets/DE40: unexpected response:") and field in str(info.value)
+
+
+# --- waluta instrumentu (zadanie 7, R8; NIEPOTWIERDZONE na rachunku: research/diag_fx.py) -------------------
+
+FOREIGN_CURRENCY_MESSAGE = (
+    "instrument.currency: USD differs from the session account currency EUR; value_per_point would need an FX rate"
+)
+
+
+def us500_rules(**kwargs) -> InstrumentRules:
+    """Reguły US500 z syntetycznego rynku serwera testowego (bid 6800,0, offer 6800,6, minimum 0,01% × mid)."""
+    fields = dict(
+        epic="US500",
+        min_size=Decimal("0.01"),
+        size_step=Decimal("0.01"),
+        value_per_point=Decimal("1"),
+        margin_rate=Decimal("0.05"),
+        min_stop_distance=Decimal("0.68003"),
+        stop_step=Decimal("0.1"),
+    )
+    return InstrumentRules(**{**fields, **kwargs})
+
+
+def test_parse_instrument_rules_refuses_a_foreign_currency_by_default():
+    with pytest.raises(ParseError) as default:
+        parse_instrument_rules("US500", us500_market(), "EUR")
+    with pytest.raises(ParseError) as explicit:
+        parse_instrument_rules("US500", us500_market(), "EUR", allow_foreign_currency=False)
+    assert str(default.value) == str(explicit.value) == FOREIGN_CURRENCY_MESSAGE
+
+
+def test_parse_instrument_rules_refuses_when_the_account_currency_is_unknown_by_default():
+    with pytest.raises(ParseError, match="instrument.currency: USD differs from the session account currency <NoneType>"):
+        parse_instrument_rules("US500", us500_market(), None)
+
+
+def test_parse_instrument_rules_with_the_default_returns_no_currency_for_the_account_currency():
+    rules = parse_instrument_rules("DE40", de40_market(), "EUR")
+    assert rules.currency is None  # DE40 v1: wynik jak dotąd (bez nowego pola)
+
+
+def test_parse_instrument_rules_allowing_a_foreign_currency_returns_the_instrument_currency():
+    rules = parse_instrument_rules("US500", us500_market(), "EUR", allow_foreign_currency=True)
+    assert rules == us500_rules(currency="USD")
+    assert rules.value_per_point == Decimal("1")  # lotSize w walucie INSTRUMENTU: adapter niczego nie przelicza
+    assert_no_float(rules)
+
+
+def test_parse_instrument_rules_allowing_a_foreign_currency_works_without_a_known_account_currency():
+    assert parse_instrument_rules("US500", us500_market(), None, allow_foreign_currency=True).currency == "USD"
+
+
+def test_parse_instrument_rules_allowing_the_flag_also_reports_the_account_currency_of_the_instrument():
+    # opt-in zawsze niesie walutę: wywołujący sam porównuje z walutą rachunku
+    assert parse_instrument_rules("DE40", de40_market(), "EUR", allow_foreign_currency=True).currency == "EUR"
+
+
+def test_allow_foreign_currency_is_keyword_only():
+    with pytest.raises(TypeError):
+        parse_instrument_rules("US500", us500_market(), "EUR", True)  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("currency", ["usd", "US", "USDX", "", "U5D", "ＵＳＤ", None, 840])
+def test_allowing_a_foreign_currency_still_rejects_a_malformed_currency_code(currency):
+    market = us500_market()
+    market["instrument"]["currency"] = currency
+    with pytest.raises(ParseError):
+        parse_instrument_rules("US500", market, "EUR", allow_foreign_currency=True)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: m["instrument"].update(marginFactorUnit="POINTS"),
+        lambda m: m["instrument"].pop("lotSize"),
+        lambda m: m["dealingRules"]["minDealSize"].update(unit="PERCENTAGE"),
+        lambda m: m["dealingRules"]["minStepDistance"].update(value=Decimal("-0.1")),
+        lambda m: m.pop("snapshot"),
+    ],
+)
+def test_allowing_a_foreign_currency_does_not_relax_any_other_check(mutate):
+    market = us500_market()
+    mutate(market)
+    with pytest.raises(ParseError):
+        parse_instrument_rules("US500", market, "EUR", allow_foreign_currency=True)
+
+
+async def test_adapter_refuses_us500_in_usd_on_a_eur_account_by_default(server, broker):
+    server.markets["US500"] = us500_market()
+    await broker.login()
+    with pytest.raises(BrokerError) as info:
+        await broker.instrument_rules("US500")
+    assert type(info.value) is BrokerError
+    assert str(info.value) == f"GET /markets/US500: unexpected response: {FOREIGN_CURRENCY_MESSAGE}"
+
+
+async def test_adapter_returns_the_currency_only_for_epics_listed_at_construction(server, make_broker):
+    server.markets["US500"] = us500_market()
+    broker = make_broker(foreign_currency_epics=["US500"])
+    await broker.login()
+    assert await broker.instrument_rules("US500") == us500_rules(currency="USD")
+    assert (await broker.instrument_rules("DE40")).currency is None  # nie na liście: bez zmian względem v1
+
+
+async def test_adapter_refuses_a_foreign_currency_on_an_epic_that_is_not_listed(server, make_broker):
+    server.markets["DE40"]["instrument"]["currency"] = "USD"
+    broker = make_broker(foreign_currency_epics={"US500"})
+    await broker.login()
+    with pytest.raises(BrokerError, match="instrument.currency: USD differs"):
+        await broker.instrument_rules("DE40")
+
+
+async def test_adapter_without_the_option_behaves_exactly_as_before(server, make_broker):
+    server.markets["US500"] = us500_market()
+    broker = make_broker(foreign_currency_epics=())
+    await broker.login()
+    with pytest.raises(BrokerError, match="instrument.currency: USD differs"):
+        await broker.instrument_rules("US500")
+    assert (await broker.instrument_rules("DE40")).currency is None
+
+
+@pytest.mark.parametrize("epics", ["US500", b"US500", 5, [5], ["US/500"], [""], [None]])
+def test_foreign_currency_epics_must_be_a_collection_of_valid_epics(capital_credentials, capital_http, clock, epics):
+    with pytest.raises((TypeError, ValueError)):
+        CapitalComBroker(capital_credentials, capital_http, clock, foreign_currency_epics=epics)
 
 
 @pytest.mark.parametrize("epic", ["", "../session", "DE40/../ping", "DE40?x=1", "DE 40", ".", "..", "DE40#", 40, None])

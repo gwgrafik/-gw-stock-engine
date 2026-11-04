@@ -367,14 +367,23 @@ def _require(condition: bool, where: str, expectation: str) -> None:
         raise ParseError(f"{where}: expected {expectation}")
 
 
-def parse_instrument_rules(epic: str, payload: Any, account_currency: str | None) -> InstrumentRules:
+def parse_instrument_rules(
+    epic: str, payload: Any, account_currency: str | None, *, allow_foreign_currency: bool = False
+) -> InstrumentRules:
     """`GET /markets/{epic}` → `InstrumentRules` (notatki §2.16.1; jednostki inne niż oczekiwane → `ParseError`).
 
     - `min_size` ← `minDealSize.value`, `size_step` ← `minSizeIncrement.value` (jednostka `POINTS`, czyli jednostki
       wielkości, notatki §5 pkt 5);
     - `stop_step` ← `minStepDistance.value` w `POINTS` (DE40: 0,1; czy krok dotyczy stopu: C16c);
-    - `value_per_point` ← `instrument.lotSize` w walucie instrumentu (C16), więc waluta instrumentu musi być walutą
-      rachunku sesji (inaczej potrzebny byłby kurs, którego adapter nie zgaduje);
+    - `value_per_point` ← `instrument.lotSize` w walucie instrumentu (C16), więc domyślnie waluta instrumentu musi być
+      walutą rachunku sesji (inaczej potrzebny byłby kurs, którego adapter nie zgaduje) i `currency` zostaje None
+      (zachowanie DE40 v1 bez zmian);
+    - `allow_foreign_currency=True` (tylko słowem kluczowym; pasma w USD, projekt §7, R8): zamiast `ParseError` przy
+      walucie instrumentu innej niż rachunku zwraca `InstrumentRules(currency=<waluta instrumentu>)`. Zawsze niesie
+      walutę instrumentu (także gdy równa się walucie rachunku): wywołujący sam porównuje ją z walutą rachunku.
+      `value_per_point` nadal jest w walucie INSTRUMENTU: adapter niczego nie przelicza i nie zgaduje kursu, a
+      rozliczenie wyniku w EUR (C8, kurs i narzut brokera) jest NIEPOTWIERDZONE, do sprawdzenia skryptem
+      research/diag_fx.py na rachunku. Kod waluty spoza formatu ISO 4217 (trzy wielkie litery ASCII) → `ParseError`;
     - `margin_rate` ← `marginFactor / 100` przy `marginFactorUnit == "PERCENTAGE"` (C25);
     - `min_stop_distance` w punktach ← `minStopOrProfitDistance`: `PERCENTAGE` → value / 100 × mid migawki
       (DE40: 0,01% ≈ 2,6 pkt), `POINTS` → value; minimum zależy od ceny, więc liczone przy każdym odczycie.
@@ -393,7 +402,7 @@ def parse_instrument_rules(epic: str, payload: Any, account_currency: str | None
     lot_size = dec(instrument, "lotSize", "instrument")
     _require(lot_size > 0, "instrument.lotSize", "a positive lot size")
     currency = text(instrument, "currency", "instrument")
-    if account_currency is None or currency != account_currency:
+    if not allow_foreign_currency and (account_currency is None or currency != account_currency):
         raise ParseError(
             f"instrument.currency: {shown(currency)} differs from the session account currency "
             f"{shown(account_currency)}; value_per_point would need an FX rate"
@@ -416,7 +425,10 @@ def parse_instrument_rules(epic: str, payload: Any, account_currency: str | None
     else:
         raise ParseError(f"dealingRules.minStopOrProfitDistance.unit: expected PERCENTAGE or POINTS, got {shown(stop_unit)}")
 
-    return build(InstrumentRules, "instrument rules", epic, min_size, size_step, lot_size, factor / 100, min_stop, stop_step)
+    return build(
+        InstrumentRules, "instrument rules", epic, min_size, size_step, lot_size, factor / 100, min_stop, stop_step,
+        currency if allow_foreign_currency else None,
+    )  # fmt: skip
 
 
 # --- świece (`GET /prices/{epic}`) ------------------------------------------------------------
