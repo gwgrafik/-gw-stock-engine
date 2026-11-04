@@ -36,6 +36,10 @@ Zasady:
   naszemu dealId (`PUT` i `DELETE` dzielą referencję `p_<dealId>`, C3), i 404 pozycji; REJECTED →
   `BrokerRejected(reason)`; cokolwiek innego → `BrokerTimeout("close outcome unknown")`; 404
   `error.not-found.dealId` na `DELETE` → `BrokerRejected("POSITION_NOT_FOUND")`;
+- `set_protection` (pasma z celem): jeden `PUT` ze `stopLevel` I `profitLevel` (NIEPOTWIERDZONE, C5d, czy `PUT` bez
+  `profitLevel` kasuje cel, więc oba poziomy idą zawsze razem); potwierdzenie `AMENDED` i odczyt kontrolny sprawdzają
+  OBA poziomy (różnica albo `null` → `BrokerError`; wynik nieznany → `BrokerTimeout`); `target_level=None` → `PUT` tylko
+  ze stopem i pozycja nadal mająca cel kończy się `BrokerError`; `set_stop` zostaje bez zmian (DE40 v1);
 - `set_stop`: `PUT` ze `stopLevel`, potwierdzenie z naszym dealId jako `AMENDED` (inaczej `BrokerTimeout`), jego
   `stopLevel` i `stopLevel` pozycji (jeśli broker je podaje; sam `stopDistance` nie jest porównywany, C6) równe
   żądanemu (inaczej `BrokerError`); broker pokazywał już klucze stopu, a pozycja po `PUT` nie ma żadnego →
@@ -65,6 +69,7 @@ from gwstock.broker.capitalcom_parse import (
     Opening,
     ParseError,
     build,
+    amended_target,
     check_amendment,
     check_closure,
     check_ident,
@@ -135,6 +140,14 @@ def _target_from(level: Decimal, side: Side, distance: Decimal) -> Decimal:
     """Cel pozycji kupna leży powyżej ceny wykonania, sprzedaży poniżej (po stronie zysku; odwrotnie niż stop).
     NIEPOTWIERDZONE, że `profitDistance` liczy się od ceny wykonania, a nie od notowania (jak C6 dla stopu)."""
     return level + distance if side is Side.BUY else level - distance
+
+
+def _check_level(method: str, name: str, value: object) -> None:
+    """Poziom stopu albo celu z wywołania: dodatni skończony `Decimal` (inaczej TypeError/ValueError przed wysyłką)."""
+    if not isinstance(value, Decimal):
+        raise TypeError(f"{method}: {name} must be a Decimal, got {type(value).__name__}")
+    if not value.is_finite() or value <= 0:
+        raise ValueError(f"{method}: {name} must be a positive finite Decimal")
 
 
 def _since_arg(value: object) -> datetime:
@@ -409,9 +422,117 @@ class TradingMixin:
             self._target_keys_seen = True
 
     async def set_protection(self, deal_id: str, stop_level: Decimal, target_level: Decimal | None) -> None:
-        """ZAŚLEPKA zadania 6 (pełna implementacja: zadanie 7). Istnieje tylko po to, żeby adapter spełniał protokół
-        `Broker`; zawsze rzuca `NotImplementedError` i niczego nie wysyła do brokera."""
-        raise NotImplementedError("set_protection: not implemented in task 6 (Capital.com adapter: task 7)")
+        """`PUT /positions/{dealId}` ze `stopLevel` I `profitLevel` w JEDNYM żądaniu, potwierdzenie i odczyt kontrolny.
+
+        Pasma z celem (R4) używają tej metody zamiast `set_stop`: NIEPOTWIERDZONE (C5d), czy `PUT` bez `profitLevel`
+        kasuje istniejący cel, więc oba poziomy idą zawsze razem, a broker sprawdza je atomowo (odmowa jednego,
+        np. cel po stronie straty albo zbyt bliski stop, nie zmienia żadnego; to założenie o brokerze jest
+        NIEPOTWIERDZONE, a odczyt kontrolny wychwyciłby częściową zmianę). `target_level=None`: pozycja bez celu, `PUT`
+        niesie wtedy tylko `stopLevel` (adapter nie umie skasować istniejącego celu, więc pozycja, która nadal go
+        ma, kończy się `BrokerError`, nie udawanym sukcesem).
+
+        Sukces wymaga (jak w `set_stop`, C3) potwierdzenia ACCEPTED z naszym dealId jako `AMENDED` (inaczej wynik
+        nieznany: `BrokerTimeout`), a potem OBU poziomów zgodnych z żądanymi tam, gdzie broker je podaje: `stopLevel` i
+        `profitLevel` potwierdzenia oraz `stopLevel` i `profitLevel` pozycji (różnica albo `null` → `BrokerError`; sam
+        `stopDistance`/`profitDistance` nie jest porównywany, bo jego punkt odniesienia jest niepotwierdzony, C6, ale
+        `null` znaczy brak). Gdy broker pokazywał już klucze stopu (celu), a pozycja po `PUT` nie ma żadnego:
+        wynik nieznany (`BrokerTimeout`), nic nie jest zapisywane. Pozycja zniknęła → `BrokerRejected("POSITION_NOT_FOUND")`.
+        Nazwy kluczy celu w potwierdzeniu i w pozycji są NIEPOTWIERDZONE (C5); do sprawdzenia skryptem
+        research/diag_fx.py na rachunku.
+        """
+        deal_id = check_ident("deal_id", deal_id)
+        _check_level("set_protection", "stop_level", stop_level)
+        if target_level is not None:
+            _check_level("set_protection", "target_level", target_level)
+        path = f"/positions/{deal_id}"
+        where = f"PUT {path}"
+        body = {"stopLevel": stop_level}
+        if target_level is not None:
+            body["profitLevel"] = target_level
+        payload = await self._request("PUT", path, body=body, not_found=NOT_FOUND_DEAL)
+        if payload is None:
+            raise self._error(BrokerRejected, POSITION_NOT_FOUND)
+        confirmation, problem = await self._outcome(payload)
+        stop_shown = target_shown = None
+        if problem is None:
+            stop_shown, problem = _attempt(check_amendment, confirmation, deal_id)
+        if problem is None:
+            target_shown, problem = _attempt(amended_target, confirmation)
+        if problem is None:
+            self._check_amendment_levels(where, stop_level, target_level, stop_shown, target_shown)
+            reply = None
+            try:
+                reply = await self._request("GET", path, not_found=NOT_FOUND_DEAL)
+            except BrokerError as exc:  # odczyt kontrolny nieudany: wynik nieznany (ponowienie tego samego jest bezpieczne)
+                problem = f"position check failed ({type(exc).__name__}: {exc})"
+            if problem is None:
+                if reply is None:
+                    raise self._error(BrokerRejected, POSITION_NOT_FOUND)
+                row = self._parse(f"GET {path}", parse_position, reply)
+                self._note_stop_keys([row])
+                self._note_target_keys([row])
+                problem = self._check_position_levels(path, deal_id, stop_level, target_level, row)
+        if problem is not None:
+            raise self._error(BrokerTimeout, f"{where}: protection outcome unknown ({problem})")
+        _remember(self._deal_stops, deal_id, stop_level)
+        if target_level is None:
+            self._deal_targets.pop(deal_id, None)
+        else:
+            _remember(self._deal_targets, deal_id, target_level)
+
+    def _check_amendment_levels(
+        self,
+        where: str,
+        stop_level: Decimal,
+        target_level: Decimal | None,
+        stop_shown: tuple[bool, Decimal | None],
+        target_shown: tuple[bool, Decimal | None],
+    ) -> None:
+        """Poziomy z potwierdzenia `PUT` (gdy broker je podaje) muszą równać się żądanym; różnica → `BrokerError`."""
+        present, level = stop_shown
+        if present and level != stop_level:
+            raise self._error(
+                BrokerError, f"{where}: the confirmation's stopLevel {level} differs from the requested {stop_level}"
+            )
+        present, level = target_shown
+        if target_level is None:
+            if present and level is not None:
+                raise self._error(
+                    BrokerError, f"{where}: the confirmation's profitLevel {level} shows a target, none was requested"
+                )
+        elif present and level != target_level:
+            raise self._error(
+                BrokerError, f"{where}: the confirmation's profitLevel {level} differs from the requested {target_level}"
+            )
+
+    def _check_position_levels(
+        self, path: str, deal_id: str, stop_level: Decimal, target_level: Decimal | None, row: Any
+    ) -> str | None:
+        """Odczyt kontrolny po `PUT`: poziomy pozycji równe żądanym (różnica albo `null` → `BrokerError`); zwraca opis
+        problemu dla wyniku nieznanego (broker pokazuje klucze, a ta pozycja ich nie ma) albo None."""
+        where = f"GET {path}"
+        no_stop = row.stop_reported and row.stop_level is None
+        if row.deal_id != deal_id or no_stop or (row.stop_level_reported and row.stop_level != stop_level):
+            raise self._error(
+                BrokerError, f"{where}: the position's stop {row.stop_level} differs from the requested {stop_level}"
+            )
+        if target_level is None:
+            if row.target_reported and row.target_level is not None:
+                raise self._error(
+                    BrokerError, f"{where}: the position still has a target {row.target_level}, none was requested"
+                )
+        else:
+            no_target = row.target_reported and row.target_level is None
+            if no_target or (row.target_level_reported and row.target_level != target_level):
+                raise self._error(
+                    BrokerError,
+                    f"{where}: the position's target {row.target_level} differs from the requested {target_level}",
+                )
+        if self._stop_keys_seen and not row.stop_reported:  # broker pokazuje klucze, a tu ich nie ma: brak stopu
+            return f"{where}: the broker shows stop keys, but this position has none after the PUT"
+        if target_level is not None and self._target_keys_seen and not row.target_reported:
+            return f"{where}: the broker shows target keys, but this position has none after the PUT"
+        return None
 
     async def set_stop(self, deal_id: str, stop_level: Decimal) -> None:
         """`PUT /positions/{dealId}` ze `stopLevel`, potwierdzenie i odczyt kontrolny pozycji; zapis stopu po sukcesie.

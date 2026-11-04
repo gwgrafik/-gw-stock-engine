@@ -151,6 +151,8 @@ class TestCapitalComContract(BrokerContract):
     `expire_session`: adapter po 401 sam loguje się ponownie, więc samo wygaszenie tokenów niczego nie pokaże;
     hook dodatkowo odrzuca NAJBLIŻSZE logowanie (jak broker przy wygasłej sesji, której nie da się odnowić), więc
     adapter musi zgłosić `SessionExpired`, a jawne `login()` potem znowu działa.
+
+    Cel zysku (zadanie 7): `supports_target` i `trigger_target` włączają testy celu z kontraktu na adapterze.
     """
 
     @pytest.fixture
@@ -180,6 +182,14 @@ class TestCapitalComContract(BrokerContract):
             fake_capital_server.fail_next("/session", 401, {"errorCode": "error.invalid.details"}, method="POST")
 
         return expire
+
+    @pytest.fixture
+    def supports_target(self) -> bool:
+        return True
+
+    @pytest.fixture
+    def trigger_target(self, fake_capital_server):
+        return lambda deal_id: fake_capital_server.trigger_target(deal_id)
 
 
 # --- open_position -----------------------------------------------------------------------------------
@@ -2151,6 +2161,8 @@ class TestCapitalComContractWithStopKeys(TestCapitalComContract):
     def broker(self, capital_broker, fake_capital_server):
         fake_capital_server.position_stop_keys = "present"
         fake_capital_server.confirm_stop_keys = True
+        fake_capital_server.position_target_keys = "present"  # cel też od brokera, nie z naszego zapisu
+        fake_capital_server.confirm_target_keys = True
         return capital_broker
 
 
@@ -2739,3 +2751,437 @@ def test_parse_opening_reads_the_profit_level_of_the_confirmation():
     assert (null.target_reported, null.target_level) == (True, None)
     with pytest.raises(capitalcom_parse.ParseError, match="profitLevel"):
         capitalcom_parse.parse_opening({**base, "profitLevel": Decimal("-1")})
+
+
+# --- set_protection: stop i cel w jednym PUT -----------------------------------------------------------------
+
+NEW_STOP = Decimal("25742.3")  # dalej od rynku niż stop wejścia (OFFER - 30 = 25752.3): zawsze dozwolone
+NEW_TARGET = Decimal("25837.3")  # dalej niż cel wejścia (OFFER + 45 = 25827.3)
+
+
+async def test_set_protection_sends_both_levels_in_one_put_and_checks_the_confirmation_and_the_position(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    mark = since_mark(server)
+    await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert seq(server, mark) == [
+        f"PUT /positions/{pos.deal_id}",
+        f"GET /confirms/p_{pos.deal_id}",
+        f"GET /positions/{pos.deal_id}",  # odczyt kontrolny: oba poziomy
+    ]
+    assert server.log[mark].raw == '{"stopLevel":25742.3,"profitLevel":25837.3}'  # JEDEN PUT z oboma poziomami
+    assert (only_position(server).stop_level, only_position(server).target_level) == (NEW_STOP, NEW_TARGET)
+    [moved] = await broker.list_positions()
+    assert type(moved) is TargetedOpenPosition
+    assert (moved.stop_level, moved.stop_derived, moved.target_level, moved.target_derived) == (
+        NEW_STOP, True, NEW_TARGET, True,
+    )  # fmt: skip
+
+
+async def test_set_protection_sends_exactly_one_put(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert server.count("PUT", f"/positions/{pos.deal_id}") == 1
+
+
+async def test_set_protection_without_a_target_sends_only_the_stop_level(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    mark = since_mark(server)
+    await broker.set_protection(pos.deal_id, NEW_STOP, None)
+    assert server.log[mark].raw == '{"stopLevel":25742.3}'
+    [moved] = await broker.list_positions()
+    assert type(moved) is OpenPosition and (moved.stop_level, moved.target_level) == (NEW_STOP, None)
+
+
+async def test_set_protection_with_a_none_target_forgets_our_target_record(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    await broker.set_protection(pos.deal_id, NEW_STOP, None)
+    assert pos.deal_id not in broker._deal_targets
+
+
+async def test_set_stop_still_sends_only_the_stop_level(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    mark = since_mark(server)
+    await broker.set_stop(pos.deal_id, NEW_STOP)
+    assert server.log[mark].raw == '{"stopLevel":25742.3}'  # DE40 v1: set_stop bez zmian
+
+
+async def test_set_stop_after_a_put_that_clears_the_target_leaves_the_position_untargeted(server, broker):
+    # C5d w najgorszym wariancie (NIEPOTWIERDZONE): PUT bez `profitLevel` kasuje cel; adapter pokazuje prawdę brokera
+    server.put_clears_target = True
+    server.position_target_keys = "present"
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    await broker.set_stop(pos.deal_id, NEW_STOP)
+    [listed] = await broker.list_positions()
+    assert type(listed) is OpenPosition and listed.target_level is None
+
+
+async def test_set_protection_keeps_the_target_even_if_a_put_without_it_would_clear_it(server, broker):
+    server.put_clears_target = True
+    server.position_target_keys = "present"
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    await broker.set_protection(pos.deal_id, NEW_STOP, pos.target_level)
+    [listed] = await broker.list_positions()
+    assert (listed.stop_level, listed.target_level) == (NEW_STOP, pos.target_level)
+
+
+async def test_set_protection_on_a_position_we_did_not_open_is_remembered(server, broker, make_broker, clock):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    restarted = await restart(make_broker, clock)
+    await restarted.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    [listed] = await restarted.list_positions()
+    assert (listed.stop_level, listed.stop_derived, listed.target_level, listed.target_derived) == (
+        NEW_STOP, True, NEW_TARGET, True,
+    )  # fmt: skip
+
+
+async def test_set_protection_of_a_gone_deal_is_position_not_found_without_confirm(server, broker):
+    await broker.login()
+    mark = since_mark(server)
+    with pytest.raises(BrokerRejected) as info:
+        await broker.set_protection("D-gone", NEW_STOP, NEW_TARGET)
+    assert info.value.reason == "POSITION_NOT_FOUND"
+    assert seq(server, mark) == ["PUT /positions/D-gone"]
+
+
+async def test_a_target_on_the_loss_side_is_rejected_and_neither_level_changes(server, broker):
+    server.position_stop_keys = server.position_target_keys = "present"
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    with pytest.raises(BrokerRejected) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, BID - 100)
+    assert info.value.reason.startswith("error.invalid.takeprofit.minvalue:")
+    assert (only_position(server).stop_level, only_position(server).target_level) == (pos.stop_level, pos.target_level)
+    assert await broker.list_positions() == [pos]
+
+
+async def test_a_stop_too_close_to_the_market_is_rejected_and_the_target_does_not_change_either(server, broker):
+    server.position_stop_keys = server.position_target_keys = "present"
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    with pytest.raises(BrokerRejected) as info:
+        await broker.set_protection(pos.deal_id, BID, NEW_TARGET)
+    assert info.value.reason.startswith("error.invalid.stoploss.maxvalue:")
+    assert (only_position(server).stop_level, only_position(server).target_level) == (pos.stop_level, pos.target_level)
+
+
+async def test_set_protection_rejected_on_confirm_keeps_our_record(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "REJECTED", "reason": "TARGET_TOO_CLOSE", "dealReference": ref})
+    with pytest.raises(BrokerRejected) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert info.value.reason == "TARGET_TOO_CLOSE"
+    assert await broker.list_positions() == [pos]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        (404, {"errorCode": "error.not-found.dealReference"}),
+        (500, {"errorCode": "error.internal"}),
+        (200, {"dealStatus": "PENDING"}),
+        (200, {"dealStatus": "ACCEPTED", "dealReference": "p_someone-else"}),
+        "timeout",
+    ],
+)
+async def test_set_protection_with_an_unknown_outcome_is_broker_timeout(server, make_broker, failure):
+    broker = make_broker(request_timeout_s=0.2)
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    ref = f"p_{pos.deal_id}"
+    if failure == "timeout":
+        server.delay_next(f"/confirms/{ref}", 2.0)
+    else:
+        server.fail_next(f"/confirms/{ref}", *failure)
+    with pytest.raises(BrokerTimeout) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert "protection outcome unknown" in str(info.value)
+    assert info.value.__context__ is None and info.value.__cause__ is None
+    [listed] = await broker.list_positions()
+    assert (listed.stop_level, listed.target_level) == (pos.stop_level, pos.target_level)  # zapis bez zmian
+
+
+@pytest.mark.parametrize(
+    "affected",
+    [[], [{"dealId": "OTHER-DEAL", "status": "AMENDED"}], [{"dealId": "{deal}", "status": "FULLY_CLOSED"}], None],
+)
+async def test_set_protection_confirm_must_name_our_deal_as_amended(server, broker, affected):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    ref = f"p_{pos.deal_id}"
+    if affected:
+        affected = [{**d, "dealId": d["dealId"].replace("{deal}", pos.deal_id)} for d in affected]
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "status": "OPEN",
+                                               "affectedDeals": affected})  # fmt: skip
+    with pytest.raises(BrokerTimeout, match="protection outcome unknown"):
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert await broker.list_positions() == [pos]
+
+
+@pytest.mark.parametrize("reported", [OFFER + 44, None, Decimal("25837.4")])
+async def test_set_protection_confirm_carrying_a_different_target_is_a_broker_error(server, broker, reported):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "profitLevel": reported,
+                                               "affectedDeals": [{"dealId": pos.deal_id, "status": "AMENDED"}]})  # fmt: skip
+    with pytest.raises(BrokerError) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert type(info.value) is BrokerError and "profitLevel" in str(info.value)
+    assert await broker.list_positions() == [pos]
+
+
+async def test_set_protection_confirm_carrying_a_different_stop_is_a_broker_error(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "stopLevel": BID - 50,
+                                               "profitLevel": NEW_TARGET,
+                                               "affectedDeals": [{"dealId": pos.deal_id, "status": "AMENDED"}]})  # fmt: skip
+    with pytest.raises(BrokerError) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert type(info.value) is BrokerError and "stopLevel" in str(info.value)
+
+
+async def test_set_protection_confirm_with_both_levels_matching_is_accepted(server, broker):
+    server.confirm_stop_keys = server.confirm_target_keys = True
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert server.confirms[f"p_{pos.deal_id}"]["profitLevel"] == NEW_TARGET
+
+
+async def test_set_protection_with_a_none_target_rejects_a_confirmation_that_still_shows_a_target(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "profitLevel": pos.target_level,
+                                               "affectedDeals": [{"dealId": pos.deal_id, "status": "AMENDED"}]})  # fmt: skip
+    with pytest.raises(BrokerError) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, None)
+    assert type(info.value) is BrokerError and "profitLevel" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("stop", "target", "error"),
+    [
+        (NEW_STOP, NEW_TARGET, None),
+        (Decimal("25700.0"), NEW_TARGET, BrokerError),  # stop pozycji inny niż żądany
+        (NEW_STOP, Decimal("25900.0"), BrokerError),  # cel pozycji inny niż żądany
+        (NEW_STOP, None, BrokerError),  # broker mówi: pozycja bez celu
+        (None, NEW_TARGET, BrokerError),  # broker mówi: pozycja bez stopu
+    ],
+)
+async def test_set_protection_checks_both_levels_the_position_reports(server, broker, stop, target, error):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    item = server._position_item(only_position(server))
+    item["position"]["stopLevel"] = stop
+    item["position"]["profitLevel"] = target
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")  # odczyt kontrolny po PUT
+    if error is None:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    else:
+        with pytest.raises(error) as info:
+            await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+        assert type(info.value) is BrokerError
+
+
+async def test_set_protection_accepts_a_position_reply_with_only_profit_distance(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    item = server._position_item(only_position(server))
+    item["position"]["profitDistance"] = Decimal("99.9")  # odległość z nieznanego punktu odniesienia (C6)
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")
+    await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)  # samego `profitDistance` nie porównujemy
+    assert only_position(server).target_level == NEW_TARGET
+
+
+async def test_set_protection_with_a_null_profit_distance_is_a_broker_error(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    item = server._position_item(only_position(server))
+    item["position"]["profitDistance"] = None  # broker mówi: brak celu
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")
+    with pytest.raises(BrokerError) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert type(info.value) is BrokerError
+
+
+async def test_set_protection_without_a_target_rejects_a_position_that_still_has_one(server, broker):
+    server.position_target_keys = "present"
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    with pytest.raises(BrokerError) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, None)  # nie umiemy skasować celu: nie udajemy sukcesu
+    assert type(info.value) is BrokerError and "still has a target" in str(info.value)
+
+
+async def test_set_protection_without_a_target_accepts_a_position_without_one(server, broker):
+    server.position_target_keys = "present"
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    await broker.set_protection(pos.deal_id, NEW_STOP, None)
+    assert only_position(server).target_level is None
+
+
+async def test_set_protection_without_the_target_key_after_keys_were_seen_is_an_unknown_outcome(server, broker):
+    server.position_target_keys = "when-set"
+    await broker.login()
+    _, pos = await open_targeted(broker)  # klucze widoczne: pozycja pokazuje swój cel
+    await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    only_position(server).target_level = None  # właściciel usunął cel: klucz znika
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="PUT")  # bez skutku
+    with pytest.raises(BrokerTimeout, match="protection outcome unknown") as info:
+        await broker.set_protection(pos.deal_id, Decimal("25732.3"), Decimal("25847.3"))
+    assert info.value.__context__ is None and info.value.__cause__ is None
+    assert broker._deal_stops[pos.deal_id] == NEW_STOP and broker._deal_targets[pos.deal_id] == NEW_TARGET
+    assert only_position(server).target_level is None  # nic nie zapisano z nieudanej próby
+
+
+async def test_set_protection_without_the_stop_key_after_keys_were_seen_is_an_unknown_outcome(server, broker):
+    server.position_stop_keys = "when-set"
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    only_position(server).stop_level = None  # właściciel usunął stop
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="PUT")  # bez skutku
+    with pytest.raises(BrokerTimeout, match="protection outcome unknown"):
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+
+
+@pytest.mark.parametrize(
+    ("failure", "error"),
+    [
+        ((404, {"errorCode": "error.not-found.dealId"}), BrokerRejected),
+        ((500, {"errorCode": "error.internal"}), BrokerTimeout),
+        ("timeout", BrokerTimeout),
+    ],
+)
+async def test_set_protection_verification_failures(server, make_broker, failure, error):
+    broker = make_broker(request_timeout_s=0.2)
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    if failure == "timeout":
+        server.delay_next(f"/positions/{pos.deal_id}", 2.0, method="GET")
+    else:
+        server.fail_next(f"/positions/{pos.deal_id}", *failure, method="GET")
+    with pytest.raises(error) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    if error is BrokerRejected:
+        assert info.value.reason == "POSITION_NOT_FOUND"
+    else:
+        assert "protection outcome unknown" in str(info.value)
+    assert broker._deal_targets[pos.deal_id] == pos.target_level  # nic nie zapisano z nieudanej próby
+
+
+async def test_set_protection_with_nothing_reported_is_accepted_and_remembered(server, broker):
+    """Pozostałe ryzyko (C3): bez poziomów w potwierdzeniu i w pozycji nieaktualnego potwierdzenia nie widać."""
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    server.fail_next(f"/positions/{pos.deal_id}", 200, {"dealReference": f"p_{pos.deal_id}"}, method="PUT")  # bez skutku
+    await broker.set_protection(pos.deal_id, Decimal("25732.3"), Decimal("25847.3"))  # nieaktualne potwierdzenie
+    [listed] = await broker.list_positions()
+    assert (listed.stop_level, listed.target_level, listed.target_derived) == (
+        Decimal("25732.3"), Decimal("25847.3"), True,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("stop", "target", "exc"),
+    [
+        (25742.3, NEW_TARGET, TypeError),
+        ("25742.3", NEW_TARGET, TypeError),
+        (None, NEW_TARGET, TypeError),
+        (Decimal("NaN"), NEW_TARGET, ValueError),
+        (Decimal("0"), NEW_TARGET, ValueError),
+        (Decimal("-1"), NEW_TARGET, ValueError),
+        (NEW_STOP, 25837.3, TypeError),
+        (NEW_STOP, "25837.3", TypeError),
+        (NEW_STOP, Decimal("NaN"), ValueError),
+        (NEW_STOP, Decimal("Infinity"), ValueError),
+        (NEW_STOP, Decimal("0"), ValueError),
+        (NEW_STOP, Decimal("-1"), ValueError),
+    ],
+)
+async def test_set_protection_validates_both_levels_before_sending(server, broker, stop, target, exc):
+    await broker.login()
+    mark = since_mark(server)
+    with pytest.raises(exc):
+        await broker.set_protection("D-1", stop, target)
+    assert seq(server, mark) == []
+
+
+@pytest.mark.parametrize("deal_id", ["", "a/b", "..", "D 1", 5, None])
+async def test_set_protection_validates_the_deal_id_before_sending(server, broker, deal_id):
+    await broker.login()
+    mark = since_mark(server)
+    with pytest.raises((TypeError, ValueError)):
+        await broker.set_protection(deal_id, NEW_STOP, NEW_TARGET)
+    assert seq(server, mark) == []
+
+
+async def test_set_protection_market_closed_and_5xx_are_mapped(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    server.fail_next(f"/positions/{pos.deal_id}", 400, {"errorCode": MARKET_CLOSED_CODE}, method="PUT")
+    with pytest.raises(MarketClosed):
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    server.fail_next(f"/positions/{pos.deal_id}", 503, None, method="PUT")
+    with pytest.raises(BrokerError) as info:
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert type(info.value) is BrokerError and str(info.value) == f"PUT /positions/{pos.deal_id}: HTTP 503"
+
+
+async def test_a_put_is_never_resent_after_an_unknown_outcome(server, make_broker):
+    broker = make_broker(request_timeout_s=0.1)
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    server.apply_then_drop_response(f"/positions/{pos.deal_id}", method="PUT")
+    with pytest.raises(BrokerTimeout):
+        await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert server.count("PUT", f"/positions/{pos.deal_id}") == 1  # ponowienie należy do silnika, nie do adaptera
+
+
+# --- zamknięcie przez cel -------------------------------------------------------------------------------------
+
+
+async def test_a_target_hit_is_reported_as_a_target_closure_at_the_target_level(server, broker, clock):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    clock.advance(60)
+    server.trigger_target(pos.deal_id)
+    assert await broker.list_positions() == []
+    [closed] = await broker.closed_since(pos.opened_at)
+    assert (closed.deal_id, closed.epic, closed.exit_level, closed.reason) == (
+        pos.deal_id, "DE40", pos.target_level, "TARGET",
+    )  # fmt: skip
+    assert at(60) <= closed.ts <= at(61) and broker.unknown_close_sources == 0
+
+
+async def test_a_stop_hit_on_a_targeted_position_is_still_a_stop(server, broker, clock):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    clock.advance(60)
+    server.trigger_stop(pos.deal_id, pos.stop_level)
+    [closed] = await broker.closed_since(pos.opened_at)
+    assert (closed.reason, closed.exit_level) == ("STOP", pos.stop_level)
+
+
+async def test_closing_by_our_delete_after_a_set_protection_is_manual(server, broker, clock):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    await broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)  # wiersz EDIT_STOP_AND_LIMIT jest pomijany
+    clock.advance(30)
+    await broker.close_position(pos.deal_id)
+    [closed] = await broker.closed_since(pos.opened_at)
+    assert closed.reason == "MANUAL"
