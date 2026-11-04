@@ -864,3 +864,16 @@ async def test_slippage_guard_uses_the_fraction_of_the_lane(lane_build, us_gate,
     [slip] = events(journal, "SLIPPAGE_GUARD")
     assert D(slip["limit"]) == D("1.00") and D(slip["deviation"]) == D("1.5")
     assert fake.positions == {}
+
+
+async def test_de40_protection_records_keep_exactly_the_v1_fields(de, fake, journal):
+    """Pasmo bez celu: zapisy zabezpieczenia bez żadnych pól celu (bajty dziennika DE40 v1)."""
+    pos = OpenPosition("DEAL-X", "DE40", Side.BUY, D("0.007"), D("25782.3"), None, T_ENTRY)
+    fake.positions["DEAL-X"] = pos
+    assert await de.protect_unprotected(pos) is True
+    assert fake.calls == ["instrument_rules", "set_stop"]
+    [raw] = payloads(journal, "broker.set_stop")
+    assert set(raw) == {"deal_id", "stop_level", "attempt", "response"}
+    [event] = events(journal, "STOP_ATTACHED")
+    assert set(event) == {"event", "deal_id", "stop_level", "attempt", "verified_by"}
+    assert journal.events("broker.set_protection") == []
