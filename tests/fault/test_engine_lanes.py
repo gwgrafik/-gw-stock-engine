@@ -298,7 +298,10 @@ async def test_a_closed_us500_market_does_not_hold_back_the_de40_flatten(lane_en
             broker.set_market_closed(True, epic=US)  # po wejściu: US500 nie da się zamknąć, DE40 tak
 
     clock.hooks.append(close_us_market)
+    de40_held: list[object] = []  # stan wstrzymania DE40 (klucz None) przy każdej próbie zamknięcia
+    broker.on_call("close_position", lambda: de40_held.append(lane_engine._guard.market_closed.get(None)))
     report = await lane_engine.run_day(DAY)
+    assert len(de40_held) > 2 and all(v is None for v in de40_held)  # odmowa US500 nie wstrzymuje DE40 (A6)
     j = lane_engine.journal
     assert report.final_position_state is P.FLAT
     de = [t for t in j.trades() if t.instrument == "DE40"]
@@ -372,3 +375,11 @@ async def test_losing_the_fx_rate_never_blocks_the_exit_and_keeps_the_result_pen
     (deal, _), = j.pnl_pending_deals()  # wynik w USD czeka na kurs: nic nie zgadnięto
     assert j.trade_fx(deal) is None
     assert any("PNL_PENDING" in m and "no valid EURUSD rate" in m for _, m in notifier.alerts)
+
+
+async def test_fresh_us500_quotes_do_not_hide_a_de40_quote_silence(lane_engine, broker, clock, market, notifier):
+    market.frozen_from = datetime(2026, 11, 2, 14, 55, tzinfo=UTC)  # DE40 zamrożone w sesji, US500 świeże
+    stop_engine_at(lane_engine, clock, datetime(2026, 11, 2, 15, 0, tzinfo=UTC))
+    await lane_engine.run_day(DAY)
+    assert lane_engine.kill.level() >= KillLevel.SOFT
+    assert any(m.startswith(QUOTE_SILENCE + ":") for _, m in notifier.alerts)  # cisza DE40 (bez nazwy pasma)
