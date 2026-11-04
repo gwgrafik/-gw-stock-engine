@@ -1797,13 +1797,16 @@ class Executor:
             self._kill.soft(KILL_CHECK_FAILED)
             self._alert("ERROR", f"{KILL_CHECK_FAILED}: realized pnl unreadable ({type(exc).__name__})")
             return []
-        daily = self._risk.max_daily_loss
+        daily, drawdown = self._risk.max_daily_loss, self._risk.max_total_drawdown
+        limits = getattr(self._portfolio, "loss_limits", None)
+        if limits is not None:  # z pasmami: progi `portfolio.toml`, gdy ostrzejsze od v1 (projekt §4.4)
+            daily, drawdown = min(daily, limits[0]), min(drawdown, limits[1])
         checks = (
             (day_pnl <= -daily, self._kill.soft, DAILY_LOSS, {"day_pnl": day_pnl, "limit": -daily}),
             (day_pnl <= -2 * daily, self._kill.hard, DAILY_LOSS_2X, {"day_pnl": day_pnl, "limit": -2 * daily}),
             (
-                total <= -self._risk.max_total_drawdown, self._kill.hard, TOTAL_DRAWDOWN,
-                {"total_pnl": total, "limit": -self._risk.max_total_drawdown},
+                total <= -drawdown, self._kill.hard, TOTAL_DRAWDOWN,
+                {"total_pnl": total, "limit": -drawdown},
             ),
         )  # fmt: skip
         triggered = []

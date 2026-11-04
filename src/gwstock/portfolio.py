@@ -231,6 +231,12 @@ class PortfolioGate:
         self._fx = fx
         self._exposure = exposure
 
+    @property
+    def loss_limits(self) -> tuple[Decimal, Decimal]:
+        """Progi kill switcha portfela (spec §4.4: „kill: jak S9, progi z tego pliku”): `(max_daily_loss,
+        max_total_drawdown)` w EUR; wykonawca bierze ostrzejszy z nich i z `risk_v1.toml`."""
+        return self._cfg.max_daily_loss, self._cfg.max_total_drawdown
+
     def check_exit(self) -> Verdict:
         """Wyjścia nigdy nie są blokowane: nie zależy od dziennika, zegara, kursu ani konta."""
         return Verdict(True, [])
