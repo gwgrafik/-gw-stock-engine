@@ -70,6 +70,10 @@ LANE_LEFT_OPEN_HINT = (
     "left open with its stop (and target); start the engine (it reconciles the lane and flattens it at the lane's "
     "flatten time) or close it in the Capital.com app"
 )
+LANE_LEFT_OPEN_TARGET_UNSURE_HINT = (  # po `set_stop` bez potwierdzonego przywrócenia celu w [6]
+    "left open with its stop (its target may be gone: step [6] did not confirm restoring it); start the engine (it "
+    "reconciles the lane and flattens it at the lane's flatten time) or close it in the Capital.com app"
+)
 _KNOWN_TARGET_KEYS = ("profitLevel", "profitDistance")  # klucze, które czyta adapter (`parse_position`)
 
 
@@ -141,6 +145,7 @@ class _Probe:
         self.estimate_eur: Decimal | None = None
         self.target_now: Decimal | None = None
         self.protection_failed: str | None = None  # krok [5] nieudany: C5d nie ustalono
+        self.target_unsure = False  # cel mógł zniknąć (set_stop bez potwierdzonego przywrócenia celu)
         self.adopted = False
         self.gone = False  # pozycja próby potwierdzona jako zniknięta u brokera (krok 8)
 
@@ -217,7 +222,7 @@ class _Probe:
             self.info(7, f"probe interrupted ({type(exc).__name__}); closing the probe position now")
             await cli._close_after_interrupt(
                 self.engine, self.deal_id, self.out, executor=self.executor, step=7, name="the probe position",
-                hint=LANE_LEFT_OPEN_HINT,
+                hint=self._left_open_hint(),
             )  # fmt: skip
             if not isinstance(exc, Exception):
                 raise
@@ -671,6 +676,7 @@ class _Probe:
         moved = sent != stop
         set_stop_error = None
         try:
+            self.target_unsure = True  # od wysłania samego stopu do potwierdzonego przywrócenia celu
             await engine.probe(engine.raw_broker.set_stop, self.deal_id, sent)
         except Exception as exc:
             set_stop_error = self.error(exc)
@@ -716,6 +722,7 @@ class _Probe:
             text = f"failed ({self.error(exc)})"
         else:
             restored, text = await self._verify(stop, target)
+            self.target_unsure = not restored
         ok = set_stop_error is None and restored
         change = f"one step closer than {stop}" if moved else "unchanged: no closer level within the broker minimum"
         first = f"set_stop with the stop only {sent} ({change})" + (f" failed ({set_stop_error})" if set_stop_error
@@ -745,7 +752,11 @@ class _Probe:
         flat = await self._flatten_position()
         self.step(7, flat, "flatten through the engine (DELETE by dealId)")
         if not flat and await cli._still_at_broker(self.engine, self.deal_id) is not False:
-            self.out(f"FAIL [7] LOUD: the probe position {LANE_LEFT_OPEN_HINT}")
+            self.out(f"FAIL [7] LOUD: the probe position {self._left_open_hint()}")
+
+    def _left_open_hint(self) -> str:
+        """Co zostało u brokera: stop i cel, a po `set_stop` bez potwierdzonego przywrócenia celu tylko stop na pewno."""
+        return LANE_LEFT_OPEN_TARGET_UNSURE_HINT if self.target_unsure else LANE_LEFT_OPEN_HINT
 
     # --- [8] księga i przyczyna zamknięcia (C7) ---
 

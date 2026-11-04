@@ -650,3 +650,58 @@ async def test_a_protection_change_accepted_despite_a_timeout_never_reads_as_a_c
     # punkt odniesienia to świeży odczyt tuż przed set_stop (7592,7), nie poziom sprzed nieudanego [5] (7592,8)
     assert any(x.startswith("PASS [6]") and "target after it: kept" in x for x in lines), "\n".join(lines)
     assert any("cel po zmianie stopu: 7592.7 (przed: 7592.7)" in x for x in lines), "\n".join(lines)
+
+
+def fail_the_target_restore(broker):
+    """Drugi `set_protection` (przywrócenie celu w [6]) odrzucony; `set_stop` przed nim kasuje cel."""
+    seen = {"n": 0}
+
+    def second_fails():
+        seen["n"] += 1
+        if seen["n"] == 2:
+            broker.fail_next("set_protection", BrokerRejected("error.invalid.takeprofit"))
+
+    broker.set_stop_clears_target = True
+    broker.on_call("set_protection", second_fails)
+
+
+async def test_a_failed_target_restore_still_flattens_the_position_left_with_its_stop_only(engine, broker):
+    fail_the_target_restore(broker)
+    left: list = []
+    broker.on_call("close_position", lambda: left.extend(broker.positions.values()), once=True)
+    code, lines = await run(engine)
+    assert code == 1 and broker.positions == {}
+    [pos] = left  # tuż przed zamknięciem: stop jest, celu nie ma
+    assert pos.stop_level is not None and pos.target_level is None
+    assert any(x.startswith("FAIL [6]") and "set_protection restored: failed" in x for x in lines)
+    assert any(x.startswith("PASS [7]") for x in lines)
+
+
+async def test_a_failed_target_restore_and_a_failed_flatten_say_the_target_may_be_gone(engine, broker):
+    fail_the_target_restore(broker)
+    broker.on_call("close_position", lambda: broker.set_market_closed(True, epic=US), once=True)
+    code, lines = await run(engine)
+    assert code == 1
+    [loud] = [x for x in lines if x.startswith("FAIL [7] LOUD")]
+    assert "(and target)" not in loud and "its target may be gone" in loud, loud
+    [pos] = broker.positions.values()
+    assert pos.stop_level == D("7587.9")  # stop z [6] (o krok bliżej ceny) zostaje; cel mogło przywrócić uzgadnianie
+    no_identifiers(lines)
+
+
+async def test_an_interrupt_after_set_stop_never_claims_the_target(engine, broker):
+    broker.set_stop_clears_target = True
+    seen = {"n": 0}
+
+    def interrupt_the_restore():
+        seen["n"] += 1
+        if seen["n"] == 2:
+            broker.set_market_closed(True, epic=US)  # zamknięcie po przerwaniu też się nie uda
+            raise asyncio.CancelledError()
+
+    broker.on_call("set_protection", interrupt_the_restore)
+    lines: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        await smoke_lane(engine, US, out=lines.append)
+    [loud] = [x for x in lines if "LOUD" in x]
+    assert loud.startswith("FAIL [7] LOUD: the probe position left open with its stop (its target may be gone"), loud
