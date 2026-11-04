@@ -1,10 +1,18 @@
-"""Test historyczny STRATEGII SILNIKA (orb_index_cfd v1) na świecach M1 DE40: pierwsza świeca 5 min (09:00-09:05 Berlin) wyznacza
-kierunek (wzrostowa = long, spadkowa = short, doji = pominięcie), wejście na otwarciu 09:05, stop 0,10 x ATR14 (dzienny) zaokrąglony
-w górę do 0,1 pkt, wyjście stopem albo 17:25. Jedna transakcja dziennie. Koszty jak w silniku: bid/ask z danych, poślizg 0,5 pkt,
-+1,0 pkt przy wyjściu stopem (config/costs_v1.toml). Punkty odniesienia: zawsze long, zawsze short (te same czasy i stopy).
-UWAGA: dzienne ATR liczone z M1 po dobie kalendarzowej Berlina (silnik używa świec dziennych brokera, granica doby może się różnić),
-a próba to ok. 87 dni = ok. 87 transakcji: wynik jest informacją, nie dowodem.
-Uruchomienie: docker compose ... run --rm -T gw-stock-engine python - < research/orb_daily_backtest.py   (plik /data/m1_de40.csv)
+"""Test historyczny STRATEGII SILNIKA (orb_index_cfd v1) na świecach M1: pierwsza świeca 5 min od otwarcia (domyślnie DE40,
+09:00-09:05 Berlin) wyznacza kierunek (wzrostowa = long, spadkowa = short, doji = pominięcie), wejście na otwarciu 09:05, stop
+0,10 x ATR14 (dzienny) zaokrąglony w górę do 0,1 pkt, wyjście stopem albo 17:25. Jedna transakcja dziennie. Koszty jak w silniku:
+bid/ask z danych, poślizg 0,5 pkt, +1,0 pkt przy wyjściu stopem (config/costs_v1.toml). Punkty odniesienia: zawsze long, zawsze
+short (te same czasy i stopy).
+UWAGA: dzienne ATR liczone z M1 po dobie kalendarzowej w strefie sesji (silnik używa świec dziennych brokera, granica doby może się
+różnić), a próba to ok. 87 dni = ok. 87 transakcji: wynik jest informacją, nie dowodem.
+Uruchomienie (DE40, wartości domyślne): docker compose ... run --rm -T gw-stock-engine python - < research/orb_daily_backtest.py
+(plik /data/m1_de40.csv).
+Inny instrument: zmienne środowiskowe (wszystkie opcjonalne; domyślne = DE40, wynik bez zmian):
+  GW_M1_CSV (plik świec), GW_TRADES_CSV (domyślnie /data/orb_daily_trades.csv dla DE40, dla innego pliku orb_trades_<plik>.csv),
+  GW_TZ (strefa sesji, np. America/New_York: godziny poniżej to czas lokalny, DST obsługuje strefa), GW_OPEN (np. 09:30),
+  GW_CLOSE (np. 15:55), GW_FIRST_MIN (długość pierwszej świecy w minutach, domyślnie 5), GW_STEP, GW_SLIP, GW_STOP_EXTRA (w punktach
+  instrumentu; to ZAŁOŻENIA kosztowe kalibrowane na DE40 i trzeba je ustawić świadomie), GW_POINT_EUR (wartość punktu przy minimalnej
+  wielkości w EUR; 0 = nie drukuj przeliczenia, np. dla instrumentów w USD bez modelu walutowego).
 """
 import csv, math, os, statistics
 from collections import namedtuple
@@ -12,10 +20,23 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-CSV = Path(os.environ.get("GW_M1_CSV", "/data/m1_de40.csv"))
-OUT = Path(os.environ.get("GW_TRADES_CSV", "/data/orb_daily_trades.csv"))
-BER = ZoneInfo("Europe/Berlin")
-SLIP, STOP_EXTRA, STEP, POINT_EUR = 0.5, 1.0, 0.1, 0.001
+DEFAULT_CSV = Path("/data/m1_de40.csv")
+CSV = Path(os.environ.get("GW_M1_CSV", str(DEFAULT_CSV)))
+# domyślny plik wyników zależy od pliku świec, żeby test innego instrumentu nie nadpisał wyników DE40
+OUT = Path(os.environ.get("GW_TRADES_CSV") or (CSV.with_name("orb_daily_trades.csv") if CSV == DEFAULT_CSV else CSV.with_name(f"orb_trades_{CSV.name}")))
+TZ = ZoneInfo(os.environ.get("GW_TZ", "Europe/Berlin"))
+
+
+def _hm(name, default):
+    h, m = os.environ.get(name, default).split(":")
+    return time(int(h), int(m))
+
+
+OPEN, CLOSE = _hm("GW_OPEN", "09:00"), _hm("GW_CLOSE", "17:25")
+FIRST_MIN = int(os.environ.get("GW_FIRST_MIN", "5"))
+ENTRY_T = (datetime.combine(datetime(2000, 1, 3), OPEN) + timedelta(minutes=FIRST_MIN)).time()  # koniec pierwszej świecy = wejście
+SLIP, STOP_EXTRA, STEP, POINT_EUR = (float(os.environ.get(k, v)) for k, v in
+                                     (("GW_SLIP", "0.5"), ("GW_STOP_EXTRA", "1.0"), ("GW_STEP", "0.1"), ("GW_POINT_EUR", "0.001")))
 STOP_ATRS = [float(x) for x in os.environ.get("GW_STOP_ATR", "0.10").split(",")]  # 0,10 = strategia silnika; inne = NOWE warianty (K+1)
 Bar = namedtuple("Bar", "t bo bh bl bc ao ah al ac")
 
@@ -54,14 +75,14 @@ def daily_atr(bars_by_day):
 
 
 def simulate(bars, side, stop_dist):
-    """bars: świece dnia od 09:05 Berlin. Zwraca (wejście, wyjście, powód, koszt_łączny)."""
+    """bars: świece dnia od końca pierwszej świecy (domyślnie 09:05 Berlin). Zwraca (wejście, wyjście, powód, koszt_łączny)."""
     b0 = bars[0]
     entry = (b0.ao + SLIP) if side == 1 else (b0.bo - SLIP)
     entry_cost = SLIP + (b0.ao - b0.bo) / 2
     stop = entry - side * stop_dist
     for b in bars:
         half = (b.ao - b.bo) / 2
-        if b.t.astimezone(BER).time() >= time(17, 25):
+        if b.t.astimezone(TZ).time() >= CLOSE:
             px = (b.bo - SLIP) if side == 1 else (b.ao + SLIP)
             return entry, px, "FLAT", entry_cost + SLIP + half
         if side == 1 and b.bl <= stop:
@@ -76,30 +97,31 @@ def stats(rows, mult=1.0):
     if not rows:
         return "brak transakcji"
     pnl = [r["pnl"] - (mult - 1) * r["cost"] for r in rows]
+    avg_r = statistics.mean(p / r["stop"] for p, r in zip(pnl, rows))  # R = wynik / nominalna odległość stopu
     gross = sum(r["pnl"] + r["cost"] for r in rows)
     w = sum(p for p in pnl if p > 0); lo = -sum(p for p in pnl if p < 0)
     cum = peak = dd = 0.0
     for p in pnl:
         cum += p; peak = max(peak, cum); dd = max(dd, peak - cum)
     wins = [p for p in pnl if p > 0]; losses = [p for p in pnl if p <= 0]
-    return (f"n={len(pnl)} BRUTTO={gross:+.0f} NETTO={sum(pnl):+.0f} pkt ({sum(pnl) * POINT_EUR:+.2f} EUR/0,001) śr={statistics.mean(pnl):+.1f} "
+    return (f"n={len(pnl)} BRUTTO={gross:+.0f} NETTO={sum(pnl):+.0f} pkt{f' ({sum(pnl) * POINT_EUR:+.2f} EUR/0,001)' if POINT_EUR else ''} śr={statistics.mean(pnl):+.1f} "
             f"traf.={len(wins) / len(pnl):.0%} śr.wygr.={statistics.mean(wins) if wins else 0:.0f} śr.str.={statistics.mean(losses) if losses else 0:.0f} "
-            f"PF={(w / lo) if lo else float('inf'):.2f} DD={dd:.0f} pkt")
+            f"PF={(w / lo) if lo else float('inf'):.2f} DD={dd:.0f} pkt śrR={avg_r:+.3f}")
 
 
 def main():
     raw, real = load()
     by_day = {}
     for b in raw:
-        by_day.setdefault(b.t.astimezone(BER).date(), []).append(b)
+        by_day.setdefault(b.t.astimezone(TZ).date(), []).append(b)
     atr = daily_atr(by_day)
     print(f"świece M1: {len(raw)}, dni: {len(by_day)}; bid/ask z danych: {'TAK' if real else 'NIE (rekonstrukcja, wynik przybliżony)'}")
     res = {}; skips = {}
     for d in sorted(by_day):
         day = by_day[d]
-        first = [b for b in day if time(9, 0) <= b.t.astimezone(BER).time() < time(9, 5)]
-        after = [b for b in day if b.t.astimezone(BER).time() >= time(9, 5)]
-        if d.weekday() >= 5 or len(first) != 5 or not after or after[0].t.astimezone(BER).time() != time(9, 5):
+        first = [b for b in day if OPEN <= b.t.astimezone(TZ).time() < ENTRY_T]
+        after = [b for b in day if b.t.astimezone(TZ).time() >= ENTRY_T]
+        if d.weekday() >= 5 or len(first) != FIRST_MIN or not after or after[0].t.astimezone(TZ).time() != ENTRY_T:
             skips["BRAK_DANYCH_LUB_WEEKEND"] = skips.get("BRAK_DANYCH_LUB_WEEKEND", 0) + 1; continue
         if atr[d] is None:
             skips["BRAK_ATR14"] = skips.get("BRAK_ATR14", 0) + 1; continue
