@@ -5,6 +5,7 @@ import threading
 from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
 
 import pytest
 
@@ -1172,3 +1173,159 @@ def test_count_smoke_trades_recognises_smoke_entries_by_order_or_entry_pointer(j
     journal.insert_order(make_order("gws-20261103-DE40-9-smoke", state=OrderState.REJECTED))  # bez transakcji
     assert journal.count_smoke_trades() == 2
     assert len(journal.trades()) == 4
+
+
+# --- liczniki i księga per instrument (wiele pasm; zadanie 5) -----------------------------------------------------
+
+
+def seed_orders(journal, rows) -> None:
+    """Zlecenia (order_id, stan) z `epic` wziętym z segmentu instrumentu identyfikatora `gws-DZIEŃ-EPIC-SEQ-ROLA`."""
+    for order_id, state in rows:
+        journal.insert_order(make_order(order_id, epic=order_id.split("-")[2], state=state))
+
+
+def test_count_entry_orders_with_an_epic_counts_only_that_instrument_in_any_state(journal):
+    seed_orders(journal, [
+        ("gws-20261102-DE40-1-entry", OrderState.REJECTED),
+        ("gws-20261102-US500-2-entry", OrderState.CONFIRMED),
+        ("gws-20261102-US500-3-entry", OrderState.NOT_PLACED),
+        ("gws-20261102-US500-4-smoke", OrderState.CONFIRMED),  # inna rola: nie jest dziennym wejściem
+        ("gws-20261102-DE40-5-smoke", OrderState.CONFIRMED),
+        ("gws-20261103-US500-1-entry", OrderState.INTENT),
+    ])  # fmt: skip
+    assert journal.count_entry_orders(DAY, "DE40") == 1
+    assert journal.count_entry_orders(DAY, "US500") == 2
+    assert journal.count_entry_orders(DAY, "EURUSD") == 0  # instrument bez wejść
+    assert journal.count_entry_orders(NEXT_DAY, "US500") == 1 and journal.count_entry_orders(NEXT_DAY, "DE40") == 0
+    # bez instrumentu zachowanie jak dotąd: wszystkie instrumenty razem (także jawne None)
+    assert journal.count_entry_orders(DAY) == 3 and journal.count_entry_orders(DAY, None) == 3
+    assert journal.count_entry_orders(DAY, "DE40") + journal.count_entry_orders(DAY, "US500") == 3
+
+
+def test_count_entry_orders_with_an_epic_does_not_mix_instruments_that_share_a_name_prefix(journal):
+    seed_orders(journal, [
+        ("gws-20261102-US5-1-entry", OrderState.CONFIRMED),
+        ("gws-20261102-US500-2-entry", OrderState.CONFIRMED),
+        ("gws-20261102-US5000-3-entry", OrderState.CONFIRMED),
+        ("gws-20261102-DE40-4-entry", OrderState.CONFIRMED),
+        ("gws-20261102-DE400-5-entry", OrderState.CONFIRMED),
+        ("gws-20261102-de40-6-entry", OrderState.CONFIRMED),  # wielkość liter ma znaczenie, jak w identyfikatorze
+    ])  # fmt: skip
+    for epic in ("US5", "US500", "US5000", "DE40", "DE400", "de40"):
+        assert journal.count_entry_orders(DAY, epic) == 1, epic
+    assert journal.count_entry_orders(DAY, "DE4") == 0 and journal.count_entry_orders(DAY, "S500") == 0
+    assert journal.count_entry_orders(DAY) == 6
+
+
+@pytest.mark.parametrize("epic", ["", "DE40-1", "DE40-", "-DE40", "DE 40", "DE40%", "DE_40", "DE40\n", "é", "DE40."])
+def test_count_entry_orders_rejects_an_epic_that_is_not_a_single_identifier_token(journal, epic):
+    # "DE40-1" złożone z prefiksu dnia dałoby `gws-20261102-DE40-1-`, czyli policzyłoby wejście nr 1 instrumentu DE40
+    seed_orders(journal, [("gws-20261102-DE40-1-entry", OrderState.CONFIRMED)])
+    with pytest.raises(ValueError):
+        journal.count_entry_orders(DAY, epic)
+
+
+class EpicStr(str, Enum):
+    DE40 = "DE40"
+
+
+@pytest.mark.parametrize("epic", [40, b"DE40", EpicStr.DE40, ["DE40"]])
+def test_count_entry_orders_rejects_an_epic_that_is_not_exactly_a_str(journal, epic):
+    with pytest.raises(TypeError):
+        journal.count_entry_orders(DAY, epic)  # podklasa str renderuje się w identyfikatorze inaczej niż jej wartość
+
+
+def test_count_entry_orders_with_an_epic_still_rejects_a_datetime_day(journal):
+    with pytest.raises(TypeError):
+        journal.count_entry_orders(T0, "DE40")
+
+
+def test_count_entry_orders_with_an_epic_gives_the_prefix_counts_on_a_mixed_journal(journal):
+    ids = [*MIXED_ORDER_IDS, "gws-20261102-US500-6-entry", "gws-20261102-US500-7-entry", "gws-20261103-US500-3-entry",
+           "gws-20261102-US500-8-smoke", "gws-20261102-US5-9-entry", "gws-20261102-DE40-10-entry"]  # fmt: skip
+    for i, order_id in enumerate(ids):
+        journal.insert_order(make_order(order_id, state=list(OrderState)[i % len(OrderState)]))
+    for day in (date(2026, 11, 1), DAY, NEXT_DAY, date(2026, 11, 4)):
+        for epic in ("DE40", "US500", "US5", "entry", "xgws"):
+            prefix = f"gws-{day:%Y%m%d}-{epic}-"
+            expected = len([o for o in ids if o.startswith(prefix) and o.endswith("-entry")])
+            assert journal.count_entry_orders(day, epic) == expected, (day, epic)
+    assert journal.count_entry_orders(DAY, "DE40") == 2 and journal.count_entry_orders(DAY, "US500") == 2
+
+
+def test_count_entry_orders_with_an_epic_searches_a_narrow_primary_key_range(journal):
+    for order_id in [*MIXED_ORDER_IDS, "gws-20261102-US500-6-entry", "gws-20261102-US500-7-entry"]:
+        journal.insert_order(make_order(order_id))
+    recording = RecordingConn(journal._conn)
+    journal._conn = recording
+    journal.count_entry_orders(DAY, "US500")
+    journal._conn = recording.real
+    ((sql, params),) = recording.statements
+    # zakres klucza głównego zawężony do prefiksu instrumentu (nie do całego dnia z filtrem po kolumnie epic)
+    assert params[:2] == ("gws-20261102-US500-", "gws-20261102-US500.")
+    plan = " | ".join(row[-1] for row in journal._conn.execute(f"EXPLAIN QUERY PLAN {sql}", params))
+    assert plan.startswith("SEARCH orders USING") and "order_id>? AND order_id<?" in plan and "SCAN" not in plan, plan
+    assert "epic" not in sql  # kolumna `epic` nie ma indeksu: filtr idzie po kluczu głównym
+
+
+def test_count_smoke_trades_with_an_epic_counts_only_that_instruments_smoke_trades(journal):
+    # DE40: DEAL-1 wejście strategii, DEAL-2 smoke po zleceniu, DEAL-3 smoke po wskaźniku wykonawcy
+    journal.record_trade(make_trade(), "DEAL-1", DAY)
+    journal.insert_order(make_order("gws-20261102-DE40-1-entry", state=OrderState.CONFIRMED, deal_id="DEAL-1"))
+    journal.record_trade(make_trade(), "DEAL-2", DAY)
+    journal.insert_order(make_order("gws-20261102-DE40-2-smoke", state=OrderState.CONFIRMED, deal_id="DEAL-2"))
+    journal.record_trade(make_trade(), "DEAL-3", NEXT_DAY)
+    journal.set_meta("entry_by_deal:DEAL-3", "gws-20261103-DE40-1-smoke")
+    # US500: DEAL-4 wejście strategii, DEAL-5 smoke po zleceniu, DEAL-6 i DEAL-7 smoke po wskaźniku
+    journal.record_trade(make_trade(instrument="US500"), "DEAL-4", DAY)
+    journal.insert_order(
+        make_order("gws-20261102-US500-3-entry", epic="US500", state=OrderState.CONFIRMED, deal_id="DEAL-4")
+    )
+    journal.record_trade(make_trade(instrument="US500"), "DEAL-5", DAY)
+    journal.insert_order(
+        make_order("gws-20261102-US500-4-smoke", epic="US500", state=OrderState.CONFIRMED, deal_id="DEAL-5")
+    )
+    journal.record_trade(make_trade(instrument="US500"), "DEAL-6", NEXT_DAY)
+    journal.set_meta("entry_by_deal:DEAL-6", "gws-20261103-US500-1-smoke")
+    journal.record_trade(make_trade(instrument="US500"), "DEAL-7", NEXT_DAY)
+    journal.set_meta("entry_by_deal:DEAL-7", "gws-20261103-US500-2-smoke")
+    assert journal.count_smoke_trades() == 5 and journal.count_smoke_trades(None) == 5
+    assert journal.count_smoke_trades("DE40") == 2
+    assert journal.count_smoke_trades("US500") == 3
+    assert journal.count_smoke_trades("EURUSD") == 0
+    # licznik sesji pasma = jego transakcje bez prób smoke; sesje pasm sumują się do sesji całej księgi
+    sessions = {e: len(journal.trades(e)) - journal.count_smoke_trades(e) for e in ("DE40", "US500")}
+    assert sessions == {"DE40": 1, "US500": 1}
+    assert sum(sessions.values()) == len(journal.trades()) - journal.count_smoke_trades()
+
+
+def test_trades_with_an_epic_returns_only_that_instrument_in_booking_order(journal):
+    a = make_trade(net_pnl=Decimal("-1"))
+    b = make_trade(instrument="US500", net_pnl=Decimal("2"))
+    c = make_trade(net_pnl=Decimal("3"), exit_reason="MANUAL")
+    d = make_trade(instrument="US500", net_pnl=Decimal("-4"), exit_reason="TARGET")
+    for i, trade in enumerate((a, b, c, d), start=1):
+        journal.record_trade(trade, f"DEAL-{i}", DAY)
+    assert journal.trades("DE40") == [a, c]
+    assert journal.trades("US500") == [b, d]
+    assert journal.trades("EURUSD") == []
+    assert journal.trades() == [a, b, c, d] and journal.trades(None) == [a, b, c, d]  # bez instrumentu: jak dotąd
+
+
+@pytest.mark.parametrize("method", ["trades", "count_smoke_trades"])
+def test_trades_and_smoke_count_reject_an_empty_or_non_str_epic_instead_of_returning_everything(journal, method):
+    journal.record_trade(make_trade(), "DEAL-1", DAY)
+    with pytest.raises(ValueError):
+        getattr(journal, method)("")  # pusty napis to nie „wszystkie instrumenty”
+    for bad in (40, b"DE40", ["DE40"]):
+        with pytest.raises(TypeError):
+            getattr(journal, method)(bad)
+
+
+@pytest.mark.parametrize("call", [
+    lambda j: j.trades("DE40"), lambda j: j.count_smoke_trades("DE40"), lambda j: j.count_entry_orders(DAY, "DE40"),
+])  # fmt: skip
+def test_per_instrument_reads_report_a_closed_journal_as_a_read_error(journal, call):
+    journal.close()
+    with pytest.raises(JournalReadError):
+        call(journal)

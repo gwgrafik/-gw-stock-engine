@@ -341,14 +341,32 @@ _ENTRY_SUFFIX = "-entry"  # rola wejścia strategii (ostatni segment identyfikat
 _SMOKE_SUFFIX = "-smoke"  # rola próby akceptacyjnej L0
 _TRADE_FLAGS = "trade_flags:{}"  # deal_id → znaczniki wiersza księgi (`record_trade(..., flags=)`)
 _FLAGS = re.compile(r"[A-Z_]+(?: [A-Z_]+)*")
+_EPIC_TOKEN = re.compile(r"[A-Za-z0-9]+")  # człon instrumentu identyfikatora zlecenia (`orders.ids`): bez "-"
 
 
-def _day_range(day: date) -> tuple[str, str]:
+def _check_epic_token(epic: object, where: str) -> str:
+    """Instrument jako człon identyfikatora zlecenia: dokładnie `str` zgodny z `[A-Za-z0-9]+` (jak w `ids`).
+
+    Wartość trafia do prefiksu klucza głównego `gws-{YYYYMMDD}-{epic}-`, więc "DE40-1" policzyłby wejście nr 1
+    instrumentu DE40, a podklasa `str` (np. (str, Enum)) renderuje się inaczej niż jej wartość."""
+    if type(epic) is not str:
+        raise TypeError(f"{where}: expected exactly str, got {type(epic).__name__} {epic!r}")
+    if not _EPIC_TOKEN.fullmatch(epic):
+        raise ValueError(f"{where}: expected a non-empty [A-Za-z0-9]+ instrument name, got {epic!r}")
+    return epic
+
+
+def _day_range(day: date, epic: str | None = None) -> tuple[str, str]:
     """Zakres klucza głównego `[prefiks, następnik)` dla identyfikatorów dnia: prefiks kończy się na "-", a "." to
     następny znak, więc w porządku BINARY (UTF-8) w zakresie są dokładnie napisy zaczynające się od prefiksu.
-    Wyszukiwanie po indeksie klucza zamiast przeglądania całej tabeli."""
+    Wyszukiwanie po indeksie klucza zamiast przeglądania całej tabeli.
+
+    Z `epic` prefiks jest węższy: `gws-{YYYYMMDD}-{epic}-` (końcowy "-" odróżnia US5 od US500), czyli tylko zlecenia tego
+    instrumentu, nadal jednym przeszukaniem zakresu klucza głównego (kolumna `epic` nie ma indeksu)."""
     _check_day(day)
     prefix = _DAY_PREFIX.format(day)
+    if epic is not None:
+        prefix += _check_epic_token(epic, "epic") + "-"
     return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
@@ -815,13 +833,17 @@ class Journal:
             ).fetchone()[0]
         )
 
-    def count_entry_orders(self, day: date) -> int:
+    def count_entry_orders(self, day: date, epic: str | None = None) -> int:
         """Liczba zleceń WEJŚCIA dnia (rola `entry`, każdy stan): podstawa ENTRIES_PER_DAY bramki ryzyka.
 
         Zlecenia innych ról (np. `smoke`, próba akceptacyjna L0) zużywają numer kolejny dnia (`count_orders`), ale nie
         dzienne wejście strategii.
+
+        Bez `epic` liczy wejścia wszystkich instrumentów (zachowanie jak dotąd). Z `epic` (np. "US500") tylko tego
+        instrumentu: zakres klucza głównego `gws-{YYYYMMDD}-{epic}-`, bez zmiany schematu. `epic` musi być dokładnie
+        `str` zgodnym z `[A-Za-z0-9]+` (człon identyfikatora); inny to `TypeError`/`ValueError`, nigdy cicho „wszystkie”.
         """
-        low, high = _day_range(day)
+        low, high = _day_range(day, epic)
         suffix = _ENTRY_SUFFIX
         return self._read(
             lambda c: c.execute(
@@ -976,26 +998,40 @@ class Journal:
         row = self._read(lambda c: c.execute("SELECT 1 FROM trades WHERE deal_id = ?", (deal_id,)).fetchone())
         return row is not None
 
-    def count_smoke_trades(self) -> int:
+    def count_smoke_trades(self, epic: str | None = None) -> int:
         """Liczba zaksięgowanych transakcji próby `smoke` (L0), które nie są sesjami strategii.
 
         Transakcja jest próbą smoke, gdy jej deal_id ma zlecenie o roli `smoke` (`...-smoke`) albo wskaźnik wykonawcy
         `entry_by_deal:<deal_id>` prowadzi do takiego zlecenia. Licznik sesji live = `len(trades()) − ta liczba`.
+
+        Bez `epic` liczy wszystkie instrumenty (zachowanie jak dotąd). Z `epic` tylko transakcje tego instrumentu
+        (`trades.instrument`), więc `len(trades(epic)) − count_smoke_trades(epic)` to sesje jednego pasma.
         """
         suffix = _SMOKE_SUFFIX
+        smoke = (
+            "EXISTS (SELECT 1 FROM orders o WHERE o.deal_id = t.deal_id AND substr(o.order_id, -?) = ?) "
+            "OR EXISTS (SELECT 1 FROM meta m WHERE m.key = 'entry_by_deal:' || t.deal_id "
+            "AND substr(m.value, -?) = ?)"
+        )
+        params: tuple[object, ...] = (len(suffix), suffix, len(suffix), suffix)
+        if epic is not None:
+            _check_str(epic, "count_smoke_trades.epic", non_empty=True)
+            smoke = f"t.instrument = ? AND ({smoke})"  # nawias: OR bez niego ominąłby filtr instrumentu
+            params = (epic, *params)
         return self._read(
-            lambda c: c.execute(
-                "SELECT count(*) FROM trades t WHERE "
-                "EXISTS (SELECT 1 FROM orders o WHERE o.deal_id = t.deal_id AND substr(o.order_id, -?) = ?) "
-                "OR EXISTS (SELECT 1 FROM meta m WHERE m.key = 'entry_by_deal:' || t.deal_id "
-                "AND substr(m.value, -?) = ?)",
-                (len(suffix), suffix, len(suffix), suffix),
-            ).fetchone()[0]
+            lambda c: c.execute(f"SELECT count(*) FROM trades t WHERE {smoke}", params).fetchone()[0]
         )
 
-    def trades(self) -> list[TradeRecord]:
-        """Księga w kolejności zaksięgowania."""
-        rows = self._read(lambda c: c.execute(f"SELECT {_TRADE_COLS} FROM trades ORDER BY id").fetchall())
+    def trades(self, epic: str | None = None) -> list[TradeRecord]:
+        """Księga w kolejności zaksięgowania; z `epic` tylko transakcje tego instrumentu (`trades.instrument`).
+
+        Pusty napis albo wartość spoza `str` to błąd, nigdy cicho cała księga (brak argumentu: `None`)."""
+        if epic is None:
+            sql, params = f"SELECT {_TRADE_COLS} FROM trades ORDER BY id", ()
+        else:
+            _check_str(epic, "trades.epic", non_empty=True)
+            sql, params = f"SELECT {_TRADE_COLS} FROM trades WHERE instrument = ? ORDER BY id", (epic,)
+        rows = self._read(lambda c: c.execute(sql, params).fetchall())
         return [_decode("trade", _trade_from_row, r) for r in rows]
 
     # --- drobne znaczniki ---
