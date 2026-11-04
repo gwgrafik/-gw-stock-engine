@@ -841,3 +841,26 @@ async def test_a_failing_lane_does_not_stop_the_emergency_flatten_of_the_other(
     with pytest.raises(RuntimeError, match="bug"):
         await emergency_flatten_lanes([de, us])
     assert "DEAL-B" not in fake.positions  # US500 zamknięte mimo błędu pasma DE40; błąd i tak wychodzi dalej
+
+
+# --- wyjścia nigdy nie czekają; straż poślizgu z konfiguracji pasma ------------------------------------------
+
+
+async def test_exits_of_a_foreign_lane_never_wait_for_a_rate_or_a_settlement(us, fx, fake, journal, plan, kill):
+    await closed_by_target_racing_the_time_limit(us, fake, journal, plan)  # transakcja czeka na rozliczenie
+    hold(fake, journal, "US500", "DEAL-B", Side.BUY, D("0.01"), US_FILL, US_STOP)
+    fx.factor, fx.par_upper = None, False  # ani kursu, ani parytetu
+    kill.hard("TEST")
+    closed = await us.flatten(journal.current_position("US500"), "TIME_LIMIT")
+    assert closed is not None and "DEAL-B" not in fake.positions
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY), ("DEAL-B", DAY)]
+
+
+async def test_slippage_guard_uses_the_fraction_of_the_lane(lane_build, us_gate, calendar, fake, journal, us_quote):
+    lane = LaneSpec("US500", calendar, D("0.10"), D("1.00"), uses_target=True)  # 10% z 10 pkt = 1 pkt
+    ex = lane_build(lane, us_gate)
+    fake.fill_slippage = D("1.5")  # gorzej o 1,5 pkt: ponad 1 pkt pasma (przy 0,25 z DE40 byłoby w normie)
+    await ex.enter(BarEntryPlan(Side.BUY, D("0.01"), US_STOP_D, US_TARGET_D, us_quote), US_RULES, DAY)
+    [slip] = events(journal, "SLIPPAGE_GUARD")
+    assert D(slip["limit"]) == D("1.00") and D(slip["deviation"]) == D("1.5")
+    assert fake.positions == {}
