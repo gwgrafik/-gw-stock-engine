@@ -87,7 +87,7 @@ from gwstock.engine_lanes import LANE_DECISION, BarLane, LaneArming, default_lan
 from gwstock.execution import KILL_CHECK_FAILED, Executor, ExitMemory, emergency_flatten_lanes
 from gwstock.fx import ESTIMATED_FX, QuoteFxView
 from gwstock.journal import Journal, JournalError, JournalWriteError, PositionRecord
-from gwstock.lanes import LaneSpec, decide_entry
+from gwstock.lanes import STALE_SIGNAL, LaneSpec, decide_entry
 from gwstock.notify import FileNotifier, Notifier
 from gwstock.orders.manager import OrderManager
 from gwstock.portfolio import PortfolioGate, PortfolioLane
@@ -1438,6 +1438,12 @@ class Engine:
         now, d = self._now(), lane.day
         if st.idle or d is None or d.session is None:
             return
+        if d.watch_from is None:
+            d.watch_from = now
+        for stale in lane.stale_candles(now):  # świeca przepadła: wpis zamiast cichego zniknięcia (F4)
+            d.decided.add(stale)
+            d.decisions += 1
+            self._record_lane_stale(lane, stale, d.waiting.pop(stale, None))
         start = lane.due_candle(now)
         if start is None:
             return
@@ -1551,6 +1557,24 @@ class Engine:
                 "side": plan.side, "size": plan.size, "stop_distance": plan.stop_distance,
                 "target_distance": plan.target_distance,
             },
+            "decided_at": self._now(),
+        }  # fmt: skip
+        try:
+            self.journal.append_raw(SOURCE_DECISION, dump(payload), self._now())
+        except Exception as exc:
+            self.kill.soft(JOURNAL_WRITE_FAILED)
+            self._alert(f"DECISION_JOURNAL:{lane.epic}", "ERROR", f"{JOURNAL_WRITE_FAILED}: lane decision not journaled: {exc}")
+
+    def _record_lane_stale(self, lane: BarLane, start: datetime, why: str | None) -> None:
+        """Decyzja STALE_SIGNAL (`lanes.STALE_SIGNAL`) dla świecy sygnału, która przepadła: czekała (ostatni powód z
+        `BarDay.waiting`, np. SIGNAL_CANDLE_MISSING, NOT_LOGGED_IN) albo jej pierwszy takt przyszedł po końcu następnej
+        świecy (`why` = None). Bez wejścia; awaria zapisu → kill miękki jak przy każdej decyzji pasma."""
+        d = lane.day
+        assert d is not None
+        payload = {
+            "event": LANE_DECISION, "epic": lane.epic, "day": d.day.isoformat(),
+            "mode": "live" if lane.executor is not None and lane.executor.live else "dry_run",
+            "signal_candle_start_utc": start, "outcome": STALE_SIGNAL, "why": why, "error": None,
             "decided_at": self._now(),
         }  # fmt: skip
         try:

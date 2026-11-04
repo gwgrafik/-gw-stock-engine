@@ -8,7 +8,8 @@ sesja brokera i limit zapytań (`GuardedBroker` silnika), kill switch, pamięć 
 
 Decyzja (`lanes.decide_entry`) zapada po zamknięciu każdej świecy M5, której początek leży w oknie sygnałów pasma, w
 pierwszym takcie po jej końcu (najpóźniej do końca następnej świecy: później to `STALE_SIGNAL`). Każda decyzja trafia
-do dziennika (źródło `decision`, zdarzenie `LANE_DECISION`), także odrzucenie.
+do dziennika (źródło `decision`, zdarzenie `LANE_DECISION`), także odrzucenie i świeca, która przepadła (wynik
+`STALE_SIGNAL` z ostatnim powodem czekania w polu `why`, `BarLane.stale_candles`).
 
 Stan dnia (`lanes.DayState`) wg rozstrzygnięć kontrolera zadania 12:
 - dzień = data lokalna kalendarza pasma (NY), `DayState.day == LaneSession.day`;
@@ -63,6 +64,7 @@ class BarDay:
     decided: set[datetime] = field(default_factory=set)  # początki świec sygnału już rozstrzygniętych
     waiting: dict[datetime, str] = field(default_factory=dict)  # świeca → powód czekania (ostatni)
     decisions: int = 0
+    watch_from: datetime | None = None  # pierwszy takt decyzji tego procesu w tym dniu (granica wpisów STALE_SIGNAL)
 
 
 class BarLane:
@@ -133,6 +135,26 @@ class BarLane:
         if start in d.decided or not d.session.in_signal_window(start) or now >= end + span:
             return None
         return start
+
+    def stale_candles(self, now: datetime) -> list[datetime]:
+        """Początki świec sygnału, które przepadły (`lanes.STALE_SIGNAL`): w oknie, nierozstrzygnięte, a teraz jest już
+        po końcu NASTĘPNEJ świecy (`now >= koniec + bar`), rosnąco. Tylko świece, za które ten proces odpowiadał: czekające
+        (`waiting`) albo zakończone nie wcześniej niż pierwszy takt decyzji tego procesu (`watch_from`); świece sprzed
+        startu procesu (np. po restarcie w środku okna) nie dostają wpisu. Wywołujący zapisuje decyzję i oznacza je jako
+        rozstrzygnięte."""
+        d = self.day
+        if d is None or d.session is None or d.watch_from is None:
+            return []
+        span = self.span
+        out = []
+        for opens, closes in d.session.windows:
+            start = opens
+            while start < closes and start + 2 * span <= now:
+                end = start + span
+                if start not in d.decided and (start in d.waiting or end >= d.watch_from):
+                    out.append(start)
+                start = end
+        return out
 
     def next_candle_end(self, now: datetime) -> datetime | None:
         """Najbliższy koniec świecy z początkiem w oknie sygnałów (budzenie pętli na decyzję)."""

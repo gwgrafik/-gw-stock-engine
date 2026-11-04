@@ -285,3 +285,62 @@ async def test_a_slow_us500_target_repair_does_not_delay_the_de40_flatten_at_172
     assert de_close and slow and de_close[0] < slow[0]
     assert timedelta(0) <= calls[de_close[0]][0] - DE_FLATTEN < timedelta(seconds=6)
     assert j.current_position(EPIC).state is P.FLAT
+
+
+# --- F4: świeca sygnału, która przepadła, zostawia decyzję STALE_SIGNAL ----------------------------------------------
+
+SIGNAL_START = new_york(DAY, 9, 45)  # 14:45 UTC
+SIGNAL_END = SIGNAL_START + timedelta(minutes=5)
+
+
+def stale_records(journal) -> list[dict]:
+    return [d for d in lane_decisions(journal) if d["outcome"] == "STALE_SIGNAL"]
+
+
+async def test_a_signal_candle_that_kept_waiting_past_the_next_candle_is_recorded_stale(lane_engine, broker, clock):
+    """F4. Oczekiwane: broker nie zwraca świecy sygnału 14:45 UTC aż do 14:56 (decyzja czeka z powodem
+    SIGNAL_CANDLE_MISSING, trzymanym dotąd tylko w pamięci); o 14:55 (koniec następnej świecy) świeca przestaje być
+    ważna: JEDNA decyzja LANE_DECISION z wynikiem STALE_SIGNAL, ostatnim powodem czekania i startem świecy w dzienniku
+    decyzji; żadnego wejścia US500 z tej świecy (zero zleceń US500)."""
+    real = broker.candles_5m
+
+    async def lagging(epic, start, end):
+        candles = await real(epic, start, end)
+        if epic == US and clock.now_utc() < SIGNAL_END + timedelta(minutes=6):
+            candles = [c for c in candles if c.start != SIGNAL_START]
+        return candles
+
+    broker.candles_5m = lagging  # type: ignore[method-assign]
+    stop_engine_at(lane_engine, clock, SIGNAL_END + timedelta(minutes=8))
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    (stale,) = stale_records(j)
+    assert stale["signal_candle_start_utc"] == SIGNAL_START.isoformat()
+    assert stale["why"] == "SIGNAL_CANDLE_MISSING" and stale["mode"] == "live" and stale["day"] == DAY.isoformat()
+    assert SIGNAL_END + timedelta(minutes=5) <= datetime.fromisoformat(stale["decided_at"])
+    assert datetime.fromisoformat(stale["decided_at"]) < SIGNAL_END + timedelta(minutes=5, seconds=10)
+    assert not [d for d in lane_decisions(j) if d["signal_candle_start_utc"] == SIGNAL_START.isoformat()
+                and d["outcome"] != "STALE_SIGNAL"]  # fmt: skip
+    assert j.count_entry_orders(DAY, US) == 0
+
+
+async def test_a_signal_candle_whose_tick_came_after_the_next_candle_is_recorded_stale(lane_engine, broker, clock):
+    """F4. Oczekiwane: pętla silnika „zasypia” od 14:49 do 14:56:30 UTC (np. zawieszony odczyt), więc pierwszy takt po
+    końcu świecy sygnału 14:45 przychodzi po końcu następnej świecy (14:55): decyzja STALE_SIGNAL bez powodu czekania
+    (`why` = None) zamiast ciszy; następna świeca (14:50, zakończona 14:55) jest rozstrzygana normalnie; świece sprzed
+    pierwszego taktu decyzji tego procesu NIE dostają wpisu (jedyny STALE to 14:45)."""
+    jumped: list[bool] = []
+
+    def stall() -> None:
+        if not jumped and clock.now_utc() >= SIGNAL_END - timedelta(minutes=1):
+            jumped.append(True)
+            clock.advance((SIGNAL_END + timedelta(minutes=6, seconds=30) - clock.now_utc()).total_seconds())
+
+    clock.hooks.append(stall)
+    stop_engine_at(lane_engine, clock, SIGNAL_END + timedelta(minutes=9))
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    (stale,) = stale_records(j)
+    assert stale["signal_candle_start_utc"] == SIGNAL_START.isoformat() and stale["why"] is None
+    nxt = (SIGNAL_START + timedelta(minutes=5)).isoformat()
+    assert [d["outcome"] for d in lane_decisions(j) if d["signal_candle_start_utc"] == nxt] == ["NO_SIGNAL"]
