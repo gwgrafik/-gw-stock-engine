@@ -36,6 +36,7 @@ from gwstock.risk import KillSwitch, RiskGate
 from gwstock.strategy import EntrySignal
 from gwstock.strategy_bars import BarEntryPlan
 from gwstock.types import (
+    BrokerError,
     ClosedDeal,
     InstrumentRules,
     KillLevel,
@@ -44,6 +45,7 @@ from gwstock.types import (
     PositionState,
     Quote,
     Side,
+    TargetedEntryRequest,
     TargetedOpenPosition,
 )
 from tests.conftest import RecordingNotifier
@@ -425,3 +427,166 @@ async def test_target_exit_costs_no_extra_stop_slippage_in_the_ledger(lane_build
     target, stop = journal.trades()
     assert target.slippage_penalty == D("0.50")  # tylko poślizg wejścia 0,5 pkt × 1
     assert stop.slippage_penalty == D("1.50")  # wejście 0,5 + stop 1,0
+
+
+# --- wejście i zabezpieczenie z celem zysku ---------------------------------------------------------------
+
+
+def spy_requests(fake, monkeypatch):
+    sent = []
+    real = fake.open_position
+
+    async def open_position(req):
+        sent.append(req)
+        return await real(req)
+
+    monkeypatch.setattr(fake, "open_position", open_position)
+    return sent
+
+
+def strip_stop_on_confirm(fake, monkeypatch):
+    """Broker przyjął wejście BEZ stopu (i bez celu): potwierdzenie i lista pozycji nie mają ochrony."""
+    real = fake.confirm
+
+    async def confirm(ref):
+        snapshot = await real(ref)
+        plain = OpenPosition(*(getattr(snapshot, f) for f in ("deal_id", "epic", "side", "size", "open_level")),
+                             None, snapshot.opened_at)  # fmt: skip
+        fake.positions[snapshot.deal_id] = plain
+        return plain
+
+    monkeypatch.setattr(fake, "confirm", confirm)
+
+
+async def test_target_lane_enters_with_a_targeted_request_and_the_target_attached_atomically(
+    ut, fake, journal, plan, kill, monkeypatch
+):
+    sent = spy_requests(fake, monkeypatch)
+    rec = await ut.enter(plan, US_RULES, DAY)
+    assert rec.state is O.CONFIRMED and rec.order_id == US_CID and rec.deal_id == "DEAL-1"
+    assert fake.calls == ["account", "open_position", "confirm"]
+    [req] = sent
+    assert isinstance(req, TargetedEntryRequest) and req.target_distance == US_TARGET_D and req.epic == "US500"
+    pos = fake.positions["DEAL-1"]
+    assert isinstance(pos, TargetedOpenPosition) and pos.stop_level == US_STOP and pos.target_level == US_TARGET
+    ctx = json.loads(journal.get_meta(f"entry_ctx:{US_CID}"))
+    assert ctx["target_distance"] == "15" and ctx["stop_distance"] == "10" and ctx["epic"] == "US500"
+    assert "currency" not in ctx  # pasmo w walucie rachunku: bez pól walutowych
+    assert journal.get_meta("entry_last:US500") == US_CID and kill.level() is KillLevel.NONE
+
+
+async def test_target_lane_never_opens_a_position_without_a_target(ut, fake, journal, notifier, us_quote, kill):
+    signal = EntrySignal(Side.BUY, US_STOP_D, D("0.01"), us_quote)  # sygnał bez celu
+    assert await ut.enter(signal, US_RULES, DAY) is None
+    assert fake.calls == [] and fake.positions == {}  # nic nie poszło do brokera, nawet odczyt konta
+    [refused] = events(journal, "ENTRY_REFUSED")
+    assert refused["reason"] == "TARGET_MISSING" and refused["epic"] == "US500"
+    assert [level for level, _ in alerts(notifier, "TARGET_MISSING")] == ["ERROR"]
+    assert journal.count_orders(DAY) == 0 and journal.get_meta(f"entry_ctx:{US_CID}") is None
+    assert kill.level() is KillLevel.NONE
+
+
+async def test_a_lane_without_a_target_refuses_a_plan_with_one(de, fake, journal, notifier, quote, rules):
+    plan = BarEntryPlan(Side.BUY, D("0.007"), D("30"), D("45"), quote)
+    assert await de.enter(plan, rules, DAY) is None
+    assert fake.calls == [] and journal.count_orders(DAY) == 0
+    assert events(journal, "ENTRY_REFUSED")[0]["reason"] == "TARGET_NOT_SUPPORTED"
+    assert alerts(notifier, "TARGET_NOT_SUPPORTED")
+
+
+async def test_target_lane_in_dry_run_records_the_targeted_request(lane_build, us_gate, calendar, plan, fake, journal):
+    ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate, live=False)
+    assert await ex.enter(plan, US_RULES, DAY) is None
+    assert fake.calls == ["account"]
+    [decision] = payloads(journal, "decision")
+    assert decision["request"]["target_distance"] == "15" and decision["request"]["client_id"] == US_CID
+
+
+async def test_target_lane_protects_with_stop_and_target_together(ut, fake, journal, plan, kill, monkeypatch, notifier):
+    strip_stop_on_confirm(fake, monkeypatch)
+    rec = await ut.enter(plan, US_RULES, DAY)
+    assert rec.state is O.CONFIRMED
+    assert fake.calls == ["account", "open_position", "confirm", "set_protection"]  # nigdy sam set_stop
+    pos = fake.positions["DEAL-1"]
+    assert pos.stop_level == US_STOP and pos.target_level == US_TARGET
+    [event] = events(journal, "STOP_ATTACHED")
+    assert D(event["stop_level"]) == US_STOP and D(event["target_level"]) == US_TARGET
+    [raw] = payloads(journal, "broker.set_protection")
+    assert D(raw["stop_level"]) == US_STOP and D(raw["target_level"]) == US_TARGET
+    assert kill.level() is KillLevel.NONE and journal.current_position("US500").state is P.OPEN
+
+
+async def test_protect_unprotected_on_a_target_lane_keeps_the_target_from_the_entry(ut, fake, journal, plan, kill):
+    await ut.enter(plan, US_RULES, DAY)
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
+    fake.calls.clear()
+    assert await ut.protect_unprotected(fake.positions["DEAL-1"]) is True
+    assert fake.calls == ["set_protection"]
+    assert fake.positions["DEAL-1"].stop_level == US_STOP and fake.positions["DEAL-1"].target_level == US_TARGET
+
+
+async def test_protect_unprotected_keeps_the_target_the_broker_reports(ut, fake, journal, kill):
+    pos = TargetedOpenPosition("DEAL-T", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY, target_level=US_TARGET)
+    fake.positions["DEAL-T"] = pos
+    assert await ut.protect_unprotected(pos) is True  # bez kontekstu: odległość z limitu straty, cel brokera zostaje
+    assert fake.calls == ["instrument_rules", "set_protection"]
+    assert fake.positions["DEAL-T"].target_level == US_TARGET and fake.positions["DEAL-T"].stop_level is not None
+
+
+async def test_protection_without_a_known_target_still_sets_the_stop_and_alarms(ut, fake, journal, kill, notifier):
+    pos = OpenPosition("DEAL-T", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
+    fake.positions["DEAL-T"] = pos
+    assert await ut.protect_unprotected(pos) is True  # ochrona przede wszystkim
+    assert fake.calls == ["instrument_rules", "set_protection"] and fake.positions["DEAL-T"].stop_level is not None
+    assert [level for level, _ in alerts(notifier, "TARGET_UNAVAILABLE")] == ["WARN"]
+    assert kill.level() is KillLevel.NONE
+
+
+async def test_failed_protection_of_a_target_lane_goes_hard_and_flattens(ut, fake, journal, plan, kill, clock):
+    await ut.enter(plan, US_RULES, DAY)
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
+    for _ in range(3):
+        fake.fail_next("set_protection", BrokerError("HTTP 500"))
+    fake.calls.clear()
+    assert await ut.protect_unprotected(fake.positions["DEAL-1"]) is False
+    assert fake.calls[:3] == ["set_protection"] * 3 and "set_stop" not in fake.calls
+    assert kill.level() is KillLevel.HARD and kill.reason() == "UNPROTECTED_POSITION"
+    assert fake.calls.count("close_position") == 1 and fake.positions == {}
+
+
+async def test_ensure_target_sets_stop_and_target_together_for_an_untargeted_position(ut, fake, journal, plan, notifier):
+    await ut.enter(plan, US_RULES, DAY)
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
+    fake.calls.clear()
+    assert await ut.ensure_target(fake.positions["DEAL-1"]) is True
+    assert fake.calls == ["set_protection"]
+    assert fake.positions["DEAL-1"].target_level == US_TARGET and fake.positions["DEAL-1"].stop_level == US_STOP
+    assert events(journal, "TARGET_ATTACHED")[0]["deal_id"] == "DEAL-1"
+    assert [level for level, _ in alerts(notifier, "TARGET_ATTACHED")] == ["INFO"]
+
+
+async def test_ensure_target_does_nothing_when_not_needed_or_not_possible(ut, de, fake, journal, plan, notifier):
+    await ut.enter(plan, US_RULES, DAY)
+    fake.calls.clear()
+    assert await ut.ensure_target(fake.positions["DEAL-1"]) is True  # cel już jest
+    stopless = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
+    assert await ut.ensure_target(stopless) is False  # najpierw stop (zabezpieczenie)
+    plain = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
+    assert await de.ensure_target(plain) is False  # pasmo bez celu, obcy instrument
+    foreign = OpenPosition("DEAL-9", "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
+    assert await ut.ensure_target(foreign) is False  # bez kontekstu wejścia celu nie zgadujemy
+    assert fake.calls == [] and [level for level, _ in alerts(notifier, "TARGET_UNAVAILABLE DEAL-9")] == ["WARN"]
+
+
+async def test_ensure_target_failure_is_an_alarm_never_a_kill(ut, fake, journal, plan, notifier, kill):
+    await ut.enter(plan, US_RULES, DAY)
+    plain = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
+    fake.positions["DEAL-1"] = plain
+    fake.fail_next("set_protection", BrokerError("HTTP 500"))
+    fake.fail_next("set_protection", BrokerError("HTTP 500"))
+    assert await ut.ensure_target(plain) is False
+    assert await ut.ensure_target(plain) is False
+    assert fake.positions["DEAL-1"].stop_level == US_STOP  # stop nietknięty
+    assert len(alerts(notifier, "TARGET_ATTACH_FAILED")) == 1  # raz na deal
+    assert len(events(journal, "TARGET_ATTACH_FAILED")) == 2
+    assert kill.level() is KillLevel.NONE

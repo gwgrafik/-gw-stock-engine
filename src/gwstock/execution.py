@@ -106,6 +106,7 @@ from gwstock.orders.manager import HISTORY_MARGIN, EntryBlocked, OrderManager
 from gwstock.risk import JOURNAL_WRITE_FAILED, EntryCandidate, KillSwitch, RiskGate
 from gwstock.serialization import dump
 from gwstock.strategy import EntrySignal
+from gwstock.strategy_bars import BarEntryPlan
 from gwstock.types import (
     BrokerRejected,
     ClosedDeal,
@@ -117,9 +118,12 @@ from gwstock.types import (
     OrderState,
     PositionState,
     Side,
+    TargetedEntryRequest,
 )
 
 T = TypeVar("T")
+# Plan wejścia: sygnał ORB (bez celu) albo plan reguły świecowej (z celem `target_distance`).
+EntryPlan = EntrySignal | BarEntryPlan
 _O = OrderState
 _P = PositionState
 
@@ -131,6 +135,7 @@ SOURCE_CLOSE = "broker.close_position"
 SOURCE_POSITIONS = "broker.list_positions"
 SOURCE_CLOSED = "broker.closed_since"
 SOURCE_SET_STOP = "broker.set_stop"
+SOURCE_SET_PROTECTION = "broker.set_protection"  # stop i cel razem (pasma z celem)
 SOURCE_QUOTE = "broker.quote"
 SOURCE_RULES = "broker.instrument_rules"
 
@@ -153,6 +158,10 @@ FILL_GUARD_CAUSES = frozenset({SLIPPAGE_GUARD, SIZE_MISMATCH_RISK})
 # Przyczyny kill switcha nadawane przez wykonawcę (JOURNAL_WRITE_FAILED z `gwstock.risk`).
 ENTRY_EXCEPTION = "ENTRY_EXCEPTION"
 ENTRY_UNRESOLVED = "ENTRY_UNRESOLVED"
+# Odmowa wejścia przez wykonawcę pasma (zdarzenie ENTRY_REFUSED, nic nie idzie do brokera): pasmo z celem dostało
+# plan bez celu (nigdy cicho pozycja bez celu) albo pasmo bez celu plan z celem.
+TARGET_MISSING = "TARGET_MISSING"
+TARGET_NOT_SUPPORTED = "TARGET_NOT_SUPPORTED"
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 GUARD_EXIT_UNPERSISTED = "GUARD_EXIT_UNPERSISTED"  # straż chce zamknąć, a dziennik nie zapisze EXITING: HARD i awaryjne
 DAILY_LOSS = "DAILY_LOSS"
@@ -381,7 +390,7 @@ class Executor:
     # --- wejście ----------------------------------------------------------------------------------------
 
     async def enter(
-        self, signal: EntrySignal, rules: InstrumentRules, day: date, *, smoke: bool = False
+        self, signal: EntryPlan, rules: InstrumentRules, day: date, *, smoke: bool = False
     ) -> OrderRecord | None:
         """Wejście z sygnału strategii; `day` to dzień handlowy (identyfikator zlecenia i jego numer kolejny).
 
@@ -389,7 +398,12 @@ class Executor:
         sesji i limitu wejść dnia) i rola identyfikatora `smoke`, więc zlecenie nie zużywa dziennego wejścia strategii.
         Tryb `dry_run` także tu nigdy nie wysyła zlecenia.
 
-        None: bramka zablokowała (`gate_block`), tryb `dry_run` (`decision`), konto niedostępne (ACCOUNT_UNAVAILABLE)
+        `signal`: sygnał ORB (`EntrySignal`, bez celu) albo plan z celem (`BarEntryPlan.target_distance`). Pasmo z celem
+        wysyła `TargetedEntryRequest` (stop i cel atomowo); plan niezgodny z pasmem (pasmo z celem bez celu albo
+        odwrotnie) to odmowa ENTRY_REFUSED z alarmem, zanim cokolwiek pójdzie do brokera.
+
+        None: odmowa pasma (ENTRY_REFUSED), bramka zablokowała (`gate_block`), tryb `dry_run` (`decision`), konto
+        niedostępne (ACCOUNT_UNAVAILABLE)
         albo awaria dziennika przed wysyłką lub z menedżera (kill miękki JOURNAL_WRITE_FAILED). Inaczej rekord zlecenia
         z menedżera: CONFIRMED (pozycja mogła zostać od razu spłaszczona przez straż), REJECTED, NOT_PLACED albo
         UNKNOWN (kill miękki ENTRY_UNRESOLVED). Wyjątek inny niż błąd zapisu dziennika: kill miękki ENTRY_EXCEPTION
@@ -423,10 +437,14 @@ class Executor:
         return rec
 
     async def _prepare(
-        self, signal: EntrySignal, rules: InstrumentRules, day: date, smoke: bool = False
+        self, signal: EntryPlan, rules: InstrumentRules, day: date, smoke: bool = False
     ) -> EntryRequest | None:
         """Konto, bramka, identyfikator i kontekst wejścia; żądanie do wysłania albo None (bez wysyłki)."""
         signal_ts = self._now()
+        target = _plan_target(signal)
+        if self._lane.uses_target != (target is not None):
+            self._refuse(TARGET_MISSING if self._lane.uses_target else TARGET_NOT_SUPPORTED, day)
+            return None
         quote = signal.decision_quote
         candidate = EntryCandidate(
             epic=self._epic,
@@ -456,7 +474,10 @@ class Executor:
             return None
         role = ROLE_SMOKE if smoke else ROLE_ENTRY
         client_id = make_client_id(day, self._epic, self._journal.next_seq(day), role)
-        request = EntryRequest(client_id, self._epic, signal.side, signal.size, signal.stop_distance)
+        request = (
+            EntryRequest(client_id, self._epic, signal.side, signal.size, signal.stop_distance) if target is None
+            else TargetedEntryRequest(client_id, self._epic, signal.side, signal.size, signal.stop_distance, target)
+        )  # fmt: skip
         if not self._live:
             self._append(SOURCE_DECISION, {"request": request, "candidate": candidate, "day": day.isoformat()})
             return None
@@ -483,11 +504,19 @@ class Executor:
             "signal_ts": signal_ts,
             "submit_ts": self._now(),
         }
+        if target is not None:  # tylko pasma z celem: kontekst DE40 v1 bajt w bajt
+            context["target_distance"] = target
         self._journal.set_meta(ctx_key, dump(context))
         self._journal.set_meta(META_ENTRY_LAST.format(self._epic), client_id)
         return request
 
-    async def _after_submit(self, rec: OrderRecord, signal: EntrySignal, rules: InstrumentRules) -> None:
+    def _refuse(self, reason: str, day: date) -> None:
+        """Plan niezgodny z pasmem: alarm i zdarzenie, nic do brokera (także bez odczytu konta)."""
+        need = "requires" if self._lane.uses_target else "does not take"
+        self._alert("ERROR", f"ENTRY_REFUSED {reason}: lane {self._epic} {need} a profit target; no entry")
+        self._event("ENTRY_REFUSED", reason=reason, epic=self._epic, day=day.isoformat())
+
+    async def _after_submit(self, rec: OrderRecord, signal: EntryPlan, rules: InstrumentRules) -> None:
         """Kontrakt z menedżerem (T7), potem ochrona: zabezpieczenie, straże i ich spłaszczenie; zapisy pomocnicze na
         końcu i wg możliwości (ich awaria = kill miękki, nigdy pominięta ochrona)."""
         position = self._journal.current_position(self._epic)
@@ -501,7 +530,7 @@ class Executor:
             return
         self._remember_deal(position)
         if position.stop_level is None:
-            if not await self._protect(_as_open(position), signal.stop_distance):
+            if not await self._protect(_as_open(position), signal.stop_distance, _plan_target(signal)):
                 return  # kill switch twardy i awaryjne spłaszczenie już wykonane
         failures: list[str] = []
         quote = signal.decision_quote
@@ -1179,7 +1208,9 @@ class Executor:
         """
         return await self._protect(position, None)
 
-    async def _protect(self, position: OpenPosition, distance: Decimal | None) -> bool:
+    async def _protect(
+        self, position: OpenPosition, distance: Decimal | None, target_distance: Decimal | None = None
+    ) -> bool:
         # nasza pozycja (z potwierdzenia wejścia albo z uzgadniania: deal z dziennika u brokera)
         self._memory.last_own_deal_by_epic[position.epic] = position.deal_id
         failures: list[str] = []
@@ -1191,7 +1222,8 @@ class Executor:
                 distance = await self._protection_distance(position, failures)
             if distance is not None:
                 level = position.open_level - distance if position.side is Side.BUY else position.open_level + distance
-                attached = await self._attach_stop(position, level, failures)
+                target = self._protection_target(position, target_distance) if self._lane.uses_target else None
+                attached = await self._attach_stop(position, level, failures, target)
         except BaseException as exc:  # także anulowanie: pozycja bez stopu nigdy nie zostaje bez HARD
             if not attached:
                 self._kill.hard(UNPROTECTED_POSITION)
@@ -1220,9 +1252,13 @@ class Executor:
             self._report_journal_failures(failures, where)
         return False
 
-    async def _attach_stop(self, position: OpenPosition, level: Decimal, failures: list[str]) -> bool:
+    async def _attach_stop(
+        self, position: OpenPosition, level: Decimal, failures: list[str], target: Decimal | None = None
+    ) -> bool:
         """Do `PROTECT_ATTEMPTS` prób `set_stop` co `PROTECT_PAUSE_S` od startu każdej (ponowienie tego samego poziomu
-        jest bezpieczne); zapisy wg możliwości, więc awaria dziennika nie skraca procedury. Gdy wszystkie zawiodą, a
+        jest bezpieczne); zapisy wg możliwości, więc awaria dziennika nie skraca procedury. Pasmo z celem: zamiast
+        `set_stop` zawsze `set_protection` ze stopem i celem `target` RAZEM (sam stop mógłby skasować cel, C5d;
+        `target=None` tylko, gdy celu nie da się ustalić: alarm TARGET_UNAVAILABLE, ochrona stopem i tak idzie). Gdy wszystkie zawiodą, a
         z budżetu `PROTECT_BUDGET_S` (od pierwszej porażki) zostało co najmniej `PROTECT_VERIFY_MIN_S`: jeden odczyt
         listy (limit: reszta budżetu, najwyżej `PROTECT_CALL_TIMEOUT_S`), bo stop mógł zostać ustawiony mimo braku
         odpowiedzi; nasz deal z tym poziomem stopu podanym przez brokera (nie wyliczonym przez adapter) = stop jest."""
@@ -1230,6 +1266,9 @@ class Executor:
         timeout = min(self._timeout, PROTECT_CALL_TIMEOUT_S)
         started = self._now()
         first_failure: datetime | None = None
+        source = SOURCE_SET_PROTECTION if self._lane.uses_target else SOURCE_SET_STOP
+        extra = {"target_level": target} if self._lane.uses_target else {}  # DE40 v1: zapisy bajt w bajt
+        with_target = f" with target {target}" if self._lane.uses_target else ""
         for attempt in range(1, PROTECT_ATTEMPTS + 1):
             if attempt > 1:  # stały rytm od startu procedury: czas oczekiwania na odpowiedź nie przesuwa kolejnej próby
                 due = started + timedelta(seconds=(attempt - 1) * PROTECT_PAUSE_S)
@@ -1239,22 +1278,22 @@ class Executor:
                 if wait > 0:
                     await self._clock.sleep(wait)
             try:
-                await _with_timeout(self._broker.set_stop(deal_id, level), timeout)
+                await _with_timeout(self._protection_call(deal_id, level, target), timeout)
             except Exception as exc:
                 if first_failure is None:
                     first_failure = self._now()
                 self._raw_error(
-                    SOURCE_SET_STOP, exc, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt
+                    source, exc, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt, **extra
                 )
                 continue
             self._raw(
-                SOURCE_SET_STOP, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt,
+                source, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt, **extra,
                 response=None,
             )  # fmt: skip
-            self._alert("INFO", f"STOP_ATTACHED {deal_id}: stop {level} set after the broker had none")
+            self._alert("INFO", f"STOP_ATTACHED {deal_id}: stop {level} set after the broker had none{with_target}")
             self._event(
                 "STOP_ATTACHED", best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt,
-                verified_by="set_stop",
+                verified_by="set_stop", **extra,
             )  # fmt: skip
             return True
         spent = 0.0 if first_failure is None else (self._now() - first_failure).total_seconds()
@@ -1272,9 +1311,100 @@ class Executor:
         )
         self._event(
             "STOP_ATTACHED", best_effort=failures, deal_id=deal_id, stop_level=level, attempt=PROTECT_ATTEMPTS,
-            verified_by="list",
+            verified_by="list", **extra,
         )  # fmt: skip
         return True
+
+    def _protection_call(self, deal_id: str, level: Decimal, target: Decimal | None) -> Awaitable[None]:
+        """Pasmo z celem: stop i cel jednym żądaniem; pasmo bez celu (DE40 v1): sam stop, jak dotąd."""
+        if self._lane.uses_target:
+            return self._broker.set_protection(deal_id, level, target)
+        return self._broker.set_stop(deal_id, level)
+
+    def _protection_target(self, position: OpenPosition, distance: Decimal | None) -> Decimal | None:
+        """Poziom celu do zabezpieczenia pasma z celem: z odległości planu wejścia, inaczej cel, który broker podaje
+        dla pozycji, inaczej z kontekstu wejścia. None (alarm TARGET_UNAVAILABLE raz na deal): celu nie zgadujemy,
+        stop i tak idzie (ochrona przede wszystkim; limit czasu i godzina spłaszczenia zamkną pozycję)."""
+        if distance is not None:
+            return _target_level(position, distance)
+        if position.target_level is not None:
+            return position.target_level
+        target = self._context_target(position)
+        if target is None:
+            self._target_unavailable(position.deal_id)
+        return target
+
+    def _context_target(self, position: OpenPosition) -> Decimal | None:
+        """Poziom celu z kontekstu wejścia pozycji (odległość od ceny otwarcia); None: brak albo nieczytelny."""
+        try:
+            ctx = self._context(position.deal_id, position.epic)
+            if ctx is None or "target_distance" not in ctx:
+                return None
+            distance = _ctx_decimal(ctx, "target_distance")
+        except Exception:  # ochrona przede wszystkim: nieczytelny kontekst = celu nie znamy
+            return None
+        return _target_level(position, distance) if distance > 0 else None
+
+    def _target_unavailable(self, deal_id: str) -> None:
+        self._alert_once(
+            "TARGET_UNAVAILABLE", deal_id, "WARN",
+            f"TARGET_UNAVAILABLE {deal_id}: no profit target known for this position (no readable entry context and "
+            "none reported by the broker); not guessed, the stop protects it and the time limit closes it",
+        )  # fmt: skip
+
+    async def ensure_target(self, position: OpenPosition) -> bool:
+        """Cel zysku dla pozycji pasma z celem, której broker go nie pokazuje (uzgadnianie: `untargeted`, projekt
+        §3.3); silnik woła raz na takt zarządzania. Jedno `set_protection` z obecnym stopem pozycji i celem z
+        kontekstu wejścia (stop i cel razem, C5d).
+
+        True: cel jest (już był albo właśnie ustawiony: zdarzenie TARGET_ATTACHED). False bez żadnego wywołania
+        brokera: pasmo bez celu, inny instrument, pozycja bez stopu (najpierw `protect_unprotected`) albo cel nie do
+        ustalenia (alarm TARGET_UNAVAILABLE raz na deal; nie zgadujemy). False po odmowie lub błędzie brokera: alarm
+        TARGET_ATTACH_FAILED raz na deal i zdarzenie przy każdej próbie. Brak celu NIGDY nie włącza kill switcha:
+        cel nie jest ochroną (stop jest), a pozycję zamknie limit czasu albo godzina spłaszczenia.
+        """
+        if not self._lane.uses_target or position.epic != self._epic:
+            return False
+        if position.target_level is not None:
+            return True
+        if position.stop_level is None:
+            return False
+        deal_id = position.deal_id
+        target = self._context_target(position)
+        if target is None:
+            self._target_unavailable(deal_id)
+            return False
+        failures: list[str] = []
+        stop = position.stop_level
+        try:
+            try:
+                await _with_timeout(
+                    self._broker.set_protection(deal_id, stop, target), min(self._timeout, PROTECT_CALL_TIMEOUT_S)
+                )
+            except Exception as exc:
+                self._raw_error(
+                    SOURCE_SET_PROTECTION, exc, best_effort=failures, deal_id=deal_id, stop_level=stop,
+                    target_level=target, context="target",
+                )  # fmt: skip
+                self._alert_once(
+                    "TARGET_ATTACH_FAILED", deal_id, "WARN",
+                    f"TARGET_ATTACH_FAILED {deal_id}: target {target} not set ({type(exc).__name__}: {exc}); the stop "
+                    "stays, retried on every management pass",
+                )  # fmt: skip
+                self._event(
+                    "TARGET_ATTACH_FAILED", best_effort=failures, deal_id=deal_id, stop_level=stop,
+                    target_level=target, error=type(exc).__name__, message=str(exc),
+                )  # fmt: skip
+                return False
+            self._raw(
+                SOURCE_SET_PROTECTION, best_effort=failures, deal_id=deal_id, stop_level=stop, target_level=target,
+                context="target", response=None,
+            )  # fmt: skip
+            self._alert("INFO", f"TARGET_ATTACHED {deal_id}: target {target} set with the stop {stop}")
+            self._event("TARGET_ATTACHED", best_effort=failures, deal_id=deal_id, stop_level=stop, target_level=target)
+            return True
+        finally:
+            self._report_journal_failures(failures, f"target of {deal_id}")
 
     async def _protection_distance(self, position: OpenPosition, failures: list[str]) -> Decimal | None:
         try:
@@ -1622,6 +1752,16 @@ class Executor:
     def _entry_exception(self, where: str, exc: BaseException) -> None:
         self._kill.soft(ENTRY_EXCEPTION)
         self._alert("ERROR", f"{ENTRY_EXCEPTION} {where}: {type(exc).__name__}: {exc}")
+
+
+def _plan_target(signal: EntryPlan) -> Decimal | None:
+    """Odległość celu planu wejścia; None: plan bez celu (sygnał ORB)."""
+    return signal.target_distance if isinstance(signal, BarEntryPlan) else None
+
+
+def _target_level(position: OpenPosition, distance: Decimal) -> Decimal:
+    """Cel po stronie zysku: BUY powyżej ceny otwarcia, SELL poniżej."""
+    return position.open_level + distance if position.side is Side.BUY else position.open_level - distance
 
 
 def _foreign(lane: LaneSpec, fx: FxView | None) -> bool:
