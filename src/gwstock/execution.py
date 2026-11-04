@@ -2024,13 +2024,22 @@ async def emergency_flatten_lanes(executors: Sequence[Executor]) -> None:
 
     Każde pasmo zachowuje własne zasady (tylko własny instrument, przy nieczytelnym dzienniku tylko własny deal z
     pamięci wyjść). Wyjątek w próbie jednego pasma kończy tylko jego procedurę: pozostałe pasma dostają swoje próby,
-    a pierwszy wyjątek wychodzi na końcu. Anulowanie przerywa wszystko (z raportem zapisów każdego pasma). Dwa
-    wykonawców tego samego instrumentu: ValueError przed jakimkolwiek wywołaniem (R1).
+    a pierwszy wyjątek wychodzi na końcu. Anulowanie przerywa wszystko (z raportem zapisów każdego pasma). Kilku
+    wykonawców tego samego instrumentu (błąd składania, R1): zostaje pierwszy, alarm EMERGENCY_DUPLICATE_LANE, a
+    spłaszczenie idzie dalej (kontrola składania nigdy nie blokuje wyjścia).
     """
-    epics = [ex._epic for ex in executors]
-    duplicates = sorted({e for e in epics if epics.count(e) > 1})
-    if duplicates:
-        raise ValueError(f"emergency_flatten_lanes: several executors for {duplicates}")
+    unique: dict[str, Executor] = {}
+    for ex in executors:
+        unique.setdefault(ex._epic, ex)
+    if len(unique) < len(executors):
+        duplicates = sorted({ex._epic for ex in executors if unique[ex._epic] is not ex})
+        first = next(iter(unique.values()))
+        first._alert(
+            "ERROR",
+            f"EMERGENCY_DUPLICATE_LANE: several executors for {duplicates}; only the first one of each instrument "
+            "flattens (check the engine wiring)",
+        )
+    executors = list(unique.values())
     if not executors:
         return
     runs = [ex._emergency_run() for ex in executors]

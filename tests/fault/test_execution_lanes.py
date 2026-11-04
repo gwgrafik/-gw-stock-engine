@@ -845,9 +845,17 @@ async def test_emergency_flatten_of_two_lanes_with_an_unreadable_journal_interle
     assert fake.calls == ["list_positions", "close_position", "list_positions", "close_position"]
 
 
-async def test_emergency_flatten_lanes_refuses_two_executors_of_one_instrument(de, lane_build, de_lane, gate):
-    with pytest.raises(ValueError, match="DE40"):
-        await emergency_flatten_lanes([de, lane_build(de_lane, gate)])
+async def test_emergency_flatten_lanes_with_a_duplicated_instrument_still_flattens_every_instrument(
+    de, us, lane_build, de_lane, gate, fake, journal, kill, notifier
+):
+    hold(fake, journal, "DE40", "DEAL-A", Side.BUY, D("0.007"), D("25782.3"), D("25752.3"))
+    hold(fake, journal, "US500", "DEAL-B", Side.BUY, D("0.01"), US_FILL, US_STOP)
+    kill.hard("TEST")
+    await emergency_flatten_lanes([de, lane_build(de_lane, gate), us])  # błąd składania nie blokuje wyjścia
+    assert fake.positions == {} and fake.calls.count("close_position") == 2  # każdy instrument raz
+    assert journal.current_position("DE40").state is P.FLAT and journal.current_position("US500").state is P.FLAT
+    [(level, message)] = alerts(notifier, "EMERGENCY_DUPLICATE_LANE")
+    assert level == "ERROR" and "DE40" in message
 
 
 async def test_a_failing_lane_does_not_stop_the_emergency_flatten_of_the_other(
