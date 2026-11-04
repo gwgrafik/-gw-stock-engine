@@ -6,6 +6,8 @@ import csv
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from gwstock.orders.ids import make_client_id
 from gwstock.report import cli as report_cli
 from tests.unit.report_lane_support import (  # noqa: F401  (jpath, lane_cfg, plain_cfg to fixtures)
@@ -13,6 +15,8 @@ from tests.unit.report_lane_support import (  # noqa: F401  (jpath, lane_cfg, pl
     plain_cfg, run, two_lanes,
 )  # fmt: skip
 from tests.unit.test_report import D1, D2, D3, D4, D5, at, emit, smoke_times
+
+RATIO_LABEL = "  koszty zmierzone / model (poślizg wejścia w punktach, bez zaokrągleń): "
 
 
 def test_two_lanes_get_separate_sections_with_the_currency_on_every_amount(journal, capsys, lane_cfg, jpath):
@@ -237,12 +241,20 @@ def test_each_lane_gets_its_own_l1_gate_from_its_own_trades(journal, capsys, lan
     assert us[1] == "  sesje na wielkości minimalnej: 2 z 5 (brakuje 3)"
 
 
-def test_a_lane_gate_uses_the_cost_model_and_session_count_of_its_lane_config(journal, capsys, lane_cfg, jpath):
-    five_sessions(journal, US, entry_fill=Decimal("7583.9"))  # poślizg 0,3 pkt: 2,0 x model 0,15, ale 0,6 x model v1 0,5
+@pytest.mark.parametrize(
+    ("fill", "slip", "verdict", "ratio"),
+    [("7583.9", "0.30", "PASS", "2.00"), ("7584.0", "0.40", "NOT YET", "2.67")],  # model pasma 0,15 pkt; v1 ma 0,5 pkt
+)
+def test_a_lane_gate_uses_the_cost_model_of_its_lane_config(journal, capsys, lane_cfg, jpath, fill, slip, verdict, ratio):
+    # poślizg 0,3 pkt to dokładnie 2 x model pasma (równo przechodzi), 0,4 pkt to 2,67 x (przegląd); wg modelu v1 (0,5)
+    # oba przeszłyby z zapasem, więc to rozróżnia model pasma od modelu v1
+    five_sessions(journal, US, entry_fill=Decimal(fill))
     _, out, _ = run(["--journal", jpath], capsys)
     lines = out.splitlines()
-    assert any("średni niekorzystny poślizg wejścia: 0.30 pkt (model: 0.15 pkt;" in line for line in lines)
-    assert any(line.startswith(gates_line_prefix("US500", "PASS")) for line in lines)  # 2,00 <= 2: równo przechodzi
+    assert any(line.startswith(gates_line_prefix("US500", verdict)) for line in lines)
+    assert any(f"średni niekorzystny poślizg wejścia: {slip} pkt (model: 0.15 pkt;" in line for line in lines)
+    ratio_lines = [line for line in lines if line.startswith(RATIO_LABEL)]
+    assert ratio_lines and ratio_lines[-1].startswith(f"{RATIO_LABEL}{ratio} (najwyżej 2;")  # ostatnia: pasmo US500
 
 
 def test_incidents_of_the_portfolio_count_in_every_lane_gate(journal, capsys, lane_cfg, jpath):
