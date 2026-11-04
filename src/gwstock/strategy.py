@@ -183,6 +183,29 @@ def _rule_size(stop: Decimal, quote: Quote, rules: InstrumentRules, risk: RiskCo
     return _floor_to_step(min(loss_limit, leverage_limit), rules.size_step)
 
 
+def select_size(
+    stop: Decimal,
+    quote: Quote,
+    rules: InstrumentRules,
+    risk: RiskConfig,
+    *,
+    session_index: int,
+    fixed_min_size_sessions: int,
+    rule_size_allowed: bool,
+) -> Decimal | None:
+    """Polityka wielkości z docstringu modułu, wspólna dla `decide` i reguł świecowych (`strategy_bars`).
+
+    `rules.min_size`, gdy `session_index < fixed_min_size_sessions` ALBO `rule_size_allowed` nie jest dokładnie `True`;
+    inaczej wielkość wg reguł dla odległości stopu `stop`. Zwraca `None`, gdy wielkość wg reguł jest poniżej
+    `rules.min_size` (wywołujący zgłasza wtedy `SKIPPED_MIN_SIZE`). Walidację `session_index` robi wywołujący.
+    """
+    # `is not True`: tylko jawne True włącza wielkość wg reguł (prawdziwa, lecz inna wartość nie wystarcza).
+    if session_index < fixed_min_size_sessions or rule_size_allowed is not True:
+        return rules.min_size
+    size = _rule_size(stop, quote, rules, risk)
+    return None if size < rules.min_size else size
+
+
 def _require_same_epic(first: Candle | None, quote: Quote, rules: InstrumentRules) -> None:
     """Świeca (jeśli jest), notowanie i reguły muszą dotyczyć tego samego instrumentu; inaczej to błąd wywołującego."""
     epics = {"quote": quote.epic, "rules": rules.epic}
@@ -226,11 +249,15 @@ def decide(
     if stop <= 0 or stop < _CALC.multiply(strat.min_stop_spread_multiple, spread):
         return Skip(STOP_TOO_TIGHT)
 
-    # `is not True`: tylko jawne True włącza wielkość wg reguł (prawdziwa, lecz inna wartość nie wystarcza).
-    if session_index < strat.fixed_min_size_sessions or rule_size_allowed is not True:
-        size = rules.min_size
-    else:
-        size = _rule_size(stop, quote, rules, risk)
-        if size < rules.min_size:
-            return Skip(SKIPPED_MIN_SIZE)
+    size = select_size(
+        stop,
+        quote,
+        rules,
+        risk,
+        session_index=session_index,
+        fixed_min_size_sessions=strat.fixed_min_size_sessions,
+        rule_size_allowed=rule_size_allowed,
+    )
+    if size is None:
+        return Skip(SKIPPED_MIN_SIZE)
     return EntrySignal(side, stop, size, quote)

@@ -900,3 +900,51 @@ def test_strategy_module_has_no_io_clock_or_float():
     assert not floats, "float literal in strategy.py"
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     assert "float" not in names
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# select_size: wspólna polityka wielkości (używa jej też strategy_bars; decide ma zachować dotychczasowe zachowanie)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def select(*, stop="30.0", session_index=9, fixed=5, allowed=True, rules=None, risk=RISK):
+    return strategy.select_size(
+        D(stop),
+        make_quote(),
+        rules if rules is not None else make_rules(),
+        risk,
+        session_index=session_index,
+        fixed_min_size_sessions=fixed,
+        rule_size_allowed=allowed,
+    )
+
+
+@pytest.mark.parametrize(
+    ("session_index", "allowed", "expected"),
+    [
+        (4, True, "0.001"),  # poniżej fixed_min_size_sessions: minimum mimo zgody
+        (5, True, "0.008"),  # granica: reguły (limit dźwigni 5 x 40 / 25000 = 0.008 < limit straty 0.0333)
+        (9, False, "0.001"),  # bez zgody właściciela: minimum
+    ],
+)
+def test_select_size_follows_the_session_and_owner_permission_policy(session_index, allowed, expected):
+    assert select(session_index=session_index, allowed=allowed) == D(expected)
+
+
+def test_select_size_requires_exactly_true_for_rule_sizing():
+    assert select(allowed=1) == D("0.001")  # type: ignore[arg-type]
+    assert select(allowed="yes") == D("0.001")  # type: ignore[arg-type]
+
+
+def test_select_size_returns_none_when_the_rule_size_is_below_the_minimum():
+    # stop 400 pkt: limit straty 1.00 / 400 = 0.0025 → w dół do kroku 0.002 < min_size 0.01
+    assert select(stop="400", rules=make_rules(min_size="0.01")) is None
+
+
+def test_select_size_in_minimum_mode_never_returns_none_even_when_the_rule_size_would_be_too_small():
+    assert select(stop="400", rules=make_rules(min_size="0.01"), allowed=False) == D("0.01")
+
+
+def test_decide_and_select_size_agree_on_the_size():
+    s = run(session_index=9, rule_size_allowed=True)
+    assert s.size == select(stop=str(s.stop_distance))
