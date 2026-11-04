@@ -52,6 +52,9 @@ Kontrole (próg, granica, powód):
 - KILL: `max(kill.level(), journal.kill_state().level) != NONE`. Poziom w pamięci się liczy, bo zapis kill
   switcha do dziennika mógł się nie udać.
 
+Silnik z wieloma pasmami (zadanie 12): `LaneRiskGate` liczy ENTRIES_PER_DAY tylko dla swojego instrumentu (A3), a
+`BarLaneRiskGate` (pasmo B1/M5) ma okno i limit wejść z pliku pasma; `RiskGate` (jedno pasmo DE40) bez zmian.
+
 `check_smoke` (próba akceptacyjna L0: jedno minimalne wejście poza oknem strategii, polecenie `smoke`) to te same
 kontrole w tej samej kolejności BEZ NOT_SESSION, OUTSIDE_WINDOW i ENTRIES_PER_DAY; pozostałe (KILL, DUPLICATE, FORMAT,
 NO_STOP, LOSS_PER_TRADE, LEVERAGE, MARGIN, DAILY_LOSS, TOTAL_DRAWDOWN, STALE_DATA) obowiązują bez zmian.
@@ -98,8 +101,9 @@ from typing import Protocol, runtime_checkable
 
 from gwstock.calendar import ExchangeCalendar
 from gwstock.clock import Clock
-from gwstock.config import RiskConfig, StrategyConfig
+from gwstock.config import BarRuleConfig, RiskConfig, StrategyConfig
 from gwstock.journal import Journal
+from gwstock.lanes import lane_session
 from gwstock.notify import Notifier
 from gwstock.serialization import dump
 from gwstock.types import AccountInfo, KillLevel, PositionState, Side
@@ -220,6 +224,7 @@ class RiskGate:
     ) -> None:
         self._cfg = cfg
         self._strat = strat
+        self._instrument = strat.instrument
         self._journal = journal
         self._calendar = calendar
         self._clock = clock
@@ -247,7 +252,7 @@ class RiskGate:
 
     def _check_entry(self, c: object, account: object, exempt: frozenset[str] = frozenset()) -> Verdict:
         epic, side, size, stop, price, vpp, rate, age = self._fields(c)
-        epic_ok = isinstance(epic, str) and epic == self._strat.instrument
+        epic_ok = isinstance(epic, str) and epic == self._instrument
         size_d, price_d, vpp_d, rate_d = _positive(size), _positive(price), _positive(vpp), _positive(rate)
         stop_d = _finite(stop)
         format_bad = not (
@@ -261,7 +266,7 @@ class RiskGate:
         )
         now, day = self._today()
         window = self._window(now, day)
-        instrument = self._strat.instrument
+        instrument = self._instrument
 
         def risk_of_candidate() -> Decimal | None:
             if size_d is None or stop_d is None or vpp_d is None:
@@ -292,7 +297,7 @@ class RiskGate:
             return required > usable
 
         def entries_per_day() -> bool:
-            return day is None or self._journal.count_entry_orders(day) >= self._cfg.max_entries_per_day
+            return day is None or self._entry_count(day) >= self._entry_limit()
 
         def daily_loss() -> bool:
             if day is None:
@@ -367,6 +372,13 @@ class RiskGate:
             _LOG.warning("risk gate cannot determine the trading day: %s: %s", type(exc).__name__, exc)
             return None, None
 
+    def _entry_count(self, day: object) -> int:
+        """Wejścia dnia, do których porównuje się limit: v1 liczy wszystkie instrumenty (zachowanie DE40 v1)."""
+        return self._journal.count_entry_orders(day)  # type: ignore[arg-type]
+
+    def _entry_limit(self) -> int:
+        return self._cfg.max_entries_per_day
+
     def _window(self, now: datetime | None, day: object) -> str | None:
         """NOT_SESSION, OUTSIDE_WINDOW albo None (wejście dozwolone czasowo)."""
         if now is None or day is None:
@@ -390,13 +402,80 @@ class RiskGate:
             return OUTSIDE_WINDOW
 
     def _open_risk(self, vpp: Decimal | None) -> Decimal:
-        position = self._journal.current_position(self._strat.instrument)
+        position = self._journal.current_position(self._instrument)
         if position is None or position.state is PositionState.FLAT:
             return _ZERO
         if position.size is None or position.open_level is None or position.stop_level is None or vpp is None:
             return self._cfg.max_loss_per_trade  # nieznany stop = pełna dozwolona strata
         distance = _EXACT.abs(_EXACT.subtract(position.open_level, position.stop_level))
         return _product(position.size, distance, vpp)
+
+
+class LaneRiskGate(RiskGate):
+    """Bramka pasma w silniku z WIELOMA pasmami (projekt §2.3, A3): jak `RiskGate`, ale ENTRIES_PER_DAY liczy wyłącznie
+    zlecenia wejścia SWOJEGO instrumentu (`count_entry_orders(day, epic)`), więc wejście jednego pasma nie zużywa
+    dziennego wejścia drugiego. Silnik z jednym pasmem DE40 używa `RiskGate` (bajt w bajt v1)."""
+
+    def _entry_count(self, day: object) -> int:
+        return self._journal.count_entry_orders(day, self._instrument)  # type: ignore[arg-type]
+
+
+class BarLaneRiskGate(LaneRiskGate):
+    """Bramka pasma świecowego B1/M5 (`config/lane_*.toml`, zadanie 11): te same kontrole i kolejność co `RiskGate`,
+    z trzema różnicami wynikającymi z pliku pasma:
+
+    - instrument: `bar.instrument` (FORMAT dla innego);
+    - ENTRIES_PER_DAY: zlecenia wejścia instrumentu w dniu lokalnym kalendarza pasma (`count_entry_orders(day, epic)`;
+      każde zlecenie wejścia w dowolnym stanie, jak S3) >= `bar.max_entries_per_day`;
+    - okno (NOT_SESSION / OUTSIDE_WINDOW): dzień sesji kalendarza pasma (`lanes.lane_session`) i chwila w jednym z
+      okien wejścia: od końca pierwszej świecy sygnału okna (`początek + bar_minutes`) do końca ostatniej świecy
+      sygnału okna plus jedna świeca (decyzja jest ważna do końca następnej świecy, `lanes.STALE_SIGNAL`), zawsze
+      przed godziną spłaszczenia pasma.
+
+    `calendar` musi mieć strefę `bar.session_timezone` (ValueError przy budowie). DAILY_LOSS liczy `realized_pnl` dnia
+    lokalnego kalendarza pasma; sesja NYSE (15:30-22:00 Berlin) leży w tej samej dacie co dzień portfela (Berlin).
+    """
+
+    def __init__(
+        self,
+        cfg: RiskConfig,
+        bar: BarRuleConfig,
+        journal: Journal,
+        calendar: ExchangeCalendar,
+        clock: Clock,
+        kill: KillView | None = None,
+    ) -> None:
+        if bar.session_timezone != calendar.profile.tz:
+            raise ValueError(
+                f"BarLaneRiskGate: lane time zone {bar.session_timezone!r} differs from the calendar "
+                f"{calendar.profile.name} time zone {calendar.profile.tz!r}"
+            )
+        self._cfg = cfg
+        self._strat = None  # type: ignore[assignment]
+        self._bar = bar
+        self._instrument = bar.instrument
+        self._journal = journal
+        self._calendar = calendar
+        self._clock = clock
+        self._kill = kill
+
+    def _entry_limit(self) -> int:
+        return self._bar.max_entries_per_day
+
+    def _window(self, now: datetime | None, day: object) -> str | None:
+        if now is None or day is None:
+            return NOT_SESSION
+        try:
+            session = lane_session(self._bar, self._calendar, day)  # type: ignore[arg-type]
+        except Exception:  # także CalendarExpiredError
+            return NOT_SESSION
+        if session is None:
+            return NOT_SESSION
+        bar = timedelta(minutes=self._bar.bar_minutes)
+        for opens, closes in session.windows:
+            if opens + bar <= now < min(closes + 2 * bar, session.flatten_at):
+                return None
+        return OUTSIDE_WINDOW
 
 
 def _marker_present(path: Path) -> bool:
