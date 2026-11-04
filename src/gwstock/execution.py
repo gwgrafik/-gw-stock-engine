@@ -1286,8 +1286,11 @@ class Executor:
     ) -> bool:
         """Do `PROTECT_ATTEMPTS` prób `set_stop` co `PROTECT_PAUSE_S` od startu każdej (ponowienie tego samego poziomu
         jest bezpieczne); zapisy wg możliwości, więc awaria dziennika nie skraca procedury. Pasmo z celem: zamiast
-        `set_stop` zawsze `set_protection` ze stopem i celem `target` RAZEM (sam stop mógłby skasować cel, C5d;
-        `target=None` tylko, gdy celu nie da się ustalić: alarm TARGET_UNAVAILABLE, ochrona stopem i tak idzie). Gdy wszystkie zawiodą, a
+        `set_stop` zawsze `set_protection` ze stopem i celem `target` RAZEM (sam stop mógłby skasować cel, C5d).
+        `target=None` wysyła sam stop: gdy celu nie da się ustalić (alarm TARGET_UNAVAILABLE) albo gdy broker ODRZUCIŁ
+        żądanie z celem (`BrokerRejected`, np. cena bliżej celu niż minimum): kolejne próby idą już bez celu (alarm
+        TARGET_REJECTED), bo odmowa celu nie może zostawić pozycji bez stopu; cel dokłada później `ensure_target`.
+        Timeout albo inny błąd nie zdejmuje celu (ponowienie tego samego żądania). Gdy wszystkie zawiodą, a
         z budżetu `PROTECT_BUDGET_S` (od pierwszej porażki) zostało co najmniej `PROTECT_VERIFY_MIN_S`: jeden odczyt
         listy (limit: reszta budżetu, najwyżej `PROTECT_CALL_TIMEOUT_S`), bo stop mógł zostać ustawiony mimo braku
         odpowiedzi; nasz deal z tym poziomem stopu podanym przez brokera (nie wyliczonym przez adapter) = stop jest."""
@@ -1296,9 +1299,9 @@ class Executor:
         started = self._now()
         first_failure: datetime | None = None
         source = SOURCE_SET_PROTECTION if self._lane.uses_target else SOURCE_SET_STOP
-        extra = {"target_level": target} if self._lane.uses_target else {}  # DE40 v1: zapisy bajt w bajt
-        with_target = f" with target {target}" if self._lane.uses_target else ""
         for attempt in range(1, PROTECT_ATTEMPTS + 1):
+            extra = {"target_level": target} if self._lane.uses_target else {}  # DE40 v1: zapisy bajt w bajt
+            with_target = f" with target {target}" if self._lane.uses_target else ""
             if attempt > 1:  # stały rytm od startu procedury: czas oczekiwania na odpowiedź nie przesuwa kolejnej próby
                 due = started + timedelta(seconds=(attempt - 1) * PROTECT_PAUSE_S)
                 # najwyżej jedna przerwa: zegar ścienny cofnięty w trakcie procedury (NTP, wznowienie maszyny) nie
@@ -1314,6 +1317,15 @@ class Executor:
                 self._raw_error(
                     source, exc, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt, **extra
                 )
+                if self._lane.uses_target and target is not None and isinstance(exc, BrokerRejected):
+                    self._alert(
+                        "WARN",
+                        f"TARGET_REJECTED {deal_id}: the broker refused stop {level} with target {target} "
+                        f"({exc.reason}); the stop is sent WITHOUT a target now (protection first). Unconfirmed at "
+                        "Capital.com whether a stop-only change removes an existing target (C5d): treat the position as "
+                        "untargeted; the target is re-added by ensure_target",
+                    )
+                    target = None
                 continue
             self._raw(
                 source, best_effort=failures, deal_id=deal_id, stop_level=level, attempt=attempt, **extra,
@@ -1325,6 +1337,7 @@ class Executor:
                 verified_by="set_stop", **extra,
             )  # fmt: skip
             return True
+        extra = {"target_level": target} if self._lane.uses_target else {}  # cel ostatniego żądania (po odmowie: None)
         spent = 0.0 if first_failure is None else (self._now() - first_failure).total_seconds()
         remaining = PROTECT_BUDGET_S - spent
         if remaining < PROTECT_VERIFY_MIN_S:

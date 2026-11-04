@@ -554,6 +554,25 @@ async def test_failed_protection_of_a_target_lane_goes_hard_and_flattens(ut, fak
     assert fake.calls.count("close_position") == 1 and fake.positions == {}
 
 
+async def test_a_rejected_target_never_blocks_the_stop(ut, fake, journal, plan, kill, clock, notifier):
+    await ut.enter(plan, US_RULES, DAY)
+    # cena podeszła pod cel bliżej niż minimum brokera: cel zostanie odrzucony (MIN_TARGET_DISTANCE), stop nie
+    fake.set_quote(Quote("US500", US_TARGET - D("0.2"), US_TARGET + D("0.4"), clock.now_utc()))
+    fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
+    fake.calls.clear()
+    assert await ut.protect_unprotected(fake.positions["DEAL-1"]) is True
+    assert fake.calls == ["set_protection", "set_protection"]  # z celem (odmowa), potem sam stop
+    assert fake.positions["DEAL-1"].stop_level == US_STOP and fake.positions["DEAL-1"].target_level is None
+    assert kill.level() is KillLevel.NONE
+    [(level, message)] = alerts(notifier, "TARGET_REJECTED")
+    assert level == "WARN" and "MIN_TARGET_DISTANCE" in message and "C5d" in message
+    raws = payloads(journal, "broker.set_protection")
+    assert raws[0]["rejection"] == "MIN_TARGET_DISTANCE" and D(raws[0]["target_level"]) == US_TARGET
+    assert raws[1]["target_level"] is None and raws[1]["attempt"] == 2
+    [attached] = events(journal, "STOP_ATTACHED")
+    assert attached["target_level"] is None and attached["attempt"] == 2
+
+
 async def test_ensure_target_sets_stop_and_target_together_for_an_untargeted_position(ut, fake, journal, plan, notifier):
     await ut.enter(plan, US_RULES, DAY)
     fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
