@@ -1,0 +1,52 @@
+Raport gw-stock-engine (pomiar)
+Dziennik: <JOURNAL>
+
+Dzień: 2026-11-09 (czas Europe/Berlin, dzień zamknięcia transakcji)
+Tryb: brak zapisu decyzji
+Transakcje: 3
+Brutto: -0.06
+Koszt spreadu: 0.00
+Poślizg (model z konfiguracji): 0.00
+Finansowanie: 0.00
+Opłaty: 0.00
+Netto: -0.08
+Netto narastająco: -0.42
+Wynik zrealizowany wg dziennika: dzień -0.08, łącznie od początku -0.32 NIEZGODNE z księgą (księga: dzień -0.08, łącznie -0.42)
+Błędy i zdarzenia:
+  blokady bramki ryzyka: 0
+  ENTRY_UNRESOLVED: 0
+  kill switch: brak
+  blokady logowania (LOGIN_LOCKOUT): 0
+
+UWAGA: 1 nieczytelnych zapisów zdarzeń pominięto w liczniku.
+
+UWAGA: transakcja z 2026-11-06 (wyjście 17:25 czasu Europe/Berlin, STOP, netto -0.02) zaksięgowana przez właściciela jako SZACUNEK (ostrożny szacunek straty, nie górna granica); sprawdź wynik w Capital.com
+
+Podsumowanie od początku dziennika:
+  transakcje: 10 (netto dodatnie 3, ujemne 7, zerowe 0)
+  brutto: -0.31
+  koszty: spread 0.06, poślizg (model) 0.03, finansowanie 0.00, opłaty 0.00
+  netto: -0.42
+  najgorszy dzień: 2026-11-04 (-0.35)
+
+Bramka L1 (spec §11): NOT YET (cały dziennik; ocena wyjaśnień należy do właściciela)
+  sesje na wielkości minimalnej: 4 z 5 (brakuje 1)
+  rozbieżności pozycja/broker starsze niż 60 s: 1 (wymagane 0; dni: 2026-11-04)
+  nieobsłużone odrzucenia: 2 (wymagane 0; dni: 2026-11-03, 2026-11-09)
+    liczy ENTRY_UNRESOLVED także po późniejszym rozstrzygnięciu zlecenia oraz zlecenia INTENT/SUBMITTING, gdy raport powstaje w trakcie wejścia
+  koszty zmierzone / model (poślizg wejścia w punktach, bez zaokrągleń): 0.33 (najwyżej 2; próbki pomiaru: 6 z 5)
+    średni niekorzystny poślizg wejścia: 0.17 pkt (model: 0.5 pkt; poprawa ceny liczona jako 0)
+    największy niekorzystny poślizg wejścia: 1.00 pkt
+    spread w chwili decyzji: średni 2.00 pkt, największy 2.00 pkt
+    zamknięcia stopem: 1 (spread i poślizg przy wyjściu stopem nie są mierzone)
+    informacyjnie, nie wpływa na werdykt: spread + poślizg wejścia / model (spread + poślizg): 0.87
+  koszty w EUR (informacyjnie): ratio 4.86
+  uwaga: koszty w EUR są zaokrąglane do 0,01 € przy wielkości 0,001, więc ratio w EUR jest zgrubne; poślizg stopu przy wyjściu NIE jest mierzony
+  wykluczone z pomiaru kosztów i z liczby sesji (brak kontekstu wejścia, uszkodzona wartość punktu albo nieużyteczne notowanie decyzji): 3
+  wykluczone z bramki szacunki właściciela (ESTIMATED): 1
+  próby smoke (poza liczbą sesji): 1
+  powód: za mało sesji na wielkości minimalnej: 4 z 5 (brakuje 1)
+  powód: rozbieżności pozycja/broker starsze niż 60 s: 1 (wymagane 0)
+  powód: nieobsłużone odrzucenia: 2 (wymagane 0)
+
+To pomiar, nie prognoza. Wynik netto po kosztach; brak przewagi nie jest wykazany ani wykluczony.

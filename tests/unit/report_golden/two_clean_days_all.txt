@@ -1,0 +1,61 @@
+Raport gw-stock-engine (pomiar)
+Dziennik: <JOURNAL>
+
+Dzień: 2026-11-02 (czas Europe/Berlin, dzień zamknięcia transakcji)
+Tryb: brak zapisu decyzji
+Transakcje: 1
+Brutto: -0.02
+Koszt spreadu: 0.00
+Poślizg (model z konfiguracji): 0.00
+Finansowanie: 0.00
+Opłaty: 0.00
+Netto: -0.02
+Netto narastająco: -0.02
+Wynik zrealizowany wg dziennika: dzień -0.02, łącznie od początku -0.04
+Błędy i zdarzenia:
+  blokady bramki ryzyka: 0
+  ENTRY_UNRESOLVED: 0
+  kill switch: brak
+  blokady logowania (LOGIN_LOCKOUT): 0
+
+Dzień: 2026-11-03 (czas Europe/Berlin, dzień zamknięcia transakcji)
+Tryb: brak zapisu decyzji
+Transakcje: 1
+Brutto: -0.02
+Koszt spreadu: 0.00
+Poślizg (model z konfiguracji): 0.00
+Finansowanie: 0.00
+Opłaty: 0.00
+Netto: -0.02
+Netto narastająco: -0.04
+Wynik zrealizowany wg dziennika: dzień -0.02, łącznie od początku -0.04
+Błędy i zdarzenia:
+  blokady bramki ryzyka: 0
+  ENTRY_UNRESOLVED: 0
+  kill switch: brak
+  blokady logowania (LOGIN_LOCKOUT): 0
+
+Podsumowanie od początku dziennika:
+  transakcje: 2 (netto dodatnie 0, ujemne 2, zerowe 0)
+  brutto: -0.04
+  koszty: spread 0.00, poślizg (model) 0.00, finansowanie 0.00, opłaty 0.00
+  netto: -0.04
+  najgorszy dzień: 2026-11-02 (-0.02)
+
+Bramka L1 (spec §11): NOT YET (cały dziennik; ocena wyjaśnień należy do właściciela)
+  sesje na wielkości minimalnej: 2 z 5 (brakuje 3)
+  rozbieżności pozycja/broker starsze niż 60 s: 0 (wymagane 0)
+  nieobsłużone odrzucenia: 0 (wymagane 0)
+  koszty zmierzone / model (poślizg wejścia w punktach, bez zaokrągleń): 0.00 (najwyżej 2; próbki pomiaru: 2 z 5)
+    średni niekorzystny poślizg wejścia: 0.00 pkt (model: 0.5 pkt; poprawa ceny liczona jako 0)
+    największy niekorzystny poślizg wejścia: 0.00 pkt
+    spread w chwili decyzji: średni 2.00 pkt, największy 2.00 pkt
+    zamknięcia stopem: 0 (spread i poślizg przy wyjściu stopem nie są mierzone)
+    informacyjnie, nie wpływa na werdykt: spread + poślizg wejścia / model (spread + poślizg): 0.80
+  koszty w EUR (informacyjnie): ratio 0.00
+  uwaga: koszty w EUR są zaokrąglane do 0,01 € przy wielkości 0,001, więc ratio w EUR jest zgrubne; poślizg stopu przy wyjściu NIE jest mierzony
+  uwaga: dowody są skąpe: pomiar kosztów z 2 transakcji przy wymaganych 5; to za mało, by oceniać koszty
+  powód: za mało sesji na wielkości minimalnej: 2 z 5 (brakuje 3)
+  powód: brak pomiaru kosztów: użytecznych próbek 2 z 5
+
+To pomiar, nie prognoza. Wynik netto po kosztach; brak przewagi nie jest wykazany ani wykluczony.

@@ -1,0 +1,24 @@
+Raport gw-stock-engine (pomiar)
+Dziennik: <JOURNAL>
+
+Dziennik jest pusty: brak transakcji i zapisów dnia.
+
+Podsumowanie od początku dziennika:
+  transakcje: 0 (netto dodatnie 0, ujemne 0, zerowe 0)
+  brutto: 0.00
+  koszty: spread 0.00, poślizg (model) 0.00, finansowanie 0.00, opłaty 0.00
+  netto: 0.00
+
+Bramka L1 (spec §11): NOT YET (cały dziennik; ocena wyjaśnień należy do właściciela)
+  sesje na wielkości minimalnej: 0 z 5 (brakuje 5)
+  rozbieżności pozycja/broker starsze niż 60 s: 0 (wymagane 0)
+  nieobsłużone odrzucenia: 0 (wymagane 0)
+  koszty zmierzone / model (poślizg wejścia w punktach, bez zaokrągleń): brak danych (najwyżej 2; próbki pomiaru: 0 z 5)
+    zamknięcia stopem: 0 (spread i poślizg przy wyjściu stopem nie są mierzone)
+  koszty w EUR (informacyjnie): brak danych
+  uwaga: koszty w EUR są zaokrąglane do 0,01 € przy wielkości 0,001, więc ratio w EUR jest zgrubne; poślizg stopu przy wyjściu NIE jest mierzony
+  uwaga: dowody są skąpe: pomiar kosztów z 0 transakcji przy wymaganych 5; to za mało, by oceniać koszty
+  powód: za mało sesji na wielkości minimalnej: 0 z 5 (brakuje 5)
+  powód: brak pomiaru kosztów: użytecznych próbek 0 z 5
+
+To pomiar, nie prognoza. Wynik netto po kosztach; brak przewagi nie jest wykazany ani wykluczony.
