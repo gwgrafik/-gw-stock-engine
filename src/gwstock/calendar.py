@@ -1,4 +1,4 @@
-"""Kalendarz i godziny sesji giełdy (profil XETRA), z konwersją czasu lokalnego na UTC.
+"""Kalendarz i godziny sesji giełdy (profile XETRA i NYSE), z konwersją czasu lokalnego na UTC.
 
 Uwaga: moduł nazywa się `gwstock.calendar`; importować go zawsze jako `gwstock.calendar`
 (nie uruchamiać skryptów z katalogu `src/gwstock/`, bo przesłoniłby bibliotekę standardową `calendar`).
@@ -109,6 +109,109 @@ XETRA = ExchangeProfile(
         }
     ),
     early_closes=MappingProxyType({}),
+)
+
+# Profil NYSE (sesja zwykła zakładanych instrumentów USA, np. US500/US100): 09:30-16:00 czasu nowojorskiego.
+# Strefę i zmiany czasu (w USA: druga niedziela marca i pierwsza niedziela listopada, czyli 1.11.2026 i 14.03.2027)
+# obsługuje `zoneinfo`; tabela poniżej nie zawiera żadnych przesunięć UTC. Handel przed i po sesji jest poza zakresem.
+#
+# Źródło i stopień pewności: daty WYLICZONE Z REGUŁ kalendarza NYSE (4.11.2026, zadanie offline: oficjalnej strony
+# NYSE „Holidays & Trading Hours” (nyse.com) nie otwierano, więc żadnej daty nie potwierdzono u źródła).
+# Ogólna reguła przeniesień: święto w sobotę przesuwa się na piątek, w niedzielę na poniedziałek; jedyny wyjątek to
+# Nowy Rok w sobotę, który NIE przesuwa się na piątek 31 grudnia poprzedniego roku (wtedy sesja się odbywa).
+# Tabela nie zawiera zamknięć nadzwyczajnych (np. dni żałoby narodowej) ani skróceń ogłaszanych w trakcie roku.
+#
+# DO POTWIERDZENIA przez właściciela (nic z tej listy nie zostało sprawdzone u źródła, wpisy opierają się na regule):
+#   1. Cała tabela, święta i skrócone sesje (2026-2027), do porównania z oficjalnym kalendarzem NYSE przed pierwszym
+#      użyciem pasma na instrumencie USA w trybie innym niż dry_run.
+#   2. Juneteenth 2027: 19.06.2027 to sobota, wpisano piątek 18.06.2027 (ogólna reguła sobota -> piątek; nie ma
+#      precedensu od wprowadzenia święta, bo w latach 2022-2026 nie wypadło w sobotę).
+#   3. Boże Narodzenie 2027: 25.12.2027 to sobota, wpisano piątek 24.12.2027 (ogólna reguła sobota -> piątek);
+#      w konsekwencji 24.12.2027 nie jest skróconą sesją, tylko świętem.
+#   4. Sesja 31.12.2027: nie wpisano święta, bo Nowy Rok 1.01.2028 wypada w sobotę (wyjątek od przeniesienia na piątek);
+#      przy zmianie tej decyzji dopisać date(2027, 12, 31) do tabeli 2027.
+#   5. Brak skróconej sesji 2.07.2026 i 2.07.2027: reguła „3 lipca” nie ma zastosowania (3.07.2026 to święto
+#      przeniesione z 4 lipca, a 3.07.2027 to sobota), więc 2 lipca ma pełną sesję do 16:00.
+#
+# Święta 2026 (wszystkie dni robocze):
+#   01.01 czwartek    Nowy Rok (1 stycznia)
+#   19.01 poniedziałek Martin Luther King Jr. Day (trzeci poniedziałek stycznia)
+#   16.02 poniedziałek Presidents' Day (trzeci poniedziałek lutego; 1.02.2026 to niedziela)
+#   03.04 piątek      Wielki Piątek (dwa dni przed Wielkanocą 5.04.2026)
+#   25.05 poniedziałek Memorial Day (ostatni poniedziałek maja; 31.05.2026 to niedziela)
+#   19.06 piątek      Juneteenth (19 czerwca)
+#   03.07 piątek      Dzień Niepodległości (4.07.2026 to sobota, więc przeniesienie na piątek)
+#   07.09 poniedziałek Labor Day (pierwszy poniedziałek września; 1.09.2026 to wtorek)
+#   26.11 czwartek    Thanksgiving (czwarty czwartek listopada; 1.11.2026 to niedziela)
+#   25.12 piątek      Boże Narodzenie (25 grudnia)
+# Święta 2027 (wszystkie dni robocze):
+#   01.01 piątek      Nowy Rok (1 stycznia)
+#   18.01 poniedziałek Martin Luther King Jr. Day (trzeci poniedziałek stycznia)
+#   15.02 poniedziałek Presidents' Day (trzeci poniedziałek lutego; 1.02.2027 to poniedziałek)
+#   26.03 piątek      Wielki Piątek (dwa dni przed Wielkanocą 28.03.2027)
+#   31.05 poniedziałek Memorial Day (ostatni poniedziałek maja)
+#   18.06 piątek      Juneteenth (19.06.2027 to sobota, przeniesienie na piątek; DO POTWIERDZENIA, punkt 2)
+#   05.07 poniedziałek Dzień Niepodległości (4.07.2027 to niedziela, więc przeniesienie na poniedziałek)
+#   06.09 poniedziałek Labor Day (pierwszy poniedziałek września; 1.09.2027 to środa)
+#   25.11 czwartek    Thanksgiving (czwarty czwartek listopada; 1.11.2027 to poniedziałek)
+#   24.12 piątek      Boże Narodzenie (25.12.2027 to sobota, przeniesienie na piątek; DO POTWIERDZENIA, punkt 3)
+#
+# Skrócone sesje (zamknięcie 13:00 czasu nowojorskiego, otwarcie bez zmian):
+#   27.11.2026 piątek  dzień po Thanksgiving
+#   24.12.2026 czwartek Wigilia w dzień sesji (25.12.2026 to piątek i święto)
+#   26.11.2027 piątek  dzień po Thanksgiving
+# Reguła 3 lipca (skrócona sesja, gdy 3.07 jest dniem sesji, a 4.07 dniem roboczym) nie daje wpisu w latach 2026-2027
+# (DO POTWIERDZENIA, punkt 5). Wigilia 24.12.2027 jest przeniesionym świętem, nie skróconą sesją (punkt 3).
+#
+# DO PRZEGLĄDU KWARTALNEGO: dodać rok 2028 przed końcem 2027 (rok spoza tabeli to wygasły kalendarz, czyli brak
+# handlu). Uwaga przy 2028: 1.01.2028 wypada w sobotę, więc wymaga decyzji z punktu 4.
+NYSE = ExchangeProfile(
+    name="NYSE",
+    tz="America/New_York",
+    open_local=time(9, 30),
+    close_local=time(16, 0),
+    holidays=MappingProxyType(
+        {
+            2026: frozenset(
+                {
+                    date(2026, 1, 1),  # Nowy Rok
+                    date(2026, 1, 19),  # Martin Luther King Jr. Day: trzeci poniedziałek stycznia
+                    date(2026, 2, 16),  # Presidents' Day: trzeci poniedziałek lutego
+                    date(2026, 4, 3),  # Wielki Piątek: Wielkanoc 5.04.2026
+                    date(2026, 5, 25),  # Memorial Day: ostatni poniedziałek maja
+                    date(2026, 6, 19),  # Juneteenth: 19 czerwca (piątek)
+                    date(2026, 7, 3),  # Dzień Niepodległości: 4 lipca w sobotę, przeniesienie na piątek
+                    date(2026, 9, 7),  # Labor Day: pierwszy poniedziałek września
+                    date(2026, 11, 26),  # Thanksgiving: czwarty czwartek listopada
+                    date(2026, 12, 25),  # Boże Narodzenie: 25 grudnia (piątek)
+                }
+            ),
+            2027: frozenset(
+                {
+                    date(2027, 1, 1),  # Nowy Rok (piątek)
+                    date(2027, 1, 18),  # Martin Luther King Jr. Day: trzeci poniedziałek stycznia
+                    date(2027, 2, 15),  # Presidents' Day: trzeci poniedziałek lutego
+                    date(2027, 3, 26),  # Wielki Piątek: Wielkanoc 28.03.2027
+                    date(2027, 5, 31),  # Memorial Day: ostatni poniedziałek maja
+                    # Juneteenth: 19 czerwca w sobotę, więc piątek; DO POTWIERDZENIA przez właściciela (2)
+                    date(2027, 6, 18),
+                    date(2027, 7, 5),  # Dzień Niepodległości: 4 lipca w niedzielę, przeniesienie na poniedziałek
+                    date(2027, 9, 6),  # Labor Day: pierwszy poniedziałek września
+                    date(2027, 11, 25),  # Thanksgiving: czwarty czwartek listopada
+                    # Boże Narodzenie: 25 grudnia w sobotę, więc piątek; DO POTWIERDZENIA przez właściciela (3)
+                    date(2027, 12, 24),
+                    # 31.12.2027 celowo bez wpisu (Nowy Rok 2028 w sobotę); DO POTWIERDZENIA przez właściciela (4)
+                }
+            ),
+        }
+    ),
+    early_closes=MappingProxyType(
+        {
+            date(2026, 11, 27): time(13, 0),  # dzień po Thanksgiving
+            date(2026, 12, 24): time(13, 0),  # Wigilia w dzień sesji (czwartek)
+            date(2027, 11, 26): time(13, 0),  # dzień po Thanksgiving
+        }
+    ),
 )
 
 
