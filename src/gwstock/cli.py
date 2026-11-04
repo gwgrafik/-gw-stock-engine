@@ -968,8 +968,8 @@ async def _reset_history_check(
     engine: Engine, position: PositionRecord, out: Callable[[str], None]
 ) -> tuple[str, list] | None:
     """Historia zamknięć deal_id pozycji BLOCKED (pełna albo wyjątek) od tego samego początku, co uzgadnianie:
-    `reconcile.history_start` (późniejszy z: znacznik ostatniego zaksięgowanego zamknięcia, otwarcie; minus
-    HISTORY_MARGIN).
+    `reconcile.history_start` (późniejszy z: znacznik ostatniego zaksięgowanego zamknięcia na instrumencie pozycji,
+    otwarcie; minus HISTORY_MARGIN; klucze znacznika jak w uzgadnianiu silnika, `Reconciler.legacy_keys`).
 
     None: odmowa (już wypisana): zamknięcie do zaksięgowania przez silnik albo historia nieczytelna. Inaczej (wynik do
     audytu, zamknięcia tego deala): `NO_CLOSURE`, `AMBIGUOUS_<n>_CLOSURES` (każde wypisane), `START_UNKNOWN` (bez czasu
@@ -980,7 +980,8 @@ async def _reset_history_check(
     from gwstock.reconcile import history_start
 
     deal_id, epic = position.deal_id, position.epic
-    start = history_start(engine.journal, position)
+    # znacznik instrumentu pozycji według kluczy uzgadniania tego pasma (jedna reguła; projekt pasm, A1)
+    start = history_start(engine.journal, position, legacy_keys=engine.reconciler.legacy_keys)
     if start is None:
         out(f"note: neither the open time of deal {deal_id} nor a booked closure is known, so its closure cannot be "
             "looked up in the history")  # fmt: skip

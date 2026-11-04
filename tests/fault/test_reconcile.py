@@ -457,7 +457,10 @@ async def test_positions_and_orders_on_other_epics_are_ignored(journal, fake, re
 
     result = await reconciler.run_once()
 
-    assert result == ReconcileResult(blocked=False, notes=[], closed=[], unprotected=[])
+    # US500 bez pasma (jedno pasmo DE40): pozycja tylko zgłoszona w `unmanaged`, bez zdarzenia i bez dotykania
+    assert result == ReconcileResult(
+        blocked=False, notes=[], closed=[], unprotected=[], unmanaged=[fake.positions["DEAL-5"]]
+    )
     assert order(journal, other).state is O.UNKNOWN and position(journal) is None
     assert kill_sink.calls == [] and fake.calls == READS
 
@@ -700,14 +703,15 @@ def test_history_start_uses_the_later_of_marker_and_open_time(journal, marker, o
     # publiczna funkcja dla narzędzi właściciela (reset-position): ta sama reguła co w przebiegu uzgadniania
     if marker is not None:
         journal.set_meta("closed_marker", marker.isoformat())
-    assert reconcile_module.history_start(journal, held(P.BLOCKED, opened_at=opened_at)) == expected
+    start = reconcile_module.history_start(journal, held(P.BLOCKED, opened_at=opened_at), legacy_keys=True)
+    assert start == expected
 
 
 async def test_run_once_reads_the_history_from_the_public_history_start(journal, fake, reconciler, monkeypatch):
     seen = []
 
-    def spy(journal_arg, position_arg):
-        seen.append(position_arg)
+    def spy(journal_arg, position_arg, *, legacy_keys):
+        seen.append((position_arg, legacy_keys))
         return T0 - 2 * HISTORY_MARGIN
 
     monkeypatch.setattr(reconcile_module, "history_start", spy)
@@ -715,7 +719,7 @@ async def test_run_once_reads_the_history_from_the_public_history_start(journal,
 
     await reconciler.run_once()
 
-    assert seen == [held()]  # jedna reguła: przebieg pyta funkcję publiczną, nie własną kopię
+    assert seen == [(held(), True)]  # jedna reguła: przebieg pyta funkcję publiczną, nie własną kopię
     assert payloads(journal, "broker.closed_since")[-1]["since"] == (T0 - 2 * HISTORY_MARGIN).isoformat()
 
 

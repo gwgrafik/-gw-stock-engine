@@ -52,6 +52,12 @@ Macierz (J = pozycja w dzienniku, B = pozycje brokera na naszym instrumencie, D 
   dodatkowo zdarzenie i alarm CLOSURE_NOT_IN_HISTORY raz na incydent w procesie (wg możliwości; stan, kill switch i
   księgowanie bez zmian: zaksięguje kolejny przebieg, gdy historia dogoni, kill switch zdejmuje właściciel).
 
+Wiele pasm (projekt pasm, zadanie 8): jeden `Reconciler` na pasmo, wszystkie na jednym dzienniku. Znaczniki
+`closed_marker` i `mismatch_since` są per instrument (`meta_key`; pasmo DE40 v1 z `legacy_keys=True` zachowuje nazwy
+dotychczasowe), więc zamknięcie jednego instrumentu nie przesuwa początku historii drugiego, a przebieg jednego pasma
+nie czyści rozbieżności oczekującej drugiego (każde ma własny MISMATCH_TIMEOUT). Pozycje na instrumentach bez pasma
+są tylko zgłaszane (`ReconcileResult.unmanaged`); pozycja pasma z celem bez celu u brokera: `untargeted`.
+
 Niezmienniki (prawdziwe pieniądze):
 - uzgadnianie tylko CZYTA u brokera: nie zamyka pozycji, nie ustawia stopu, nie anuluje zleceń;
 - pozycji, której nie da się udowodnić jako naszej (nie wynika z naszego zlecenia ani z zapisu w dzienniku),
@@ -68,10 +74,11 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Protocol, TypeVar
+from weakref import WeakKeyDictionary
 
 from gwstock.broker.base import Broker
 from gwstock.clock import Clock
@@ -96,9 +103,14 @@ SOURCE_ENGINE_CLOSE = "broker.close_position"
 
 CLOSURE_NOT_IN_HISTORY = "CLOSURE_NOT_IN_HISTORY"
 
+# Nazwy znaczników per instrument (klucz w `meta` daje `meta_key`): pasmo z `legacy_keys=True` (DE40 v1) używa nazw
+# dotychczasowych bez przyrostka (dziennik na VPS i złote ślady), każde inne pasmo `<nazwa>:<epic>`. Wspólny klucz dla
+# dwóch instrumentów to błąd A1/A2 projektu pasm: zamknięcie jednego przesuwałoby początek historii drugiego, a przebieg
+# jednego czyściłby rozbieżność oczekującą drugiego.
 META_MISMATCH_SINCE = "mismatch_since"  # ISO-8601 pierwszego wykrycia rozbieżności oczekującej; "" = brak
 META_CLOSED_MARKER = "closed_marker"  # ISO-8601 czasu ostatniego zaksięgowanego zamknięcia
 META_EMPTY_READS = "unknown_empty_reads:{}"  # liczba kolejnych udanych odczytów bez pozycji dla zlecenia UNKNOWN
+# (klucz zlecenia jest już jednoznaczny: identyfikator zlecenia zawiera instrument)
 
 # Protokół UNKNOWN ze spec §6 ("po trzech zapytaniach w 30 s jej nie ma"): te same stałe co w menedżerze zleceń.
 EMPTY_READS_TO_NOT_PLACED = UNKNOWN_CHECKS
@@ -139,6 +151,12 @@ class ReconcileResult:
     dziennik zmienił się w trakcie odczytu brokera (`SKIPPED_STATE_CHANGED`); pozostałe pola są wtedy puste.
     Wyjątek: `SKIPPED_STATE_CHANGED_AFTER_BOOKING`: zamknięcie ZOSTAŁO zaksięgowane (jest w `closed`), a zmianę
     wykryto dopiero po księgowaniu, więc reszta zapisów (FLAT, znaczniki) została pominięta.
+
+    `unmanaged` (projekt pasm, sekcja 5.1): pozycje brokera na instrumentach BEZ pasma (z tej samej odpowiedzi
+    `list_positions`); tylko informacja dla silnika: uzgadnianie ich nie zamyka, nie przyjmuje, nie zapisuje do
+    dziennika, nie daje zdarzenia ani kill switcha (zdarzenie i alarm raz na deal są po stronie silnika).
+    `untargeted` (sekcja 3.3): NASZA pozycja pasma z celem, która u brokera nie ma celu; zdarzenie UNTARGETED, bez
+    kill switcha i bez BLOCKED (cel nie jest ochroną; ustawia go wykonawca). Pasmo bez celu: zawsze puste.
     """
 
     blocked: bool
@@ -147,6 +165,8 @@ class ReconcileResult:
     unprotected: list[OpenPosition]
     skipped: bool = False
     working_orders: list[WorkingOrder] = field(default_factory=list)
+    unmanaged: list[OpenPosition] = field(default_factory=list)
+    untargeted: list[OpenPosition] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -174,6 +194,7 @@ class _Plan:
     mismatch_since: str | None = None  # None: bez zmiany
     closed: list[ClosedDeal] = field(default_factory=list)
     unprotected: list[OpenPosition] = field(default_factory=list)
+    untargeted: list[OpenPosition] = field(default_factory=list)
     resolved: set[str] = field(default_factory=set)
     history_since: datetime | None = None  # początek udanego odczytu historii w tym przebiegu (None: bez odczytu)
     missing: PositionRecord | None = None  # nasza pozycja, której nie ma ani na liście, ani w historii
@@ -190,7 +211,17 @@ class _Plan:
 
 
 class Reconciler:
-    """Uzgadnia dziennik z brokerem dla jednego instrumentu (`epic`); patrz docstring modułu."""
+    """Uzgadnia dziennik z brokerem dla jednego instrumentu (`epic`); patrz docstring modułu.
+
+    Pasma (projekt wielu pasm): jeden obiekt na pasmo, wszystkie na jednym dzienniku.
+    - `legacy_keys`: znaczniki `closed_marker`/`mismatch_since` pod nazwami dotychczasowymi (True: pasmo DE40 v1, a
+      także domyślne złożenie silnika z jednym pasmem) albo `<nazwa>:<epic>` (False: każde inne pasmo). Najwyżej JEDEN
+      instrument dziennika może używać kluczy dotychczasowych; złożenie drugiego (np. pasma US500 z domyślnym True)
+      odmawia `ValueError` (sprawdzane w obrębie procesu, bez zapisu do dziennika).
+    - `lane_epics`: instrumenty wszystkich pasm (z własnym); pozycje brokera na pozostałych trafiają do `unmanaged`.
+      None: jedno pasmo (każdy inny instrument jest bez pasma).
+    - `targeted`: pasmo ustawia cel zysku; nasza pozycja bez celu u brokera trafia do `untargeted`.
+    """
 
     def __init__(
         self,
@@ -203,9 +234,26 @@ class Reconciler:
         booker: TradeBooker | None = None,
         entry_gate: Callable[[], bool] | None = None,
         notifier: Notifier | None = None,
+        *,
+        legacy_keys: bool = True,
+        lane_epics: Iterable[str] | None = None,
+        targeted: bool = False,
     ) -> None:
         if not isinstance(epic, str) or not epic:
             raise ValueError(f"epic: expected a non-empty instrument name, got {epic!r}")
+        if not isinstance(legacy_keys, bool):
+            raise ValueError(f"legacy_keys: expected a bool, got {legacy_keys!r}")
+        if not isinstance(targeted, bool):
+            raise ValueError(f"targeted: expected a bool, got {targeted!r}")
+        lanes = frozenset([epic] if lane_epics is None else lane_epics)
+        if epic not in lanes:
+            raise ValueError(f"lane_epics: must contain the reconciler's own instrument {epic!r}, got {sorted(lanes)}")
+        _claim_keys(journal, epic, legacy_keys)
+        self._legacy_keys = legacy_keys
+        self._lanes = lanes
+        self._targeted = targeted
+        self._closed_key = meta_key(META_CLOSED_MARKER, epic, legacy_keys=legacy_keys)
+        self._mismatch_key = meta_key(META_MISMATCH_SINCE, epic, legacy_keys=legacy_keys)
         self._journal = journal
         self._broker = broker
         self._clock = clock
@@ -222,6 +270,11 @@ class Reconciler:
     def booker(self) -> TradeBooker | None:
         """Księgujący zamknięcia (tylko odczyt): silnik w trybie live sprawdza, że to jego wykonawca."""
         return self._booker
+
+    @property
+    def legacy_keys(self) -> bool:
+        """Czy znaczniki tego pasma mają nazwy dotychczasowe (narzędzia właściciela czytają je tą samą regułą)."""
+        return self._legacy_keys
 
     async def run_once(self) -> ReconcileResult:
         """Jeden przebieg uzgadniania. Wyjątki brokera i dziennika z odczytów propagują się bez zmiany stanu.
@@ -242,6 +295,7 @@ class Reconciler:
         self._raw(SOURCE_WORKING_ORDERS, {"response": working})
         mine = [p for p in positions if p.epic == self._epic]
         working_ours = [w for w in working if w.epic == self._epic]
+        unmanaged = [p for p in positions if p.epic not in self._lanes]  # tylko zgłoszenie, nigdy macierz
 
         # 2. decyzja (bez zapisów stanu)
         plan = _Plan()
@@ -268,8 +322,9 @@ class Reconciler:
         if not await self._apply(plan, current, (orders, stored)):
             return ReconcileResult(False, ["SKIPPED_STATE_CHANGED_AFTER_BOOKING"], plan.closed, [], skipped=True)
         return ReconcileResult(
-            final.state is _P.BLOCKED, plan.notes, plan.closed, plan.unprotected, working_orders=working_ours
-        )
+            final.state is _P.BLOCKED, plan.notes, plan.closed, plan.unprotected, working_orders=working_ours,
+            unmanaged=unmanaged, untargeted=plan.untargeted,
+        )  # fmt: skip
 
     def _gate_closed(self) -> bool:
         return self._entry_gate is not None and bool(self._entry_gate())
@@ -439,6 +494,9 @@ class Reconciler:
             if at_broker.stop_level is None:
                 plan.unprotected.append(at_broker)
                 plan.record("UNPROTECTED", deal_id=at_broker.deal_id)
+            if self._targeted and at_broker.target_level is None:  # sekcja 3.3: zdarzenie, bez kill i bez BLOCKED
+                plan.untargeted.append(at_broker)
+                plan.record("UNTARGETED", deal_id=at_broker.deal_id)
         else:
             found = [c for c in closures if c.deal_id == ours.deal_id and c.epic == self._epic]
             if len(found) == 1:
@@ -467,7 +525,7 @@ class Reconciler:
 
     def _plan_mismatch(self, plan: _Plan, *, pending: bool) -> None:
         """Rozbieżność oczekująca (zlecenie nierozstrzygnięte lub pozycja BLOCKED) dłużej niż tolerancja: kill miękki."""
-        text = self._journal.get_meta(META_MISMATCH_SINCE)
+        text = self._journal.get_meta(self._mismatch_key)
         since = datetime.fromisoformat(text) if text else None
         now = self._clock.now_utc()
         if not pending:
@@ -536,7 +594,7 @@ class Reconciler:
         broker zgłasza wyjątkiem, który przerywa przebieg przed jakąkolwiek zmianą stanu."""
         starts = []
         if ours is not None and not any(p.deal_id == ours.deal_id for p in mine):
-            start = history_start(self._journal, ours)
+            start = history_start(self._journal, ours, legacy_keys=self._legacy_keys)
             if start is None:  # nie znamy początku: bez odczytu zamknięcia nie ma dowodu, pozycja zostanie BLOCKED
                 plan.record("HISTORY_START_UNKNOWN", deal_id=ours.deal_id)
             else:
@@ -595,12 +653,12 @@ class Reconciler:
         for write in plan.orders_after:
             self._write_order(write)
         if plan.closed:
-            marker = self._journal.get_meta(META_CLOSED_MARKER)
+            marker = self._journal.get_meta(self._closed_key)
             latest = max(c.ts for c in plan.closed)
             if not marker or datetime.fromisoformat(marker) < latest:
-                self._journal.set_meta(META_CLOSED_MARKER, latest.isoformat())
+                self._journal.set_meta(self._closed_key, latest.isoformat())
         if plan.mismatch_since is not None:
-            self._journal.set_meta(META_MISMATCH_SINCE, plan.mismatch_since)
+            self._journal.set_meta(self._mismatch_key, plan.mismatch_since)
         return True
 
     def _write_order(self, write: _OrderWrite) -> None:
@@ -624,15 +682,46 @@ class Reconciler:
         self._journal.append_raw(source, dump(payload), self._clock.now_utc())
 
 
-def history_start(journal: Journal, position: PositionRecord) -> datetime | None:
-    """Początek odczytu historii zamknięć dla NASZEJ pozycji: późniejsza z dwóch dolnych granic (znacznik ostatniego
-    zaksięgowanego zamknięcia `closed_marker`, otwarcie pozycji) minus `HISTORY_MARGIN`; zamknięcie tej pozycji nie może
-    być wcześniejsze. None, gdy nie znamy żadnej z nich (początku nie zgadujemy).
+def meta_key(name: str, epic: str, *, legacy_keys: bool) -> str:
+    """Klucz `meta` znacznika `name` dla instrumentu `epic`: nazwa dotychczasowa dla pasma z `legacy_keys=True`
+    (DE40 v1), inaczej `<nazwa>:<epic>`."""
+    return name if legacy_keys else f"{name}:{epic}"
 
-    Jedna reguła dla uzgadniania i narzędzi właściciela (np. `reset-position` przy nieznanym czasie otwarcia)."""
-    marker = journal.get_meta(META_CLOSED_MARKER)
+
+def history_start(journal: Journal, position: PositionRecord, *, legacy_keys: bool) -> datetime | None:
+    """Początek odczytu historii zamknięć dla NASZEJ pozycji: późniejsza z dwóch dolnych granic (znacznik ostatniego
+    zaksięgowanego zamknięcia NA INSTRUMENCIE pozycji, otwarcie pozycji) minus `HISTORY_MARGIN`; zamknięcie tej pozycji
+    nie może być wcześniejsze. None, gdy nie znamy żadnej z nich (początku nie zgadujemy).
+
+    Znacznik: `meta_key(closed_marker, position.epic, legacy_keys=...)`, z tym samym `legacy_keys` co uzgadnianie pasma
+    (`Reconciler.legacy_keys`); parametr jest wymagany, bo znacznik innego instrumentu mógłby przesunąć początek za
+    zamknięcie tej pozycji (A1). Jedna reguła dla uzgadniania i narzędzi właściciela (np. `reset-position`)."""
+    marker = journal.get_meta(meta_key(META_CLOSED_MARKER, position.epic, legacy_keys=legacy_keys))
     bounds = [t for t in (datetime.fromisoformat(marker) if marker else None, position.opened_at) if t is not None]
     return max(bounds) - HISTORY_MARGIN if bounds else None
+
+
+# Dziennik → instrument, który używa jego kluczy dotychczasowych (w obrębie procesu; słabe odwołanie: zamknięty i
+# zwolniony dziennik znika z mapy). Nic nie trafia do dziennika (bajty DE40 bez zmian).
+_LEGACY_OWNERS: WeakKeyDictionary[Any, str] = WeakKeyDictionary()
+
+
+def _claim_keys(journal: Any, epic: str, legacy_keys: bool) -> None:
+    """Odmowa złożenia, w którym klucze dotychczasowe dzieliłyby dwa instrumenty albo jeden instrument miałby dwa
+    zestawy kluczy (dwa uzgadniania tego samego instrumentu na różnych kluczach)."""
+    try:
+        owner = _LEGACY_OWNERS.get(journal)
+    except TypeError:  # obiekt bez słabych odwołań (atrapa w teście): bez sprawdzenia
+        return
+    if legacy_keys:
+        if owner is not None and owner != epic:
+            raise ValueError(
+                f"legacy_keys: the journal's legacy reconciliation keys already belong to {owner!r}; "
+                f"the lane {epic!r} needs legacy_keys=False"
+            )
+        _LEGACY_OWNERS[journal] = epic
+    elif owner == epic:
+        raise ValueError(f"legacy_keys: {epic!r} already uses the journal's legacy reconciliation keys")
 
 
 def _skipped(code: str) -> ReconcileResult:
