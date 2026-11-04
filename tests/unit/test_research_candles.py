@@ -1,6 +1,6 @@
 """Regresja skryptu badawczego research/candle_strategies.py (tylko odczyt, bez sieci)."""
 import importlib.util
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -78,3 +78,21 @@ def test_gapped_data_is_skipped(cs):
     atr = cs.atr_series(bars)
     tr, skips = cs.run("B1", "M1", "ALL", bars, atr, None, None)
     assert tr == []
+
+
+def test_session_defaults_stay_berlin(cs):
+    assert cs.WINDOWS["ALL"] == [(time(9, 15), time(17, 0))] and cs.WINDOWS["SESJE"] == [(time(9, 15), time(11, 30)), (time(15, 30), time(17, 0))]
+    assert cs.FLAT == time(17, 25) and str(cs.TZ) == "Europe/Berlin"
+
+
+def test_session_comes_from_env_for_another_market(monkeypatch):
+    env = dict(GW_EPIC="US100", GW_SLIP="0.55", GW_STOP_EXTRA="1.1", GW_STEP="0.1", GW_POINT_EUR="0", GW_TZ="America/New_York",
+               GW_WIN_ALL="09:45-15:30", GW_WIN_SESJE="09:45-11:45,14:00-15:30", GW_FLAT="15:55")
+    for key, val in env.items():
+        monkeypatch.setenv(key, val)
+    spec = importlib.util.spec_from_file_location("candle_strategies_us", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.WINDOWS["ALL"] == [(time(9, 45), time(15, 30))]
+    assert mod.WINDOWS["SESJE"] == [(time(9, 45), time(11, 45)), (time(14, 0), time(15, 30))]
+    assert mod.FLAT == time(15, 55) and str(mod.TZ) == "America/New_York"

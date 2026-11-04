@@ -18,7 +18,11 @@ PODZIAŁ CHRONOLOGICZNY: 60% dni = opracowanie, 20% = wybór, 20% = ocena końco
   wariantów, które przeszły wybór (>= 30 transakcji, netto > 0 przy kosztach x1,5, PF > 1,2). Przyjęcie: ocena końcowa z
   >= 30 transakcji, netto > 0 przy x1,5 i PF > 1,2. Wynik NIE uwzględnia, że sprawdzono 14 wariantów: kilka "sukcesów" z 14 może
   być samym przypadkiem, więc przyjęcie oznacza tylko "warto badać dalej w dry_run", nie zysk.
-Instrument inny niż DE40: ustaw GW_EPIC, GW_SLIP, GW_STOP_EXTRA, GW_STEP, GW_POINT_EUR (wartość punktu przy minimalnej wielkości).
+Instrument inny niż DE40: ustaw GW_EPIC, GW_SLIP, GW_STOP_EXTRA, GW_STEP, GW_POINT_EUR (wartość punktu przy minimalnej wielkości;
+  0 = nie drukuj przeliczenia na EUR, np. instrumenty w USD bez modelu walutowego).
+Sesja z env (domyślnie Berlin jak wyżej): GW_TZ, GW_WIN_ALL, GW_WIN_SESJE ("hh:mm-hh:mm,..."), GW_FLAT (zaplanowane wyjście).
+  Okna USA zadeklarowane PRZED uruchomieniem: GW_TZ=America/New_York GW_WIN_ALL=09:45-15:30 GW_WIN_SESJE=09:45-11:45,14:00-15:30
+  GW_FLAT=15:55 (odpowiednik DE40: sygnały od 15 min po otwarciu do 30 min przed zamknięciem, wyjście 5 min przed zamknięciem).
 """
 import csv, os, statistics
 from collections import namedtuple
@@ -29,14 +33,27 @@ from zoneinfo import ZoneInfo
 EPIC = os.environ.get("GW_EPIC", "DE40")
 CSV = Path(os.environ.get("GW_M1_CSV", f"/data/m1_{EPIC.lower()}.csv"))
 OUT = Path(os.environ.get("GW_TRADES_CSV", f"/data/candle_trades_{EPIC.lower()}.csv"))
-BER = ZoneInfo("Europe/Berlin")
+TZ = ZoneInfo(os.environ.get("GW_TZ", "Europe/Berlin"))  # strefa sesji: godziny poniżej to czas lokalny, DST obsługuje strefa
+
+
+def _hm(text):
+    h, m = text.split(":")
+    return time(int(h), int(m))
+
+
+def _windows(spec):  # "09:15-11:30,15:30-17:00" -> [(time, time), ...]
+    return [tuple(_hm(p) for p in part.split("-")) for part in spec.split(",")]
+
+
+FLAT = _hm(os.environ.get("GW_FLAT", "17:25"))  # zaplanowane wyjście (otwarcie świecy o tej porze lub później)
 if EPIC != "DE40" and not all(k in os.environ for k in ("GW_SLIP", "GW_STOP_EXTRA", "GW_STEP", "GW_POINT_EUR")):
     raise SystemExit("inny instrument niż DE40: ustaw GW_SLIP, GW_STOP_EXTRA, GW_STEP i GW_POINT_EUR (koszty z costs_v1.toml dotyczą DE40)")
 SLIP = float(os.environ.get("GW_SLIP", "0.5")); STOP_EXTRA = float(os.environ.get("GW_STOP_EXTRA", "1.0"))
 STEP = float(os.environ.get("GW_STEP", "0.1")); POINT_EUR = float(os.environ.get("GW_POINT_EUR", "0.001"))
 ATR_N, MAX_DAY, DAY_STOP_R, MIN_STOP_FRAC = 14, 10, -3.0, 0.0001
 Bar = namedtuple("Bar", "t bo bh bl bc ao ah al ac")
-WINDOWS = {"ALL": [(time(9, 15), time(17, 0))], "SESJE": [(time(9, 15), time(11, 30)), (time(15, 30), time(17, 0))]}
+WINDOWS = {"ALL": _windows(os.environ.get("GW_WIN_ALL", "09:15-17:00")),
+           "SESJE": _windows(os.environ.get("GW_WIN_SESJE", "09:15-11:30,15:30-17:00"))}
 TF = {"M1": dict(n=15, minutes=1, limits={"B1": 10, "B2": 10, "B3": 15, "B4": 5}),
       "M5": dict(n=12, minutes=5, limits={"B1": 50, "B2": 50, "B3": 75, "B4": 25})}
 
@@ -158,7 +175,7 @@ def run(name, tf, window, bars, atr, ctx, m1ema):
     cfg = TF[tf]; n, step_min = cfg["n"], cfg["minutes"]
     trades, skips, by_day = [], {}, {}
     for i, b in enumerate(bars):
-        by_day.setdefault(b.t.astimezone(BER).date(), []).append(i)
+        by_day.setdefault(b.t.astimezone(TZ).date(), []).append(i)
 
     def skip(why):
         skips[why] = skips.get(why, 0) + 1
@@ -167,7 +184,7 @@ def run(name, tf, window, bars, atr, ctx, m1ema):
         n_day, r_day, k = 0, 0.0, 0
         while k < len(idx) - 1:
             i = idx[k]; k += 1
-            tl = bars[i].t.astimezone(BER).time()
+            tl = bars[i].t.astimezone(TZ).time()
             if i < n + 2 or atr[i] is None or not in_window(tl, window):
                 continue
             if n_day >= MAX_DAY or r_day <= DAY_STOP_R:
@@ -201,7 +218,7 @@ def run(name, tf, window, bars, atr, ctx, m1ema):
                 b = bars[idx[j]]; last = j
                 held = (b.t - nb.t).total_seconds() / 60
                 half = (b.ao - b.bo) / 2
-                if b.t.astimezone(BER).time() >= time(17, 25) or held >= limit_min:  # wyjście na OTWARCIU, bez zakresu tej świecy
+                if b.t.astimezone(TZ).time() >= FLAT or held >= limit_min:  # wyjście na OTWARCIU, bez zakresu tej świecy
                     reason = "TIME" if held >= limit_min else "FLAT"
                     exit_px = (b.bo - SLIP) if side == 1 else (b.ao + SLIP); exit_cost = SLIP + half
                 elif side == 1 and b.bl <= stop:
@@ -234,7 +251,7 @@ def stats(tr, mult=1.0):
     for p in pnl:
         cum += p; peak = max(peak, cum); dd = max(dd, peak - cum)
     wins = [p for p in pnl if p > 0]
-    return (f"n={len(pnl)} BRUTTO={gross:+.0f} NETTO={sum(pnl):+.0f} pkt ({sum(pnl) * POINT_EUR:+.2f} EUR) śr={statistics.mean(pnl):+.2f} "
+    return (f"n={len(pnl)} BRUTTO={gross:+.0f} NETTO={sum(pnl):+.0f} pkt{f' ({sum(pnl) * POINT_EUR:+.2f} EUR)' if POINT_EUR else ''} śr={statistics.mean(pnl):+.2f} "
             f"traf.={len(wins) / len(pnl):.0%} PF={(w / lo) if lo else float('inf'):.2f} DD={dd:.0f}")
 
 
@@ -248,7 +265,7 @@ def passes(tr, min_n=30):
 
 def main():
     raw, real = load()
-    days = sorted({b.t.astimezone(BER).date() for b in raw})
+    days = sorted({b.t.astimezone(TZ).date() for b in raw})
     print(f"{EPIC}: świece M1: {len(raw)}, dni: {len(days)} ({days[0]} .. {days[-1]}); bid/ask z danych: {'TAK' if real else 'NIE (rekonstrukcja ze spreadu, wynik przybliżony)'}")
     c1, c2 = days[int(len(days) * 0.6)], days[int(len(days) * 0.8)]
     print(f"podział: opracowanie < {c1} | wybór {c1} .. < {c2} | ocena końcowa >= {c2} (otwierana tylko dla kandydatów)")
