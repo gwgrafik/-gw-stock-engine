@@ -1190,3 +1190,22 @@ async def test_close_by_our_delete_does_not_depend_on_target_epics(server, plain
     _, pos = await open_confirmed(plain_broker)
     await plain_broker.close_position(pos.deal_id)
     assert server.positions == {}
+
+
+# --- pas bezpieczeństwa: pamięć celu nigdy nie dotyczy instrumentu spoza target_epics -----------------------------
+
+
+async def test_a_remembered_target_is_never_reported_for_an_epic_outside_target_epics(server, plain_broker):
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    plain_broker._deal_targets[pos.deal_id] = OFFER + 45  # stan niemożliwy w normalnej pracy: adapter go nie tworzy
+    [listed] = await plain_broker.list_positions()
+    assert type(listed) is OpenPosition and (listed.target_level, listed.target_derived) == (None, False)
+
+
+async def test_a_sent_target_is_never_derived_for_an_epic_outside_target_epics(server, plain_broker):
+    await plain_broker.login()
+    ack = await plain_broker.open_position(entry())
+    plain_broker._sent_targets[ack.deal_reference] = (Side.BUY, Decimal("45"))  # j.w.: tylko pas bezpieczeństwa
+    pos = await plain_broker.confirm(ack.deal_reference)
+    assert type(pos) is OpenPosition and (pos.target_level, pos.target_derived) == (None, False)
