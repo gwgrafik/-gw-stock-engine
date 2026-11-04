@@ -1,5 +1,6 @@
 """Testy typów domenowych: pochodne notowania i kontrola granic (Decimal, UTC, poprawne wartości)."""
 
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -20,6 +21,8 @@ from gwstock.types import (
     Quote,
     SessionExpired,
     Side,
+    TargetedEntryRequest,
+    TargetedOpenPosition,
     WorkingOrder,
 )
 
@@ -72,7 +75,7 @@ def test_open_position_rejects_plain_string_side_and_float_stop():
         OpenPosition("DEAL-1", "DE40", Side.BUY, Decimal("0.001"), Decimal("1"), 0.5, TS)
 
 
-@pytest.mark.parametrize("reason", ["STOP", "MANUAL", "FORCED"])
+@pytest.mark.parametrize("reason", ["STOP", "MANUAL", "FORCED", "TARGET"])
 def test_closed_deal_accepts_known_reasons(reason):
     assert ClosedDeal("DEAL-1", "DE40", Decimal("25750"), reason, TS).reason == reason
 
@@ -189,3 +192,77 @@ def test_instrument_rules_accept_the_smallest_positive_values_and_zero_min_stop_
         )
     )
     assert rules.min_stop_distance == 0 and rules.margin_rate == Decimal("1E-9")
+
+
+# --- cel zysku (zadanie 6, R4) i waluta instrumentu (R8) -----------------------------------------
+#
+# Cel NIE jest polem klas `EntryRequest` i `OpenPosition`: obie trafiają do dziennika (`serialization.dump`) i do
+# złotych śladów DE40 wszystkimi polami dataclass, więc nowe pole zmieniłoby zapis DE40 v1 (R2). Cel niosą podklasy
+# `TargetedEntryRequest` i `TargetedOpenPosition`; klasy bazowe odpowiadają na te same nazwy właściwościami "brak celu".
+
+POS_ARGS = ("DEAL-1", "DE40", Side.BUY, Decimal("0.001"), Decimal("25782.3"), Decimal("25752.3"), TS)
+
+
+def test_plain_entry_request_has_no_target_and_keeps_its_five_fields():
+    req = EntryRequest("gws-1", "DE40", Side.BUY, Decimal("0.007"), Decimal("30"))
+    assert req.target_distance is None
+    assert [f.name for f in fields(req)] == ["client_id", "epic", "side", "size", "stop_distance"]
+
+
+def test_targeted_entry_request_carries_target_distance_and_is_an_entry_request():
+    req = TargetedEntryRequest("gws-1", "US500", Side.SELL, Decimal("0.01"), Decimal("4"), Decimal("6"))
+    assert isinstance(req, EntryRequest)
+    assert (req.stop_distance, req.target_distance) == (Decimal("4"), Decimal("6"))
+    assert [f.name for f in fields(req)][-1] == "target_distance"
+    assert req != EntryRequest("gws-1", "US500", Side.SELL, Decimal("0.01"), Decimal("4"))
+
+
+def test_targeted_entry_request_requires_a_finite_decimal_target():
+    base = ("gws-1", "US500", Side.BUY, Decimal("0.01"), Decimal("4"))
+    with pytest.raises(TypeError, match="target_distance"):
+        TargetedEntryRequest(*base, 6.0)
+    with pytest.raises(TypeError, match="target_distance"):
+        TargetedEntryRequest(*base)  # brak celu: zwykłe EntryRequest, nie podklasa z None
+    with pytest.raises(ValueError, match="target_distance"):
+        TargetedEntryRequest(*base, Decimal("NaN"))
+
+
+def test_plain_open_position_has_no_target_and_keeps_its_eight_fields():
+    pos = OpenPosition(*POS_ARGS)
+    assert (pos.target_level, pos.target_derived) == (None, False)
+    assert [f.name for f in fields(pos)] == [
+        "deal_id", "epic", "side", "size", "open_level", "stop_level", "opened_at", "stop_derived",
+    ]  # fmt: skip
+
+
+def test_targeted_open_position_carries_target_level_and_derived_flag():
+    pos = TargetedOpenPosition(*POS_ARGS, target_level=Decimal("25827.3"), target_derived=True)
+    assert isinstance(pos, OpenPosition)
+    assert (pos.target_level, pos.target_derived, pos.stop_derived) == (Decimal("25827.3"), True, False)
+    assert pos != OpenPosition(*POS_ARGS)
+    assert replace(pos, stop_level=Decimal("25760")).target_level == Decimal("25827.3")  # zmiana stopu nie gubi celu
+
+
+def test_targeted_open_position_requires_decimal_target_and_bool_flag():
+    with pytest.raises(TypeError, match="target_level"):
+        TargetedOpenPosition(*POS_ARGS, target_level=25827.3)
+    with pytest.raises(TypeError, match="target_level"):
+        TargetedOpenPosition(*POS_ARGS)  # pozycja bez celu to zwykłe OpenPosition
+    with pytest.raises(TypeError, match="target_derived"):
+        TargetedOpenPosition(*POS_ARGS, target_level=Decimal("25827.3"), target_derived="yes")
+
+
+def test_target_properties_of_base_classes_are_read_only():
+    with pytest.raises(AttributeError):
+        OpenPosition(*POS_ARGS).target_level = Decimal("1")  # type: ignore[misc]
+
+
+def test_instrument_rules_currency_defaults_to_none_and_accepts_iso_code():
+    assert InstrumentRules(**_rules_kwargs()).currency is None
+    assert InstrumentRules(**_rules_kwargs(epic="US500", currency="USD")).currency == "USD"
+
+
+@pytest.mark.parametrize("bad", ["usd", "US", "USDT", "", 840])
+def test_instrument_rules_currency_rejects_non_iso_values(bad):
+    with pytest.raises((TypeError, ValueError), match="currency"):
+        InstrumentRules(**_rules_kwargs(currency=bad))

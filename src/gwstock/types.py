@@ -47,8 +47,9 @@ class KillLevel(IntEnum):
     HARD = 2
 
 
-# Przyczyny zamknięcia: stop u brokera, zamknięcie wywołaniem (silnik lub ręcznie), wymuszone przez brokera.
-CLOSE_REASONS = frozenset({"STOP", "MANUAL", "FORCED"})
+# Przyczyny zamknięcia: stop u brokera, zamknięcie wywołaniem (silnik lub ręcznie), wymuszone przez brokera,
+# cel zysku u brokera ("TARGET", pasma z celem; R4).
+CLOSE_REASONS = frozenset({"STOP", "MANUAL", "FORCED", "TARGET"})
 
 
 def _require_decimal(owner: object, name: str, *, optional: bool = False) -> None:
@@ -66,6 +67,12 @@ def _require_utc(owner: object, name: str) -> None:
     value = getattr(owner, name)
     if not isinstance(value, datetime) or value.utcoffset() != timedelta(0):
         raise ValueError(f"{type(owner).__name__}.{name}: expected a timezone-aware UTC datetime, got {value!r}")
+
+
+def _require_bool(owner: object, name: str) -> None:
+    value = getattr(owner, name)
+    if not isinstance(value, bool):
+        raise TypeError(f"{type(owner).__name__}.{name}: expected bool, got {value!r}")
 
 
 def _require_side(owner: object) -> None:
@@ -127,6 +134,9 @@ class InstrumentRules:
     `stop_step` to krok odległości stopu w punktach (DE40: `minStepDistance` = 0,1; hipoteza, że dotyczy stopu,
     do potwierdzenia na próbie `smoke`). 0 oznacza brak kroku, czyli stop nie jest zaokrąglany.
 
+    `currency`: waluta instrumentu (kod ISO 4217) albo None, gdy adapter jej nie podaje (DE40 v1: instrument w walucie
+    rachunku). Pole do modelu walutowego pasm (R8, projekt §7); samo w sobie niczego nie przelicza.
+
     `min_size`, `size_step`, `value_per_point` i `margin_rate` muszą być > 0: strategia dzieli przez wartość punktu,
     zaokrągla wielkość do kroku, a depozyt i ryzyko mnożą się przez te pola, więc zero lub liczba ujemna od brokera
     to błąd danych (adapter i tak ich nie przepuszcza), a nie reguła. `min_stop_distance` = 0 oznacza brak minimum.
@@ -139,6 +149,7 @@ class InstrumentRules:
     margin_rate: Decimal
     min_stop_distance: Decimal
     stop_step: Decimal = Decimal("0")
+    currency: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("min_size", "size_step", "value_per_point", "margin_rate", "min_stop_distance", "stop_step"):
@@ -148,6 +159,12 @@ class InstrumentRules:
                 raise ValueError(f"InstrumentRules.{name}: expected > 0, got {getattr(self, name)}")
         if self.stop_step < 0:
             raise ValueError(f"InstrumentRules.stop_step: expected >= 0, got {self.stop_step}")
+        if self.currency is not None:
+            if not isinstance(self.currency, str):
+                raise TypeError(f"InstrumentRules.currency: expected str or None, got {self.currency!r}")
+            c = self.currency
+            if not (len(c) == 3 and c.isascii() and c.isalpha() and c.isupper()):
+                raise ValueError(f"InstrumentRules.currency: expected a 3-letter ISO 4217 code, got {self.currency!r}")
 
 
 @dataclass(frozen=True)
@@ -155,6 +172,10 @@ class OpenPosition:
     """Pozycja otwarta u brokera. `stop_level=None` oznacza brak stopu.
 
     `stop_derived=True`: broker nie podał stopu, a adapter wyliczył go z własnego żądania (poziom ∓ stopDistance).
+
+    Cel zysku: ta klasa to zawsze pozycja BEZ celu (`target_level` = None, `target_derived` = False jako właściwości,
+    nie pola). Pozycję z celem opisuje podklasa `TargetedOpenPosition`. Powód: dziennik (`serialization.dump`) zapisuje
+    wszystkie pola dataclass, więc nowe pole tutaj zmieniłoby bajty zapisu DE40 v1 (R2, złote ślady).
     """
 
     deal_id: str
@@ -172,6 +193,31 @@ class OpenPosition:
         _require_decimal(self, "open_level")
         _require_decimal(self, "stop_level", optional=True)
         _require_utc(self, "opened_at")
+
+    @property
+    def target_level(self) -> Decimal | None:
+        return None
+
+    @property
+    def target_derived(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True)
+class TargetedOpenPosition(OpenPosition):
+    """Pozycja otwarta u brokera z celem zysku (`target_level`, wymagany; pozycja bez celu to `OpenPosition`).
+
+    `target_derived=True`: broker nie podał celu, a adapter wyliczył go z własnego żądania (poziom ± profitDistance).
+    Domyślne wartości pól wynikają tylko z kolejności pól dataclass; `target_level=None` jest odrzucane.
+    """
+
+    target_level: Decimal | None = None  # type: ignore[assignment]
+    target_derived: bool = False  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _require_decimal(self, "target_level")
+        _require_bool(self, "target_derived")
 
 
 @dataclass(frozen=True)
@@ -221,7 +267,11 @@ class AccountInfo:
 
 @dataclass(frozen=True)
 class EntryRequest:
-    """Wejście rynkowe ze stopem dołączonym atomowo (`stop_distance` w punktach od ceny wykonania)."""
+    """Wejście rynkowe ze stopem dołączonym atomowo (`stop_distance` w punktach od ceny wykonania).
+
+    Ta klasa to zawsze wejście BEZ celu (`target_distance` = None jako właściwość, nie pole); wejście z celem to
+    `TargetedEntryRequest`. Powód jak w `OpenPosition`: żądanie trafia do dziennika wszystkimi polami (R2).
+    """
 
     client_id: str
     epic: str
@@ -233,6 +283,25 @@ class EntryRequest:
         _require_side(self)
         _require_decimal(self, "size")
         _require_decimal(self, "stop_distance")
+
+    @property
+    def target_distance(self) -> Decimal | None:
+        return None
+
+
+@dataclass(frozen=True)
+class TargetedEntryRequest(EntryRequest):
+    """Wejście rynkowe ze stopem i celem zysku dołączonymi atomowo (R4).
+
+    `target_distance` (wymagany) w punktach od ceny wykonania, po stronie zysku. Domyślne None wynika tylko z kolejności
+    pól dataclass i jest odrzucane. Kontrolę odległości (> 0, minimum brokera) robi broker (odmowa przy otwarciu).
+    """
+
+    target_distance: Decimal | None = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _require_decimal(self, "target_distance")
 
 
 @dataclass(frozen=True)
