@@ -2580,14 +2580,33 @@ async def test_confirm_with_a_target_level_differing_from_our_request_is_a_broke
     assert type(info.value) is BrokerError and "profitLevel" in str(info.value)
 
 
-async def test_confirm_of_a_closed_by_target_position_still_returns_the_derived_target(server, broker):
+async def seen_target_keys(server, broker) -> None:
+    """Broker pokazał już klucze celu (przy obcej pozycji): od tej chwili brak klucza znaczy brak celu."""
+    foreign = position_item(position__dealId="D-9", position__profitLevel=Decimal("25900.0"))
+    server.fail_next("/positions", 200, {"positions": [foreign]}, method="GET")
+    await broker.list_positions()
+
+
+async def test_confirm_after_target_keys_were_seen_reports_a_missing_key_as_no_target(server, broker):
     await broker.login()
+    await seen_target_keys(server, broker)
+    _, pos = await open_targeted(broker)  # nasza pozycja bez klucza celu: według brokera bez celu
+    assert type(pos) is OpenPosition and (pos.target_level, pos.target_derived) == (None, False)
+    assert pos.stop_derived  # stop (klucze stopu nigdy nie wystąpiły) nadal wyliczony: reguły są niezależne
+
+
+@pytest.mark.parametrize("keys_seen", [False, True])
+async def test_confirm_of_a_closed_by_target_position_still_returns_the_derived_target(server, broker, keys_seen):
+    await broker.login()
+    if keys_seen:
+        await seen_target_keys(server, broker)
     ack = await broker.open_position(targeted())
+    created = only_position(server).created
     server.trigger_target(only_position(server).deal_id)  # cel zadziałał, zanim zapytaliśmy o potwierdzenie
     pos = await broker.confirm(ack.deal_reference)
     assert type(pos) is TargetedOpenPosition
     assert (pos.stop_level, pos.target_level, pos.stop_derived, pos.target_derived) == (OFFER - 30, OFFER + 45, True, True)
-    assert pos.opened_at == at(0.2)  # z wiersza otwarcia w historii
+    assert pos.opened_at == created  # z wiersza otwarcia w historii
 
 
 async def test_confirm_without_our_record_uses_the_reported_target_and_otherwise_none(
