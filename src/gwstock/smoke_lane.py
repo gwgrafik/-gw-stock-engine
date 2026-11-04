@@ -75,6 +75,7 @@ LANE_LEFT_OPEN_TARGET_UNSURE_HINT = (  # po `set_stop` bez potwierdzonego przywr
     "reconciles the lane and flattens it at the lane's flatten time) or close it in the Capital.com app"
 )
 _KNOWN_TARGET_KEYS = ("profitLevel", "profitDistance")  # klucze, które czyta adapter (`parse_position`)
+_NULL_NOTE = " (jawny null: nie potwierdza celu)"
 
 
 @dataclass
@@ -522,9 +523,11 @@ class _Probe:
         else:
             keys = ", ".join(f"{k}={show(v)}" for k, v in pos.target.items())
             known = [k for k in pos.target if k in _KNOWN_TARGET_KEYS]
-            statuses.append(CONFIRMED if known else DIVERGENT)
+            valued = [k for k in known if isinstance(pos.target[k], Decimal)]
+            statuses.append(CONFIRMED if valued else UNKNOWN if known else DIVERGENT)
             details.append(f"GET /positions/{{dealId}}: klucze celu {keys}"
-                           + ("" if known else " (inne niż profitLevel/profitDistance, których adapter szuka)"))
+                           + ("" if valued else _NULL_NOTE if known
+                              else " (inne niż profitLevel/profitDistance, których adapter szuka)"))  # fmt: skip
         if not conf.found:
             statuses.append(UNKNOWN)
             details.append("GET /confirms/{dealReference}: potwierdzenia nie odczytano")
@@ -533,8 +536,12 @@ class _Probe:
             details.append("GET /confirms/{dealReference}: brak kluczy celu (adapter ich nie wymaga)")
         else:
             keys = ", ".join(f"{k}={show(v)}" for k, v in conf.target.items())
-            statuses.append(CONFIRMED if "profitLevel" in conf.target else DIVERGENT)
-            details.append(f"GET /confirms/{{dealReference}}: klucze celu {keys}")
+            if "profitLevel" not in conf.target:
+                statuses.append(DIVERGENT)
+            else:  # jawny null to nie potwierdzenie celu, ale też nie dowód jego braku
+                statuses.append(CONFIRMED if isinstance(conf.target["profitLevel"], Decimal) else UNKNOWN)
+            null = "profitLevel" in conf.target and not isinstance(conf.target["profitLevel"], Decimal)
+            details.append(f"GET /confirms/{{dealReference}}: klucze celu {keys}" + (_NULL_NOTE if null else ""))
         shown, level = _shown_target(pos, self.side, self.open_level)
         level_key = shown and any(k.lower().endswith("level") for k in pos.target)
         distance = plan.target_distance

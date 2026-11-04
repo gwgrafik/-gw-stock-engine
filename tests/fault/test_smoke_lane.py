@@ -705,3 +705,40 @@ async def test_an_interrupt_after_set_stop_never_claims_the_target(engine, broke
         await smoke_lane(engine, US, out=lines.append)
     [loud] = [x for x in lines if "LOUD" in x]
     assert loud.startswith("FAIL [7] LOUD: the probe position left open with its stop (its target may be gone"), loud
+
+
+# --- jawny null w polach celu (przegląd S4) --------------------------------------------------------------------------
+#
+# OCZEKIWANE: `profitLevel: null` (jawny null) nie jest potwierdzeniem C5 ani w `GET /confirms`, ani w `GET /positions`:
+# wynik NIE USTALONO (null widać w linii szczegółów), nigdy POTWIERDZONE; brak klucza zostaje ROZBIEŻNE jak dotąd.
+
+
+def null_target_in(monkeypatch, broker, where):
+    from dataclasses import replace as dc_replace
+
+    real = broker.diagnose_target_fields
+
+    async def nulled(deal_id, ref):
+        report = await real(deal_id, ref)
+        part = getattr(report, where)
+        if part.found:
+            part = dc_replace(part, target={"profitLevel": None})
+        return dc_replace(report, **{where: part})
+
+    monkeypatch.setattr(broker, "diagnose_target_fields", nulled)
+
+
+async def test_an_explicit_null_target_in_the_confirm_is_not_a_confirmation(engine, broker, monkeypatch):
+    broker.fill_slippage = D("0.1")  # punkt odniesienia rozróżnialny: bez nulla C5 byłoby POTWIERDZONE
+    null_target_in(monkeypatch, broker, "confirm")
+    code, lines = await run(engine)
+    assert finding(lines, "C5").startswith("C5  NIE USTALONO"), finding(lines, "C5")
+    assert "    - GET /confirms/{dealReference}: klucze celu profitLevel=null (jawny null: nie potwierdza celu)" in lines
+
+
+async def test_an_explicit_null_target_in_the_position_is_not_a_confirmation(engine, broker, monkeypatch):
+    broker.fill_slippage = D("0.1")
+    null_target_in(monkeypatch, broker, "position")
+    code, lines = await run(engine)
+    assert finding(lines, "C5").startswith("C5  NIE USTALONO"), finding(lines, "C5")
+    assert "    - GET /positions/{dealId}: klucze celu profitLevel=null (jawny null: nie potwierdza celu)" in lines
