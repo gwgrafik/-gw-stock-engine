@@ -1,0 +1,20 @@
+# Limity portfela (R3, spec wielu pasm §4.4): wspólne dla wszystkich pasm, sprawdzane przez bramkę portfelową
+# (`gwstock.portfolio.PortfolioGate`) PONAD bramką pasma. Kwoty w EUR jako napisy (parsowane do Decimal).
+#
+# PROPOZYCJA, do zatwierdzenia przez właściciela (pytanie 2 w spec wielu pasm §10). Wartości konserwatywne:
+# wspólny limit dnia i łączne obsunięcie RÓWNE risk_v1.toml (budżet ryzyka portfela nie rośnie z liczbą pasm),
+# suma ryzyka otwartych pozycji nie większa niż max_daily_loss z risk_v1.toml.
+#
+# Ładowanie (`config.load_portfolio`) ODRZUCA wartości łagodniejsze od risk_v1.toml (z nazwą pliku i klucza).
+# Plik leży POZA odciskiem pre-rejestracji v1 (`prereg.CONFIG_FILES`); jego zmiana nie zmienia odcisku DE40 v1.
+
+max_open_positions = 2                # instrumenty z pozycją != FLAT lub nierozstrzygniętym zleceniem (R1: jedna na instrument)
+max_open_risk = "1.50"                # EUR, suma strat przy stopach otwartych pozycji + kandydat (<= max_daily_loss v1)
+max_daily_loss = "1.50"               # EUR, wspólny limit dnia portfela (= risk_v1.toml)
+max_total_drawdown = "12"             # EUR od startu, wspólny (= risk_v1.toml)
+max_effective_leverage = "5"          # nominał portfela / min(virtual_capital, equity) (= risk_v1.toml)
+virtual_capital = "40"                # EUR (= risk_v1.toml)
+margin_reserve_fraction = "0.20"      # depozyt kandydata <= dostępne x (1 - ułamek) (= risk_v1.toml)
+unknown_position_risk = "1.50"        # EUR, ryzyko pozycji bez znanego stopu na instrumencie bez pasma (= limit dnia: blokuje wejścia)
+fx_quote_epic = "EURUSD"              # instrument brokera do przeliczeń (spec §7.3, pytanie 9: nie zatwierdzono)
+fx_quote_max_age_s = 60               # maksymalny wiek notowania kursu w sekundach

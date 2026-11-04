@@ -5,7 +5,7 @@ Zasady:
   napis to wyłącznie zwykły zapis dziesiętny `cyfry` albo `cyfry.cyfry` (ASCII, bez spacji, `_`, wykładnika i plusa);
 - liczniki i sekundy są liczbami całkowitymi, flagi są wartościami bool TOML;
 - granice (sprawdzane przy wczytaniu, nie w konstruktorach): pola `*_s`, `max_entries_per_day`, `range_minutes`,
-  `bar_minutes`, `lookback_bars`, `time_limit_min`, `target_r`
+  `bar_minutes`, `lookback_bars`, `time_limit_min`, `target_r`, `max_open_positions`, `unknown_position_risk`
   oraz kwoty i dźwignia ryzyka (`virtual_capital`, `max_*`) są > 0 (to dzielniki, okresy i limity), pola `*_fraction`
   i `fx_markup` leżą w [0, 1], pozostałe liczby są >= 0 (zero ma tam sens według specyfikacji);
 - brakujący klucz, nieznany klucz, zły typ lub poza granicą to ValueError z nazwą pliku i klucza (literówka nie
@@ -83,6 +83,43 @@ class BarRuleConfig:
     fixed_min_size_sessions: int
 
 
+@dataclass(frozen=True)
+class PortfolioConfig:
+    """Limity portfela (R3, spec wielu pasm §4.4) z `config/portfolio.toml`: wspólne dla wszystkich pasm.
+
+    Kwoty w EUR. Plik leży POZA odciskiem pre-rejestracji v1 (`prereg.CONFIG_FILES`). `load_portfolio` odmawia
+    wartości łagodniejszych od `risk_v1.toml` (zob. `PORTFOLIO_VS_RISK`).
+    """
+
+    max_open_positions: int
+    max_open_risk: Decimal
+    max_daily_loss: Decimal
+    max_total_drawdown: Decimal
+    max_effective_leverage: Decimal
+    virtual_capital: Decimal
+    margin_reserve_fraction: Decimal
+    unknown_position_risk: Decimal
+    fx_quote_epic: str
+    fx_quote_max_age_s: int
+
+
+PORTFOLIO_FILE = "portfolio.toml"
+RISK_FILE = "risk_v1.toml"
+
+# Spójność portfela z v1 (spec §4.4): (pole portfela, pole `risk_v1.toml`, kierunek). "max": wartość portfela nie
+# większa od v1 (limit, kapitał, dźwignia; suma ryzyka otwartego nie większa od dziennego limitu straty, rozstrzygnięcie
+# właściciela-kontrolera R9); "min": nie mniejsza (rezerwa depozytu, ryzyko pozycji o nieznanym stopie).
+PORTFOLIO_VS_RISK: tuple[tuple[str, str, str], ...] = (
+    ("max_open_risk", "max_daily_loss", "max"),
+    ("max_daily_loss", "max_daily_loss", "max"),
+    ("max_total_drawdown", "max_total_drawdown", "max"),
+    ("max_effective_leverage", "max_effective_leverage", "max"),
+    ("virtual_capital", "virtual_capital", "max"),
+    ("margin_reserve_fraction", "margin_reserve_fraction", "min"),
+    ("unknown_position_risk", "max_loss_per_trade", "min"),
+)
+
+
 _T = TypeVar("_T")
 
 # Zwykły zapis dziesiętny: tylko cyfry ASCII, opcjonalna część ułamkowa i opcjonalny minus (odrzucany niżej jako
@@ -100,6 +137,9 @@ def _is_positive_field(key: str) -> bool:
         "max_total_drawdown",
         "max_effective_leverage",
         "max_entries_per_day",
+        "max_open_positions",
+        "max_open_risk",
+        "unknown_position_risk",
         "range_minutes",
         "bar_minutes",
         "lookback_bars",
@@ -188,6 +228,29 @@ def load_bar_rule_config(path: Path) -> BarRuleConfig:
     pliku i klucza. Osobne od `load_config`: pliki v1 i ich odcisk pre-rejestracji się nie zmieniają.
     """
     return _load_table(Path(path), BarRuleConfig)
+
+
+def load_portfolio(config_dir: Path, risk: RiskConfig | None = None) -> PortfolioConfig:
+    """Wczytuje `config_dir/portfolio.toml` ściśle jak pliki v1 i sprawdza spójność z limitami v1.
+
+    `risk`: limity v1 do porównania; bez niego czytane z `config_dir/risk_v1.toml` (ściśle). Brak pliku to
+    FileNotFoundError. Brakujący lub nieznany klucz, zły typ, wartość poza granicą i wartość ŁAGODNIEJSZA od
+    `risk_v1.toml` (zob. `PORTFOLIO_VS_RISK`) to ValueError z nazwą pliku i klucza: łagodniejszy próg portfela byłby
+    martwy (wykonawca DE40 eskaluje kill switch na globalnym wyniku z progami v1) i mylący. Równy przechodzi.
+    """
+    config_dir = Path(config_dir)
+    cfg = _load_table(config_dir / PORTFOLIO_FILE, PortfolioConfig)
+    if risk is None:
+        risk = _load_table(config_dir / RISK_FILE, RiskConfig)
+    for key, risk_key, bound in PORTFOLIO_VS_RISK:
+        mine, theirs = getattr(cfg, key), getattr(risk, risk_key)
+        if (bound == "max" and mine > theirs) or (bound == "min" and mine < theirs):
+            relation = "greater than" if bound == "max" else "less than"
+            raise ValueError(
+                f"{PORTFOLIO_FILE}: {key}: {mine} is more lenient than {RISK_FILE} {risk_key} = {theirs} "
+                f"(portfolio limits must not be {relation} the v1 limits)"
+            )
+    return cfg
 
 
 def _load_live_allowed(path: Path) -> bool:
