@@ -707,6 +707,12 @@ def check_golden(name: str, text: str, directory: Path = GOLDEN_DIR, actual_dir:
             f"tests/fault/test_golden_de40.py (tylko na kodzie, którego zachowanie ma być wzorcem)."
         )
     expected = path.read_bytes()
+    if b"\r" in expected:
+        raise GoldenMismatch(
+            f"wzorzec {path.name} ma końce linii CRLF (konwersja przez git, np. autocrlf): wzorce muszą mieć LF. "
+            f"Wpis do .gitattributes (zmiana poza zakresem zadania 4, decyzja właściciela): "
+            f"tests/fault/golden/*.json text eol=lf"
+        )
     if actual != expected:
         where = ""
         if actual_dir is not None:
@@ -781,6 +787,13 @@ def test_check_golden_compares_byte_for_byte(tmp_path, monkeypatch):
         with pytest.raises(GoldenMismatch, match="różni się od wzorca"):
             check_golden("x", other, directory=tmp_path, actual_dir=tmp_path)
     assert (tmp_path / "x.json").read_bytes() == b'{\n "a": 1\n}\n'  # wzorzec nietknięty
+
+
+def test_check_golden_names_the_line_ending_problem_instead_of_a_generic_difference(tmp_path, monkeypatch):
+    monkeypatch.delenv(WRITE_ENV, raising=False)
+    (tmp_path / "x.json").write_bytes(b'{\r\n "a": 1\r\n}\r\n')  # wzorzec po konwersji LF → CRLF przez git
+    with pytest.raises(GoldenMismatch, match="CRLF"):
+        check_golden("x", '{\n "a": 1\n}\n', directory=tmp_path)
 
 
 def test_check_golden_writes_only_with_the_switch_and_then_skips(tmp_path, monkeypatch):
