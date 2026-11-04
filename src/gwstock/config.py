@@ -4,7 +4,8 @@ Zasady:
 - kwoty i ułamki w TOML są napisami ("1.00") parsowanymi do Decimal; liczba TOML-float jest odrzucana;
   napis to wyłącznie zwykły zapis dziesiętny `cyfry` albo `cyfry.cyfry` (ASCII, bez spacji, `_`, wykładnika i plusa);
 - liczniki i sekundy są liczbami całkowitymi, flagi są wartościami bool TOML;
-- granice (sprawdzane przy wczytaniu, nie w konstruktorach): pola `*_s`, `max_entries_per_day`, `range_minutes`
+- granice (sprawdzane przy wczytaniu, nie w konstruktorach): pola `*_s`, `max_entries_per_day`, `range_minutes`,
+  `bar_minutes`, `lookback_bars`, `time_limit_min`, `target_r`
   oraz kwoty i dźwignia ryzyka (`virtual_capital`, `max_*`) są > 0 (to dzielniki, okresy i limity), pola `*_fraction`
   i `fx_markup` leżą w [0, 1], pozostałe liczby są >= 0 (zero ma tam sens według specyfikacji);
 - brakujący klucz, nieznany klucz, zły typ lub poza granicą to ValueError z nazwą pliku i klucza (literówka nie
@@ -66,6 +67,22 @@ class RuntimeConfig:
     account_id: str | None
 
 
+@dataclass(frozen=True)
+class BarRuleConfig:
+    """Parametry reguły świecowej B1 (`strategy_bars`): jeden plik na pasmo, np. `lane_us500_b1_m5.toml`."""
+
+    instrument: str
+    bar_minutes: int
+    lookback_bars: int
+    min_body_fraction: Decimal
+    long_min_close_fraction: Decimal
+    short_max_close_fraction: Decimal
+    spread_buffer_fraction: Decimal
+    target_r: Decimal
+    time_limit_min: int
+    fixed_min_size_sessions: int
+
+
 _T = TypeVar("_T")
 
 # Zwykły zapis dziesiętny: tylko cyfry ASCII, opcjonalna część ułamkowa i opcjonalny minus (odrzucany niżej jako
@@ -84,6 +101,10 @@ def _is_positive_field(key: str) -> bool:
         "max_effective_leverage",
         "max_entries_per_day",
         "range_minutes",
+        "bar_minutes",
+        "lookback_bars",
+        "time_limit_min",
+        "target_r",
     }
 
 
@@ -158,6 +179,15 @@ def load_config(config_dir: Path) -> tuple[StrategyConfig, RiskConfig, CostConfi
         _load_table(config_dir / "risk_v1.toml", RiskConfig),
         _load_table(config_dir / "costs_v1.toml", CostConfig),
     )
+
+
+def load_bar_rule_config(path: Path) -> BarRuleConfig:
+    """Wczytuje plik reguły świecowej pasma (np. `config/lane_us500_b1_m5.toml`), ściśle jak pliki v1.
+
+    Brak pliku to FileNotFoundError; brakujący lub nieznany klucz, zły typ i wartość poza granicą to ValueError z nazwą
+    pliku i klucza. Osobne od `load_config`: pliki v1 i ich odcisk pre-rejestracji się nie zmieniają.
+    """
+    return _load_table(Path(path), BarRuleConfig)
 
 
 def _load_live_allowed(path: Path) -> bool:
