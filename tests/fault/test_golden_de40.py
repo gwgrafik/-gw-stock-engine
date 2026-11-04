@@ -36,6 +36,7 @@ roli właściciela; ten plik niczego nie uzbraja i nie dotyka `data/` repozytori
 SCENARIUSZE (źródło w nawiasie to test, którego sytuację nagrywa; ślad biegnie do końca dnia, o ile nie zaznaczono):
 - `full_day_long_flat_1725`: wejście BUY o 09:05, spłaszczenie FORCED o 17:25 i raport (test_engine_day);
 - `full_day_short_flat_1725`: to samo dla SELL (test_engine_day: short_entry);
+- `full_day_long_odd_atr`: to samo przy ATR14 = 277,7, więc stop 27,77 pkt zaokrąglony w górę do kroku (27,8);
 - `stop_hit_by_broker`: stop u brokera o 11:00 księgowany raz, reszta dnia bez pozycji (test_engine_day);
 - `restart_mid_position`: proces ginie o 11:00 z otwartą pozycją, nowy silnik na tym samym brokerze i dzienniku
   doprowadza dzień do spłaszczenia (test_trade_lifecycle_e2e: test_h);
@@ -50,12 +51,20 @@ SCENARIUSZE (źródło w nawiasie to test, którego sytuację nagrywa; ślad bie
 - `dry_run_restart_mid_day`: dry_run z restartem w środku sesji (test_engine_day);
 - `hard_kill_emergency_flatten`: plik HARD_STOP o 11:00, awaryjne spłaszczenie co takt z timeoutami zamknięcia
   przez minutę (test_engine_day), przerwany 5 minut po odzyskaniu brokera;
-- `market_closed_at_flatten`: zamknięty rynek w chwili spłaszczenia, ponowienie po minucie (test_engine_day).
+- `market_closed_at_flatten`: zamknięty rynek w chwili spłaszczenia, ponowienie po minucie (test_engine_day);
+- `session_expired_mid_flatten`: wygasła sesja w chwili zamknięcia 17:25, ponowne logowanie i ponowienie w tym samym
+  takcie (test_engine_day);
+- `lagging_history_after_flatten`: historia brokera spóźniona o 90 s po spłaszczeniu: BLOCKED, kill miękki
+  MISMATCH_TIMEOUT, alarm CLOSURE_NOT_IN_HISTORY i księgowanie po dogonieniu historii (test_engine_day);
+- `startup_loss_hard_kill`: strata z poprzedniego dnia w dzienniku, start przywraca kill twardy DAILY_LOSS_2X i silnik
+  nie wchodzi, przerwany o 09:20 (test_engine_day).
 
 CZEGO ŚLADY NIE POKRYWAJĄ: adaptera Capital.com (tylko `FakeBroker`), rzeczywistego dysku i fsync (dziennik na tmpfs),
-`run_forever`, blokady instancji i tętna, wygasłej sesji i ponownego logowania, kill switcha wywołanego limitami
-strat, dni zmiany czasu, skróconych sesji i dni bez sesji, zamkniętego rynku w nocy, awarii zapisu dziennika,
-rozmiaru wejścia według reguł po `L1_PASSED`, wielu pozycji i wielu instrumentów, celu zysku.
+`run_forever`, blokady instancji i tętna, niepowodzenia ponownego logowania i blokady konta, kill switcha miękkiego
+od limitów strat po wybiciu stopem, dni zmiany czasu, skróconych sesji i dni bez sesji, zamkniętego rynku w nocy,
+awarii zapisu i odczytu dziennika, wypełnienia innego niż żądane, rozmiaru wejścia według reguł po `L1_PASSED` (plik
+uzbrojenia tworzy tylko właściciel, a ten plik nie ma wyjątku w strażniku), ścieżki `STOP_TOO_TIGHT`, wielu pozycji
+i wielu instrumentów, celu zysku.
 """
 
 from __future__ import annotations
@@ -76,7 +85,8 @@ import pytest
 
 from gwstock.app import Mode
 from gwstock.broker.fake import BROKER_METHODS, FakeBroker
-from gwstock.types import BrokerTimeout
+from gwstock.journal import TradeRecord
+from gwstock.types import BrokerTimeout, Side
 from tests.fault.e2e_support import ProcessDied, die
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     DAY,
@@ -92,6 +102,7 @@ from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     cfgs,
     clock,
     config_dir,
+    daily_candles,
     data_dir,
     day_rules,
     five_minute_candles,
@@ -423,6 +434,14 @@ class Sim:
         self.runs.append(plain(record))
 
 
+def seeded_loss(net: str, exit_ts: datetime) -> TradeRecord:
+    """Wcześniejsza transakcja wpisana do dziennika przed startem silnika (jak `trade()` w test_engine_day)."""
+    return TradeRecord(
+        "DE40", Side.BUY, D("0.001"), MID - 1, MID + 1, MID + 1, MID + 40, D("0.04"), D("0.00"), D("0.00"), D("0.00"),
+        D("0.00"), D(net), exit_ts, exit_ts, exit_ts, exit_ts, 0, "FORCED",
+    )  # fmt: skip
+
+
 @dataclass(frozen=True)
 class Scenario:
     name: str
@@ -450,6 +469,14 @@ async def _full_day_long(sim: Sim) -> None:
 async def _full_day_short(sim: Sim) -> None:
     sim.broker.set_candles_5m(five_minute_candles(DAY, D("25790"), D("25780")))  # świeca spadkowa: SELL
     sim.market.late_mid = MID - 20
+    await sim.run_day("day", sim.engine(Mode.LIVE))
+
+
+@scenario("full_day_long_odd_atr")
+async def _full_day_odd_atr(sim: Sim) -> None:
+    # ATR14 = 277,7 → stop 27,77 pkt zaokrąglony W GÓRĘ do kroku brokera (27,8): pilnuje zaokrąglenia, którego
+    # okrągłe dane dnia wzorcowego (ATR 300, stop 30) nie ruszają
+    sim.broker.set_daily_candles(daily_candles(DAY, atr=D("277.7")))
     await sim.run_day("day", sim.engine(Mode.LIVE))
 
 
@@ -526,6 +553,37 @@ async def _hard_kill(sim: Sim) -> None:
     at_time(sim.broker, sim.clock, HARD_AT, lambda: (sim.data_dir / "HARD_STOP").write_text(""))
     sim.broker.on_call("close_position", timing_out)
     stop_engine_at(engine, sim.clock, reopen + timedelta(minutes=5))
+    await sim.run_day("day", engine)
+
+
+@scenario("session_expired_mid_flatten")
+async def _session_expired_mid_flatten(sim: Sim) -> None:
+    # pierwsze zamknięcie 17:25 trafia na wygasłą sesję: ponowne logowanie i ponowienie w tym samym takcie
+    at_time(sim.broker, sim.clock, FLATTEN_UTC, sim.broker.expire_session, method="close_position")
+    await sim.run_day("day", sim.engine(Mode.LIVE))
+
+
+@scenario("lagging_history_after_flatten")
+async def _lagging_history(sim: Sim) -> None:
+    # historia brokera pokazuje zamknięcie dopiero 90 s po nim: uzgadnianie BLOCKED, po tolerancji kill miękki
+    # MISMATCH_TIMEOUT i alarm CLOSURE_NOT_IN_HISTORY, potem księgowanie, gdy historia dogoni
+    real = sim.broker.closed_since  # nakładka CallLog: wywołania nadal trafiają do śladu
+
+    async def lagging(since: datetime) -> Any:
+        return [c for c in await real(since) if c.ts + timedelta(seconds=90) <= sim.clock.now_utc()]
+
+    sim.broker.closed_since = lagging
+    await sim.run_day("day", sim.engine(Mode.LIVE))
+
+
+@scenario("startup_loss_hard_kill")
+async def _startup_loss_hard_kill(sim: Sim) -> None:
+    # wczorajsza strata 3,10 EUR zapisana w dzienniku (kill zgubiony w awarii): start przywraca kill twardy
+    # DAILY_LOSS_2X z dziennika i nie wchodzi
+    engine = sim.engine(Mode.LIVE)
+    exit_ts = datetime(2026, 10, 30, 15, 0, tzinfo=UTC)  # piątek
+    engine.journal.record_trade(seeded_loss("-3.10", exit_ts), "LOSS-1", date(2026, 10, 30))
+    stop_engine_at(engine, sim.clock, berlin(DAY, 9, 20))
     await sim.run_day("day", engine)
 
 
@@ -619,7 +677,7 @@ def first_difference(expected: str, actual: str) -> str:
 
 
 def check_golden(name: str, text: str, directory: Path = GOLDEN_DIR, actual_dir: Path | None = None) -> None:
-    """Porównuje `text` z wzorcem bajt w bajt; zapis wzorca TYLKO przy `GW_WRITE_GOLDEN=1` (test jest wtedy pominięty)."""
+    """Porównuje `text` z wzorcem bajt w bajt; zapis wzorca TYLKO przy `GW_WRITE_GOLDEN=1` (test wtedy się pomija)."""
     path = directory / f"{name}.json"
     actual = text.encode("utf-8")
     if writing_requested():
