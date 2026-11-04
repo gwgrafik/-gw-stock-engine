@@ -2504,3 +2504,232 @@ async def test_build_engine_refuses_a_broken_lanes_file(armed_dirs, tmp_path, cl
     (config_dir / "lanes.toml").write_text(lanes_sim.LANES_TOML.replace('rule = "bar_b1_m5"', 'rule = "x"'))
     with pytest.raises(EngineMisconfigured, match="lanes"):
         await _built(config_dir, data, tmp_path, clock)
+
+
+# --- polecenia właściciela z --epic (domyślnie DE40), znaczniki per instrument -----------------------------------
+
+
+def spy_history(broker) -> list:
+    seen: list = []
+    real = broker.closed_since
+
+    async def spy(since):
+        seen.append(since)
+        return await real(since)
+
+    broker.closed_since = spy
+    return seen
+
+
+async def test_reset_position_of_a_lane_reads_the_history_from_the_lane_marker(
+    make_engine, lane_broker, armed_lane, clock
+):
+    from gwstock.orders.manager import HISTORY_MARGIN
+
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    j = engine.journal
+    lane_marker = clock.now_utc() - timedelta(hours=3)
+    j.set_meta("closed_marker", (clock.now_utc() - timedelta(hours=1)).isoformat())  # znacznik DE40 (późniejszy)
+    j.set_meta("closed_marker:US500", lane_marker.isoformat())
+    j.upsert_position(PositionRecord(US, P.BLOCKED, "DEAL-U", Side.BUY, D("0.01"), D("7580"), D("7575"), None))
+    seen = spy_history(lane_broker)
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed("DEAL-U"), out=lines.append, epic=US) == 0, lines
+    assert seen == [lane_marker - HISTORY_MARGIN]  # znacznik pasma US500, nigdy DE40 (A1)
+    assert j.current_position(US).state is P.FLAT
+    [audit] = payloads(j, "owner.reset")
+    assert audit["unbooked_deal"] == "DEAL-U" and audit["previous"]["epic"] == US
+
+
+async def test_reset_position_without_epic_is_de40_and_an_unknown_epic_is_refused(
+    make_engine, lane_broker, armed_lane, clock
+):
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    engine.journal.upsert_position(PositionRecord(US, P.BLOCKED, "DEAL-U", Side.BUY, D("0.01"), D("7580"), None,
+                                                  None))  # fmt: skip
+    lines: list[str] = []
+    assert await cli.reset_position(engine, "wlasciciel", Typed("DEAL-U"), out=lines.append) == 1
+    assert lines == ["position DE40: FLAT; nothing to reset"]  # domyślnie DE40, jak dotąd
+    assert await cli.reset_position(engine, "wlasciciel", Typed("DEAL-U"), out=lines.append, epic="US100") == 1
+    assert "no lane for US100" in lines[-1]
+    assert engine.journal.current_position(US).state is P.BLOCKED
+
+
+async def test_reset_position_of_de40_in_a_lane_engine_keeps_the_legacy_marker(
+    make_engine, lane_broker, armed_lane, clock
+):
+    from gwstock.orders.manager import HISTORY_MARGIN
+
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    j = engine.journal
+    legacy = clock.now_utc() - timedelta(hours=2)
+    j.set_meta("closed_marker", legacy.isoformat())
+    j.set_meta("closed_marker:US500", (clock.now_utc() - timedelta(minutes=5)).isoformat())
+    j.upsert_position(PositionRecord("DE40", P.BLOCKED, "DEAL-D", Side.BUY, D("1"), D("25780"), D("25750"), None))
+    seen = spy_history(lane_broker)
+    assert await cli.reset_position(engine, "wlasciciel", Typed("DEAL-D"), out=lambda _: None, epic="DE40") == 0
+    assert seen == [legacy - HISTORY_MARGIN]
+
+
+async def test_resolve_lost_trade_of_a_lane_books_with_the_lane_executor_and_its_own_marker(
+    make_engine, lane_broker, armed_lane, clock
+):
+    config_dir, data_dir = armed_lane
+    lane_broker.set_candles_5m(five_minute_candles(DAY, D("25780"), D("25780")), epic="DE40")  # DE40: doji, bez wejścia
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    lose_the_ack(lane_broker)  # wejście US500 przyjęte, odpowiedź zgubiona, stop zamyka pozycję przed odczytem listy
+    stop_engine_at(engine, clock, lanes_sim.SIGNAL_END + timedelta(minutes=15))
+    await engine.run_day(DAY)
+    j = engine.journal
+    [order] = j.unresolved_orders()
+    assert order.epic == US and order.state is OrderState.UNKNOWN
+    assert j.current_position(US) == PositionRecord(US, P.BLOCKED)
+    [closed] = await lane_broker.closed_since(order.created_at - timedelta(minutes=5))
+    lines: list[str] = []
+    # domyślnie DE40: tu nie ma czego rozstrzygać
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed(), out=lines.append) == 1
+    assert "na DE40" in lines[-1]
+    owner = Typed(closed.deal_id, "SZACUNEK")
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", owner, out=lines.append, epic=US) == 0, lines
+    [trade] = j.trades()
+    assert trade.instrument == US and "ESTIMATED" in (j.trade_flags(closed.deal_id) or "")
+    assert j.current_position(US).state is P.FLAT and j.get_order(order.order_id).state is OrderState.CONFIRMED
+    assert j.get_meta("closed_marker:US500") == closed.ts.isoformat()  # znacznik pasma (A1)
+    assert j.get_meta("closed_marker") is None  # znacznik DE40 nietknięty
+    assert [deal for deal, _ in j.pnl_pending_deals()] == [closed.deal_id]  # wynik w USD czeka na EUR (faza 2)
+    assert any("USD" in line for line in lines)
+
+
+async def test_resolve_lost_trade_of_an_unknown_epic_is_refused(make_engine, lane_broker, armed_lane):
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    lines: list[str] = []
+    assert await cli.resolve_lost_trade(engine, "wlasciciel", Typed(), out=lines.append, epic="US100") == 1
+    assert "no lane for US100" in lines[-1]
+
+
+def test_clear_kill_with_an_epic_names_the_lane_and_says_the_kill_switch_is_shared(config_dir, data_dir, clock):
+    enable_lanes(config_dir)
+    soft_killed_journal(data_dir, clock)
+    lines: list[str] = []
+    assert cli.clear_kill(data_dir, "wlasciciel", Typed("CLEAR"), out=lines.append, clock=clock,
+                          config_dir=config_dir, epic=US) == 0  # fmt: skip
+    text = "\n".join(lines)
+    assert "shared by all lanes (DE40, US500)" in text and "position US500: FLAT" in text
+
+
+def test_clear_kill_refuses_an_epic_without_a_lane_and_changes_nothing(config_dir, data_dir, clock):
+    enable_lanes(config_dir)
+    soft_killed_journal(data_dir, clock)
+    lines: list[str] = []
+    owner = Typed("CLEAR")
+    assert cli.clear_kill(data_dir, "wlasciciel", owner, out=lines.append, clock=clock, config_dir=config_dir,
+                          epic="US100") == 1  # fmt: skip
+    assert owner.prompts == [] and "no lane for US100" in lines[-1]
+    journal = Journal.open(str(data_dir / "journal.sqlite"))
+    try:
+        assert journal.kill_state().level is KillLevel.SOFT
+    finally:
+        journal.close()
+
+
+def test_clear_kill_without_lanes_and_without_epic_prints_exactly_as_before(config_dir, data_dir, clock):
+    soft_killed_journal(data_dir, clock)
+    lines: list[str] = []
+    assert cli.clear_kill(data_dir, "wlasciciel", Typed("CLEAR"), out=lines.append, clock=clock,
+                          config_dir=config_dir) == 0  # fmt: skip
+    assert not any("shared" in line or "position" in line for line in lines)
+
+
+@pytest.mark.parametrize("command", ["clear-kill", "reset-position", "resolve-lost-trade", "status"])
+def test_cli_passes_the_epic_and_defaults_to_none_meaning_de40(monkeypatch, tmp_path, command):
+    seen = []
+    monkeypatch.setitem(cli.COMMANDS, command, lambda paths, args: seen.append(args.epic) or 0)
+    by = ["--by", "wlasciciel"] if command != "status" else []
+    assert cli.main([command, *by]) == 0
+    assert cli.main([command, *by, "--epic", "US500"]) == 0
+    assert seen == [None, "US500"]
+    with pytest.raises(SystemExit) as exc:
+        cli.main([command, *by, "--epic", "../x"])
+    assert exc.value.code == 2
+
+
+def test_cli_commands_hand_the_epic_to_the_owner_tools(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_reset(paths, by, epic=None):
+        calls.append(("reset", epic))
+        return 0
+
+    async def fake_resolve(paths, by, epic=None):
+        calls.append(("resolve", epic))
+        return 0
+
+    monkeypatch.setattr(cli, "_reset_engine", fake_reset)
+    monkeypatch.setattr(cli, "_resolve_engine", fake_resolve)
+    monkeypatch.setattr(cli, "status", lambda c, d, epic=None: calls.append(("status", epic)) or 0)
+    monkeypatch.setattr(
+        cli, "clear_kill", lambda d, by, ask, config_dir=None, epic=None: calls.append(("clear", epic, config_dir)) or 0
+    )
+    (tmp_path / "d").mkdir()
+    monkeypatch.setenv("GW_CONFIG_DIR", str(tmp_path / "c"))
+    monkeypatch.setenv("GW_DATA_DIR", str(tmp_path / "d"))
+    assert cli.main(["reset-position", "--by", "w", "--epic", "US500"]) == 0
+    assert cli.main(["resolve-lost-trade", "--by", "w"]) == 0
+    assert cli.main(["status", "--epic", "US500"]) == 0
+    assert cli.main(["clear-kill", "--by", "w", "--epic", "US500"]) == 0
+    assert calls == [("reset", "US500"), ("resolve", None), ("status", "US500"), ("clear", "US500", tmp_path / "c")]
+
+
+# --- status per pasmo ----------------------------------------------------------------------------------------------
+
+
+async def test_status_shows_each_lane_with_its_mode_position_entries_and_result(
+    make_engine, lane_broker, armed_lane, clock
+):
+    config_dir, data_dir = armed_lane
+    make_engine.journal_path = data_dir / "journal.sqlite"  # układ produkcyjny: dziennik w data/
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    stop_engine_at(engine, clock, lanes_sim.SIGNAL_END + timedelta(minutes=2))
+    await engine.run_day(DAY)
+    lines: list[str] = []
+    assert cli.status(config_dir, data_dir, out=lines.append, now=clock.now_utc()) == 0
+    text = "\n".join(lines)
+    assert "mode (files): live (all arming conditions met)" in text
+    assert "position DE40: OPEN" in text and "unresolved orders: 0" in text
+    assert "lane US500 (bar_b1_m5, NYSE, USD): mode (files) live" in text
+    assert "lane size: always the minimum" in text
+    assert "  position US500: OPEN" in text and "unresolved orders US500: 0" in text
+    assert "entries today (2026-11-02, America/New_York): 1 of 10" in text
+    assert "trades today US500: 0, net 0 USD (instrument currency)" in text
+    (data_dir / "preregistration-US500.json").unlink()
+    lines.clear()
+    assert cli.status(config_dir, data_dir, out=lines.append, now=clock.now_utc(), epic=US) == 0
+    text = "\n".join(lines)
+    assert "lane US500 (bar_b1_m5, NYSE, USD): mode (files) dry_run (LANE_PREREGISTRATION_NOT_FROZEN" in text
+    assert "position DE40" not in text and "  position US500: OPEN" in text
+
+
+async def test_status_of_de40_with_lanes_counts_only_de40(make_engine, lane_broker, armed_lane, clock):
+    config_dir, data_dir = armed_lane
+    make_engine.journal_path = data_dir / "journal.sqlite"
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    engine.journal.insert_order(OrderRecord("gws-20261102-US500-1-entry", US, Side.BUY, D("0.01"), D("5"),
+                                            OrderState.UNKNOWN, None, None, clock.now_utc(), clock.now_utc(), "x"))
+    lines: list[str] = []
+    assert cli.status(config_dir, data_dir, out=lines.append, now=clock.now_utc(), epic="DE40") == 0
+    text = "\n".join(lines)
+    assert "unresolved orders: 0" in text and "lane US500" not in text
+    lines.clear()
+    assert cli.status(config_dir, data_dir, out=lines.append, now=clock.now_utc()) == 0
+    assert "unresolved orders US500: 1" in "\n".join(lines)
+
+
+def test_status_of_an_epic_without_a_lane_is_an_error(armed_lane):
+    config_dir, data_dir = armed_lane
+    lines: list[str] = []
+    assert cli.status(config_dir, data_dir, out=lines.append, epic="US100") == 2
+    assert lines == ["no lane for US100 (lanes: DE40, US500)"]

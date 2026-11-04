@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import sys
 from collections.abc import Callable
@@ -105,6 +106,7 @@ NOTHING_CHANGED = "nic nie zmieniono"
 DEAL_PROMPT = "Wpisz identyfikator zamknięcia (deal id) z alarmu {code}, które jest tą transakcją: "
 INTERRUPTED = "pytanie przerwane (Ctrl-C albo koniec wejścia)"
 CENT = Decimal("0.01")  # wydruk kwot szacunku (księga zaokrągla tak samo)
+_EPIC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")  # `--epic`: nazwa instrumentu pasma
 # kody przypadków zgubionej transakcji w notatce zlecenia (pytanie o deal id nazywa właściwy alarm)
 _LOST_TRADE_CODES = frozenset({
     "UNMATCHED_CLOSED_DEAL", "REJECTED_BUT_LISTED", "AMBIGUOUS_MATCH", "CONFIRM_MISMATCH", "CONFIRM_UNVERIFIED",
@@ -728,21 +730,38 @@ def _history_latency(journal: Any, deal_id: str, since: datetime) -> float | Non
 # --- status, health ------------------------------------------------------------------------------------------------
 
 
-def status(config_dir: Path, data_dir: Path, out: Callable[[str], None] = print, now: datetime | None = None) -> int:
+def status(
+    config_dir: Path,
+    data_dir: Path,
+    out: Callable[[str], None] = print,
+    now: datetime | None = None,
+    epic: str | None = None,
+) -> int:
     """Stan tylko do odczytu: tryb z plików i powód, kill switch, pozycja i zlecenia, tętno, ostatnia decyzja,
     dzisiejsze transakcje. Niczego nie zapisuje (dziennik otwierany tylko, gdy istnieje). Część dziennika, której nie
     da się odczytać (np. uszkodzony wiersz zlecenia dowolnego instrumentu), to linia UNREADABLE, a reszta stanu i tak
-    jest wypisana."""
+    jest wypisana.
+
+    Kolejne pasma (`config/lanes.toml`): po stanie DE40 (wtedy liczonym tylko dla instrumentu DE40) sekcja każdego
+    pasma: tryb z plików i powód dry_run (`lane_arming_problem`), pozycja, zlecenia, wejścia dnia (dzień lokalny
+    kalendarza pasma) i wynik dnia w walucie instrumentu. `epic`: tylko to pasmo (DE40: dotychczasowy stan; instrument
+    bez pasma: 2). Bez pliku pasm i bez `epic` wyjście jest dokładnie takie jak dotąd."""
     from gwstock.journal import Journal
 
     config_dir, data_dir = Path(config_dir), Path(data_dir)
     now = now or datetime.now(timezone.utc)
     try:
         strat = load_config(config_dir)[0]
-        epic = strat.instrument
+        primary = strat.instrument
     except Exception as exc:
         out(f"config: unreadable ({type(exc).__name__}: {exc})")
-        epic = "DE40"
+        primary = "DE40"
+    lanes = _status_lanes(config_dir, out)
+    if epic is not None and epic != primary and epic not in [lane.epic for lane in lanes]:
+        out(f"no lane for {epic} (lanes: {', '.join([primary, *(lane.epic for lane in lanes)])})")
+        return 2
+    shown = [lane for lane in lanes if epic is None or lane.epic == epic]
+    runtime = None
     try:
         runtime = load_runtime(config_dir, data_dir)
         mode, missing = runtime_mode(config_dir, data_dir, runtime)
@@ -757,27 +776,111 @@ def status(config_dir: Path, data_dir: Path, out: Callable[[str], None] = print,
     else:
         out(f"heartbeat: {age:.0f} s ago, engine mode {beat.get('mode')}, state {beat.get('state')}, kill "
             f"{beat.get('kill_level')}, last quote {beat.get('last_quote_ts')}")  # fmt: skip
+    foreign = foreign_currency_epics(lanes)  # jak złożenie `build_engine`
+    lane_modes = {
+        lane.epic: lane_arming_problem(
+            config_dir, data_dir, lane, bound_account=runtime.account_id if runtime else None, foreign_epics=foreign
+        )
+        for lane in shown
+    }  # fmt: skip
     path = data_dir / JOURNAL_FILE
     if not path.exists():
+        for lane in shown:
+            _status_lane_mode(lane, lane_modes[lane.epic], out)
         out("journal: none yet")
         return 0
     journal = Journal.open_readonly(str(path))  # status nigdy nie pisze (sqlite tylko do odczytu)
     try:
-        parts = (
-            ("kill switch", _status_kill), (f"position {epic}", _status_position),
-            ("unresolved orders", _status_orders), ("last decision", _status_decision),
-            ("live sessions", _status_sessions), ("trades today", _status_trades),
-        )  # fmt: skip
+        per_instrument = bool(lanes)  # z pasmami część DE40 liczy tylko DE40
+        parts: tuple = (("kill switch", _status_kill),)
+        if epic is None or epic == primary:
+            parts += (
+                (f"position {primary}", _status_position), ("unresolved orders", _status_orders),
+                ("last decision", _status_decision), ("live sessions", _status_sessions),
+                ("trades today", _status_trades),
+            )  # fmt: skip
         for label, part in parts:
             try:
-                part(journal, epic, data_dir, now, out)
+                if per_instrument and part in (_status_orders, _status_sessions, _status_trades):
+                    part(journal, primary, data_dir, now, out, per_instrument=True)
+                else:
+                    part(journal, primary, data_dir, now, out)
             except (JournalError, ValueError) as exc:  # uszkodzony wiersz nie urywa reszty stanu
-                out(f"{label}: UNREADABLE ({type(exc).__name__}: {exc}); entries stay blocked while the journal cannot "
-                    "be read, exits are unaffected; only a journal repair or the owner's decision with Claude helps "
-                    "(runbook, section 9)")  # fmt: skip
+                out(_unreadable(label, exc))
+        for lane in shown:
+            _status_lane(journal, lane, lane_modes[lane.epic], now, out)
     finally:
         journal.close()
     return 0
+
+
+def _unreadable(label: str, exc: Exception) -> str:
+    return (f"{label}: UNREADABLE ({type(exc).__name__}: {exc}); entries stay blocked while the journal cannot be "
+            "read, exits are unaffected; only a journal repair or the owner's decision with Claude helps (runbook, "
+            "section 9)")  # fmt: skip
+
+
+def _status_lanes(config_dir: Path, out: Callable[[str], None]) -> tuple:
+    """Kolejne pasma z `lanes.toml` (brak pliku albo wyłączone: żadnych); zły plik: linia i żadnych pasm."""
+    from gwstock.config import load_lanes
+
+    try:
+        return tuple(load_lanes(config_dir) or ())
+    except Exception as exc:
+        out(f"lanes: configuration unreadable ({type(exc).__name__}: {exc}); the engine refuses to start with it")
+        return ()
+
+
+def _status_lane_mode(lane: Any, problem: str | None, out: Callable[[str], None]) -> None:
+    cfg = lane.cfg
+    head = f"lane {lane.epic} ({cfg.rule}, {cfg.exchange_profile}, {cfg.currency})"
+    if problem is None:
+        out(f"{head}: mode (files) live (the process is armed and the lane pre-registration matches)")
+    else:
+        out(f"{head}: mode (files) dry_run ({problem})")
+    out("  lane size: always the minimum (no per-lane size gate)")
+
+
+def _status_lane(journal: Any, lane: Any, problem: str | None, now: datetime, out: Callable[[str], None]) -> None:
+    """Sekcja pasma: tryb, pozycja, zlecenia, wejścia dnia i wynik dnia (dzień lokalny kalendarza pasma)."""
+    from gwstock.calendar import NYSE, XETRA, ExchangeCalendar
+
+    _status_lane_mode(lane, problem, out)
+    epic = lane.epic
+    calendar = ExchangeCalendar({NYSE.name: NYSE, XETRA.name: XETRA}[lane.cfg.exchange_profile])
+    today = calendar.to_local(now).date()
+
+    def position() -> None:
+        _status_position(journal, epic, Path("."), now, lambda line: out(f"  {line}"))
+
+    def orders() -> None:
+        found = [o for o in journal.unresolved_orders() if o.epic == epic]
+        out(f"  unresolved orders {epic}: {len(found)}")
+        for o in found:
+            out(f"    {o.order_id} {o.state.value} {o.side.value} {o.size} ({o.note})")
+
+    def entries() -> None:
+        out(f"  entries today ({today}, {calendar.profile.tz}): {journal.count_entry_orders(today, epic)} of "
+            f"{lane.bar.max_entries_per_day}")  # fmt: skip
+
+    def result() -> None:
+        todays = [t for t in journal.trades(epic) if calendar.to_local(t.exit_ts).date() == today]
+        net = sum((t.net_pnl for t in todays), Decimal(0))
+        unit = lane.cfg.currency + ("" if lane.cfg.currency == ACCOUNT_CURRENCY else " (instrument currency)")
+        out(f"  trades today {epic}: {len(todays)}, net {net} {unit}")
+        for t in todays:
+            out(f"    {t.side.value} {t.size} entry {t.entry_fill} exit {t.exit_fill} net {t.net_pnl} ({t.exit_reason})")
+        mine = {deal for deal, _ in journal.trades_by_deal(epic)}
+        pending = [deal for deal, _ in journal.pnl_pending_deals() if deal in mine]
+        if pending:
+            out(f"  awaiting settlement in {ACCOUNT_CURRENCY}: {', '.join(pending)} (all entries blocked until then)")
+
+    for label, part in ((f"position {epic}", position), (f"unresolved orders {epic}", orders),
+                        (f"entries today {epic}", entries), (f"trades today {epic}", result)):  # fmt: skip
+        try:
+            part()
+        except (JournalError, ValueError) as exc:
+            out(f"  {_unreadable(label, exc)}")
 
 
 def _status_kill(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
@@ -794,8 +897,12 @@ def _status_position(journal: Any, epic: str, data_dir: Path, now: datetime, out
             f"{pos.size} open {pos.open_level} stop {pos.stop_level}")  # fmt: skip
 
 
-def _status_orders(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+def _status_orders(
+    journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None], per_instrument: bool = False
+) -> None:
     orders = journal.unresolved_orders()
+    if per_instrument:  # z kolejnymi pasmami: zlecenia pasma DE40 (pozostałe w sekcjach pasm)
+        orders = [o for o in orders if o.epic == epic]
     out(f"unresolved orders: {len(orders)}")
     for o in orders:
         out(f"  {o.order_id} {o.state.value} {o.side.value} {o.size} ({o.note})")
@@ -819,21 +926,29 @@ def _estimated(flags: str | None) -> bool:
     return "ESTIMATED" in (flags or "").split()
 
 
-def _status_sessions(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+def _status_sessions(
+    journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None], per_instrument: bool = False
+) -> None:
     booked = journal.trade_flags()  # księga ze znacznikami jednym odczytem
-    sessions = len(booked) - journal.count_smoke_trades()
+    if per_instrument:  # z kolejnymi pasmami: sesje pasma DE40 (A4)
+        booked = [(t, flags) for t, flags in booked if t.instrument == epic]
+    sessions = len(booked) - journal.count_smoke_trades(epic if per_instrument else None)
     estimates = sum(1 for _, flags in booked if _estimated(flags))
     note = f" (including {estimates} owner estimate{'' if estimates == 1 else 's'})" if estimates else ""
     l1 = (data_dir / L1_PASSED_FILE).exists()
     out(f"live sessions (trades without smoke): {sessions}{note}; {L1_PASSED_FILE}: {'yes' if l1 else 'no'}")
 
 
-def _status_trades(journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None]) -> None:
+def _status_trades(
+    journal: Any, epic: str, data_dir: Path, now: datetime, out: Callable[[str], None], per_instrument: bool = False
+) -> None:
     from gwstock.calendar import XETRA, ExchangeCalendar
 
     calendar = ExchangeCalendar(XETRA)
     today = calendar.to_local(now).date()
     booked = journal.trade_flags()  # księga ze znacznikami jednym odczytem (piszący silnik niczego nie rozjedzie)
+    if per_instrument:  # z kolejnymi pasmami: księga pasma DE40 (wynik US500 jest w innej walucie)
+        booked = [(t, flags) for t, flags in booked if t.instrument == epic]
 
     def line(t: Any, flags: str | None) -> str:
         mark = " [ESTIMATED]" if _estimated(flags) else ""  # szacunek właściciela, nie pomiar
@@ -868,8 +983,23 @@ def _tail(path: Path, n: int) -> list[str]:
         return []
 
 
+def _configured_epics(config_dir: Path) -> tuple[str, list[str]]:
+    """Instrument pasma DE40 v1 i kolejnych pasm z `config_dir` (zły plik: wyjątek z jego nazwą)."""
+    from gwstock.config import load_lanes
+
+    primary = load_config(Path(config_dir))[0].instrument
+    return primary, [lane.epic for lane in (load_lanes(Path(config_dir)) or ())]
+
+
 def clear_kill(
-    data_dir: Path, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print, clock: Any = None
+    data_dir: Path,
+    by: str,
+    ask: Callable[[str], str],
+    out: Callable[[str], None] = print,
+    clock: Any = None,
+    *,
+    config_dir: Path | None = None,
+    epic: str | None = None,
 ) -> int:
     """Zdjęcie kill switcha przez właściciela (silnik zatrzymany: blokada instancji bierze wywołujący).
 
@@ -878,12 +1008,28 @@ def clear_kill(
     (gdy odczyt przy starcie przełącznika zawiódł chwilowo, czyta jeszcze raz, żeby właściciel nie zdjął HARD, widząc
     zastępczy SOFT KILL_STATE_UNREADABLE), przyczynę i ostatnie alarmy; bez wpisanego `CLEAR` nic nie zmienia (2).
     `KillSwitch.clear` zapisuje stan NONE i wiersz audytu `kill.audit` (CLEAR, kto). 0: zdjęty.
+
+    Kill switch jest WSPÓLNY dla wszystkich pasm (R3): `epic` (domyślnie pasmo DE40) wskazuje pasmo, którego pozycję
+    polecenie pokazuje obok poziomu; instrument bez pasma w `config_dir` to odmowa (1). Z kolejnymi pasmami polecenie
+    mówi wprost, że zdjęcie odblokowuje wejścia KAŻDEGO pasma. Bez pasm i bez `epic` wyjście jest takie jak dotąd.
     """
     from gwstock.clock import SystemClock
     from gwstock.journal import Journal
     from gwstock.notify import FileNotifier
     from gwstock.risk import KILL_STATE_UNREADABLE, KillSwitch
 
+    primary, lane_epics = None, []
+    if config_dir is not None:
+        try:
+            primary, lane_epics = _configured_epics(config_dir)
+        except Exception as exc:
+            if epic is not None:
+                out(f"refused: the lanes configuration cannot be read ({type(exc).__name__}: {exc}); nothing changed")
+                return 1
+    if epic is not None and epic != primary and epic not in lane_epics:
+        known = ", ".join(e for e in (primary, *lane_epics) if e) or "unknown"
+        out(f"refused: no lane for {epic} (lanes: {known}); nothing changed")
+        return 1
     data_dir = Path(data_dir)
     path = data_dir / JOURNAL_FILE
     if not path.exists():
@@ -926,6 +1072,13 @@ def clear_kill(
             return 1
         since = stored.since
         out(f"kill switch: {level.name} ({reason}" + (f", since {since.isoformat()})" if since else ")"))
+        if lane_epics:  # wspólny kill switch: zdjęcie dotyczy wszystkich pasm
+            out(f"note: the kill switch is shared by all lanes ({', '.join([primary, *lane_epics])}): clearing it "
+                "re-enables the entries of every lane")  # fmt: skip
+            try:
+                _status_position(journal, epic or primary, data_dir, datetime.now(timezone.utc), out)
+            except (JournalError, ValueError) as exc:
+                out(f"position {epic or primary}: UNREADABLE ({type(exc).__name__}: {exc})")
         out("last alerts:")
         for line in _tail(data_dir / ALERTS_FILE, 10):
             out(f"  {line}")
@@ -943,8 +1096,32 @@ def clear_kill(
         journal.close()
 
 
-async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print) -> int:
+def _lane_parts(engine: Engine, epic: str | None) -> tuple[str, Any, Any] | None:
+    """Instrument, wykonawca i uzgadnianie pasma `epic` (None: pasmo DE40 v1, jak dotąd); None, gdy nie ma pasma.
+
+    Narzędzia właściciela księgują wykonawcą TEGO pasma i czytają znaczniki uzgadniania jego kluczami
+    (`Reconciler.legacy_keys`: DE40 nazwy dotychczasowe, kolejne pasma `<nazwa>:<epic>`; A1 projektu pasm)."""
+    primary = engine.strat.instrument
+    if epic is None or epic == primary:
+        return primary, engine.executor, engine.reconciler
+    for lane in getattr(engine, "lanes", ()):
+        if lane.epic == epic:
+            return lane.epic, lane.executor, lane.reconciler
+    return None
+
+
+def _no_lane(engine: Engine, epic: str) -> str:
+    known = [engine.strat.instrument, *(lane.epic for lane in getattr(engine, "lanes", ()))]
+    return f"no lane for {epic} (lanes: {', '.join(known)})"
+
+
+async def reset_position(
+    engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print, epic: str | None = None
+) -> int:
     """Wyczyszczenie lokalnego stanu pozycji (BLOCKED/ENTERING → FLAT) przez właściciela, gdy broker jest pusty.
+
+    `epic`: pasmo (None = DE40 v1, jak dotąd); instrument bez pasma: odmowa (1). Początek historii z kluczy znacznika
+    uzgadniania TEGO pasma (`Reconciler.legacy_keys`).
 
     Odmowa (1): pozycja już FLAT; nierozstrzygnięte zlecenie w dzienniku (rozstrzyga uzgadnianie silnika); pozycja
     OPEN/EXITING (silnik sam ją uzgadnia i księguje: reset mógłby pominąć zaksięgowanie prawdziwego zamknięcia);
@@ -959,7 +1136,12 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     historii, zamknięcia tego deala, potwierdzenie) przed zapisem FLAT przez automat stanów. Wyjście nie zawiera
     identyfikatorów rachunków. 0: wyczyszczone.
     """
-    journal, epic = engine.journal, engine.strat.instrument
+    parts = _lane_parts(engine, epic)
+    if parts is None:
+        out(f"refused: {_no_lane(engine, str(epic))}; nothing changed")
+        return 1
+    epic, _, reconciler = parts
+    journal = engine.journal
     position = journal.current_position(epic)
     if position is None or position.state is PositionState.FLAT:
         out(f"position {epic}: FLAT; nothing to reset")
@@ -1003,7 +1185,7 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
     deal_id = position.deal_id
     history, closures = "NOT_APPLICABLE", []
     if deal_id is not None:
-        checked = await _reset_history_check(engine, position, out)
+        checked = await _reset_history_check(engine, position, out, reconciler.legacy_keys)
         if checked is None:
             return 1
         history, closures = checked
@@ -1042,7 +1224,7 @@ async def reset_position(engine: Engine, by: str, ask: Callable[[str], str], out
 
 
 async def _reset_history_check(
-    engine: Engine, position: PositionRecord, out: Callable[[str], None]
+    engine: Engine, position: PositionRecord, out: Callable[[str], None], legacy_keys: bool
 ) -> tuple[str, list] | None:
     """Historia zamknięć deal_id pozycji BLOCKED (pełna albo wyjątek) od tego samego początku, co uzgadnianie:
     `reconcile.history_start` (późniejszy z: znacznik ostatniego zaksięgowanego zamknięcia na instrumencie pozycji,
@@ -1058,7 +1240,7 @@ async def _reset_history_check(
 
     deal_id, epic = position.deal_id, position.epic
     # znacznik instrumentu pozycji według kluczy uzgadniania tego pasma (jedna reguła; projekt pasm, A1)
-    start = history_start(engine.journal, position, legacy_keys=engine.reconciler.legacy_keys)
+    start = history_start(engine.journal, position, legacy_keys=legacy_keys)
     if start is None:
         out(f"note: neither the open time of deal {deal_id} nor a booked closure is known, so its closure cannot be "
             "looked up in the history")  # fmt: skip
@@ -1089,7 +1271,7 @@ async def _reset_history_check(
 
 
 async def resolve_lost_trade(
-    engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print
+    engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None] = print, epic: str | None = None
 ) -> int:
     """Rozstrzygnięcie „zgubionej transakcji" przez właściciela (silnik zatrzymany: blokadę bierze wywołujący).
 
@@ -1116,16 +1298,29 @@ async def resolve_lost_trade(
     nie dotyka. Audyt `owner.resolve` w każdym przypadku (odmowa i przerwanie wg możliwości); bez identyfikatorów
     rachunków. Kody: 0 rozstrzygnięte, 1 odmowa (stan bez zmian), 2 przerwane przy pytaniu, także Ctrl-C albo koniec
     wejścia (stan bez zmian).
+
+    `epic`: pasmo (None = DE40 v1, jak dotąd); instrument bez pasma: odmowa (1). Księguje wykonawca TEGO pasma (wynik
+    pasma w walucie obcej czeka na rozliczenie w EUR), a znacznik historii ma klucz uzgadniania tego pasma
+    (`reconcile.meta_key(..., legacy_keys=reconciler.legacy_keys)`; A1).
     """
-    return await _LostTrade(engine, by, ask, out).run()
+    parts = _lane_parts(engine, epic)
+    if parts is None:
+        out(f"odmowa: {_no_lane(engine, str(epic))}; {NOTHING_CHANGED}")
+        return 1
+    return await _LostTrade(engine, by, ask, out, parts).run()
 
 
 class _LostTrade:
     """Jedno uruchomienie `resolve-lost-trade` (patrz `resolve_lost_trade`)."""
 
-    def __init__(self, engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None]) -> None:
+    def __init__(
+        self, engine: Engine, by: str, ask: Callable[[str], str], out: Callable[[str], None], parts: tuple
+    ) -> None:
         self.engine, self.ask, self.out = engine, ask, out
-        self.journal, self.epic, self.clock = engine.journal, engine.strat.instrument, engine.clock
+        self.epic, self.executor, self.reconciler = parts
+        self.journal, self.clock = engine.journal, engine.clock
+        lane = next((ln for ln in getattr(engine, "lanes", ()) if ln.epic == self.epic), None)
+        self.currency = lane.loaded.cfg.currency if lane is not None else ACCOUNT_CURRENCY  # waluta wyniku w księdze
         self.who = by.strip()
 
     # --- wynik i audyt ---
@@ -1264,7 +1459,7 @@ class _LostTrade:
             self.audit("RESUMED", order_id=order.order_id, chosen=closed.deal_id, booked=booked_as,
                        acknowledged=acknowledged)  # fmt: skip
             # przerwanie mogło przyjść między księgą a kill switchem: limity strat z liczników, zanim pokażemy poziom
-            engine.executor.enforce_loss_limits(engine.calendar.to_local(closed.ts).date())
+            self.executor.enforce_loss_limits(engine.calendar.to_local(closed.ts).date())
             return self._finish(order, closed, booked_as)
 
         # 5. dane wejścia, od najlepszych: potwierdzenie brokera, lista pozycji brokera z tym dealem zapisana
@@ -1356,7 +1551,7 @@ class _LostTrade:
         if estimate is None:  # księga bierze prawdziwy kontekst wejścia (notowanie decyzji, czasy) tego zlecenia
             journal.set_meta(META_ENTRY_BY_DEAL.format(closed.deal_id), order.order_id)
         try:
-            await engine.executor.book(booked, closed, estimated=estimate is not None, by_owner=True)
+            await self.executor.book(booked, closed, estimated=estimate is not None, by_owner=True)
         except BookingError as exc:
             written = "wiersz audytu BOOKING" + (", wskaźnik kontekstu wejścia" if estimate is None else "")
             text = (f"księgowanie nie powiodło się ({exc}); nic nie zaksięgowano, a zlecenie i pozycja są bez zmian "
@@ -1420,8 +1615,9 @@ class _LostTrade:
         basis = (f"większa z odległości stopu {stop} pkt i odległości notowania decyzji od wyjścia {gap} pkt"
                  if gap is not None else f"odległość stopu {stop} pkt, bez notowania decyzji")  # fmt: skip
         self.out(f"brak danych wejścia u brokera: zostanie zaksięgowany ostrożny szacunek straty (nie górna granica) "
-                 f"(SZACUNEK): {size} x {points} pkt x {vpp} EUR/pkt = -{loss} EUR przed kosztami ({basis}); wiersz "
-                 "księgi dostanie znacznik ESTIMATED; zysku z szacunku nigdy nie księgujemy")  # fmt: skip
+                 f"(SZACUNEK): {size} x {points} pkt x {vpp} {self.currency}/pkt = -{loss} {self.currency} przed "
+                 f"kosztami ({basis}); wiersz księgi dostanie znacznik ESTIMATED; zysku z szacunku nigdy nie "
+                 "księgujemy")  # fmt: skip
         word = self._prompt(ESTIMATE_PROMPT)
         if word is None:
             return self.abort(INTERRUPTED)
@@ -1469,9 +1665,10 @@ class _LostTrade:
 
     def _finish(self, order: Any, closed: Any, booked_as: str) -> int:
         """Zapisy po księdze (każdy idempotentny): zlecenie CONFIRMED, pozycja FLAT, znacznik historii, audyt."""
-        from gwstock.reconcile import META_CLOSED_MARKER
+        from gwstock.reconcile import META_CLOSED_MARKER, meta_key
 
         journal, epic = self.journal, self.epic
+        marker_key = meta_key(META_CLOSED_MARKER, epic, legacy_keys=self.reconciler.legacy_keys)  # klucz pasma (A1)
         now = self.clock.now_utc()
         check_order_transition(OrderState.UNKNOWN, OrderState.CONFIRMED)
         note = _note_tokens(
@@ -1482,18 +1679,23 @@ class _LostTrade:
                              updated_at=now)  # fmt: skip
         check_position_transition(PositionState.BLOCKED, PositionState.FLAT)
         journal.upsert_position(PositionRecord(epic, PositionState.FLAT))
-        marker = journal.get_meta(META_CLOSED_MARKER)
+        marker = journal.get_meta(marker_key)
         if not marker or datetime.fromisoformat(marker) < closed.ts:
-            journal.set_meta(META_CLOSED_MARKER, closed.ts.isoformat())
+            journal.set_meta(marker_key, closed.ts.isoformat())
         net = _booked_net(journal, closed)
         self.audit("DONE", deal_id=closed.deal_id, order_id=order.order_id, net_pnl=net, booked=booked_as)
         how = "DOKŁADNIE z potwierdzenia" if booked_as == "EXACT" else "SZACUNEK"
         day = self.engine.calendar.to_local(closed.ts).date()
         shown = net if net is not None else "?"
-        self.out(f"zaksięgowano transakcję {closed.deal_id} ({how}): wynik netto {shown} EUR, "
+        self.out(f"zaksięgowano transakcję {closed.deal_id} ({how}): wynik netto {shown} {self._amount_currency()}, "
                  f"dzień {day}; zlecenie {order.order_id} → CONFIRMED (RESOLVED_BY_OWNER), pozycja {epic} → FLAT; "
                  f"{self._kill_hint()}")  # fmt: skip
         return 0
+
+    def _amount_currency(self) -> str:
+        if self.currency == ACCOUNT_CURRENCY:
+            return ACCOUNT_CURRENCY
+        return f"{self.currency} (waluta instrumentu; kwota w {ACCOUNT_CURRENCY} czeka na rozliczenie przez silnik)"
 
     def _kill_hint(self) -> str:
         kill = self.engine.kill
@@ -1789,9 +1991,9 @@ async def _smoke_engine(paths: Paths, hold_s: int = 0) -> int:
         return await _with_engine(paths, run, lock=lock)
 
 
-async def _reset_engine(paths: Paths, by: str) -> int:
+async def _reset_engine(paths: Paths, by: str, epic: str | None = None) -> int:
     with _engine_stopped(paths) as lock:
-        return await _with_engine(paths, lambda engine: reset_position(engine, by, input), lock=lock)
+        return await _with_engine(paths, lambda engine: reset_position(engine, by, input, epic=epic), lock=lock)
 
 
 def _owner_input(prompt: str) -> str:
@@ -1808,9 +2010,11 @@ def _owner_input(prompt: str) -> str:
         signal.signal(signal.SIGINT, previous)
 
 
-async def _resolve_engine(paths: Paths, by: str) -> int:
+async def _resolve_engine(paths: Paths, by: str, epic: str | None = None) -> int:
     with _engine_stopped(paths) as lock:  # blokada instancji przed konfiguracją, dziennikiem i siecią
-        return await _with_engine(paths, lambda engine: resolve_lost_trade(engine, by, _owner_input), lock=lock)
+        return await _with_engine(
+            paths, lambda engine: resolve_lost_trade(engine, by, _owner_input, epic=epic), lock=lock
+        )  # fmt: skip
 
 
 async def _bind(paths: Paths) -> int:
@@ -1841,15 +2045,15 @@ def _cmd_smoke(paths: Paths, args: argparse.Namespace) -> int:
 
 def _cmd_clear_kill(paths: Paths, args: argparse.Namespace) -> int:
     with _engine_stopped(paths):  # działający silnik trzymałby swój poziom w pamięci
-        return clear_kill(paths.data_dir, args.by, input)
+        return clear_kill(paths.data_dir, args.by, input, config_dir=paths.config_dir, epic=args.epic)
 
 
 def _cmd_reset_position(paths: Paths, args: argparse.Namespace) -> int:
-    return asyncio.run(_reset_engine(paths, args.by))
+    return asyncio.run(_reset_engine(paths, args.by, args.epic))
 
 
 def _cmd_resolve_lost_trade(paths: Paths, args: argparse.Namespace) -> int:
-    return asyncio.run(_resolve_engine(paths, args.by))
+    return asyncio.run(_resolve_engine(paths, args.by, args.epic))
 
 
 def _cmd_bind(paths: Paths, args: argparse.Namespace) -> int:
@@ -1857,7 +2061,7 @@ def _cmd_bind(paths: Paths, args: argparse.Namespace) -> int:
 
 
 def _cmd_status(paths: Paths, args: argparse.Namespace) -> int:
-    return status(paths.config_dir, paths.data_dir)
+    return status(paths.config_dir, paths.data_dir, epic=args.epic)
 
 
 def _cmd_health(paths: Paths, args: argparse.Namespace) -> int:
@@ -1898,6 +2102,12 @@ def _hold_seconds(text: str) -> int:
     return value
 
 
+def _epic_name(text: str) -> str:
+    if not _EPIC_NAME.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"expected an instrument name such as US500, got {text!r}")
+    return text
+
+
 def _owner_name(text: str) -> str:
     if not text.strip():
         raise argparse.ArgumentTypeError("a non-empty name of who does it")
@@ -1914,6 +2124,11 @@ def main(argv: list[str] | None = None) -> int:
     )  # fmt: skip
     for name in ("clear-kill", "reset-position", "resolve-lost-trade"):
         parsers[name].add_argument("--by", type=_owner_name, required=True, help="who does it (audit trail)")
+    for name in ("status", "clear-kill", "reset-position", "resolve-lost-trade"):
+        parsers[name].add_argument(
+            "--epic", type=_epic_name, default=None, metavar="EPIC",
+            help="lane instrument (default: the v1 lane, DE40); other lanes come from config/lanes.toml",
+        )  # fmt: skip
     args = parser.parse_args(argv)
     command = args.command or "run"
     if command not in ("health", "status"):
