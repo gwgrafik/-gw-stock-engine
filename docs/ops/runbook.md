@@ -845,6 +845,79 @@ docker compose -f docker/compose.yml up -d gw-stock-engine
 
 **Co się dzieje po przerwaniu `--hold` i co wtedy zostaje w dzienniku.** Jeśli polecenie zostanie przerwane w trakcie wstrzymania (Ctrl+C, sygnał, zerwane połączenie SSH, błąd), program sam próbuje zamknąć pozycję próby: najpierw procedurą awaryjną wykonawcy, a gdy broker nadal ją pokazuje, jednym bezpośrednim zamknięciem po numerze transakcji (to zamknięcie **nie idzie przez wykonawcę silnika**). Gdy się uda, wypisze `INFO [4] deal ... closed after the interrupt; the engine's reconciliation books it if needed`. Dziennik silnika **zostaje wtedy z pozycją `OPEN`** (`status` pokazuje `position DE40: OPEN ...`), dopóki uzgadnianie silnika nie zaksięguje zamknięcia z historii brokera, czyli dopóki nie uruchomisz silnika. Gdy się nie uda, wypisze głośną linię `FAIL [4] LOUD: deal ... left open with its stop; ...`: pozycja ma wtedy stop u brokera, ale zamknij ją ręcznie w aplikacji (albo uruchom silnik, który ją uzgodni i spłaszczy o 17:25). W obu przypadkach najpierw zdejmij uzbrojenie (reguła przerwania powyżej), potem uruchom silnik w `dry_run` (punkt 2.2), odczekaj kilka minut na uzgodnienie i sprawdź `status` (ma być `position DE40: FLAT`). Wynik opisz Claude. Jeśli pozycja pozostaje `OPEN` albo `BLOCKED`, nie obchodź tego: punkt 8.5.
 
+**Uwaga przy włączonym `config/lanes.toml`:** próba DE40 (bez `--epic`) działa tak samo jak dotąd, a to znaczy, że z włączonymi pasmami zatrzymuje się w kroku [2] z powodem bramki portfelowej `PORTFOLIO_UNMANAGED_EXPOSURE` i nic nie wysyła. Próbę DE40 rób przy `enabled = false` w `config/lanes.toml` (albo bez tego pliku); próbę pasma opisuje punkt 5.1.
+
+### 5.1 Próba pasma z celem: `smoke --epic US500`
+
+**To jest prawdziwa transakcja na instrumencie pasma (US500, w USD).** Próba wysyła jedno zlecenie rynkowe US500 o wielkości **0,01** (minimalna wielkość pasma) **ze stopem i celem zysku** naraz, trzyma pozycję `--hold` sekund (domyślnie 20, najmniej 15), potem sprawdza na niej założenia o brokerze, zamyka ją przez silnik i wypisuje blok `USTALENIA O BROKERZE`. Rozstrzyga cztery niepotwierdzone założenia, od których zależy uzbrojenie pasma:
+
+- **C5**: czy broker pokazuje cel (take profit) w `GET /positions` i `GET /confirms`, pod jakimi nazwami pól, i czy odległość celu liczy się od ceny wykonania;
+- **C5d**: czy zmiana samego stopu (`PUT` bez celu) kasuje cel;
+- **C7**: jaką przyczynę zamknięcia broker zapisuje w historii (zamknięcie przez API ma być `USER`, czyli `MANUAL`);
+- **C8**: w jakiej walucie i jaką kwotą broker rozlicza wynik US500 na rachunku w EUR.
+
+Koszt: spread i poślizg przy 0,01, czyli kilka centów USD (stop to średni zakres świecy 5-minutowej, rzędu kilku punktów; 1 punkt przy 0,01 to 0,01 USD). Cel leży w odległości 1,5 × stop (z pliku pasma), czyli dalej, niż cena zwykle przechodzi w kilkanaście sekund; gdyby cel albo stop zadziałał w trakcie, próba to rozpozna i i tak zakończy się zamknięciem.
+
+Próba **nie zamraża** odcisku pasma, **nie uzbraja** pasma i **nie zmienia** jego trybu (po próbie `status --epic US500` nadal pokazuje `dry_run` z tym samym powodem). Zlecenie ma rolę `smoke`: nie zużywa wejść dnia pasma ani nie liczy się do jego sesji.
+
+#### Warunki wstępne (wszystkie)
+
+- Próba DE40 z punktu 5 wykonana i zaliczona (ścieżka zleceń, zamknięcia i księgowania jest już potwierdzona).
+- Na serwerze `config/lanes.toml` z `enabled = true` i pasmem US500, `config/portfolio.toml` i `config/lane_us500_b1_m5.toml` (punkt 6.1). Zamrożony odcisk pasma **nie jest potrzebny**.
+- Proces uzbrojony na czas próby dokładnie jak w punkcie 5 („Procedura”): `live_allowed = true` i plik `data/ARM_LIVE`, powiązany rachunek, zgodny odcisk DE40 v1. `status` ma pokazać `mode (files): live (all arming conditions met)`.
+- `status` pokazuje `kill switch: NONE`, a w aplikacji Capital.com nie ma **żadnej** otwartej pozycji (ani US500, ani DE40, ani innej): pozycja na instrumencie bez pasma blokuje każde wejście (`PORTFOLIO_UNMANAGED_EXPOSURE`), a pozycja US500 blokuje próbę.
+- W dzienniku nie ma transakcji czekającej na rozliczenie w EUR (`status --epic US500` bez wzmianki o oczekującym wyniku).
+- Godzina: dzień sesji NYSE, najlepiej **17:00 do 21:00 czasu Berlina** (płynny rynek US500); nie w pierwszych 15 minutach po 15:30 ani po 21:50.
+- Aplikacja Capital.com otwarta na ekranie pozycji (US500 dodany do obserwowanych) i odświeżana.
+
+#### Polecenie
+
+Silnik zatrzymany (jak w punkcie 5), proces uzbrojony na czas próby. Uruchom próbę z trzymaniem pozycji 30 sekund (wystarczy na obejrzenie stopu i celu w aplikacji; dopuszczalne 15 do 600):
+
+```bash
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock smoke --epic US500 --hold 30
+```
+
+**Nie przerywaj polecenia** (bez Ctrl+C). Gdyby jednak zostało przerwane, program sam zamyka pozycję próby i pisze `INFO [7] the probe position closed after the interrupt ...`; gdy nie może (np. zamknięty rynek), pisze głośną linię `FAIL [7] LOUD: the probe position left open with its stop (and target) ...`. Wtedy działa reguła przerwania z punktu 5: zdejmij uzbrojenie i zamknij pozycję ręcznie w aplikacji.
+
+#### Co zobaczysz
+
+Wydruk nie zawiera numerów transakcji, referencji ani numeru rachunku. Kroki:
+
+- `INFO [0]`: tryb pasma (`dry_run` z powodem, np. `LANE_PREREGISTRATION_NOT_FROZEN`) i przypomnienie, że próba go nie zmienia;
+- `[1]` rachunek; `[2]` wejście przyjęte: wielkość, poziom otwarcia, poziom stopu i celu (z dopiskiem, czy podało je API, czy silnik wyliczył je z żądania) oraz żądane odległości stopu i celu; `[3]` pozycja widoczna ze stopem i celem, potem odliczanie `holding ... s more`;
+- `[4]` surowe pola celu z `GET /positions` i `GET /confirms` (linie `INFO [4] ... target fields: ...; other fields: ...`);
+- `[5]` zmiana ochrony ze stopem i celem naraz; **cel przesuwa się o jeden krok (0,1 pkt) bliżej** ceny, żeby zmiana była prawdziwa;
+- `[6]` zmiana samego stopu (ten sam poziom), odczyt, czy cel przetrwał (`target after it: kept`, `removed` albo `not shown by the API`), i przywrócenie celu;
+- `[7]` zamknięcie przez silnik; `[8]` pozycja zniknęła, transakcja zaksięgowana w USD, a linia `INFO [8] broker close reason: ...` podaje przyczynę z historii brokera; `[9]` wynik w EUR z szacunku kursu EURUSD brokera (`ESTIMATED_FX`); `[10]` drugie zamknięcie odrzucone jako „nie znaleziono” (wymagane);
+- `INFO [11]` wiersze historii transakcji z okresu próby (typ, kwota, waluta) oraz saldo przed i po;
+- wynik `PASS smoke --epic US500: 10/10 checks passed` albo `FAIL ...`, a pod nim blok `USTALENIA O BROKERZE` z liniami `C5`, `C5d`, `C7`, `C8`, każda ze statusem **POTWIERDZONE**, **ROZBIEŻNE** albo **NIE USTALONO** i szczegółami.
+
+`ROZBIEŻNE` nie jest awarią próby: to ustalenie, że broker zachowuje się inaczej, niż zakłada adapter (np. API nie pokazuje celu w `GET /positions`). `NIE USTALONO` znaczy, że ta próba nie mogła tego rozstrzygnąć (np. cena wykonania równa notowaniu, więc punktu odniesienia celu nie da się rozróżnić, albo wiersz wyniku nie pojawił się jeszcze w historii transakcji); wtedy liczy się Twój odczyt z aplikacji. Jeśli krok `[2]` kończy się `FAIL [2] no valid quote of the portfolio FX pair ...` albo `... (gate: ... FX_UNAVAILABLE ...)`, nic nie zostało wysłane: broker nie podał kursu EURUSD (nazwa instrumentu pary w `config/portfolio.toml`, pytanie 9); zgłoś to Claude.
+
+#### Co sprawdzasz w aplikacji Capital.com (w czasie `--hold` i zaraz po próbie)
+
+1. Pozycja US500 0,01 ma **stop loss i take profit**. Zapisz oba poziomy i porównaj z `stop level` i `target level` z kroku `[2]`.
+2. Po kroku `[5]` take profit przesunął się o 0,1 pkt bliżej ceny (np. z 7592,9 na 7592,8). Zapisz, czy to widzisz.
+3. Po kroku `[6]` take profit **nadal jest** przy pozycji (to jest C5d widziane w aplikacji; w historii aktywności zmiany stopu i celu mają typ w rodzaju „edycja stop/limit”).
+4. Po próbie, w historii: **dokładnie jedna** transakcja US500 0,01, otwarta i zamknięta, i **żadnej** otwartej pozycji.
+5. W historii transakcji (rozliczenia) przy tej transakcji: **waluta i kwota wyniku** (EUR czy USD) oraz ewentualne osobne wiersze przewalutowania albo prowizji walutowej. Porównaj z linią `C8` i z saldem rachunku przed i po.
+
+#### Co wkleić Claude
+
+- **Cały wydruk** od linii `INFO [0]` do ostatniej linii bloku `USTALENIA O BROKERZE` (wydruk nie zawiera identyfikatorów ani numeru rachunku, więc można go wkleić w całości).
+- Twoje odczyty z aplikacji z punktów 1 do 5 powyżej: poziomy stopu i celu, czy cel przesunął się w kroku 5 i przetrwał krok 6, waluta i kwota wyniku w historii transakcji, saldo przed i po. **Bez** numeru rachunku i numerów transakcji.
+
+#### Po próbie
+
+Dokładnie jak w punkcie 5 („Po próbie”): zdejmij uzbrojenie (usuń plik `data/ARM_LIVE` i ustaw `live_allowed = false` tymi samymi poleceniami), sprawdź `status` i dodatkowo stan pasma:
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock status --epic US500
+```
+
+Ma być: pasmo w `dry_run` (ten sam powód co przed próbą), pozycja US500 `FLAT`, `kill switch: NONE`. Jeśli krok `[9]` był `FAIL` (brak kursu przy rozliczeniu), wynik czeka na rozliczenie w EUR i do tego czasu wejścia wszystkich pasm są zablokowane: rozliczy go silnik z włączonym `config/lanes.toml` przy najbliższym uzgadnianiu z ważnym kursem; zgłoś to Claude. Po nieudanym kroku `[10]` jest `kill switch: SOFT` (`SMOKE_SECOND_CLOSE_UNEXPECTED`): zdejmij go (`clear-kill`) dopiero po wyjaśnieniu z Claude. Uzbrojenie pasma (zamrożenie odcisku, punkt 6.1) to osobna decyzja, dopiero po omówieniu ustaleń.
+
 ---
 
 ## 6. Uzbrajanie (live)
