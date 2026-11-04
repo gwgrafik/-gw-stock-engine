@@ -4,6 +4,10 @@ cel pozycji w potwierdzeniu i na liście, `set_protection`, zamknięcie przez ce
 Adapter rozmawia wyłącznie z lokalnym serwerem `fake_capital_server` (127.0.0.1); prawdziwa sieć nie jest używana.
 Wspólne pomocnicze funkcje (`entry`, `open_confirmed`, `position_item`, ...) pochodzą z `test_capitalcom_trading`.
 Czas: zegar testu startuje 2026-11-02 07:30:00 UTC (jak w części 2).
+
+Pola celu są czytane i walidowane WYŁĄCZNIE dla epików z `target_epics` adaptera (pasma z celem). Fixture `broker` to
+adapter z `target_epics={"DE40"}` (DE40 gra tu rolę instrumentu pasma z celem), `plain_broker` to adapter bez
+`target_epics` (DE40 v1 i pozycje ręczne właściciela: pola celu są ignorowane, dokładnie jak w kodzie sprzed celu).
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from gwstock.types import (
     TargetedEntryRequest,
     TargetedOpenPosition,
 )
-from tests.unit.fake_capital_server import MARKET_CLOSED_CODE
+from tests.unit.fake_capital_server import MARKET_CLOSED_CODE, us500_market
 from tests.unit.test_capitalcom_trading import (
     BID,
     OFFER,
@@ -46,21 +50,33 @@ def server(fake_capital_server):
     return fake_capital_server
 
 
-@pytest.fixture
-def broker(capital_broker):
-    return capital_broker
+TARGET_EPICS = frozenset({"DE40"})
 
 
 @pytest.fixture
 def make_broker(fake_capital_server, capital_credentials, capital_http, clock):
-    """Nowa instancja adaptera (np. „po restarcie”: bez pamięci własnych żądań) na tym samym serwerze."""
+    """Nowa instancja adaptera (np. „po restarcie”: bez pamięci własnych żądań) na tym samym serwerze; domyślnie z
+    `target_epics={"DE40"}` (pasmo z celem), `target_epics=()` daje adapter bez pasm z celem."""
 
     def make(**kwargs):
+        kwargs.setdefault("target_epics", TARGET_EPICS)
         return CapitalComBroker(
             capital_credentials, capital_http, clock, base_url=fake_capital_server.base_url, **kwargs
         )
 
     return make
+
+
+@pytest.fixture
+def broker(make_broker):
+    """Adapter z celem dla DE40 (rola: instrument pasma z celem)."""
+    return make_broker()
+
+
+@pytest.fixture
+def plain_broker(make_broker):
+    """Adapter bez pasm z celem: DE40 v1 i pozycje ręczne właściciela."""
+    return make_broker(target_epics=())
 
 
 # =============================================================================================================
@@ -372,7 +388,7 @@ async def test_target_keys_seen_in_a_list_also_disable_derivation_for_other_posi
     assert (again.target_level, again.target_derived) == (None, False)
 
 
-async def test_a_manual_target_set_by_the_owner_on_a_plain_position_is_reported(server, broker):
+async def test_a_manual_target_set_by_the_owner_on_a_position_of_a_target_instrument_is_reported(server, broker):
     server.position_target_keys = "when-set"
     await broker.login()
     await open_confirmed(broker)  # wejście bez celu (DE40 v1)
@@ -420,13 +436,13 @@ def test_position_row_requires_the_target_flags():
     ],
 )
 def test_parse_position_reads_the_target_like_the_stop(changes, expected):
-    row = capitalcom_parse.parse_position(position_item(**changes))
+    row = capitalcom_parse.parse_position(position_item(**changes), target_epics=TARGET_EPICS)
     assert (row.target_reported, row.target_level, row.target_level_reported) == expected
 
 
 def test_parse_position_target_distance_of_a_sell_is_below_the_level():
     item = position_item(position__direction="SELL", position__profitDistance=Decimal("40.5"))
-    assert capitalcom_parse.parse_position(item).target_level == OFFER - Decimal("40.5")
+    assert capitalcom_parse.parse_position(item, target_epics=TARGET_EPICS).target_level == OFFER - Decimal("40.5")
 
 
 @pytest.mark.parametrize(
@@ -443,7 +459,7 @@ def test_parse_position_target_distance_of_a_sell_is_below_the_level():
 )
 def test_parse_position_rejects_a_malformed_target(changes):
     with pytest.raises(capitalcom_parse.ParseError, match="profit"):
-        capitalcom_parse.parse_position(position_item(**changes))
+        capitalcom_parse.parse_position(position_item(**changes), target_epics=TARGET_EPICS)
 
 
 async def test_list_positions_with_a_malformed_target_is_a_broker_error(server, broker):
@@ -458,14 +474,15 @@ def test_parse_opening_reads_the_profit_level_of_the_confirmation():
         "affectedDeals": [{"dealId": "D-1", "status": "OPENED"}], "dealId": "W-1", "epic": "DE40",
         "direction": "BUY", "size": Decimal("0.001"), "level": OFFER,
     }  # fmt: skip
-    plain = capitalcom_parse.parse_opening(dict(base))
+    parse = lambda payload: capitalcom_parse.parse_opening(payload, target_epics=TARGET_EPICS)  # noqa: E731
+    plain = parse(dict(base))
     assert (plain.target_reported, plain.target_level) == (False, None)
-    shown = capitalcom_parse.parse_opening({**base, "profitLevel": Decimal("25827.3")})
+    shown = parse({**base, "profitLevel": Decimal("25827.3")})
     assert (shown.target_reported, shown.target_level) == (True, Decimal("25827.3"))
-    null = capitalcom_parse.parse_opening({**base, "profitLevel": None})
+    null = parse({**base, "profitLevel": None})
     assert (null.target_reported, null.target_level) == (True, None)
     with pytest.raises(capitalcom_parse.ParseError, match="profitLevel"):
-        capitalcom_parse.parse_opening({**base, "profitLevel": Decimal("-1")})
+        parse({**base, "profitLevel": Decimal("-1")})
 
 
 # --- set_protection: stop i cel w jednym PUT -----------------------------------------------------------------
@@ -679,7 +696,8 @@ async def test_set_protection_with_a_none_target_rejects_a_confirmation_that_sti
     await broker.login()
     _, pos = await open_targeted(broker)
     ref = f"p_{pos.deal_id}"
-    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "profitLevel": pos.target_level,
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "epic": "DE40",
+                                               "profitLevel": pos.target_level,
                                                "affectedDeals": [{"dealId": pos.deal_id, "status": "AMENDED"}]})  # fmt: skip
     with pytest.raises(BrokerError) as info:
         await broker.set_protection(pos.deal_id, NEW_STOP, None)
@@ -900,3 +918,275 @@ async def test_closing_by_our_delete_after_a_set_protection_is_manual(server, br
     await broker.close_position(pos.deal_id)
     [closed] = await broker.closed_since(pos.opened_at)
     assert closed.reason == "MANUAL"
+
+
+# =============================================================================================================
+# `target_epics`: pola celu tylko dla instrumentów pasm z celem (poprawka po przeglądzie). GET /positions zwraca
+# WSZYSTKIE pozycje rachunku, więc dziwna wartość pola celu na pozycji DE40 v1 albo na ręcznej pozycji właściciela
+# nie może psuć odczytu: dla epików spoza `target_epics` adapter zachowuje się jak kod sprzed celu (pola celu nie są
+# czytane ani walidowane, wynik to zwykły `OpenPosition` bez celu). Ścisłość zostaje dla epików z `target_epics`.
+# =============================================================================================================
+
+# wartości kluczy celu, których kod sprzed celu w ogóle nie widział: zero, ujemna, napis, null, dodatnia, zły typ
+STRANGE = [
+    Decimal("0"),
+    Decimal("-5"),
+    "abc",
+    "25900.0",
+    None,
+    Decimal("25900.0"),
+    True,
+    [1],
+    {"a": 1},
+]
+STRANGE_IDS = ["zero", "negative", "text", "numeric-text", "null", "positive", "bool", "list", "object"]
+PROFIT_KEYS = ["profitLevel", "profitDistance"]
+
+
+def test_target_epics_default_to_empty_and_are_validated(capital_credentials, capital_http, clock):
+    assert CapitalComBroker(capital_credentials, capital_http, clock)._target_epics == frozenset()
+    assert CapitalComBroker(capital_credentials, capital_http, clock, target_epics=["US500", "DE40"])._target_epics == (
+        frozenset({"US500", "DE40"})
+    )
+    for bad in ("US500", b"US500", 5, [5], ["US/500"], [""], [None]):
+        with pytest.raises((TypeError, ValueError)):
+            CapitalComBroker(capital_credentials, capital_http, clock, target_epics=bad)
+
+
+# --- parsery: epik spoza zbioru = pola celu ignorowane ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", PROFIT_KEYS)
+@pytest.mark.parametrize("value", STRANGE, ids=STRANGE_IDS)
+def test_parse_position_ignores_target_fields_of_an_epic_outside_target_epics(key, value):
+    item = position_item(**{f"position__{key}": value})
+    for epics in (None, frozenset(), frozenset({"US500"})):  # domyślnie, pusty zbiór, zbiór bez DE40
+        row = (
+            capitalcom_parse.parse_position(item)
+            if epics is None
+            else capitalcom_parse.parse_position(item, target_epics=epics)
+        )
+        assert (row.target_reported, row.target_level, row.target_level_reported) == (False, None, False)
+
+
+def test_parse_position_reads_the_target_of_an_epic_inside_target_epics_strictly():
+    item = position_item(position__profitLevel=Decimal("-5"))
+    with pytest.raises(capitalcom_parse.ParseError, match="profitLevel"):
+        capitalcom_parse.parse_position(item, target_epics={"DE40"})
+    item["market"]["epic"] = "US500"  # ta sama pozycja na innym instrumencie: ignorowana
+    assert capitalcom_parse.parse_position(item, target_epics={"DE40"}).target_reported is False
+    with pytest.raises(capitalcom_parse.ParseError, match="profitLevel"):
+        capitalcom_parse.parse_position(item, target_epics={"US500"})
+
+
+def test_parse_positions_with_a_strange_foreign_target_does_not_spoil_the_other_rows():
+    good = position_item()
+    foreign = position_item(position__dealId="D-2", position__profitLevel="abc", market__epic="US500")
+    rows = capitalcom_parse.parse_positions({"positions": [good, foreign]}, target_epics={"DE40"})
+    assert [(r.deal_id, r.target_reported) for r in rows] == [("D-1", False), ("D-2", False)]
+    with pytest.raises(capitalcom_parse.ParseError, match="profitLevel"):
+        capitalcom_parse.parse_positions({"positions": [good, foreign]}, target_epics={"US500"})
+    assert [r.target_reported for r in capitalcom_parse.parse_positions({"positions": [good, foreign]})] == [False, False]
+
+
+@pytest.mark.parametrize("value", STRANGE, ids=STRANGE_IDS)
+def test_parse_opening_ignores_the_profit_level_of_an_epic_outside_target_epics(value):
+    base = {
+        "affectedDeals": [{"dealId": "D-1", "status": "OPENED"}], "dealId": "W-1", "epic": "DE40",
+        "direction": "BUY", "size": Decimal("0.001"), "level": OFFER, "profitLevel": value,
+    }  # fmt: skip
+    for kwargs in ({}, {"target_epics": frozenset()}, {"target_epics": {"US500"}}):
+        opening = capitalcom_parse.parse_opening(dict(base), **kwargs)
+        assert (opening.target_reported, opening.target_level) == (False, None)
+
+
+def test_parse_opening_reads_the_profit_level_of_an_epic_inside_target_epics_strictly():
+    base = {
+        "affectedDeals": [{"dealId": "D-1", "status": "OPENED"}], "dealId": "W-1", "epic": "DE40",
+        "direction": "BUY", "size": Decimal("0.001"), "level": OFFER, "profitLevel": "abc",
+    }  # fmt: skip
+    with pytest.raises(capitalcom_parse.ParseError, match="profitLevel"):
+        capitalcom_parse.parse_opening(base, target_epics={"DE40"})
+
+
+# --- adapter bez pasm z celem: DE40 v1 jak w kodzie sprzed celu -------------------------------------------------
+
+
+@pytest.mark.parametrize("key", PROFIT_KEYS)
+@pytest.mark.parametrize("value", STRANGE, ids=STRANGE_IDS)
+async def test_confirm_of_a_plain_entry_ignores_strange_target_fields_of_the_position(server, plain_broker, key, value):
+    await plain_broker.login()
+    ack = await plain_broker.open_position(entry())
+    deal_id = only_position(server).deal_id
+    item = server._position_item(only_position(server))
+    item["position"][key] = value
+    server.fail_next(f"/positions/{deal_id}", 200, item, method="GET")
+    pos = await plain_broker.confirm(ack.deal_reference)
+    assert type(pos) is OpenPosition and (pos.target_level, pos.target_derived) == (None, False)
+    assert (pos.stop_level, pos.stop_derived) == (OFFER - 30, True)  # reszta migawki jak dotąd
+
+
+@pytest.mark.parametrize("value", STRANGE, ids=STRANGE_IDS)
+async def test_confirm_of_a_plain_entry_ignores_a_strange_profit_level_in_the_confirmation(server, plain_broker, value):
+    await plain_broker.login()
+    ack = await plain_broker.open_position(entry())
+    payload = dict(server.confirms[ack.deal_reference])
+    payload["profitLevel"] = value
+    server.fail_next(f"/confirms/{ack.deal_reference}", 200, payload)
+    pos = await plain_broker.confirm(ack.deal_reference)
+    assert type(pos) is OpenPosition and (pos.target_level, pos.target_derived) == (None, False)
+
+
+@pytest.mark.parametrize("key", PROFIT_KEYS)
+@pytest.mark.parametrize("value", STRANGE, ids=STRANGE_IDS)
+async def test_list_positions_ignores_strange_target_fields_of_every_position(server, plain_broker, key, value):
+    await plain_broker.login()
+    ours = position_item()
+    foreign = position_item(position__dealId="D-2", position__workingOrderId="W-2", market__epic="US500")
+    ours["position"][key] = value  # nasza pozycja DE40
+    foreign["position"][key] = value  # i pozycja ręczna właściciela na innym instrumencie
+    server.fail_next("/positions", 200, {"positions": [ours, foreign]}, method="GET")
+    first, second = await plain_broker.list_positions()
+    assert [(type(p), p.epic, p.target_level, p.target_derived) for p in (first, second)] == [
+        (OpenPosition, "DE40", None, False), (OpenPosition, "US500", None, False),
+    ]  # fmt: skip
+
+
+async def test_mixed_list_a_good_de40_position_and_a_foreign_one_with_a_strange_target(server, plain_broker):
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)  # DE40 v1 bez celu
+    foreign = position_item(position__dealId="D-9", position__profitLevel="abc", market__epic="US500")
+    foreign["position"]["profitDistance"] = Decimal("-1")
+    server.fail_next("/positions", 200, {"positions": [server._position_item(only_position(server)), foreign]}, method="GET")
+    listed = await plain_broker.list_positions()
+    assert listed[0] == pos and type(listed[0]) is OpenPosition
+    assert [(p.deal_id, type(p), p.target_level) for p in listed[1:]] == [("D-9", OpenPosition, None)]
+
+
+async def test_a_manual_target_of_the_owner_is_not_reported_by_an_adapter_without_target_epics(server, plain_broker):
+    server.position_target_keys = "when-set"
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    only_position(server).target_level = OFFER + 100  # właściciel dodał cel ręcznie do pozycji DE40 v1
+    [listed] = await plain_broker.list_positions()
+    assert type(listed) is OpenPosition and (listed.target_level, listed.target_derived) == (None, False)
+    assert listed == pos  # identycznie jak przed ręcznym celem
+
+
+@pytest.mark.parametrize("keys", ["present", "null", "when-set", "distance"])
+async def test_a_plain_adapter_never_sees_target_keys_in_any_mode(server, plain_broker, keys):
+    server.position_target_keys = keys
+    server.confirm_target_keys = True
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    only_position(server).target_level = OFFER + 100
+    [listed] = await plain_broker.list_positions()
+    assert type(pos) is OpenPosition and type(listed) is OpenPosition
+    assert plain_broker._target_keys_seen is False and plain_broker._deal_targets == {}
+
+
+async def test_target_keys_of_another_epic_do_not_hide_the_derived_target_of_a_target_epic(server, make_broker):
+    server.markets["US500"] = us500_market()
+    broker = make_broker(target_epics={"US500"})
+    await broker.login()
+    ack = await broker.open_position(targeted(epic="US500", size="0.01", stop="30", target="45"))
+    pos = await broker.confirm(ack.deal_reference)
+    assert (pos.target_level, pos.target_derived) == (Decimal("6800.6") + 45, True)
+    item = server._position_item(only_position(server))
+    manual = position_item(position__dealId="D-9", position__profitLevel=Decimal("25900.0"))  # DE40: ręczny cel
+    server.fail_next("/positions", 200, {"positions": [item, manual]}, method="GET")
+    us, de = await broker.list_positions()
+    assert broker._target_keys_seen is False  # klucze celu DE40 (spoza zbioru) nie liczą się jako "broker je pokazuje"
+    assert (type(us), us.target_level, us.target_derived) == (TargetedOpenPosition, Decimal("6800.6") + 45, True)
+    assert (type(de), de.target_level) == (OpenPosition, None)
+
+
+async def test_a_target_instrument_stays_strict_while_a_foreign_position_is_not(server, make_broker):
+    server.markets["US500"] = us500_market()
+    broker = make_broker(target_epics={"US500"})
+    await broker.login()
+    de40 = position_item(position__profitLevel="abc")
+    us500 = position_item(position__dealId="D-2", position__profitLevel="abc", market__epic="US500")
+    server.fail_next("/positions", 200, {"positions": [de40]}, method="GET")
+    [listed] = await broker.list_positions()  # DE40 spoza zbioru: dziwny cel ignorowany
+    assert type(listed) is OpenPosition
+    server.fail_next("/positions", 200, {"positions": [de40, us500]}, method="GET")
+    with pytest.raises(BrokerError, match="profitLevel") as info:  # instrument pasma: ścisłość jak dotąd
+        await broker.list_positions()
+    assert type(info.value) is BrokerError
+
+
+async def test_a_targeted_entry_on_an_epic_outside_target_epics_is_refused_before_sending(server, plain_broker):
+    await plain_broker.login()
+    with pytest.raises(ValueError, match="target_epics"):
+        await plain_broker.open_position(targeted())
+    assert server.count("POST", "/positions") == 0 and server.positions == {}
+
+
+async def test_a_plain_entry_body_is_the_same_with_and_without_target_epics(server, plain_broker, broker, clock):
+    await plain_broker.login()
+    await plain_broker.open_position(entry(Side.BUY, size="0.001", stop="30.0"))
+    server.positions.clear()
+    clock.advance(1)  # limit logowań na klucz API
+    await broker.login()
+    await broker.open_position(entry(Side.BUY, size="0.001", stop="30.0"))
+    first, second = server.requests("POST", "/positions")
+    assert first.raw == second.raw == PLAIN_BUY_BODY
+
+
+async def test_set_stop_ignores_strange_target_fields_of_the_position_it_reads_back(server, plain_broker):
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    item = server._position_item(only_position(server))
+    item["position"]["profitLevel"] = "abc"
+    item["position"]["profitDistance"] = Decimal("-1")
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")  # odczyt kontrolny po PUT
+    await plain_broker.set_stop(pos.deal_id, NEW_STOP)
+    assert only_position(server).stop_level == NEW_STOP
+
+
+async def test_set_stop_on_a_target_epic_still_reads_the_target_strictly(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    item = server._position_item(only_position(server))
+    item["position"]["profitLevel"] = "abc"
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")
+    with pytest.raises(BrokerError, match="profitLevel"):
+        await broker.set_stop(pos.deal_id, NEW_STOP)
+
+
+async def test_set_protection_with_a_target_on_a_position_outside_target_epics_is_a_loud_error(server, plain_broker):
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    with pytest.raises(BrokerError, match="target_epics") as info:
+        await plain_broker.set_protection(pos.deal_id, NEW_STOP, NEW_TARGET)
+    assert type(info.value) is BrokerError
+
+
+async def test_set_protection_without_a_target_on_a_position_outside_target_epics_ignores_target_fields(
+    server, plain_broker
+):
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    item = server._position_item(only_position(server))
+    item["position"]["profitLevel"] = "abc"
+    server.fail_next(f"/positions/{pos.deal_id}", 200, item, method="GET")
+    await plain_broker.set_protection(pos.deal_id, NEW_STOP, None)  # jak set_stop: pola celu poza zbiorem są nieistotne
+    assert only_position(server).stop_level == NEW_STOP
+
+
+async def test_the_amendment_confirmation_of_a_plain_epic_may_carry_any_profit_level(server, plain_broker):
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    ref = f"p_{pos.deal_id}"
+    server.fail_next(f"/confirms/{ref}", 200, {"dealStatus": "ACCEPTED", "dealReference": ref, "epic": "DE40",
+                                               "profitLevel": "abc",
+                                               "affectedDeals": [{"dealId": pos.deal_id, "status": "AMENDED"}]})  # fmt: skip
+    await plain_broker.set_protection(pos.deal_id, NEW_STOP, None)
+
+
+async def test_close_by_our_delete_does_not_depend_on_target_epics(server, plain_broker):
+    await plain_broker.login()
+    _, pos = await open_confirmed(plain_broker)
+    await plain_broker.close_position(pos.deal_id)
+    assert server.positions == {}

@@ -40,7 +40,10 @@ Zasady:
 - JSON wyłącznie z liczbami `Decimal` (`capitalcom_parse.loads`), czas wyłącznie z pól UTC;
 - waluta instrumentu (zadanie 7, R8): `instrument_rules` odmawia, gdy waluta instrumentu różni się od waluty rachunku
   sesji; wyjątek tylko dla epików z `foreign_currency_epics` konstruktora (pasma w USD), które dostają
-  `InstrumentRules(currency=...)` bez przeliczenia. Rozliczenie wyniku w EUR jest NIEPOTWIERDZONE (research/diag_fx.py).
+  `InstrumentRules(currency=...)` bez przeliczenia. Rozliczenie wyniku w EUR jest NIEPOTWIERDZONE (research/diag_fx.py);
+- cel zysku (zadanie 7): pola celu pozycji i potwierdzeń czyta (ściśle) wyłącznie dla epików z `target_epics`
+  konstruktora (pasma z celem); `GET /positions` zwraca wszystkie pozycje rachunku, więc dziwna wartość pola celu na
+  pozycji DE40 v1 albo ręcznej pozycji właściciela nie może psuć odczytu. Pozostałe epiki: jak kod sprzed celu.
 """
 
 from __future__ import annotations
@@ -452,6 +455,7 @@ class CapitalComBroker(TradingMixin):
         *,
         request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
         foreign_currency_epics: Iterable[str] = (),
+        target_epics: Iterable[str] = (),
     ) -> None:
         if not isinstance(creds, Credentials):
             raise TypeError(f"creds: expected Credentials, got {type(creds).__name__}")
@@ -460,6 +464,12 @@ class CapitalComBroker(TradingMixin):
         # epiki, dla których `instrument_rules` zwraca walutę instrumentu zamiast odmawiać przy walucie innej niż
         # rachunku (pasma w USD, projekt §7); pozostałe instrumenty zachowują się jak w v1
         self._foreign_currency_epics = frozenset(_check_epic(epic) for epic in foreign_currency_epics)
+        if isinstance(target_epics, (str, bytes)):
+            raise TypeError("target_epics: expected a collection of epics, not a single string")
+        # instrumenty pasm Z CELEM: tylko dla nich adapter czyta i ściśle waliduje pola celu (`profitLevel`,
+        # `profitDistance`) pozycji i potwierdzeń oraz przyjmuje `TargetedEntryRequest`; dla każdego innego instrumentu
+        # (DE40 v1, ręczne pozycje właściciela) pola celu są pomijane jak w kodzie sprzed celu
+        self._target_epics = frozenset(_check_epic(epic) for epic in target_epics)
         self._api = api_root(base_url)
         if (
             isinstance(request_timeout_s, bool)

@@ -30,7 +30,11 @@ Zasady:
   klucz `profitLevel`/`profitDistance` w odpowiedzi → wartość brokera (jawny `null` → brak celu), kluczy brak →
   zapis adaptera (wykonanie ± wysłana odległość, `target_derived=True`, sprawdzony z `profitLevel` potwierdzenia),
   a gdy JAKAKOLWIEK odpowiedź pokazała klucze celu, brak klucza znaczy brak celu; pozycja z celem to
-  `TargetedOpenPosition`, bez celu zwykły `OpenPosition`;
+  `TargetedOpenPosition`, bez celu zwykły `OpenPosition`. Pola celu są czytane i walidowane WYŁĄCZNIE dla instrumentów
+  z `target_epics` adaptera (pasma z celem): `GET /positions` zwraca wszystkie pozycje rachunku, więc dziwna wartość
+  pola celu na pozycji DE40 v1 albo ręcznej pozycji właściciela nie może psuć odczytu. Dla każdego innego instrumentu
+  adapter zachowuje się jak kod sprzed celu (pola celu pomijane, zwykły `OpenPosition` bez celu), a
+  `TargetedEntryRequest` na takim instrumencie jest odrzucany przed wysyłką;
 - `close_position`: ZAWSZE `DELETE /positions/{dealId}` (nigdy przeciwne zlecenie), potem `GET /confirms` z
   referencją z odpowiedzi i `GET /positions/{dealId}`: sukces tylko przy ACCEPTED, które przypisuje zamknięcie
   naszemu dealId (`PUT` i `DELETE` dzielą referencję `p_<dealId>`, C3), i 404 pozycji; REJECTED →
@@ -66,6 +70,7 @@ from typing import Any
 from gwstock.broker import capitalcom_history as history
 from gwstock.broker.capitalcom_history import DealRow
 from gwstock.broker.capitalcom_parse import (
+    ALL_EPICS,
     Opening,
     ParseError,
     build,
@@ -168,7 +173,7 @@ def _attempt(parser: Callable[..., Any], *args: Any) -> tuple[Any, str | None]:
 
 class TradingMixin:
     """Część handlowa adaptera. Wymaga od klasy docelowej: `_clock`, `_request`, `_error`, `_scrub`, `_parse`,
-    `_session_account_id`."""
+    `_session_account_id`, `_target_epics` (zbiór instrumentów pasm z celem)."""
 
     def _init_trading(self) -> None:
         self.unknown_close_sources = 0
@@ -218,6 +223,8 @@ class TradingMixin:
             target_distance = req.target_distance
             if not isinstance(target_distance, Decimal) or not target_distance.is_finite() or target_distance <= 0:
                 raise ValueError("open_position: target_distance must be a positive finite Decimal for a targeted entry")
+            if epic not in self._target_epics:  # adapter nie czytałby celu tej pozycji z powrotem: nie otwieramy jej
+                raise ValueError(f"open_position: a targeted entry on {epic} needs {epic} in the adapter's target_epics")
             body["profitDistance"] = target_distance
         payload = await self._request("POST", "/positions", body=body, order=True)
         reference = self._parse("POST /positions", parse_reference, payload)
@@ -241,7 +248,7 @@ class TradingMixin:
             raise self._rejection(reason)
         if status != "ACCEPTED":
             raise self._error(BrokerError, f"{where}: unexpected dealStatus {shown(status)}")
-        opening = self._parse(where, parse_opening, payload)
+        opening = self._parse(where, parse_opening, payload, target_epics=self._target_epics)
         snapshot = await self._snapshot(reference, opening, where)
         _remember(self._snapshots, reference, snapshot)
         return snapshot
@@ -253,7 +260,7 @@ class TradingMixin:
         stop_reported, stop = False, None
         target_reported, target = False, None
         if reply is not None:
-            row = self._parse(f"GET {path}", parse_position, reply)
+            row = self._parse(f"GET {path}", parse_position, reply, target_epics=self._target_epics)
             checks = (
                 ("dealId", row.deal_id == opening.deal_id),
                 ("epic", row.epic == opening.epic),
@@ -277,9 +284,12 @@ class TradingMixin:
         else:  # pozycja już zamknięta (stop, cel, ręcznie): czas otwarcia z wiersza otwarcia w historii
             opened_at = await self._opened_at_from_history(opening, where)
         stop, derived = self._snapshot_stop(reference, opening, where, reply is not None, stop_reported, stop)
-        target, target_derived = self._snapshot_target(
-            reference, opening, where, reply is not None, target_reported, target
-        )
+        if opening.epic in self._target_epics:
+            target, target_derived = self._snapshot_target(
+                reference, opening, where, reply is not None, target_reported, target
+            )
+        else:  # inne instrumenty: jak kod sprzed celu (zwykły OpenPosition bez celu)
+            target, target_derived = None, False
         if target is None:  # bez celu zawsze zwykły `OpenPosition` (DE40 v1: bez zmian)
             snapshot = self._parse(
                 where, build, OpenPosition, "confirm", opening.deal_id, opening.epic, opening.side, opening.size,
@@ -385,7 +395,9 @@ class TradingMixin:
     async def list_positions(self) -> list[OpenPosition]:
         """Wszystkie pozycje aktywnego rachunku (`GET /positions`), w kolejności brokera; stop wg docstringu modułu."""
         where = "GET /positions"
-        rows = self._parse(where, parse_positions, await self._request("GET", "/positions"))
+        rows = self._parse(
+            where, parse_positions, await self._request("GET", "/positions"), target_epics=self._target_epics
+        )
         self._note_stop_keys(rows)
         self._note_target_keys(rows)
         result: list[OpenPosition] = []
@@ -395,7 +407,7 @@ class TradingMixin:
                 stop = self._deal_stops.get(row.deal_id)
                 derived = stop is not None
             target, target_derived = row.target_level, False
-            if not row.target_reported and not self._target_keys_seen:
+            if row.epic in self._target_epics and not row.target_reported and not self._target_keys_seen:
                 target = self._deal_targets.get(row.deal_id)
                 target_derived = target is not None
             if target is None:
@@ -453,11 +465,13 @@ class TradingMixin:
         if payload is None:
             raise self._error(BrokerRejected, POSITION_NOT_FOUND)
         confirmation, problem = await self._outcome(payload)
+        # prośba o cel jest jawna, więc jego pola czytamy ściśle bez względu na instrument; bez celu: jak `set_stop`
+        reads = ALL_EPICS if target_level is not None else self._target_epics
         stop_shown = target_shown = None
         if problem is None:
             stop_shown, problem = _attempt(check_amendment, confirmation, deal_id)
         if problem is None:
-            target_shown, problem = _attempt(amended_target, confirmation)
+            target_shown, problem = _attempt(amended_target, confirmation, reads)
         if problem is None:
             self._check_amendment_levels(where, stop_level, target_level, stop_shown, target_shown)
             reply = None
@@ -468,7 +482,13 @@ class TradingMixin:
             if problem is None:
                 if reply is None:
                     raise self._error(BrokerRejected, POSITION_NOT_FOUND)
-                row = self._parse(f"GET {path}", parse_position, reply)
+                row = self._parse(f"GET {path}", parse_position, reply, target_epics=reads)
+                if target_level is not None and row.epic not in self._target_epics:
+                    raise self._error(
+                        BrokerError,
+                        f"GET {path}: a target was set on {row.epic}, which is not in the adapter's target_epics "
+                        "(its target would not be read back)",
+                    )
                 self._note_stop_keys([row])
                 self._note_target_keys([row])
                 problem = self._check_position_levels(path, deal_id, stop_level, target_level, row)
@@ -572,7 +592,7 @@ class TradingMixin:
             if problem is None:
                 if reply is None:
                     raise self._error(BrokerRejected, POSITION_NOT_FOUND)
-                row = self._parse(f"GET {path}", parse_position, reply)
+                row = self._parse(f"GET {path}", parse_position, reply, target_epics=self._target_epics)
                 self._note_stop_keys([row])
                 # porównujemy tylko `stopLevel` podany wprost; sam `stopDistance` nie mówi, od czego liczono (C6),
                 # ale `null` znaczy brak stopu

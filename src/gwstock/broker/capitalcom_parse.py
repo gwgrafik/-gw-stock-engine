@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -508,7 +508,8 @@ class Opening:
 
     `stop_reported`: potwierdzenie ma klucz `stopLevel` (pole znane z [S3]); `stop_level` to jego wartość (None dla
     jawnego `null`). `target_reported` / `target_level`: to samo dla klucza `profitLevel` (cel zysku, R4;
-    NIEPOTWIERDZONE, że żywe API go zwraca: C5, do sprawdzenia skryptem research/diag_fx.py).
+    NIEPOTWIERDZONE, że żywe API go zwraca: C5, do sprawdzenia skryptem research/diag_fx.py); czytany TYLKO dla
+    instrumentu z `target_epics` (patrz `parse_opening`), dla każdego innego zostaje `False`/None.
     """
 
     order_id: str | None
@@ -521,6 +522,24 @@ class Opening:
     stop_level: Decimal | None = None
     target_reported: bool = False
     target_level: Decimal | None = None
+
+
+class _EveryEpic:
+    """Zbiór „każdy epik” (dla wywołania, które samo prosi o cel: `set_protection` z celem)."""
+
+    def __contains__(self, epic: object) -> bool:
+        return True
+
+
+ALL_EPICS = _EveryEpic()
+"""Wartość `target_epics`: pola celu czytane i walidowane dla każdego instrumentu."""
+
+
+def _reads_target(epic: object, target_epics: Container[str]) -> bool:
+    """Czy pola celu tego instrumentu są czytane. Domyślnie (pusty zbiór) NIE: GET /positions zwraca wszystkie
+    pozycje rachunku, więc dziwna wartość pola celu na pozycji DE40 v1 albo ręcznej pozycji właściciela nie może
+    psuć odczytu. Ścisłość (zła wartość → `ParseError`) dotyczy tylko instrumentów pasm z celem."""
+    return target_epics is ALL_EPICS or (isinstance(epic, str) and epic in target_epics)
 
 
 def _level_key(root: dict[str, Any], key: str, where: str) -> tuple[bool, Decimal | None]:
@@ -542,13 +561,16 @@ def _target_key(root: dict[str, Any], where: str) -> tuple[bool, Decimal | None]
     return _level_key(root, "profitLevel", where)
 
 
-def parse_opening(payload: Any) -> Opening:
+def parse_opening(payload: Any, target_epics: Container[str] = frozenset()) -> Opening:
     """Id pozycji = JEDYNY wpis `affectedDeals`, ze statusem `OPENED` (notatki §2.15, C2); inaczej `ParseError`.
 
     Brak wpisu `OPENED` (np. `AMENDED` przy agregacji z inną pozycją, C15) albo kilka takich wpisów: nie wiadomo,
     którą pozycję utworzyło zlecenie. Jakikolwiek inny wpis obok naszego `OPENED` (np. zlecenie zmniejszyło albo
     zamknęło inną pozycję przy wyłączonym hedgingu, C15): to nie jest czyste wykonanie. W obu przypadkach adapter nie
     zgaduje; wynik zlecenia rozstrzygają menedżer zleceń i uzgadnianie z listy pozycji.
+
+    Klucz `profitLevel` potwierdzenia jest czytany i walidowany TYLKO dla instrumentu (`epic` potwierdzenia) z
+    `target_epics` (pasma z celem); dla każdego innego jest pomijany jak w kodzie sprzed celu.
     """
     root = obj(payload, "")
     affected = items(get(root, "affectedDeals", ""), "affectedDeals")
@@ -566,7 +588,9 @@ def parse_opening(payload: Any) -> Opening:
         )
     order_id = root.get("dealId")
     stop_reported, stop_level = _stop_key(root, "")
-    target_reported, target_level = _target_key(root, "")
+    target_reported, target_level = False, None
+    if _reads_target(root.get("epic"), target_epics):  # tylko instrument pasma z celem; reszta: jak kod sprzed celu
+        target_reported, target_level = _target_key(root, "")
     return Opening(
         order_id=order_id if isinstance(order_id, str) and order_id else None,
         deal_id=opened[0],
@@ -607,11 +631,15 @@ def check_amendment(payload: Any, deal_id: str) -> tuple[bool, Decimal | None]:
     return _stop_key(root, "")
 
 
-def amended_target(payload: Any) -> tuple[bool, Decimal | None]:
+def amended_target(payload: Any, target_epics: Container[str] = frozenset()) -> tuple[bool, Decimal | None]:
     """Klucz `profitLevel` potwierdzenia `PUT` (jak w `Opening`): (czy jest, wartość albo None dla `null`); wywołujący
     porównuje go z żądanym celem (`set_protection`). Że potwierdzenie `PUT` w ogóle niesie `profitLevel`, jest
-    NIEPOTWIERDZONE (pole znane z [S3]); jego brak nie jest błędem."""
-    return _target_key(obj(payload, ""), "")
+    NIEPOTWIERDZONE (pole znane z [S3]); jego brak nie jest błędem. Instrument spoza `target_epics` (epik z klucza
+    `epic` potwierdzenia): klucz ignorowany, jak w `parse_opening`."""
+    root = obj(payload, "")
+    if not _reads_target(root.get("epic"), target_epics):
+        return False, None
+    return _target_key(root, "")
 
 
 @dataclass(frozen=True)
@@ -638,7 +666,7 @@ class PositionRow:
     target_level_reported: bool
 
 
-def parse_position(item: Any, where: str = "") -> PositionRow:
+def parse_position(item: Any, where: str = "", *, target_epics: Container[str] = frozenset()) -> PositionRow:
     """`{position, market}` → `PositionRow`; czas WYŁĄCZNIE z `createdDateUTC` (`createdDate` jest lokalny).
 
     Stop (C5, C24): klucz `stopLevel` obecny → jego wartość (jawny `null` → brak stopu); inaczej klucz
@@ -651,6 +679,11 @@ def parse_position(item: Any, where: str = "") -> PositionRow:
     kluczy i znak `profitDistance` są NIEPOTWIERDZONE (występują w [S3] i w przykładzie zleceń oczekujących, nie w
     oficjalnym przykładzie pozycji; do sprawdzenia skryptem research/diag_fx.py). Wartość niedodatnia albo nie-liczba
     → `ParseError`, jak dla stopu.
+
+    Pola celu są czytane i walidowane TYLKO dla instrumentu (`market.epic`) z `target_epics` (pasma z celem). Dla
+    każdego innego (DE40 v1, ręczne pozycje właściciela) są pomijane bez czytania i walidacji, a wiersz ma
+    `target_reported=False`, dokładnie jak w kodzie sprzed celu: `GET /positions` zwraca WSZYSTKIE pozycje rachunku,
+    więc zła wartość na dowolnej obcej pozycji nie może psuć odczytu pozycji silnika.
     """
     entry = obj(item, where)
     pos_where, market_where = path(where, "position"), path(where, "market")
@@ -668,16 +701,19 @@ def parse_position(item: Any, where: str = "") -> PositionRow:
             stop = level - distance if side is Side.BUY else level + distance
     else:
         reported = False
-    target_reported, target = True, None
-    if "profitLevel" in position:
-        if position["profitLevel"] is not None:
-            target = positive(position, "profitLevel", pos_where)
-    elif "profitDistance" in position:
-        if position["profitDistance"] is not None:
-            profit = positive(position, "profitDistance", pos_where)
-            target = level + profit if side is Side.BUY else level - profit
-    else:
-        target_reported = False
+    target_reported, target = False, None
+    reads_target = _reads_target(market.get("epic"), target_epics)
+    if reads_target:
+        target_reported = True
+        if "profitLevel" in position:
+            if position["profitLevel"] is not None:
+                target = positive(position, "profitLevel", pos_where)
+        elif "profitDistance" in position:
+            if position["profitDistance"] is not None:
+                profit = positive(position, "profitDistance", pos_where)
+                target = level + profit if side is Side.BUY else level - profit
+        else:
+            target_reported = False
     return PositionRow(
         deal_id=ident(position, "dealId", pos_where),
         working_order_id=optional_text(position, "workingOrderId", pos_where),
@@ -691,15 +727,16 @@ def parse_position(item: Any, where: str = "") -> PositionRow:
         stop_level_reported="stopLevel" in position,
         target_reported=target_reported,
         target_level=target,
-        target_level_reported="profitLevel" in position,
+        target_level_reported=reads_target and "profitLevel" in position,
     )
 
 
-def parse_positions(payload: Any) -> list[PositionRow]:
-    """`GET /positions` → wiersze w kolejności brokera; powtórzony `dealId` → `ParseError`."""
+def parse_positions(payload: Any, target_epics: Container[str] = frozenset()) -> list[PositionRow]:
+    """`GET /positions` → wiersze w kolejności brokera; powtórzony `dealId` → `ParseError`. `target_epics`: patrz
+    `parse_position` (pola celu tylko dla pozycji na tych instrumentach)."""
     rows: list[PositionRow] = []
     for i, item in enumerate(items(get(obj(payload, ""), "positions", ""), "positions")):
-        row = parse_position(item, path("positions", i))
+        row = parse_position(item, path("positions", i), target_epics=target_epics)
         if any(r.deal_id == row.deal_id for r in rows):
             raise ParseError(f"positions[{i}].position.dealId: duplicate deal id")
         rows.append(row)

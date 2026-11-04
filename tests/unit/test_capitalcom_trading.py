@@ -150,12 +150,15 @@ class TestCapitalComContract(BrokerContract):
     hook dodatkowo odrzuca NAJBLIŻSZE logowanie (jak broker przy wygasłej sesji, której nie da się odnowić), więc
     adapter musi zgłosić `SessionExpired`, a jawne `login()` potem znowu działa.
 
-    Cel zysku (zadanie 7): `supports_target` i `trigger_target` włączają testy celu z kontraktu na adapterze.
+    Cel zysku (zadanie 7): `supports_target` i `trigger_target` włączają testy celu z kontraktu na adapterze, a
+    `broker` ma `target_epics` z instrumentem kontraktu (pasmo z celem): pola celu czyta tylko dla niego.
     """
 
     @pytest.fixture
-    def broker(self, capital_broker):
-        return capital_broker
+    def broker(self, fake_capital_server, capital_credentials, capital_http, clock):
+        return CapitalComBroker(
+            capital_credentials, capital_http, clock, base_url=fake_capital_server.base_url, target_epics=[self.epic]
+        )
 
     @pytest.fixture
     def close_market(self, fake_capital_server):
@@ -2156,12 +2159,14 @@ class TestCapitalComContractWithStopKeys(TestCapitalComContract):
     """Kontrakt także wtedy, gdy broker pokazuje klucze stopu: asercje stopu porównują wartość brokera, nie nasz zapis."""
 
     @pytest.fixture
-    def broker(self, capital_broker, fake_capital_server):
+    def broker(self, fake_capital_server, capital_credentials, capital_http, clock):
         fake_capital_server.position_stop_keys = "present"
         fake_capital_server.confirm_stop_keys = True
         fake_capital_server.position_target_keys = "present"  # cel też od brokera, nie z naszego zapisu
         fake_capital_server.confirm_target_keys = True
-        return capital_broker
+        return CapitalComBroker(
+            capital_credentials, capital_http, clock, base_url=fake_capital_server.base_url, target_epics=[self.epic]
+        )
 
 
 async def test_stop_keys_mode_reports_the_brokers_stop_not_ours(server, broker):
