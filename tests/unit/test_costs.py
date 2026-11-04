@@ -68,9 +68,18 @@ def test_stop_exit_adds_extra_slippage():
     assert b.net_pnl == D("5.34")  # 6.00 − 0.36 − 0.30
 
 
-@pytest.mark.parametrize("reason", ["MANUAL", "FORCED"])
+@pytest.mark.parametrize("reason", ["MANUAL", "FORCED", "TARGET"])
 def test_only_stop_gets_extra_slippage(reason):
     assert model.compute(facts(exit_reason=reason)).slippage_penalty == D("0.10")
+
+
+def test_target_exit_pays_only_entry_slippage_and_half_spreads():
+    """Wyjście celem zysku (pasma z celem, R4) to zlecenie z limitem: bez dodatkowego poślizgu stopu, jak w badaniach
+    (`research/candle_strategies.run`: wyjście celem kosztuje połowę spreadu)."""
+    b = model.compute(facts(exit_reason="TARGET"))
+    assert parts(b) == (D("6.00"), D("0.36"), D("0.10"), D("0.00"), D("0.00"), D("5.54"))
+    stop = model.compute(facts(exit_reason="STOP"))
+    assert stop.slippage_penalty - b.slippage_penalty == D("0.20")  # 1.0 pkt × 0.2 tylko dla STOP
 
 
 def test_spread_cost_never_below_quoted_spread_when_fills_are_at_mid():

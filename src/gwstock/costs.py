@@ -4,7 +4,8 @@ Zasady:
 - `gross_pnl` liczony na cenach **mid** (decyzji i wyjścia), a nie na wypełnieniach;
 - `spread_cost = max(koszt zrealizowany w wypełnieniach, koszt modelowy z notowanych spreadów)`,
   więc nigdy nie jest niższy niż model z notowań (poprawa ceny w wypełnieniu nie zmniejsza kosztu);
-- `slippage_penalty` = poślizg wejścia (+ dodatkowy poślizg, gdy wyjście to STOP) z konfiguracji;
+- `slippage_penalty` = poślizg wejścia (+ dodatkowy poślizg, gdy wyjście to STOP) z konfiguracji; wyjście celem
+  zysku (TARGET, pasma z celem) to zlecenie z limitem, więc bez dodatkowego poślizgu (jak w badaniach);
 - finansowanie w v1 to zawsze 0,00; pozycja trzymana przez noc nie przewraca liczenia, tylko dostaje notatkę
   `FINANCING_NOT_MODELLED` (księgowanie zamkniętej transakcji nie może się nie udać);
 - `fees` to markup walutowy `fx_markup × |gross_pnl|` (stosowany do przeliczanego wyniku), tylko gdy
@@ -87,7 +88,7 @@ class TradeFacts:
     """Fakty jednej zamkniętej transakcji.
 
     `mid_*` to środek notowania (decyzji i wyjścia), `*_fill` to ceny wypełnień od brokera, `spread_*` to
-    notowany spread (ask − bid) w chwili wejścia i wyjścia. `exit_reason` ∈ {"STOP", "MANUAL", "FORCED"}
+    notowany spread (ask − bid) w chwili wejścia i wyjścia. `exit_reason` ∈ {"STOP", "MANUAL", "FORCED", "TARGET"}
     (jak `ClosedDeal.reason`), `nights_held` to liczba nocy z otwartą pozycją.
     """
 
@@ -180,7 +181,7 @@ class CostModel:
                 spread = max(realized, modeled)
 
                 slippage_points = cfg.entry_slippage_points
-                if t.exit_reason == "STOP":
+                if t.exit_reason == "STOP":  # TARGET (zlecenie z limitem) i wyjścia wywołaniem: bez dodatku
                     slippage_points += cfg.stop_exit_extra_slippage_points
                 slippage = slippage_points * per_point
 
