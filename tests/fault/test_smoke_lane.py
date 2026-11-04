@@ -538,9 +538,9 @@ async def test_a_journal_error_while_resolving_an_unknown_entry_still_closes_the
 
 # --- wątpliwość w trakcie wstrzymania (przegląd S2) ------------------------------------------------------------------
 #
-# OCZEKIWANE: wstrzymanie przerwane wątpliwością (pierwszy sygnał zatrzymania, kill switch także HARD) pomija diagnostykę
-# [4]-[6] (żadnych zmian ochrony ani odczytów diagnostycznych) i spłaszcza od razu (FAIL [4]); przy zatrzymaniu na
-# żądanie po spłaszczeniu pomija też odczyty historii transakcji [11] (C8 NIE USTALONO).
+# OCZEKIWANE: wstrzymanie przerwane wątpliwością (pierwszy sygnał zatrzymania, kill switch także HARD) pomija
+# diagnostykę [4]-[6] (żadnych zmian ochrony ani odczytów diagnostycznych) i spłaszcza od razu (FAIL [4]); przy
+# zatrzymaniu na żądanie po spłaszczeniu pomija też odczyty historii transakcji [11] (C8 NIE USTALONO).
 
 
 async def test_a_stop_request_during_the_hold_skips_the_diagnostics_and_flattens_at_once(engine, broker, clock):

@@ -18,10 +18,11 @@ Kroki (PASS/FAIL/INFO w stylu próby DE40, bez identyfikatorów deali i rachunk�
  [3] pozycja widoczna ze stopem i celem, potem wstrzymanie `--hold` (domyślnie `LANE_HOLD_DEFAULT_S`, najmniej
  `LANE_HOLD_MIN_S`) pod zwykłym nadzorem; [4] surowe pola celu z `GET /positions/{dealId}` i `GET /confirms` (C5);
  [5] `set_protection` z obu poziomami (cel o krok bliżej, gdy wolno) i ich weryfikacja; [6] `set_stop` z samym stopem
- o krok bliżej ceny (gdy wolno), odczyt, czy cel przetrwał (C5d), i przywrócenie `set_protection` z odczytanym stopem; [7] spłaszczenie przez silnik; [8] pozycja znikła,
- transakcja zaksięgowana w walucie instrumentu, przyczyna zamknięcia z historii (C7); [9] faza 2 w EUR (szacunek
- `ESTIMATED_FX`); [10] drugie zamknięcie odrzucone `POSITION_NOT_FOUND`; [11] historia transakcji i saldo (C8). Na
- końcu blok `USTALENIA O BROKERZE` z POTWIERDZONE / ROZBIEŻNE / NIE USTALONO dla C5, C5d, C7, C8.
+ o krok bliżej ceny (gdy wolno), odczyt, czy cel przetrwał (C5d), i przywrócenie `set_protection` z odczytanym stopem;
+ [7] spłaszczenie przez silnik; [8] pozycja znikła, transakcja zaksięgowana w walucie instrumentu, przyczyna
+ zamknięcia z historii (C7); [9] faza 2 w EUR (szacunek `ESTIMATED_FX`); [10] drugie zamknięcie odrzucone
+ `POSITION_NOT_FOUND`; [11] historia transakcji i saldo (C8). Na końcu blok `USTALENIA O BROKERZE` z POTWIERDZONE /
+ ROZBIEŻNE / NIE USTALONO dla C5, C5d, C7, C8.
 
 Bezpieczeństwo: każda awaria po wejściu (wyjątek, anulowanie, Ctrl-C, sygnał) kończy się spłaszczeniem procedurą
 awaryjną wykonawcy próby (`cli._close_after_interrupt`), a pozycja, której nie da się zamknąć (np. zamknięty rynek),
@@ -498,7 +499,7 @@ class _Probe:
         await self._c5d_step(report)
 
     async def _go_on(self, n: int) -> bool:
-        """Czy diagnostyka idzie dalej: nie po prośbie o zatrzymanie (sygnał) ani gdy pozycji nie ma albo nie ma stopu."""
+        """Czy diagnostyka idzie dalej: nie po prośbie o zatrzymanie (sygnał) ani bez pozycji albo bez jej stopu."""
         if self.engine.shutdown_requested:
             self.info(n, f"stopped: {SHUTDOWN_REASON}; flattening at once")
             return False
@@ -675,7 +676,7 @@ class _Probe:
             self.finding("C5d", UNKNOWN, "nie sprawdzono (brak pozycji ze stopem i znanym celem)")
             return
         stop = at_broker.stop_level
-        try:  # stop o krok bliżej ceny: prawdziwa zmiana dla PUT (ten sam poziom broker mógłby uznać za „nic do zmiany”)
+        try:  # stop o krok bliżej ceny: prawdziwa zmiana dla PUT (ten sam poziom broker mógłby uznać za brak zmiany)
             rules = await engine.broker.instrument_rules(self.epic)
             sent = self._closer_stop(stop, rules, await engine.broker.quote(self.epic))
         except Exception:
@@ -762,7 +763,7 @@ class _Probe:
             self.out(f"FAIL [7] LOUD: the probe position {self._left_open_hint()}")
 
     def _left_open_hint(self) -> str:
-        """Co zostało u brokera: stop i cel, a po `set_stop` bez potwierdzonego przywrócenia celu tylko stop na pewno."""
+        """Co zostało u brokera: stop i cel, a po `set_stop` bez potwierdzonego przywrócenia celu na pewno tylko stop."""
         return LANE_LEFT_OPEN_TARGET_UNSURE_HINT if self.target_unsure else LANE_LEFT_OPEN_HINT
 
     # --- [8] księga i przyczyna zamknięcia (C7) ---
