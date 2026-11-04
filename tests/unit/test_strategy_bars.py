@@ -39,6 +39,17 @@ CFG = BarRuleConfig(
     target_r=D("1.5"),
     time_limit_min=50,
     fixed_min_size_sessions=5,
+    session_timezone="America/New_York",  # od tu pola, których `strategy_bars` nie czyta (okna i filtry dnia: `lanes`)
+    signal_windows="09:45-11:45,14:00-15:30",
+    flatten_before_close_min=5,
+    atr_period=14,
+    gap_tolerance_bars=2,
+    max_entries_per_day=10,
+    day_stop_r=D("3.0"),
+    min_stop_fraction=D("0.0001"),
+    slippage_filter_atr_fraction=D("0.5"),
+    max_round_trip_cost_r=D("0.20"),
+    assumed_slippage_points=D("0.15"),
 )
 RISK = RiskConfig(
     virtual_capital=D("40"),

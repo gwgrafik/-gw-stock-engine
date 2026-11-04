@@ -1,8 +1,12 @@
-# Reguła świecowa B1 na świecach M5, instrument US500 (wariant "lanes", osobny od orb_index_cfd v1).
-# Wartości przeniesione z research/candle_strategies.py (gałąź B1 funkcji `signals`, interwał M5), stan kodu `6c15bc8`.
+# Pasmo B1 na świecach M5, instrument US500 (wariant "lanes", osobny od orb_index_cfd v1).
+# Wartości przeniesione z research/candle_strategies.py (stan kodu `6c15bc8`): reguła sygnału (gałąź B1 funkcji `signals`,
+# interwał M5) i reszta funkcji `run` (filtry, limity dnia, okna sesji), czyli całość zamrożonej hipotezy testu forward
+# `docs/preregistration/forward-us500-b1-m5-sesje.md` (środowisko: GW_SLIP=0.15 GW_STEP=0.1 GW_TZ=America/New_York
+# GW_WIN_SESJE=09:45-11:45,14:00-15:30 GW_FLAT=15:55).
 # Ułamki i mnożniki są napisami (parsowane do Decimal); liczby TOML-float są odrzucane.
-# Zmiana któregokolwiek pola zmienia regułę i tworzy NOWY wariant (zwiększa K, wymaga osobnej pre-rejestracji).
-# Okna czasowe sygnałów, godzina spłaszczenia i koszty NIE leżą tutaj: robi to wywołujący (reguła to czysta funkcja).
+# Zmiana któregokolwiek pola zmienia pasmo i tworzy NOWY wariant (zwiększa K, wymaga osobnej pre-rejestracji).
+# Reguła sygnału i wielkości (`strategy_bars`) czyta pola do `fixed_min_size_sessions`; resztę czyta `lanes` (okna, filtry
+# dnia, wyjście zaplanowane). Stop, cel i limit czasu po wejściu wykonuje broker i silnik (nie są tu opisane poza limitem).
 
 instrument = "US500"
 bar_minutes = 5                       # interwał świec (M5); koniec świecy sygnału = początek + bar_minutes
@@ -14,3 +18,18 @@ spread_buffer_fraction = "0.25"       # bufor wybicia b = max(krok stopu, 0,25 x
 target_r = "1.5"                      # cel zysku = 1,5 x odległość stopu (R)
 time_limit_min = 50                   # limit czasu pozycji w minutach (10 świec M5)
 fixed_min_size_sessions = 5           # jak w v1: tyle pierwszych sesji pasma na minimalnej wielkości
+
+# --- sesja (research: GW_TZ, GW_WIN_SESJE, GW_FLAT) ---
+session_timezone = "America/New_York"          # strefa godzin poniżej; musi zgadzać się ze strefą kalendarza pasma (NYSE)
+signal_windows = "09:45-11:45,14:00-15:30"     # okna SESJE: początek świecy sygnału w [od, do), czas lokalny
+flatten_before_close_min = 5                   # zaplanowane wyjście: zamknięcie kalendarza minus 5 min (NYSE 15:55)
+
+# --- filtry dnia i wejścia (research: stałe i filtry funkcji `run`) ---
+atr_period = 14                       # ATR14 ze świec M5 (średnia prawdziwych zakresów świec mid)
+gap_tolerance_bars = 2                # GAPPED_DATA: rozpiętość n+2 świec > (n+1+2) x bar_minutes
+max_entries_per_day = 10              # MAX_DAY: najwyżej tyle wejść w dniu lokalnym pasma
+day_stop_r = "3.0"                    # DAY_STOP_R = -3,0: wynik dnia <= -3,0 R kończy wejścia dnia (tu wartość bezwzględna)
+min_stop_fraction = "0.0001"          # MIN_STOP_FRAC: STOP_TOO_CLOSE, gdy odległość stopu < 0,01% ceny wejścia
+slippage_filter_atr_fraction = "0.5"  # SLIP_FILTER: |cena wejścia - zamknięcie świecy sygnału| > 0,5 x ATR14
+max_round_trip_cost_r = "0.20"        # COST_OVER_0.20R: (spread + 2 x poślizg) / odległość stopu > 0,20
+assumed_slippage_points = "0.15"      # ZAŁOŻONY poślizg wejścia i wyjścia (GW_SLIP), nie pomiar z konta

@@ -7,7 +7,9 @@ Zasady:
 - granice (sprawdzane przy wczytaniu, nie w konstruktorach): pola `*_s`, `max_entries_per_day`, `range_minutes`,
   `bar_minutes`, `lookback_bars`, `time_limit_min`, `target_r`, `max_open_positions`, `unknown_position_risk`
   oraz kwoty i dźwignia ryzyka (`virtual_capital`, `max_*`) są > 0 (to dzielniki, okresy i limity), pola `*_fraction`
-  i `fx_markup` leżą w [0, 1], pozostałe liczby są >= 0 (zero ma tam sens według specyfikacji);
+  i `fx_markup` leżą w [0, 1], pozostałe liczby są >= 0 (zero ma tam sens według specyfikacji); pola filtrów dnia pasma
+  świecowego (`atr_period`, `day_stop_r`, `min_stop_fraction`, `slippage_filter_atr_fraction`, `max_round_trip_cost_r`)
+  są > 0, bo zero wyłączałoby filtr albo odrzucałoby każde wejście;
 - brakujący klucz, nieznany klucz, zły typ lub poza granicą to ValueError z nazwą pliku i klucza (literówka nie
   przechodzi po cichu); plik TOML, którego nie da się odczytać, to ValueError z nazwą pliku;
 - wszystkie dataclasses są niemutowalne.
@@ -19,9 +21,11 @@ import json
 import re
 import tomllib
 from dataclasses import dataclass, fields
+from datetime import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @dataclass(frozen=True)
@@ -69,7 +73,20 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class BarRuleConfig:
-    """Parametry reguły świecowej B1 (`strategy_bars`): jeden plik na pasmo, np. `lane_us500_b1_m5.toml`."""
+    """Parametry pasma świecowego B1: jeden plik na pasmo, np. `lane_us500_b1_m5.toml`.
+
+    Pola do `fixed_min_size_sessions` to czysta reguła sygnału i wielkości (`strategy_bars`). Pozostałe to zakres reguł
+    `run()` z `research/candle_strategies.py`, który pasmo dokłada do sygnału (`lanes.decide_entry`, `lanes.exit_due`):
+
+    - `session_timezone`, `signal_windows` ("GG:MM-GG:MM,..." czasu lokalnego, początek świecy sygnału w [od, do)),
+      `flatten_before_close_min` (zaplanowane wyjście: zamknięcie kalendarza pasma minus tyle minut);
+    - `atr_period` (ATR ze świec M5 do filtra poślizgu), `gap_tolerance_bars` (ile świec może brakować w rozpiętości
+      zakresu, zanim dane to `GAPPED_DATA`);
+    - `max_entries_per_day`, `day_stop_r` (WARTOŚĆ BEZWZGLĘDNA straty dnia w R, wynik dnia <= -`day_stop_r` kończy dzień);
+    - `min_stop_fraction` (stop bliżej niż ten ułamek ceny wejścia), `slippage_filter_atr_fraction` (cena wejścia dalej
+      od zamknięcia świecy sygnału niż ten ułamek ATR), `max_round_trip_cost_r` (koszt rundy w R),
+      `assumed_slippage_points` (ZAŁOŻONY poślizg wejścia i wyjścia w punktach, jak `GW_SLIP` w badaniach).
+    """
 
     instrument: str
     bar_minutes: int
@@ -81,6 +98,17 @@ class BarRuleConfig:
     target_r: Decimal
     time_limit_min: int
     fixed_min_size_sessions: int
+    session_timezone: str
+    signal_windows: str
+    flatten_before_close_min: int
+    atr_period: int
+    gap_tolerance_bars: int
+    max_entries_per_day: int
+    day_stop_r: Decimal
+    min_stop_fraction: Decimal
+    slippage_filter_atr_fraction: Decimal
+    max_round_trip_cost_r: Decimal
+    assumed_slippage_points: Decimal
 
 
 @dataclass(frozen=True)
@@ -145,6 +173,11 @@ def _is_positive_field(key: str) -> bool:
         "lookback_bars",
         "time_limit_min",
         "target_r",
+        "atr_period",
+        "day_stop_r",
+        "min_stop_fraction",
+        "slippage_filter_atr_fraction",
+        "max_round_trip_cost_r",
     }
 
 
@@ -221,13 +254,58 @@ def load_config(config_dir: Path) -> tuple[StrategyConfig, RiskConfig, CostConfi
     )
 
 
+# Godzina lokalna "GG:MM" (dokładnie dwie cyfry ASCII, bez spacji): okna sygnałów pasma.
+_CLOCK = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
+
+
+def _parse_clock(text: str) -> time:
+    match = _CLOCK.fullmatch(text)
+    if match is None:
+        raise ValueError(f"signal_windows: {text!r} is not a clock time HH:MM")
+    return time(int(match.group(1)), int(match.group(2)))
+
+
+def parse_signal_windows(text: str) -> tuple[tuple[time, time], ...]:
+    """Okna sygnałów "GG:MM-GG:MM,GG:MM-GG:MM" jako pary czasu lokalnego [od, do), rosnąco i bez nakładania.
+
+    Zapis ścisły: bez spacji, dwie cyfry ASCII na godzinę i minutę, `od` < `do`, kolejne okno zaczyna się nie wcześniej
+    niż kończy się poprzednie (styk dozwolony), co najmniej jedno okno. Błąd to ValueError z nazwą klucza
+    `signal_windows`; wywołujący dopisuje nazwę pliku.
+    """
+    if not isinstance(text, str) or not text:
+        raise ValueError(f"signal_windows: expected a non-empty string, got {text!r}")
+    windows: list[tuple[time, time]] = []
+    for part in text.split(","):
+        bounds = part.split("-")
+        if len(bounds) != 2:
+            raise ValueError(f"signal_windows: {part!r} is not a window HH:MM-HH:MM")
+        start, end = _parse_clock(bounds[0]), _parse_clock(bounds[1])
+        if not start < end:
+            raise ValueError(f"signal_windows: window {part!r} must start before it ends")
+        if windows and start < windows[-1][1]:
+            raise ValueError(f"signal_windows: window {part!r} overlaps or precedes the previous window")
+        windows.append((start, end))
+    return tuple(windows)
+
+
 def load_bar_rule_config(path: Path) -> BarRuleConfig:
-    """Wczytuje plik reguły świecowej pasma (np. `config/lane_us500_b1_m5.toml`), ściśle jak pliki v1.
+    """Wczytuje plik pasma świecowego (np. `config/lane_us500_b1_m5.toml`), ściśle jak pliki v1.
 
     Brak pliku to FileNotFoundError; brakujący lub nieznany klucz, zły typ i wartość poza granicą to ValueError z nazwą
-    pliku i klucza. Osobne od `load_config`: pliki v1 i ich odcisk pre-rejestracji się nie zmieniają.
+    pliku i klucza. Dodatkowo `session_timezone` musi być znaną strefą IANA, a `signal_windows` poprawnym zapisem okien
+    (`parse_signal_windows`). Osobne od `load_config`: pliki v1 i ich odcisk pre-rejestracji się nie zmieniają.
     """
-    return _load_table(Path(path), BarRuleConfig)
+    path = Path(path)
+    cfg = _load_table(path, BarRuleConfig)
+    try:
+        ZoneInfo(cfg.session_timezone)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        raise ValueError(f"{path.name}: session_timezone: unknown time zone {cfg.session_timezone!r}") from None
+    try:
+        parse_signal_windows(cfg.signal_windows)
+    except ValueError as exc:
+        raise ValueError(f"{path.name}: {exc}") from None
+    return cfg
 
 
 def load_portfolio(config_dir: Path, risk: RiskConfig | None = None) -> PortfolioConfig:

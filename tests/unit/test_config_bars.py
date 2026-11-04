@@ -6,12 +6,13 @@ Uruchamiać z korzenia repozytorium (ścieżki względne `config/`).
 import dataclasses
 import re
 import shutil
+from datetime import time
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from gwstock.config import BarRuleConfig, load_bar_rule_config, load_config
+from gwstock.config import BarRuleConfig, load_bar_rule_config, load_config, parse_signal_windows
 
 FILENAME = "lane_us500_b1_m5.toml"
 
@@ -48,15 +49,35 @@ DECIMAL_KEYS = [
     "short_max_close_fraction",
     "spread_buffer_fraction",
     "target_r",
+    "day_stop_r",
+    "min_stop_fraction",
+    "slippage_filter_atr_fraction",
+    "max_round_trip_cost_r",
+    "assumed_slippage_points",
 ]
-INT_KEYS = ["bar_minutes", "lookback_bars", "time_limit_min", "fixed_min_size_sessions"]
-STR_KEYS = ["instrument"]
+INT_KEYS = [
+    "bar_minutes",
+    "lookback_bars",
+    "time_limit_min",
+    "fixed_min_size_sessions",
+    "flatten_before_close_min",
+    "atr_period",
+    "gap_tolerance_bars",
+    "max_entries_per_day",
+]
+STR_KEYS = ["instrument", "session_timezone", "signal_windows"]
 ALL_KEYS = DECIMAL_KEYS + INT_KEYS + STR_KEYS
 
-POSITIVE_DECIMAL_KEYS = ["target_r"]
-POSITIVE_INT_KEYS = ["bar_minutes", "lookback_bars", "time_limit_min"]
+POSITIVE_DECIMAL_KEYS = ["target_r", "day_stop_r", "min_stop_fraction", "slippage_filter_atr_fraction", "max_round_trip_cost_r"]
+POSITIVE_INT_KEYS = ["bar_minutes", "lookback_bars", "time_limit_min", "atr_period", "max_entries_per_day"]
+# ułamki w [0, 1], zero ma sens (korpus, położenie zamknięcia, bufor wybicia)
 FRACTION_KEYS = ["min_body_fraction", "long_min_close_fraction", "short_max_close_fraction", "spread_buffer_fraction"]
-ZERO_ALLOWED_INT_KEYS = ["fixed_min_size_sessions"]  # 0 = reguły od razu po zgodzie właściciela (jak w v1)
+# ułamki w (0, 1]: zero wyłączałoby filtr (stop bliżej niż 0 %) albo odrzucałoby każde wejście (poślizg > 0 x ATR)
+POSITIVE_FRACTION_KEYS = ["min_stop_fraction", "slippage_filter_atr_fraction"]
+ZERO_ALLOWED_DECIMAL_KEYS = ["assumed_slippage_points"]  # 0 = bez założonego poślizgu
+# 0 ma sens: fixed_min_size_sessions: reguły od razu po zgodzie właściciela (jak w v1); flatten_before_close_min: godzina
+# zamknięcia; gap_tolerance_bars: żadnej brakującej świecy w zakresie
+ZERO_ALLOWED_INT_KEYS = ["fixed_min_size_sessions", "flatten_before_close_min", "gap_tolerance_bars"]
 
 
 def test_lane_config_holds_the_frozen_research_values():
@@ -73,6 +94,17 @@ def test_lane_config_holds_the_frozen_research_values():
         target_r=Decimal("1.5"),
         time_limit_min=50,
         fixed_min_size_sessions=5,
+        session_timezone="America/New_York",
+        signal_windows="09:45-11:45,14:00-15:30",
+        flatten_before_close_min=5,
+        atr_period=14,
+        gap_tolerance_bars=2,
+        max_entries_per_day=10,
+        day_stop_r=Decimal("3.0"),
+        min_stop_fraction=Decimal("0.0001"),
+        slippage_filter_atr_fraction=Decimal("0.5"),
+        max_round_trip_cost_r=Decimal("0.20"),
+        assumed_slippage_points=Decimal("0.15"),
     )
 
 
@@ -87,11 +119,17 @@ def test_load_bar_rule_config_returns_a_frozen_dataclass_without_floats():
 
 def test_every_dataclass_field_is_classified_below():
     assert {f.name for f in dataclasses.fields(BarRuleConfig)} == set(ALL_KEYS)
-    classified = set(POSITIVE_DECIMAL_KEYS + POSITIVE_INT_KEYS + FRACTION_KEYS + ZERO_ALLOWED_INT_KEYS)
+    classified = set(
+        POSITIVE_DECIMAL_KEYS
+        + POSITIVE_INT_KEYS
+        + FRACTION_KEYS
+        + ZERO_ALLOWED_DECIMAL_KEYS
+        + ZERO_ALLOWED_INT_KEYS
+    )
     assert {k for k in DECIMAL_KEYS + INT_KEYS} == classified
     for key in DECIMAL_KEYS + INT_KEYS:
         if key.endswith("_fraction"):
-            assert key in FRACTION_KEYS, key
+            assert key in FRACTION_KEYS + POSITIVE_FRACTION_KEYS, key
 
 
 def test_v1_loader_ignores_the_lane_file_and_still_loads():
@@ -165,7 +203,7 @@ def test_zero_is_rejected_for_positive_integers(lane_path: Path, key: str):
         load_bar_rule_config(lane_path)
 
 
-@pytest.mark.parametrize("key", FRACTION_KEYS)
+@pytest.mark.parametrize("key", FRACTION_KEYS + POSITIVE_FRACTION_KEYS)
 @pytest.mark.parametrize("literal", ['"1.01"', '"2"', '"100"'])
 def test_fractions_above_one_are_rejected(lane_path: Path, key: str, literal: str):
     set_key(lane_path, key, literal)
@@ -184,3 +222,92 @@ def test_fractions_accept_the_closed_unit_interval(lane_path: Path, key: str, li
 def test_zero_is_accepted_where_it_has_a_meaning(lane_path: Path, key: str):
     set_key(lane_path, key, "0")
     assert getattr(load_bar_rule_config(lane_path), key) == 0
+
+
+@pytest.mark.parametrize("key", POSITIVE_FRACTION_KEYS)
+@pytest.mark.parametrize("literal", ['"0.0001"', '"1"', '"0.5"'])
+def test_positive_fractions_accept_the_half_open_unit_interval(lane_path: Path, key: str, literal: str):
+    set_key(lane_path, key, literal)
+    assert getattr(load_bar_rule_config(lane_path), key) == Decimal(literal.strip('"'))
+
+
+@pytest.mark.parametrize("key", ZERO_ALLOWED_DECIMAL_KEYS)
+@pytest.mark.parametrize("literal", ['"0"', '"0.00"', '"0.15"'])
+def test_zero_is_accepted_for_decimals_where_it_has_a_meaning(lane_path: Path, key: str, literal: str):
+    set_key(lane_path, key, literal)
+    assert getattr(load_bar_rule_config(lane_path), key) == Decimal(literal.strip('"'))
+
+
+@pytest.mark.parametrize("key", ZERO_ALLOWED_DECIMAL_KEYS)
+@pytest.mark.parametrize("literal", ['"-0.1"', '"-0"'])
+def test_negative_decimals_are_rejected_everywhere(lane_path: Path, key: str, literal: str):
+    set_key(lane_path, key, literal)
+    with pytest.raises(ValueError, match=rf"{FILENAME}: {key}.*non-negative"):
+        load_bar_rule_config(lane_path)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# strefa i okna sygnałów: ściśle, błąd z nazwą pliku i klucza
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_parse_signal_windows_returns_ascending_local_time_pairs():
+    assert parse_signal_windows("09:45-11:45,14:00-15:30") == ((time(9, 45), time(11, 45)), (time(14, 0), time(15, 30)))
+    assert parse_signal_windows("00:00-23:59") == ((time(0, 0), time(23, 59)),)
+    assert parse_signal_windows("09:45-11:45,11:45-12:00") == ((time(9, 45), time(11, 45)), (time(11, 45), time(12, 0)))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        " ",
+        "09:45",
+        "09:45-",
+        "-11:45",
+        "9:45-11:45",
+        "09:45-11:45,",
+        ",09:45-11:45",
+        "09:45-11:45;14:00-15:30",
+        "09:45 - 11:45",
+        "09:45-11:45, 14:00-15:30",
+        "09:45-11:60",
+        "24:00-24:30",
+        "09:45-09:45",
+        "11:45-09:45",
+        "09:45-11:45,10:00-12:00",
+        "14:00-15:30,09:45-11:45",
+        "09:45-11:45,11:44-12:00",
+        "09:45-11:45:00",
+        "0945-1145",
+        "09:45-1１:45",
+    ],
+)
+def test_parse_signal_windows_rejects_malformed_or_overlapping_windows(text: str):
+    with pytest.raises(ValueError, match="signal_windows"):
+        parse_signal_windows(text)
+
+
+@pytest.mark.parametrize("text", ["09:45-11:45;14:00", "11:45-09:45", "09:45-11:45,10:00-12:00"])
+def test_load_rejects_bad_signal_windows_naming_file_and_key(lane_path: Path, text: str):
+    set_key(lane_path, "signal_windows", f'"{text}"')
+    with pytest.raises(ValueError, match=rf"{re.escape(FILENAME)}: signal_windows"):
+        load_bar_rule_config(lane_path)
+
+
+@pytest.mark.parametrize("zone", ["Nowhere/City", "America/New York", "../etc", "ET", "NYC"])
+def test_load_rejects_an_unknown_time_zone_naming_file_and_key(lane_path: Path, zone: str):
+    set_key(lane_path, "session_timezone", f'"{zone}"')
+    with pytest.raises(ValueError, match=rf"{re.escape(FILENAME)}: session_timezone"):
+        load_bar_rule_config(lane_path)
+
+
+def test_load_accepts_another_known_time_zone(lane_path: Path):
+    set_key(lane_path, "session_timezone", '"Europe/Berlin"')
+    assert load_bar_rule_config(lane_path).session_timezone == "Europe/Berlin"
+
+
+def test_lane_file_has_no_toml_floats():
+    """Wszystkie ułamki i mnożniki w pliku pasma to napisy (liczba TOML-float jest odrzucana przy ładowaniu)."""
+    text = (Path("config") / FILENAME).read_text(encoding="utf-8")
+    assert not re.search(r"^\s*[a-z_]+\s*=\s*-?[0-9]+\.[0-9]", text, flags=re.MULTILINE)
