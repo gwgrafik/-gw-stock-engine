@@ -957,3 +957,13 @@ def test_malformed_toml_names_the_file(cfg_dir):
 def test_load_config_ignores_the_portfolio_file(cfg_dir):
     (cfg_dir / PORTFOLIO_FILE).write_text("garbage = = \n", encoding="utf-8")
     assert load_config(cfg_dir) == load_config(CONFIG)
+
+
+# --- zadanie 12: zajętość z wszystkich zapisów pozycji dziennika (Journal.positions) ------------------------------
+
+
+def test_a_journal_position_on_an_instrument_without_a_lane_occupies_and_carries_the_unknown_risk(journal, clock, pcfg):
+    journal.upsert_position(PositionRecord("US100", PositionState.BLOCKED))  # bez pasma, bez zlecenia
+    gate = build(journal, clock, dataclasses.replace(pcfg, max_open_positions=1))
+    got = reasons(gate)
+    assert PORTFOLIO_MAX_POSITIONS in got and PORTFOLIO_OPEN_RISK in got  # ryzyko nieznane = unknown_position_risk

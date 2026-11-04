@@ -16,7 +16,7 @@ Inexact): zaokrąglenie nie może zamienić „o grosz więcej” w „równo”
 
 Zajętość (podstawa PORTFOLIO_MAX_POSITIONS): instrumenty z pozycją w stanie innym niż FLAT (każdy stan, także ENTERING
 i BLOCKED) oraz instrumenty z nierozstrzygniętym zleceniem (`journal.unresolved_orders()`), każdy instrument raz.
-Przeglądane są instrumenty pasm i instrumenty nierozstrzygniętych zleceń (dziennik nie ma listy wszystkich pozycji).
+Przeglądane są instrumenty pasm, nierozstrzygniętych zleceń i wszystkich zapisów pozycji (`journal.positions()`).
 
 Ryzyko zajętego instrumentu (spec §4.3), w EUR:
 - znane `size`, `open_level`, `stop_level` pozycji i wartość punktu z JEJ kontekstu wejścia (`entry_ctx`, przez
@@ -384,7 +384,8 @@ class PortfolioGate:
         for order in self._journal.unresolved_orders():
             orders.setdefault(order.epic, []).append(order)
         result = []
-        for epic in sorted(set(self._lanes) | set(orders)):
+        recorded = {p.epic for p in self._journal.positions()}  # także instrumenty bez pasma (spec §4.3)
+        for epic in sorted(set(self._lanes) | set(orders) | recorded):
             position = self._journal.current_position(epic)
             if position is not None and position.state is PositionState.FLAT:
                 position = None
