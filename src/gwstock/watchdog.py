@@ -24,7 +24,12 @@ Wyzwalacze (każdy idempotentny: kill switch nie powtarza zapisu ani alarmu tej 
 - UNKNOWN_BROKER_RESPONSES: licznik adaptera `unknown_close_sources` (zamknięcia o nieznanym źródle) osiąga
   `UNKNOWN_RESPONSES_LIMIT`; każdy wzrost licznika to alarm.
 
-Tętno: JSON `{ts, mode, state, last_quote_ts, kill_level}` zapisywany atomowo (plik tymczasowy w tym samym katalogu
+Wiele pasm (projekt §2.8): okno sesji, ostatnie notowanie i liczniki uzgadniania (błędy i pominięcia z rzędu) są per
+instrument (`epic=...`; bez niego pasmo dotychczasowe DE40 v1, zachowanie jak dotąd). Notowanie jednego instrumentu
+nie karmi straży ciszy innego (A7), a udany przebieg uzgadniania jednego pasma nie zeruje awarii drugiego (A8).
+Przyczyny kill switcha są wspólne (portfel, R3); alarmy kolejnych pasm mają nazwę instrumentu w treści i w kluczu.
+
+Tętno: JSON `{ts, mode, state, last_quote_ts, kill_level}` (z kolejnymi pasmami także `lanes`) zapisywany atomowo (plik tymczasowy w tym samym katalogu
 + `os.replace`); nieudany zapis zostawia poprzedni plik i nie przerywa pracy. `health` sprawdza świeżość po `ts`.
 
 Blokada instancji: `fcntl.flock` (LOCK_EX | LOCK_NB) na pliku w katalogu danych; jądro zwalnia ją przy śmierci procesu,
@@ -222,8 +227,12 @@ class Watchdog:
             notifier if notifier is not None else FileNotifier(self._heartbeat.parent / "alerts.log", clock)
         )
         self._reset_path = Path(reset_path) if reset_path is not None else self._heartbeat.parent / LOGIN_RESET_FILE
-        self._window: _Window | None = None
-        self._last_quote_ts: datetime | None = None
+        # Okna sesji, ostatnie notowania i liczniki uzgadniania per instrument (projekt wielu pasm §2.8, A7, A8).
+        # Klucz None: pasmo dotychczasowe (DE40 v1, wywołania bez `epic`); klucz `epic`: kolejne pasmo.
+        self._windows: dict[str | None, _Window] = {}
+        self._last_quotes: dict[str | None, datetime] = {}
+        self._reconcile_errors_by: dict[str | None, int] = {}
+        self._reconcile_skips_by: dict[str | None, int] = {}
         self._mode = ""
         self._state = ""
         self._login_failures = 0  # porażki z rzędu (dowolne): kill miękki przy limicie
@@ -232,15 +241,18 @@ class Watchdog:
         self._last_login_failure: datetime | None = None
         self._login_pause_s = 0.0
         self._rejections = 0
-        self._reconcile_errors = 0
-        self._reconcile_skips = 0
         self._unknown_seen = 0
 
     # --- stan dla tętna i okno sesji ---
 
     @property
     def last_quote_ts(self) -> datetime | None:
-        return self._last_quote_ts
+        """Ostatnie notowanie pasma dotychczasowego (wywołania bez `epic`)."""
+        return self._last_quotes.get(None)
+
+    def last_quote_of(self, epic: str | None) -> datetime | None:
+        """Ostatnie notowanie instrumentu `epic` (None: pasmo dotychczasowe)."""
+        return self._last_quotes.get(epic)
 
     @property
     def login_failures(self) -> int:
@@ -252,24 +264,31 @@ class Watchdog:
         if state is not None:
             self._state = state
 
-    def set_session_window(self, start: datetime | None, end: datetime | None) -> None:
-        """Okno, w którym obowiązuje straż ciszy notowań (UTC); None wyłącza straż (poza sesją)."""
+    def set_session_window(self, start: datetime | None, end: datetime | None, *, epic: str | None = None) -> None:
+        """Okno, w którym obowiązuje straż ciszy notowań (UTC); None wyłącza straż (poza sesją).
+
+        `epic`: okno instrumentu kolejnego pasma; bez niego okno pasma dotychczasowego. Okna są niezależne: notowanie
+        jednego instrumentu nigdy nie karmi straży innego (A7)."""
         if start is None or end is None:
-            self._window = None
+            self._windows.pop(epic, None)
             return
-        self._window = _Window(start, end, self._now())
+        self._windows[epic] = _Window(start, end, self._now())
 
     def rearm_silence(self) -> None:
-        """Cisza notowań liczona od teraz (po długim wejściu, w trakcie którego pętla nie odczytywała notowań)."""
-        if self._window is not None:
-            self._window = _Window(self._window.start, self._window.end, self._now())
+        """Cisza notowań liczona od teraz we WSZYSTKICH oknach (po długim wejściu, w trakcie którego pętla nie
+        odczytywała notowań żadnego pasma)."""
+        now = self._now()
+        for key, w in list(self._windows.items()):
+            self._windows[key] = _Window(w.start, w.end, now)
 
     # --- notyfikacje od silnika ---
 
-    def note_quote(self, ts: datetime) -> None:
-        """Udany odczyt notowania; `ts` to chwila ostatniej zmiany pary (bid, ask) (`Quote.ts`)."""
-        if self._last_quote_ts is None or ts > self._last_quote_ts:
-            self._last_quote_ts = ts
+    def note_quote(self, ts: datetime, *, epic: str | None = None) -> None:
+        """Udany odczyt notowania; `ts` to chwila ostatniej zmiany pary (bid, ask) (`Quote.ts`). `epic`: instrument
+        kolejnego pasma (bez niego: pasmo dotychczasowe)."""
+        last = self._last_quotes.get(epic)
+        if last is None or ts > last:
+            self._last_quotes[epic] = ts
 
     def note_login_failure(self, detail: str = "", *, credential: bool = False) -> None:
         """Nieudane logowanie. `credential=True`: broker odrzucił dane logowania (liczy się do blokady prób)."""
@@ -327,33 +346,38 @@ class Watchdog:
     def note_success(self) -> None:
         self._rejections = 0
 
-    def note_reconcile_error(self, exc_type: str, message: str = "") -> None:
-        self._reconcile_errors += 1
-        n = self._reconcile_errors
-        self._alert_keyed("RECONCILE_ERROR", "WARN", f"RECONCILE_ERROR {n} in a row: {exc_type}: {message}")
+    def note_reconcile_error(self, exc_type: str, message: str = "", *, epic: str | None = None) -> None:
+        """Przebieg uzgadniania z wyjątkiem. `epic`: uzgadnianie kolejnego pasma (licznik tylko tego pasma, A8)."""
+        n = self._reconcile_errors_by.get(epic, 0) + 1
+        self._reconcile_errors_by[epic] = n
+        key, lane = _keyed("RECONCILE_ERROR", epic), _lane_text(epic)
+        self._alert_keyed(key, "WARN", f"RECONCILE_ERROR{lane} {n} in a row: {exc_type}: {message}")
         for code in LOUD_HISTORY_CODES:
             if code in message:
                 self._alert_keyed(
-                    code,
+                    _keyed(code, epic),
                     "ERROR",
-                    f"{code}: the broker history cannot be read completely ({exc_type}: {message}); closures cannot "
-                    "be booked until it can; the owner checks the Capital.com activity",
+                    f"{code}{lane}: the broker history cannot be read completely ({exc_type}: {message}); closures "
+                    "cannot be booked until it can; the owner checks the Capital.com activity",
                 )
         if n >= RECONCILE_FAILURE_LIMIT:
             self._kill.soft(RECONCILE_FAILING)
-            message = f"{RECONCILE_FAILING}: {n} reconciliation passes failed in a row ({exc_type})"
-            self._alert_keyed(RECONCILE_FAILING, "ERROR", message)
+            message = f"{RECONCILE_FAILING}{lane}: {n} reconciliation passes failed in a row ({exc_type})"
+            self._alert_keyed(_keyed(RECONCILE_FAILING, epic), "ERROR", message)
 
-    def note_reconcile_ok(self) -> None:
-        self._reconcile_errors = 0
-        self._reconcile_skips = 0
+    def note_reconcile_ok(self, *, epic: str | None = None) -> None:
+        """Udany przebieg uzgadniania pasma `epic` (None: dotychczasowe): zeruje liczniki TYLKO tego pasma."""
+        self._reconcile_errors_by[epic] = 0
+        self._reconcile_skips_by[epic] = 0
 
-    def note_reconcile_skipped(self) -> None:
-        self._reconcile_skips += 1
-        if self._reconcile_skips >= RECONCILE_SKIP_LIMIT:
+    def note_reconcile_skipped(self, *, epic: str | None = None) -> None:
+        n = self._reconcile_skips_by.get(epic, 0) + 1
+        self._reconcile_skips_by[epic] = n
+        if n >= RECONCILE_SKIP_LIMIT:
             self._alert_keyed(
-                "RECONCILE_STARVED", "WARN", f"RECONCILE_STARVED: {self._reconcile_skips} reconciliation passes skipped"
-            )
+                _keyed("RECONCILE_STARVED", epic), "WARN",
+                f"RECONCILE_STARVED{_lane_text(epic)}: {n} reconciliation passes skipped",
+            )  # fmt: skip
 
     # --- takt ---
 
@@ -371,17 +395,24 @@ class Watchdog:
         self._write_heartbeat(now)
 
     def _check_silence(self, now: datetime) -> None:
-        w = self._window
-        if w is None or not w.start <= now <= w.end:
-            return
-        ref = max(w.start, w.armed_at)
-        if self._last_quote_ts is not None and self._last_quote_ts > ref:
-            ref = self._last_quote_ts
-        silent = (now - ref).total_seconds()
-        if silent > self._risk.stale_quote_s:
-            self._kill.soft(QUOTE_SILENCE)
-            message = f"{QUOTE_SILENCE}: no fresh quote for {silent:.0f} s (limit {self._risk.stale_quote_s} s)"
-            self._alert_keyed(QUOTE_SILENCE, "ERROR", message)
+        """Każde okno osobno (kolejność stała: dotychczasowe, potem instrumenty alfabetycznie); przyczyna kill switcha
+        wspólna (QUOTE_SILENCE, kill miękki portfela, R3), alarm z nazwą instrumentu kolejnego pasma."""
+        for epic in sorted(self._windows, key=lambda k: (k is not None, k or "")):
+            w = self._windows[epic]
+            if not w.start <= now <= w.end:
+                continue
+            ref = max(w.start, w.armed_at)
+            last = self._last_quotes.get(epic)
+            if last is not None and last > ref:
+                ref = last
+            silent = (now - ref).total_seconds()
+            if silent > self._risk.stale_quote_s:
+                self._kill.soft(QUOTE_SILENCE)
+                message = (
+                    f"{QUOTE_SILENCE}{_lane_text(epic)}: no fresh quote for {silent:.0f} s "
+                    f"(limit {self._risk.stale_quote_s} s)"
+                )
+                self._alert_keyed(_keyed(QUOTE_SILENCE, epic), "ERROR", message)
 
     def _check_unknown_sources(self) -> None:
         count = getattr(self._broker, "unknown_close_sources", None)
@@ -401,10 +432,13 @@ class Watchdog:
             "ts": now,
             "mode": self._mode,
             "state": self._state,
-            "last_quote_ts": self._last_quote_ts,
+            "last_quote_ts": self._last_quotes.get(None),
             "kill_level": _level_name(self._kill),
         }
-        tmp = self._heartbeat.with_name(self._heartbeat.name + ".tmp")
+        lanes = sorted(k for k in set(self._windows) | set(self._last_quotes) if k is not None)
+        if lanes:  # tylko z kolejnymi pasmami: tętno jednego pasma bez zmian (`cli.health` czyta `ts`)
+            payload["lanes"] = {epic: {"last_quote_ts": self._last_quotes.get(epic)} for epic in lanes}
+        tmp =self._heartbeat.with_name(self._heartbeat.name + ".tmp")
         try:
             tmp.write_text(dump(payload) + "\n", encoding="ascii")
             os.replace(tmp, self._heartbeat)
@@ -458,6 +492,15 @@ class Watchdog:
 
     def _now(self) -> datetime:
         return self._clock.now_utc()
+
+
+def _keyed(code: str, epic: str | None) -> str:
+    """Klucz alarmu: dotychczasowy dla pasma bez `epic`, z instrumentem dla kolejnego pasma (osobny budżet)."""
+    return code if epic is None else f"{code}:{epic}"
+
+
+def _lane_text(epic: str | None) -> str:
+    return "" if epic is None else f" ({epic})"
 
 
 def _level_name(kill: KillSwitch) -> str:

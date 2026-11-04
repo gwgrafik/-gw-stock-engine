@@ -455,3 +455,92 @@ def test_keyed_alerts_share_one_budget_even_with_changing_text(clock, notifier):
 def test_rate_limiter_never_raises_when_the_notifier_fails(clock, notifier):
     notifier.fail = RuntimeError("alert sink down")
     RateLimitedNotifier(notifier, clock).alert("ERROR", "x")  # bez wyjątku
+
+
+# --- wiele pasm (zadanie 12, projekt §2.8, A7, A8): straż ciszy i liczniki uzgadniania per instrument --------------
+
+NY_OPEN = datetime(2026, 11, 2, 14, 30, tzinfo=timezone.utc)  # 09:30 w Nowym Jorku (15:30 w Berlinie)
+NY_CLOSE = datetime(2026, 11, 2, 21, 0, tzinfo=timezone.utc)
+
+
+async def test_quotes_of_another_instrument_do_not_feed_the_silence_guard_of_a_lane(wd, clock, kill, notifier):
+    wd.set_session_window(T0, NY_CLOSE, epic="US500")
+    for _ in range(13):  # świeże notowania DE40 (okno dotychczasowe), cisza na US500
+        clock.advance(5)
+        wd.note_quote(clock.now_utc())
+        await wd.tick()
+    assert kill.level() is KillLevel.SOFT and kill.reason() == QUOTE_SILENCE
+    silence = alerts_with(notifier, "no fresh quote")
+    assert silence and all("US500" in m for _, m in silence)
+
+
+async def test_quotes_of_a_lane_do_not_feed_the_legacy_silence_guard(wd, clock, kill):
+    wd.set_session_window(T0, NY_CLOSE, epic="US500")
+    for _ in range(13):
+        clock.advance(5)
+        wd.note_quote(clock.now_utc(), epic="US500")
+        await wd.tick()
+    assert kill.reason() == QUOTE_SILENCE  # okno DE40 (bez epic) milczy
+
+
+async def test_lane_windows_are_independent_and_fresh_quotes_on_both_keep_the_kill_off(wd, clock, kill):
+    wd.set_session_window(T0, NY_CLOSE, epic="US500")
+    for _ in range(40):
+        clock.advance(5)
+        wd.note_quote(clock.now_utc())
+        wd.note_quote(clock.now_utc(), epic="US500")
+        await wd.tick()
+    assert kill.level() is KillLevel.NONE
+    wd.set_session_window(None, None, epic="US500")  # koniec okna US500: straż tylko DE40
+    for _ in range(20):
+        clock.advance(5)
+        wd.note_quote(clock.now_utc())
+        await wd.tick()
+    assert kill.level() is KillLevel.NONE
+
+
+async def test_rearm_silence_rearms_every_lane_window(wd, clock, kill):
+    wd.set_session_window(T0, NY_CLOSE, epic="US500")
+    clock.advance(50)
+    wd.rearm_silence()  # długie wejście jednego pasma: pętla nie czytała notowań żadnego pasma
+    clock.advance(50)
+    await wd.tick()
+    assert kill.level() is KillLevel.NONE
+
+
+async def test_heartbeat_lists_lane_quotes_only_with_lane_windows(wd, heartbeat, clock):
+    wd.note_quote(T0)
+    await wd.tick()
+    assert "lanes" not in json.loads(heartbeat.read_text())  # jedno pasmo: tętno jak dotąd
+    wd.set_session_window(NY_OPEN, NY_CLOSE, epic="US500")
+    wd.note_quote(T0, epic="US500")
+    await wd.tick()
+    data = json.loads(heartbeat.read_text())
+    assert data["last_quote_ts"] == T0.isoformat()
+    assert data["lanes"] == {"US500": {"last_quote_ts": T0.isoformat()}}
+    assert wd.last_quote_of("US500") == T0 and wd.last_quote_of(None) == T0
+
+
+def test_a_good_reconcile_of_one_lane_does_not_reset_the_failures_of_another(wd, kill, notifier):
+    for _ in range(3):
+        wd.note_reconcile_error("BrokerError", "HTTP 503", epic="US500")
+        wd.note_reconcile_ok()  # pasmo DE40 uzgadnia się poprawnie w tym samym takcie
+    assert kill.level() is KillLevel.SOFT and kill.reason() == RECONCILE_FAILING
+    assert any("US500" in m for _, m in alerts_with(notifier, RECONCILE_FAILING))
+
+
+def test_a_good_reconcile_of_a_lane_resets_only_its_own_failures(wd, kill):
+    for _ in range(5):
+        wd.note_reconcile_error("BrokerError", "x", epic="US500")
+        wd.note_reconcile_error("BrokerError", "x")
+        wd.note_reconcile_ok(epic="US500")
+        wd.note_reconcile_ok()
+    assert kill.level() is KillLevel.NONE
+
+
+def test_reconcile_skips_are_counted_per_lane(wd, notifier):
+    for _ in range(6):
+        wd.note_reconcile_skipped(epic="US500")
+        wd.note_reconcile_ok()
+    starved = alerts_with(notifier, "RECONCILE_STARVED")
+    assert starved and "US500" in starved[0][1]
