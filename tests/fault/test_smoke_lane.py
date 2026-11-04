@@ -534,3 +534,37 @@ async def test_a_journal_error_while_resolving_an_unknown_entry_still_closes_the
     assert code == 1 and broker.positions == {}, "\n".join(lines)
     assert any(x.startswith("INFO [2] the probe position closed after the interrupt") for x in lines), "\n".join(lines)
     no_identifiers(lines)
+
+
+# --- wątpliwość w trakcie wstrzymania (przegląd S2) ------------------------------------------------------------------
+#
+# OCZEKIWANE: wstrzymanie przerwane wątpliwością (pierwszy sygnał zatrzymania, kill switch także HARD) pomija diagnostykę
+# [4]-[6] (żadnych zmian ochrony ani odczytów diagnostycznych) i spłaszcza od razu (FAIL [4]); przy zatrzymaniu na
+# żądanie po spłaszczeniu pomija też odczyty historii transakcji [11] (C8 NIE USTALONO).
+
+
+async def test_a_stop_request_during_the_hold_skips_the_diagnostics_and_flattens_at_once(engine, broker, clock):
+    opened = calls_at(broker, clock, "open_position")
+    closes = calls_at(broker, clock, "close_position")
+    at_time(broker, clock, PROBE_AT + timedelta(seconds=8), engine.request_shutdown)
+    code, lines = await run(engine)
+    assert code == 1, "\n".join(lines)
+    for method in ("diagnose_target_fields", "set_protection", "set_stop", "diagnose_transactions"):
+        assert method not in broker.calls, method
+    assert broker.positions == {} and (closes[0] - opened[0]).total_seconds() < 15
+    assert "FAIL [4] diagnostics skipped: hold stopped (stop requested (signal)); flattening at once" in lines
+    assert any(x.startswith("PASS [7]") for x in lines)
+    assert "INFO [11] skipped: stop requested; read the transaction history in the Capital.com app" in lines
+    assert finding(lines, "C5d").startswith("C5d NIE USTALONO")
+    assert finding(lines, "C8").startswith("C8  NIE USTALONO")
+    no_identifiers(lines)
+
+
+async def test_a_hard_kill_during_the_hold_skips_the_diagnostics_and_flattens_at_once(engine, broker, clock):
+    at_time(broker, clock, PROBE_AT + timedelta(seconds=8), lambda: engine.kill.hard("HARD_STOP_FILE"))
+    code, lines = await run(engine)
+    assert code == 1, "\n".join(lines)
+    for method in ("diagnose_target_fields", "set_protection", "set_stop"):
+        assert method not in broker.calls, method
+    assert broker.positions == {}
+    assert any(x.startswith("FAIL [4] diagnostics skipped: hold stopped (kill switch HARD") for x in lines), lines

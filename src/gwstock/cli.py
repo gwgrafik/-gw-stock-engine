@@ -573,8 +573,11 @@ async def _hold(
     epic: str | None = None,
     reconcile: Callable[[], Awaitable[Any]] | None = None,
     what: str = "its stop",
-) -> None:
+) -> str | None:
     """Wstrzymanie z otwartą pozycją próby: zwykły nadzór; wątpliwość → koniec wstrzymania (spłaszczenie od razu).
+
+    Wynik: None po upływie czasu, a przy wątpliwości (sygnał zatrzymania, kill switch, nieudane uzgadnianie, brak
+    kursu, pozycja w dzienniku nie OPEN) jej powód; próba DE40 go nie używa, próba pasma pomija wtedy diagnostykę.
 
     Domyślnie próba DE40 (instrument v1, `engine.reconcile_once`); próba pasma podaje `epic`, uzgadnianie pasma
     (`reconcile`) i to, co właściciel ogląda w aplikacji (`what`)."""
@@ -589,7 +592,7 @@ async def _hold(
         remaining = (end - now).total_seconds()
         if remaining <= 0:
             info(3, "hold finished: flattening now")
-            return
+            return None
         if now >= next_print:
             info(3, f"holding {remaining:.0f} s more: look at the position and {what} in the Capital.com app")
             next_print += timedelta(seconds=SMOKE_HOLD_COUNTDOWN_S)
@@ -614,7 +617,7 @@ async def _hold(
             doubt = doubt or "stop requested (signal)"
         if doubt is not None:
             info(3, f"hold stopped: {doubt}; flattening at once")
-            return
+            return doubt
         await clock.sleep(min(SMOKE_HOLD_TICK_S, remaining))
 
 

@@ -25,8 +25,10 @@ Kroki (PASS/FAIL/INFO w stylu próby DE40, bez identyfikatorów deali i rachunk�
 
 Bezpieczeństwo: każda awaria po wejściu (wyjątek, anulowanie, Ctrl-C, sygnał) kończy się spłaszczeniem procedurą
 awaryjną wykonawcy próby (`cli._close_after_interrupt`), a pozycja, której nie da się zamknąć (np. zamknięty rynek),
-dostaje głośną linię z tym, co zostało u brokera; każda wątpliwość w trakcie (brak stopu po zmianie ochrony, pozycja
-znikła) przerywa diagnostykę i spłaszcza od razu. Wyjść nie blokuje żadna bramka.
+dostaje głośną linię z tym, co zostało u brokera; każda wątpliwość w trakcie (wątpliwość wstrzymania `cli._hold`, w
+tym pierwszy Ctrl-C/SIGTERM i kill switch, brak stopu po zmianie ochrony, pozycja znikła) przerywa diagnostykę i
+spłaszcza od razu, a po prośbie o zatrzymanie próba pomija też odczyty historii transakcji [11]. Przerwanie albo błąd
+w trakcie wejścia: rozstrzygnięcie wyniku i zamknięcie, a bez dealId głośna linia. Wyjść nie blokuje żadna bramka.
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ CLOSURE_LOOKBACK = timedelta(minutes=2)  # historia zamknięć i transakcji od c
 TX_ATTEMPTS = 5  # odczyty historii transakcji, zanim wiersz TRADE się pojawi (opóźnienie C8)
 TX_PAUSE_S = 3
 FLATTEN_REASON = "SMOKE"
+SHUTDOWN_REASON = "stop requested (signal)"  # ten sam tekst co wątpliwość `cli._hold` przy sygnale
 POSITION_NOT_FOUND = "POSITION_NOT_FOUND"
 ADOPTED_AFTER_UNKNOWN = "ADOPTED_AFTER_UNKNOWN"
 LANE_LEFT_OPEN_HINT = (
@@ -404,20 +407,30 @@ class _Probe:
         if at_broker is not None and (at_broker.stop_derived or at_broker.target_derived):
             self.info(3, "the API did not show the stop or the target: verify both in the Capital.com app")
         self.target_now = at_broker.target_level if at_broker is not None else None
+        stopped: str | None = None
         if at_broker is not None and position is not None and position.state is PositionState.OPEN:
-            await cli._hold(
+            stopped = await cli._hold(
                 engine, self.deal_id, hold_s, self.info, epic=epic,
                 reconcile=lambda: engine.reconcile_lane_once(epic), what="its stop and target",
             )  # fmt: skip
-        if await self._still_open():
-            await self._diagnostics()
-        else:
+        if stopped is None and engine.shutdown_requested:
+            stopped = SHUTDOWN_REASON
+        if not await self._still_open():
             self.info(4, "diagnostics skipped: the position is no longer open (stop or target during the hold?)")
+        elif stopped is not None:  # wątpliwość albo zatrzymanie: bez zmian ochrony i odczytów, od razu zamknięcie
+            self.step(4, False, f"diagnostics skipped: hold stopped ({stopped}); flattening at once")
+        else:
+            await self._diagnostics()
         await self._flatten()
         trade = await self._booked()
         await self._phase_two(trade)
         await self._second_close()
-        await self._settlement()
+        if engine.shutdown_requested:  # zatrzymanie na żądanie: bez kilku odczytów historii co kilka sekund
+            self.info(11, "skipped: stop requested; read the transaction history in the Capital.com app")
+            self.finding("C8", UNKNOWN, "nie sprawdzono (zatrzymanie na żądanie): sprawdź w aplikacji walutę i kwotę "
+                                        "wyniku")  # fmt: skip
+        else:
+            await self._settlement()
 
     @staticmethod
     def _source(p: Any, what: str) -> str:
@@ -469,15 +482,23 @@ class _Probe:
                 self.position_other = dict(report.position.other)
                 self.step(4, report.position.found, "broker target fields read (GET /positions, GET /confirms)")
                 self._judge_c5(report)
-        if not await self._still_open():
-            self.info(5, "stopped: the position is gone or shows no stop; flattening at once")
+        if not await self._go_on(5):
             return
         if not await self._protection_step(report):
             return
-        if not await self._still_open():
-            self.info(6, "stopped: the position is gone or shows no stop; flattening at once")
+        if not await self._go_on(6):
             return
         await self._c5d_step(report)
+
+    async def _go_on(self, n: int) -> bool:
+        """Czy diagnostyka idzie dalej: nie po prośbie o zatrzymanie (sygnał) ani gdy pozycji nie ma albo nie ma stopu."""
+        if self.engine.shutdown_requested:
+            self.info(n, f"stopped: {SHUTDOWN_REASON}; flattening at once")
+            return False
+        if not await self._still_open():
+            self.info(n, "stopped: the position is gone or shows no stop; flattening at once")
+            return False
+        return True
 
     def _judge_c5(self, report: TargetFieldsReport) -> None:
         plan = self.plan
