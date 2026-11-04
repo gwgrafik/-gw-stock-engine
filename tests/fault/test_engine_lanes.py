@@ -42,6 +42,7 @@ from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     clock,
     config_dir,
     daily_candles,
+    disarm,
     data_dir,
     day_rules,
     five_minute_candles,
@@ -292,12 +293,35 @@ async def test_hard_kill_flattens_both_lanes(lane_engine, broker, clock, data_di
 
 
 async def test_a_closed_us500_market_does_not_hold_back_the_de40_flatten(lane_engine, broker, clock):
-    broker.set_market_closed(True, epic=US)  # US500 nie da się zamknąć, DE40 tak
+    def close_us_market() -> None:
+        if clock.now_utc() >= SIGNAL_END + timedelta(minutes=1):
+            broker.set_market_closed(True, epic=US)  # po wejściu: US500 nie da się zamknąć, DE40 tak
+
+    clock.hooks.append(close_us_market)
     report = await lane_engine.run_day(DAY)
     j = lane_engine.journal
     assert report.final_position_state is P.FLAT
     de = [t for t in j.trades() if t.instrument == "DE40"]
-    assert len(de) == 1 and de[0].exit_ts < datetime(2026, 11, 2, 16, 26, tzinfo=UTC)  # 17:25 bez minuty zwłoki
+    flatten = datetime(2026, 11, 2, 16, 25, tzinfo=UTC)  # 17:25 Berlin
+    assert len(de) == 1 and de[0].exit_ts - flatten < timedelta(seconds=10)  # bez minuty zwłoki po odmowie US500
+    assert j.current_position(US).state is P.EXITING  # US500: stop u brokera zostaje, ponowienia co minutę
+
+
+async def test_disarming_mid_day_downgrades_every_lane_and_no_lane_entry_follows(lane_engine, broker, clock, data_dir):
+    done: list[bool] = []
+
+    def owner_disarms() -> None:
+        if not done and clock.now_utc() >= SIGNAL_START:
+            done.append(True)
+            disarm(data_dir)  # właściciel usuwa plik uzbrojenia (engine_sim)
+
+    clock.hooks.append(owner_disarms)
+    stop_engine_at(lane_engine, clock, SIGNAL_END + timedelta(minutes=2))
+    await lane_engine.run_day(DAY)
+    assert lane_engine.mode is Mode.DRY_RUN and not lane_engine.lanes[0].executor.live
+    assert lane_engine.journal.count_entry_orders(DAY, US) == 0
+    assert any(d["outcome"] == "ENTER" for d in lane_decisions(lane_engine.journal))  # decyzja jest, zlecenia nie
+    assert events(lane_engine.journal, "MODE_DOWNGRADED")
 
 
 async def test_quote_silence_on_us500_alone_soft_kills_and_names_the_instrument(lane_engine, broker, clock, notifier):
@@ -328,10 +352,23 @@ async def test_session_index_is_per_instrument(lane_engine, broker, clock):
     assert lane_engine.lanes[0].session_index(lane_engine.journal) == 1
 
 
-async def test_no_valid_fx_rate_blocks_the_lane_entry_but_never_its_exit(lane_engine, broker, clock):
+async def test_no_valid_fx_rate_blocks_the_lane_entry(lane_engine, broker, clock):
     broker.set_quote_fn(lambda now: Quote("EURUSD", D("1.08"), D("1.0802"), now - timedelta(hours=1)), epic="EURUSD")
+    stop_engine_at(lane_engine, clock, SIGNAL_END + timedelta(minutes=2))
     await lane_engine.run_day(DAY)
     j = lane_engine.journal
     assert j.count_entry_orders(DAY, US) == 0
     blocks = [json.loads(e.payload) for e in j.events("gate_block")]
     assert any("FX_UNAVAILABLE" in r for b in blocks for r in b["reasons"])
+
+
+async def test_losing_the_fx_rate_never_blocks_the_exit_and_keeps_the_result_pending(lane_engine, broker, clock,
+                                                                                    notifier):
+    frozen = SIGNAL_END + timedelta(minutes=1)  # po wejściu kurs EURUSD przestaje się zmieniać (nieważny po 60 s)
+    broker.set_quote_fn(lambda now: Quote("EURUSD", D("1.08"), D("1.0802"), min(now, frozen)), epic="EURUSD")
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    assert j.current_position(US).state is P.FLAT  # wyjście z limitu czasu poszło bez kursu
+    (deal, _), = j.pnl_pending_deals()  # wynik w USD czeka na kurs: nic nie zgadnięto
+    assert j.trade_fx(deal) is None
+    assert any("PNL_PENDING" in m and "no valid EURUSD rate" in m for _, m in notifier.alerts)
