@@ -152,6 +152,9 @@ SHUTDOWN = "SHUTDOWN"
 
 # Przyczyny kill switcha nadawane przez silnik.
 JOURNAL_UNREADABLE = "JOURNAL_UNREADABLE"
+# Skład bez pasm (brak `config/lanes.toml`) z nierozliczoną transakcją w walucie obcej (`pnl_pending`): liczniki strat
+# (DAILY_LOSS, TOTAL_DRAWDOWN) nie widzą jej wyniku, a bramka v1 nie czyta znaczników, więc wejścia blokuje kill SOFT.
+PNL_PENDING_WITHOUT_LANES = "PNL_PENDING_WITHOUT_LANES"
 
 SOURCE_DECISION = "decision"
 SOURCE_ENGINE = "engine"
@@ -477,6 +480,7 @@ class Engine:
         self._unmanaged_epics: frozenset[str] | None = None  # None: jeszcze żadnego udanego odczytu listy brokera
         self._unmanaged_seen: set[str] = set()
         self._lane_arming: LaneArming = lane_arming if lane_arming is not None else default_lane_arming
+        self._pending_reported: frozenset[str] = frozenset()  # deale PNL_PENDING_WITHOUT_LANES już w zdarzeniu
         if lanes_mode:
             self._setup_portfolio(extra, portfolio)
         self.executor = self._build_executor()
@@ -713,6 +717,40 @@ class Engine:
         if problem is not None:
             self._downgrade(f"{problem}; re-arming requires a restart of the engine")
 
+    def _check_pending_without_lanes(self) -> None:
+        """Skład bez pasm (dokładnie v1) z transakcją czekającą na rozliczenie w EUR (`journal.pnl_pending_deals()`,
+        zostawioną przez wyłączone już pasmo w walucie obcej): bramka v1 nie czyta znaczników, a liczniki strat dnia i
+        łączne nie zawierają tego wyniku, więc kill SOFT PNL_PENDING_WITHOUT_LANES z alarmem i zdarzeniem (raz na zbiór
+        deali w procesie) zamiast odmowy startu. Wyjścia i zarządzanie pozycjami działają dalej; rozstrzyga właściciel
+        (runbook: `resolve-lost-trade` / `clear-kill`; rozliczenie wykona silnik z włączonym `config/lanes.toml`).
+        Wołane na początku każdego dnia i tuż przed każdym wejściem v1; bez znaczników nic nie zapisuje (ślady DE40
+        bez zmian). Nieczytelne znaczniki: kill SOFT JOURNAL_UNREADABLE (nie wiemy, czy liczniki są pełne)."""
+        if self.lanes:  # z pasmami blokuje bramka portfelowa (PORTFOLIO_PNL_PENDING), a rozlicza `_settle_foreign`
+            return
+        try:
+            pending = self.journal.pnl_pending_deals()
+        except Exception as exc:
+            self.kill.soft(JOURNAL_UNREADABLE)
+            self._alert(
+                "PNL_PENDING:journal", "ERROR",
+                f"{JOURNAL_UNREADABLE}: settlement markers unreadable ({type(exc).__name__}: {exc}); no new entries",
+            )  # fmt: skip
+            return
+        if not pending:
+            return
+        deals = [deal for deal, _ in pending]
+        self.kill.soft(PNL_PENDING_WITHOUT_LANES)
+        self._alert(
+            PNL_PENDING_WITHOUT_LANES, "ERROR",
+            f"{PNL_PENDING_WITHOUT_LANES}: trade(s) {', '.join(deals)} await their settlement in {ACCOUNT_CURRENCY} "
+            "but config/lanes.toml is off, so the loss counters miss them; no new entries (kill SOFT), exits and "
+            "position management go on; the owner decides (runbook: resolve-lost-trade / clear-kill, or enable the "
+            "lanes again so the engine settles them)",
+        )  # fmt: skip
+        if frozenset(deals) != self._pending_reported:
+            self._pending_reported = frozenset(deals)
+            self._event(PNL_PENDING_WITHOUT_LANES, deals=deals, exit_days=[day.isoformat() for _, day in pending])
+
     def _entry_block(self) -> str | None:
         """Powód odmowy wysłania wejścia (None: wolno): dry_run albo rachunek niesprawdzony w bieżącej sesji."""
         if self._mode is not Mode.LIVE:
@@ -809,6 +847,7 @@ class Engine:
         """Jeden dzień giełdy (patrz docstring modułu). Wraca po uzgadnianiu końcowym albo po prośbie o zatrzymanie."""
         self.check_wiring()
         self._check_armed()
+        self._check_pending_without_lanes()
         try:
             if self.lanes:
                 return await self._run_day_lanes(day)
@@ -1621,6 +1660,7 @@ class Engine:
 
     async def _enter(self, st: _DayState, signal: EntrySignal, rules: InstrumentRules) -> None:
         self._check_armed()  # właściciel mógł rozbroić między 09:00 a 09:05: wtedy wejście tylko jako dry_run
+        self._check_pending_without_lanes()  # znacznik mógł się pojawić po starcie dnia: wejście zablokuje KILL
         if self._mode is Mode.LIVE and self._verified_gen != self._guard.gen:
             await self._check_account(st)  # ponowne logowanie w trakcie decyzji: rachunek jeszcze raz przed wysyłką
             if self._mode is Mode.LIVE and self._verified_gen != self._guard.gen:

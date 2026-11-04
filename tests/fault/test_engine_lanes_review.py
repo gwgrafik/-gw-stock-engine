@@ -18,8 +18,9 @@ import pytest
 from gwstock.app import Engine, Mode
 from gwstock.broker.fake import FakeBroker
 from gwstock.config import LANES_FILE, load_lanes
-from gwstock.risk import LOSS_PER_TRADE
-from gwstock.types import PositionState
+from gwstock.journal import TradeRecord
+from gwstock.risk import KILL, LOSS_PER_TRADE
+from gwstock.types import KillLevel, PositionState, Side
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     DAY,
     EPIC,
@@ -131,3 +132,94 @@ async def test_lane_loss_limit_tighter_than_v1_blocks_the_entry_before_any_order
     assert not engine_events(j, "SIZE_MISMATCH_RISK")
     assert engine.kill.level() == 0
     assert_portfolio_books_balance(journal_path)
+
+
+# --- F2: nierozliczona transakcja USD w składzie bez pasm -----------------------------------------------------------
+
+PENDING_DEAL = "DEAL-US-OLD"
+PENDING_DAY = date(2026, 10, 30)  # piątek: transakcja US500 z dnia, gdy pasma jeszcze działały
+
+
+def usd_trade(net: Decimal = D("-0.95"), instrument: str = US) -> TradeRecord:
+    t0 = datetime(2026, 10, 30, 14, 50, tzinfo=UTC)
+    return TradeRecord(
+        instrument, Side.BUY, D("0.01"), D("7589.2"), D("7589.8"), D("7589.8"), D("7494.8"), D("-0.95"), D("0.006"),
+        D("0"), D("0"), D("0"), net, t0, t0, t0, t0 + timedelta(minutes=20), 900, "STOP",
+    )  # fmt: skip
+
+
+def pending_trade(journal, deal: str = PENDING_DEAL, instrument: str = US) -> None:
+    """Faza 1 księgowania transakcji w USD (wiersz księgi i `pnl_pending:<deal>`), jak zostawiło ją pasmo US500."""
+    assert journal.record_trade_pending(usd_trade(instrument=instrument), deal, PENDING_DAY)
+
+
+def kill_alerts(notifier, code: str) -> list[str]:
+    return [m for _, m in notifier.alerts if code in m]
+
+
+async def test_pending_usd_trade_without_lanes_soft_kills_at_start_and_blocks_the_de40_entry(
+    make_engine, broker, clock, notifier
+):
+    """F2 (rozstrzygnięcie kontrolera). Oczekiwane: skład v1 (brak `config/lanes.toml`), dziennik ze znacznikiem
+    `pnl_pending` transakcji US500 → przy starcie dnia kill SOFT z powodem PNL_PENDING_WITHOUT_LANES (nie odmowa
+    startu), alarm ERROR z numerem deala i zdarzenie silnika; wejście DE40 o 09:05 zablokowane przez KILL (zero
+    `open_position`); znacznik zostaje (silnik bez pasm niczego nie zgaduje i nie rozlicza)."""
+    engine = make_engine(Mode.LIVE)
+    assert engine.lanes == []
+    pending_trade(engine.journal)
+    calls = broker_calls(broker, clock, ("open_position",))
+    stop_engine_at(engine, clock, berlin(DAY, 9, 12))
+    await engine.run_day(DAY)
+    j = engine.journal
+    assert engine.kill.level() is KillLevel.SOFT and j.kill_state().reason == "PNL_PENDING_WITHOUT_LANES"
+    assert any(PENDING_DEAL in m for m in kill_alerts(notifier, "PNL_PENDING_WITHOUT_LANES"))
+    (event,) = engine_events(j, "PNL_PENDING_WITHOUT_LANES")
+    assert event["deals"] == [PENDING_DEAL]
+    assert calls == [] and j.count_entry_orders(DAY) == 0
+    assert any(KILL in b["reasons"] for b in gate_blocks(j))
+    assert j.pnl_pending_deals() == [(PENDING_DEAL, PENDING_DAY)]
+
+
+async def test_pending_marker_appearing_after_start_still_blocks_the_next_v1_entry(make_engine, broker, clock):
+    """F2: kontrola także tuż przed każdym wejściem v1. Oczekiwane: znacznik pojawia się o 09:02 (po starcie dnia,
+    np. dziennik przywrócony z kopii), wejście DE40 o 09:05 zablokowane (kill SOFT PNL_PENDING_WITHOUT_LANES, KILL w
+    `gate_block`), zero `open_position`."""
+    engine = make_engine(Mode.LIVE)
+    calls = broker_calls(broker, clock, ("open_position",))
+    added: list[bool] = []
+
+    def add_marker() -> None:
+        if not added and clock.now_utc() >= berlin(DAY, 9, 2):
+            added.append(True)
+            pending_trade(engine.journal)
+
+    clock.hooks.append(add_marker)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 12))
+    await engine.run_day(DAY)
+    assert added and calls == []
+    assert engine.journal.kill_state().reason == "PNL_PENDING_WITHOUT_LANES"
+    assert any(KILL in b["reasons"] for b in gate_blocks(engine.journal))
+
+
+async def test_pending_usd_trade_without_lanes_still_manages_and_flattens_the_de40_position(
+    make_engine, broker, clock, journal_path
+):
+    """F2: wyjścia i zarządzanie działają dalej. Oczekiwane: proces v1 wszedł w DE40 o 09:05 i padł; nowy proces
+    startuje z niepustym `pnl_pending` (pasma wyłączone) → kill SOFT, ale pozycja DE40 dalej zarządzana i spłaszczona
+    o 17:25 (`FORCED`), zaksięgowana raz; licznik dnia zawiera tylko DE40 (kwota USD nie jest zgadywana)."""
+    engine = make_engine(Mode.LIVE)
+    stop_engine_at(engine, clock, berlin(DAY, 9, 10))
+    await engine.run_day(DAY)
+    assert engine.journal.current_position(EPIC).state is P.OPEN
+    pending_trade(engine.journal)
+    clock.hooks.clear()
+    restarted = make_engine.restart(engine, Mode.LIVE)
+    report = await restarted.run_day(DAY)
+    j = restarted.journal
+    assert restarted.kill.level() is KillLevel.SOFT and j.kill_state().reason == "PNL_PENDING_WITHOUT_LANES"
+    assert report.final_position_state is P.FLAT
+    (de,) = [t for t in j.trades() if t.instrument == EPIC]
+    assert de.exit_reason == "FORCED" and timedelta(0) <= de.exit_ts - berlin(DAY, 17, 25) < timedelta(seconds=10)
+    assert j.realized_pnl(DAY) == de.net_pnl
+    assert j.pnl_pending_deals() == [(PENDING_DEAL, PENDING_DAY)]
+
