@@ -223,7 +223,7 @@ class _Probe:
             self.info(7, f"probe interrupted ({type(exc).__name__}); closing the probe position now")
             await cli._close_after_interrupt(
                 self.engine, self.deal_id, self.out, executor=self.executor, step=7, name="the probe position",
-                hint=self._left_open_hint(),
+                hint=self._left_open_hint(), scrub=self.scrub,
             )  # fmt: skip
             if not isinstance(exc, Exception):
                 raise
@@ -347,7 +347,7 @@ class _Probe:
         if self.deal_id is not None and (failed or not settled):
             await cli._close_after_interrupt(
                 self.engine, self.deal_id, self.out, executor=self.executor, step=2, name="the probe position",
-                hint=LANE_LEFT_OPEN_HINT,
+                hint=LANE_LEFT_OPEN_HINT, scrub=self.scrub,
             )  # fmt: skip
             return
         if failed or not settled:

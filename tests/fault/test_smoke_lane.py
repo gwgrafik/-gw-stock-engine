@@ -742,3 +742,34 @@ async def test_an_explicit_null_target_in_the_position_is_not_a_confirmation(eng
     code, lines = await run(engine)
     assert finding(lines, "C5").startswith("C5  NIE USTALONO"), finding(lines, "C5")
     assert "    - GET /positions/{dealId}: klucze celu profitLevel=null (jawny null: nie potwierdza celu)" in lines
+
+
+# --- logi próby bez identyfikatorów (przegląd S5) --------------------------------------------------------------------
+#
+# OCZEKIWANE: logi, które próba pasma pisze w tym samym terminalu co wydruk (ostrzeżenia ścieżki zamknięcia po
+# przerwaniu, z tekstem wyjątku brokera), nie zawierają identyfikatora deala ani referencji; stderr też nie.
+
+
+async def test_the_probe_logs_carry_no_deal_identifiers(engine, broker, clock, monkeypatch, caplog, capsys):
+    import logging
+
+    async def failing_close(deal_id):
+        broker.calls.append("close_position")
+        raise BrokerTimeout(f"DELETE /positions/{deal_id}: timeout")
+
+    def interrupt():
+        monkeypatch.setattr(broker, "close_position", failing_close)
+        raise asyncio.CancelledError()
+
+    at_time(broker, clock, PROBE_AT + timedelta(seconds=10), interrupt)
+    caplog.set_level(logging.DEBUG)
+    lines: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        await smoke_lane(engine, US, out=lines.append)
+    assert any(x.startswith("FAIL [7] LOUD") for x in lines)
+    assert "smoke direct close failed: BrokerTimeout: DELETE /positions/<deal>: timeout" in caplog.text
+    err = capsys.readouterr().err
+    for token in ("DEAL-", "REF-"):
+        assert token not in caplog.text, caplog.text
+        assert token not in err
+    no_identifiers(lines)

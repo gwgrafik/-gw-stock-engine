@@ -666,6 +666,7 @@ async def _close_after_interrupt(
     step: int = 4,
     name: str | None = None,
     hint: str = LEFT_OPEN_HINT,
+    scrub: Callable[[str], str] | None = None,
 ) -> None:
     """Po przerwaniu wstrzymania: zamknięcie pozycji próby osłonięte przed kolejnym anulowaniem (biegnie jako osobne
     zadanie, a kolejne przerwania nie kończą czekania na nie, najwyżej `SMOKE_CLOSE_WAIT_SUBMITS` × submit_timeout_s);
@@ -676,21 +677,23 @@ async def _close_after_interrupt(
     uzgadnianie silnika zaksięguje później z historii. Bez czytelnej listy pozycji nic nie wysyłamy na ślepo.
 
     Domyślnie próba DE40 (wykonawca v1, krok 4, deal po identyfikatorze); próba pasma podaje wykonawcę próby, numer
-    kroku spłaszczenia, nazwę pozycji bez identyfikatora (`name`) i podpowiedź dla właściciela (`hint`).
+    kroku spłaszczenia, nazwę pozycji bez identyfikatora (`name`), podpowiedź dla właściciela (`hint`) i `scrub`, który
+    usuwa identyfikatory z tekstów wyjątków w ostrzeżeniach logu (log idzie do tego samego terminala co wydruk).
     """
     executor = engine.executor if executor is None else executor
+    clean = (lambda text: text) if scrub is None else scrub
     name = f"deal {deal_id}" if name is None else name
 
     async def attempt() -> None:
         try:
             await executor.emergency_flatten()
         except Exception as exc:
-            _LOG.warning("smoke emergency close via the executor failed: %s: %s", type(exc).__name__, exc)
+            _LOG.warning("smoke emergency close via the executor failed: %s: %s", type(exc).__name__, clean(str(exc)))
         if await _still_at_broker(engine, deal_id):
             try:
                 await engine.probe(engine.raw_broker.close_position, deal_id)
             except Exception as exc:
-                _LOG.warning("smoke direct close failed: %s: %s", type(exc).__name__, exc)
+                _LOG.warning("smoke direct close failed: %s: %s", type(exc).__name__, clean(str(exc)))
 
     await _await_shielded(engine, attempt())
     if await _still_at_broker(engine, deal_id) is not False:
