@@ -702,3 +702,74 @@ async def test_protection_distance_without_a_rate_or_a_par_bound_goes_hard(us, f
     journal.upsert_position(PositionRecord("US500", P.OPEN, "DEAL-B", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY))
     assert await us.protect_unprotected(pos) is False
     assert kill.level() is KillLevel.HARD and "set_protection" not in fake.calls and fake.positions == {}
+
+
+# --- waluta obca: dwufazowe księgowanie (projekt §7.4) ------------------------------------------------------
+
+
+async def closed_by_target_racing_the_time_limit(us, fake, journal, plan):
+    await us.enter(plan, US_RULES, DAY)
+    fake.on_call("close_position", lambda: fake.trigger_target("DEAL-1"), once=True)
+    closed = await us.flatten(journal.current_position("US500"), "TIME_LIMIT")
+    assert closed is not None and closed.reason == "TARGET"
+    return closed
+
+
+async def test_foreign_close_is_booked_pending_without_touching_the_eur_counter(us, fake, journal, plan, kill):
+    await closed_by_target_racing_the_time_limit(us, fake, journal, plan)
+    [row] = journal.trades()
+    # w USD: mid wejścia 7583.3, mid wyjścia 7598.6 + 0.3 = 7598.9; brutto 15.6 × 0.01 = 0.156 → 0.16;
+    # spread 0.006 → 0.01; poślizg wejścia 0.5 × 0.01 = 0.005 → 0.01 (bez dodatku stopu); netto 0.14 USD
+    assert row.exit_reason == "TARGET" and row.net_pnl == D("0.14") and row.slippage_penalty == D("0.01")
+    assert journal.realized_pnl(DAY) == D("0") and journal.realized_pnl_total() == D("0")  # USD nie trafia do EUR
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY)]
+    [booked] = events(journal, "TRADE_BOOKED")
+    assert booked["pnl_pending"] is True and booked["currency"] == "USD" and booked["exit_reason"] == "TARGET"
+    assert journal.current_position("US500") == PositionRecord("US500", P.FLAT)
+    record = PositionRecord("US500", P.EXITING, "DEAL-1", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
+    await us.book(record, (await fake.closed_since(T_ENTRY))[0])  # ponowne księgowanie: bez zmian
+    assert len(journal.trades()) == 1 and journal.realized_pnl(DAY) == D("0")
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY)] and kill.level() is KillLevel.NONE
+
+
+async def test_settling_a_foreign_trade_adds_the_eur_amount_exactly_once(us, fake, journal, plan):
+    await closed_by_target_racing_the_time_limit(us, fake, journal, plan)
+    assert us.settle_foreign_pnl("DEAL-1", D("0.12"), source="HISTORY_TRANSACTIONS", rate=D("1.1667")) is True
+    assert journal.realized_pnl(DAY) == D("0.12") and journal.pnl_pending_deals() == []
+    fx = journal.trade_fx("DEAL-1")
+    assert fx.net_eur == D("0.12") and fx.source == "HISTORY_TRANSACTIONS" and fx.rate == D("1.1667")
+    [settled] = events(journal, "TRADE_SETTLED")
+    assert settled["deal_id"] == "DEAL-1" and D(settled["net_eur"]) == D("0.12") and settled["exit_day"] == "2026-11-02"
+    assert us.settle_foreign_pnl("DEAL-1", D("0.12"), source="HISTORY_TRANSACTIONS") is False  # drugi raz: nic
+    assert journal.realized_pnl(DAY) == D("0.12") and len(events(journal, "TRADE_SETTLED")) == 1
+
+
+async def test_settling_a_foreign_loss_enforces_the_loss_limits(us, fake, journal, plan, kill, notifier):
+    await closed_by_target_racing_the_time_limit(us, fake, journal, plan)
+    assert kill.level() is KillLevel.NONE
+    assert us.settle_foreign_pnl("DEAL-1", D("-1.60"), source="ESTIMATED_FX", rate=D("1.08")) is True
+    assert kill.level() is KillLevel.SOFT and kill.reason() == "DAILY_LOSS"  # −1,60 ≤ −1,50 EUR
+    assert events(journal, "DAILY_LOSS")[0]["exit_day"] == "2026-11-02"
+    assert alerts(notifier, "DAILY_LOSS")
+
+
+async def test_a_foreign_lane_refuses_its_next_entry_while_a_trade_awaits_settlement(us, fake, journal, plan, us_quote):
+    await closed_by_target_racing_the_time_limit(us, fake, journal, plan)
+    fake.calls.clear()
+    plan2 = BarEntryPlan(Side.BUY, D("0.01"), US_STOP_D, US_TARGET_D, us_quote)
+    assert await us.enter(plan2, US_RULES, DAY) is None
+    assert fake.calls == []  # licznik EUR niepełny: bez wejścia, nic do brokera
+    assert payloads(journal, "gate_block")[-1]["reasons"] == ["PNL_PENDING"]
+
+
+def test_settlement_is_only_for_a_foreign_lane(de, ut):
+    for ex in (de, ut):
+        with pytest.raises(ValueError, match="foreign"):
+            ex.settle_foreign_pnl("DEAL-1", D("1"), source="HISTORY_TRANSACTIONS")
+
+
+async def test_domestic_lanes_still_book_straight_into_the_eur_counter(ut, fake, journal):
+    hold_targeted(fake, journal)
+    fake.trigger_target("DEAL-T")
+    await ut.flatten(journal.current_position("US500"), "FORCED")
+    assert journal.pnl_pending_deals() == [] and journal.realized_pnl(DAY) == journal.trades()[0].net_pnl != D("0")

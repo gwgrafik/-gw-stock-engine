@@ -33,6 +33,9 @@ Niezmienniki (prawdziwe pieniądze):
   nieudanym zapisie EXITING: pamięć wyjść `ExitMemory`, przekazywana wykonawcy odbudowanemu przy zejściu do dry_run);
   zamknięty rynek: EXITING, stop u brokera zostaje, alarm. Zwykłe spłaszczenie zapisuje
   EXITING PRZED zamknięciem (spec §8: po restarcie nie wysyłamy na ślepo), a jego błąd dziennika propaguje się;
+- pasmo w walucie obcej księguje dwufazowo (projekt §7.4): wiersz księgi w walucie instrumentu i `pnl_pending` w
+  jednej transakcji, bez dopisania do licznika EUR (`record_trade_pending`); kwota w EUR trafia do licznika dokładnie
+  raz przez `settle_foreign_pnl` (potem limity strat); do tego czasu kolejne wejście pasma jest zablokowane;
 - nigdy FLAT bez zaksięgowania: zamknięcie z historii (do `SETTLE_ATTEMPTS` prób) → `book` → FLAT; gdy historia go nie
   pokazuje, pozycja zostaje EXITING i księguje ją później uzgadnianie (`Reconciler(booker=executor)`);
 - `book` jest idempotentny (`journal.has_trade` przed czymkolwiek innym; jedyny zapis wyniku to `journal.record_trade`
@@ -174,6 +177,9 @@ FX_UNAVAILABLE = "FX_UNAVAILABLE"
 FX_RATE = "RATE"  # ważny kurs, strona niekorzystna
 FX_PAR_BOUND = "PAR_BOUND"  # bez kursu; kwota w walucie instrumentu jest górnym ograniczeniem (parytet)
 FX_NONE = "UNAVAILABLE"  # bez kursu i bez ograniczenia: straż zamyka
+# Pasmo w walucie obcej z transakcją czekającą na rozliczenie w walucie rachunku (faza 2): licznik strat niepełny,
+# więc kolejne wejście tego pasma jest zablokowane (bramka portfelowa blokuje wszystkie pasma: PORTFOLIO_PNL_PENDING).
+PNL_PENDING = "PNL_PENDING"
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 GUARD_EXIT_UNPERSISTED = "GUARD_EXIT_UNPERSISTED"  # straż chce zamknąć, a dziennik nie zapisze EXITING: HARD i awaryjne
 DAILY_LOSS = "DAILY_LOSS"
@@ -460,9 +466,12 @@ class Executor:
         quote = signal.decision_quote
         vpp_account = rules.value_per_point
         if self._foreign:  # bramka liczy w walucie rachunku: wartość punktu po kursie niekorzystnym (projekt §7.3)
+            if self._journal.pnl_pending_deals():
+                self._foreign_block(PNL_PENDING, day, smoke)
+                return None
             converted = self._to_account(rules.value_per_point)
             if converted is None:
-                self._fx_unavailable(day, smoke)
+                self._foreign_block(FX_UNAVAILABLE, day, smoke)
                 return None
             vpp_account = converted
         candidate = EntryCandidate(
@@ -532,11 +541,16 @@ class Executor:
         self._journal.set_meta(META_ENTRY_LAST.format(self._epic), client_id)
         return request
 
-    def _fx_unavailable(self, day: date, smoke: bool) -> None:
-        """Wejście pasma w walucie obcej bez ważnego kursu: blokada (jak bramka), nic do brokera, bez zgadywania."""
-        self._alert("WARN", f"{FX_UNAVAILABLE}: no valid {self._lane.currency} rate for {self._epic}; no entry")
+    def _foreign_block(self, reason: str, day: date, smoke: bool) -> None:
+        """Wejście pasma w walucie obcej zablokowane (jak bramka), nic do brokera: brak ważnego kursu (nie zgadujemy)
+        albo transakcja czekająca na rozliczenie w walucie rachunku (licznik strat niepełny)."""
+        why = (
+            f"no valid {self._lane.currency} rate" if reason == FX_UNAVAILABLE
+            else "a closed trade awaits its settlement in the account currency"
+        )  # fmt: skip
+        self._alert("WARN", f"{reason}: {why} ({self._epic}); no entry")
         block: dict[str, Any] = {
-            "reasons": [FX_UNAVAILABLE], "epic": self._epic, "currency": self._lane.currency, "day": day.isoformat()
+            "reasons": [reason], "epic": self._epic, "currency": self._lane.currency, "day": day.isoformat()
         }
         if smoke:
             block["smoke"] = True
@@ -1540,22 +1554,33 @@ class Executor:
                 self._alert("ERROR", f"BOOKING_FAILED {closed.deal_id}: {type(exc2).__name__}: {exc2} ({fallback})")
                 raise BookingError(f"cannot book {closed.deal_id}: {type(exc2).__name__}: {exc2}") from exc2
         flags = FLAGS_ESTIMATED if estimated else FLAGS_BY_OWNER if by_owner else ""
-        booked = self._journal.record_trade(trade, closed.deal_id, exit_day, flags=flags)
+        if self._foreign:  # faza 1: wiersz w walucie instrumentu, licznik EUR czeka na kwotę od brokera (§7.4)
+            booked = self._journal.record_trade_pending(trade, closed.deal_id, exit_day, flags=flags)
+        else:
+            booked = self._journal.record_trade(trade, closed.deal_id, exit_day, flags=flags)
         triggered = self._enforce_loss_limits(exit_day, announce=booked)  # kill przed zapisami zdarzeń
         if not booked:
             return  # zaksięgował ktoś w międzyczasie: w księdze nic się nie zmienia
         if fallback is not None:
             self._alert("WARN", f"{COST_FALLBACK} {closed.deal_id}: degraded ledger row ({fallback}); check the broker")
             self._event(COST_FALLBACK, deal_id=closed.deal_id, reason=fallback)
+        currency = self._lane.currency if self._foreign else "EUR"
         if estimated:
             self._alert(
                 "ERROR",
-                f"LOST_TRADE_ESTIMATED {closed.deal_id}: worst-case loss booked (net {trade.net_pnl} EUR, entry "
+                f"LOST_TRADE_ESTIMATED {closed.deal_id}: worst-case loss booked (net {trade.net_pnl} {currency}, entry "
                 f"assumed at the stop distance); compare it with the Capital.com history",
             )
-        owner = {"estimated": True} if estimated else {}
+        owner: dict[str, Any] = {"estimated": True} if estimated else {}
         if flags:
             owner["flags"] = flags
+        if self._foreign:
+            owner.update(currency=currency, pnl_pending=True)
+            self._alert(
+                "WARN",
+                f"PNL_PENDING {closed.deal_id}: booked in {currency} (net {trade.net_pnl}); the account-currency amount "
+                "is not in the loss counters until it is settled, entries of this lane wait for it",
+            )
         self._event(
             "TRADE_BOOKED", deal_id=closed.deal_id, exit_day=exit_day.isoformat(), exit_reason=trade.exit_reason,
             net_pnl=trade.net_pnl, notes=list(notes), cost_fallback=fallback is not None, **owner,
@@ -1685,6 +1710,32 @@ class Executor:
     def _nights(self, opened_at: datetime, closed: ClosedDeal) -> int:
         local = self._calendar.to_local
         return max(0, (local(closed.ts).date() - local(opened_at).date()).days)
+
+    def settle_foreign_pnl(
+        self, deal_id: str, net_eur: Decimal, *, source: str, rate: Decimal | None = None
+    ) -> bool:
+        """Faza 2 księgowania pasma w walucie obcej (projekt §7.4): kwota `net_eur` w walucie rachunku (z historii
+        transakcji brokera albo szacunek `ESTIMATED_FX` z kursu brokera) trafia do licznika dnia wyjścia razem z
+        zapisem `trade_fx` i zdjęciem `pnl_pending` (jedna transakcja dziennika), potem limity strat dnia wyjścia.
+
+        Idempotentne: transakcja nieczekająca (już rozliczona) → False bez zmian w licznikach. Kwoty nigdy nie
+        wymyślamy: wywołujący podaje ją ze źródła. Pasmo w walucie rachunku: ValueError (księguje od razu).
+        """
+        if not self._foreign:
+            raise ValueError(f"settle_foreign_pnl: lane {self._epic} is not in a foreign currency")
+        exit_day = dict(self._journal.pnl_pending_deals()).get(deal_id)
+        settled = self._journal.settle_trade_pnl(deal_id, net_eur, source=source, rate=rate)
+        if exit_day is None:
+            return settled
+        triggered = self._enforce_loss_limits(exit_day, announce=settled)  # kill przed zapisami zdarzeń
+        if settled:
+            self._event(
+                "TRADE_SETTLED", deal_id=deal_id, exit_day=exit_day.isoformat(), net_eur=net_eur, source=source,
+                rate=rate, currency=self._lane.currency,
+            )  # fmt: skip
+        for code, detail in triggered:
+            self._event(code, **detail)
+        return settled
 
     # --- limity strat (spec §9) -----------------------------------------------------------------------------
 
