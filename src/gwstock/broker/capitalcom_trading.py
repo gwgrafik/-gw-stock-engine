@@ -307,6 +307,11 @@ class TradingMixin:
         if any(row.stop_reported for row in rows):
             self._stop_keys_seen = True
 
+    async def set_protection(self, deal_id: str, stop_level: Decimal, target_level: Decimal | None) -> None:
+        """ZAŚLEPKA zadania 6 (pełna implementacja: zadanie 7). Istnieje tylko po to, żeby adapter spełniał protokół
+        `Broker`; zawsze rzuca `NotImplementedError` i niczego nie wysyła do brokera."""
+        raise NotImplementedError("set_protection: not implemented in task 6 (Capital.com adapter: task 7)")
+
     async def set_stop(self, deal_id: str, stop_level: Decimal) -> None:
         """`PUT /positions/{dealId}` ze `stopLevel`, potwierdzenie i odczyt kontrolny pozycji; zapis stopu po sukcesie.
 

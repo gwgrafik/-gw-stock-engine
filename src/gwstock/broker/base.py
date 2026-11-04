@@ -61,7 +61,11 @@ class Broker(Protocol):
         ...
 
     async def open_position(self, req: EntryRequest) -> EntryAck:
-        """Wejście rynkowe ze stopem atomowym; zwraca tylko referencję (potwierdzenie przez `confirm`)."""
+        """Wejście rynkowe ze stopem atomowym; zwraca tylko referencję (potwierdzenie przez `confirm`).
+
+        `TargetedEntryRequest`: także cel zysku atomowo (`target_distance` od ceny wykonania, po stronie zysku);
+        potwierdzenie i lista pozycji zwracają wtedy `TargetedOpenPosition`.
+        """
         ...
 
     async def confirm(self, deal_reference: str) -> OpenPosition | None:
@@ -92,6 +96,15 @@ class Broker(Protocol):
     async def close_position(self, deal_id: str) -> None: ...
 
     async def set_stop(self, deal_id: str, stop_level: Decimal) -> None: ...
+
+    async def set_protection(self, deal_id: str, stop_level: Decimal, target_level: Decimal | None) -> None:
+        """Ustawia stop i cel zysku pozycji RAZEM (jedno żądanie): pasma z celem (R4, projekt §3.1).
+
+        Wysyła zawsze oba poziomy, bo nie ustalono, czy zmiana samego stopu u Capital.com kasuje cel (C5d).
+        `target_level=None`: pozycja bez celu. Poziom zbyt bliski rynku albo cel po stronie straty:
+        `BrokerRejected`, a pozycja zostaje bez zmian (oba poziomy albo żaden). DE40 v1 używa wyłącznie `set_stop`.
+        """
+        ...
 
     async def closed_since(self, since: datetime) -> list[ClosedDeal]:
         """WSZYSTKIE zamknięcia z `ts >= since` albo `BrokerError`; nigdy lista częściowa.

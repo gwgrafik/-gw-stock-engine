@@ -65,6 +65,14 @@ class TestFakeBrokerContract(BrokerContract):
     def expire_session(self, fake):
         return fake.expire_session
 
+    @pytest.fixture
+    def supports_target(self):
+        return True
+
+    @pytest.fixture
+    def trigger_target(self, fake):
+        return fake.trigger_target
+
 
 # --- testy z planu -------------------------------------------------------------
 
@@ -444,6 +452,7 @@ CALLS = {
     "list_working_orders": lambda b: b.list_working_orders(),
     "close_position": lambda b: b.close_position("DEAL-1"),
     "set_stop": lambda b: b.set_stop("DEAL-1", Decimal("25700")),
+    "set_protection": lambda b: b.set_protection("DEAL-1", Decimal("25700"), Decimal("25900")),
     "closed_since": lambda b: b.closed_since(T0),
     "account": lambda b: b.account(),
     "list_accounts": lambda b: b.list_accounts(),

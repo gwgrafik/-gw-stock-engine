@@ -341,6 +341,11 @@ class GuardedBroker:
     async def set_stop(self, deal_id: str, stop_level: Decimal) -> None:
         return await self._guard.call("set_stop", self._inner.set_stop, deal_id, stop_level)
 
+    async def set_protection(self, deal_id: str, stop_level: Decimal, target_level: Decimal | None) -> None:
+        # Zadanie 6: tylko przekazanie (jak `set_stop`), żeby nowa metoda protokołu nie omijała ponownego logowania;
+        # DE40 v1 jej nie wywołuje. Użycie przez silnik pasm: zadania 9 i 12.
+        return await self._guard.call("set_protection", self._inner.set_protection, deal_id, stop_level, target_level)
+
     async def closed_since(self, since: datetime) -> list[ClosedDeal]:
         return await self._guard.call("closed_since", self._inner.closed_since, since)
 

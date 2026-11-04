@@ -10,6 +10,11 @@ Klasa nie zaczyna się od `Test`, więc pytest nie zbiera jej samej. Podklasa `T
 - fixture `reject_next_entry`: funkcja `(reason) -> None`: broker przyjmie najbliższe wejście (zwróci referencję),
   ale go nie wykona, a potwierdzenie pokaże odrzucenie z tym powodem;
 - fixture `expire_session`: funkcja bez argumentów, po której broker traktuje sesję jako wygasłą.
+- fixture `supports_target` (zadanie 6): zwraca True, gdy adapter obsługuje cel zysku (`TargetedEntryRequest`,
+  `set_protection`); domyślnie `pytest.skip`, więc testy celu są pomijane w adapterze, który jeszcze go nie ma
+  (Capital.com do zadania 7). Podklasa włącza je, nadpisując fixture;
+- fixture `trigger_target` (zadanie 6): funkcja `(deal_id) -> None`, po której broker zamknął pozycję celem zysku
+  po poziomie celu (FakeBroker: `trigger_target`; adapter: stan lokalnego serwera testowego); domyślnie `pytest.skip`.
 Hooki `add_working_order`, `reject_next_entry` i `expire_session` są opcjonalne: podklasa, która nie umie danego
 stanu wytworzyć (np. adapter z przezroczystym ponownym logowaniem), wywołuje w tej fixture `pytest.skip(powód)`,
 co pomija tylko test, który jej używa.
@@ -35,6 +40,7 @@ from gwstock.types import (
     OpenPosition,
     SessionExpired,
     Side,
+    TargetedEntryRequest,
     WorkingOrder,
 )
 
@@ -42,6 +48,7 @@ from gwstock.types import (
 class BrokerContract:
     epic = "DE40"
     stop_distance = Decimal("30")
+    target_distance = Decimal("45")
 
     @pytest.fixture
     def broker(self) -> Broker:
@@ -71,6 +78,14 @@ class BrokerContract:
             "subclass must override the `expire_session` fixture "
             "(call pytest.skip(...) in it if the adapter cannot surface an expired session)"
         )
+
+    @pytest.fixture
+    def supports_target(self) -> bool:
+        pytest.skip("this broker does not support a profit target yet (Capital.com: task 7)")
+
+    @pytest.fixture
+    def trigger_target(self) -> Callable[[str], None]:
+        pytest.skip("this test broker cannot close a position by its profit target yet (Capital.com: task 7)")
 
     async def _request(self, broker: Broker, side: Side) -> EntryRequest:
         rules = await broker.instrument_rules(self.epic)
@@ -211,3 +226,84 @@ class BrokerContract:
             await broker.list_positions()
         await broker.login()
         assert await broker.list_positions() == []
+
+    # --- cel zysku (zadanie 6; adapter Capital.com włącza w zadaniu 7) ------------------------------
+
+    async def _targeted_request(self, broker: Broker, side: Side) -> TargetedEntryRequest:
+        req = await self._request(broker, side)
+        rules = await broker.instrument_rules(self.epic)
+        target = max(self.target_distance, rules.min_stop_distance)
+        return TargetedEntryRequest(req.client_id, req.epic, req.side, req.size, req.stop_distance, target)
+
+    async def _open_targeted(self, broker: Broker, side: Side) -> tuple[TargetedEntryRequest, OpenPosition]:
+        req = await self._targeted_request(broker, side)
+        ack = await broker.open_position(req)
+        pos = await broker.confirm(ack.deal_reference)
+        assert pos is not None, "confirm() of a fresh entry must return the open position"
+        return req, pos
+
+    async def test_plain_entry_has_no_target(self, broker):
+        await broker.login()
+        _, _, pos = await self._open(broker, Side.BUY)
+        assert (pos.target_level, pos.target_derived) == (None, False)
+
+    @pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+    async def test_open_attaches_stop_and_target_atomically(self, broker, supports_target, side):
+        await broker.login()
+        req, pos = await self._open_targeted(broker, side)
+        sign = 1 if side is Side.BUY else -1
+        assert pos.stop_level == pos.open_level - sign * req.stop_distance
+        assert pos.target_level == pos.open_level + sign * req.target_distance  # cel po stronie zysku
+        assert await broker.list_positions() == [pos]
+
+    async def test_target_closer_than_broker_minimum_is_rejected_without_position(self, broker, supports_target):
+        await broker.login()
+        req = await self._targeted_request(broker, Side.BUY)
+        rules = await broker.instrument_rules(self.epic)
+        too_close = TargetedEntryRequest(
+            req.client_id, req.epic, req.side, req.size, req.stop_distance, rules.min_stop_distance / 2
+        )
+        with pytest.raises(BrokerRejected):  # odmowa przy wysłaniu albo przy potwierdzeniu (dealStatus REJECTED)
+            ack = await broker.open_position(too_close)
+            await broker.confirm(ack.deal_reference)
+        assert await broker.list_positions() == []
+
+    async def test_set_protection_moves_stop_and_target_together(self, broker, supports_target):
+        await broker.login()
+        _, pos = await self._open_targeted(broker, Side.BUY)
+        wider_stop = pos.stop_level - Decimal("10")  # dalej od rynku: zawsze dozwolone
+        farther_target = pos.target_level + Decimal("10")
+        await broker.set_protection(pos.deal_id, wider_stop, farther_target)
+        [moved] = await broker.list_positions()
+        assert (moved.deal_id, moved.stop_level, moved.target_level) == (pos.deal_id, wider_stop, farther_target)
+
+    async def test_set_protection_adds_target_to_untargeted_position(self, broker, supports_target):
+        await broker.login()
+        _, _, pos = await self._open(broker, Side.SELL)
+        target = pos.open_level - self.target_distance
+        await broker.set_protection(pos.deal_id, pos.stop_level, target)
+        [moved] = await broker.list_positions()
+        assert (moved.stop_level, moved.target_level) == (pos.stop_level, target)
+
+    async def test_set_protection_with_target_on_the_loss_side_is_rejected_and_changes_nothing(
+        self, broker, supports_target
+    ):
+        await broker.login()
+        _, pos = await self._open_targeted(broker, Side.BUY)
+        with pytest.raises(BrokerRejected):
+            await broker.set_protection(pos.deal_id, pos.stop_level - Decimal("10"), pos.open_level - Decimal("100"))
+        assert await broker.list_positions() == [pos]
+
+    async def test_set_protection_of_unknown_deal_is_rejected(self, broker, supports_target):
+        await broker.login()
+        with pytest.raises(BrokerRejected):
+            await broker.set_protection("DEAL-does-not-exist", Decimal("1000"), Decimal("2000"))
+
+    async def test_target_hit_closes_position_and_reports_target_reason(self, broker, supports_target, trigger_target):
+        await broker.login()
+        _, pos = await self._open_targeted(broker, Side.BUY)
+        trigger_target(pos.deal_id)
+        assert await broker.list_positions() == []
+        closed = [d for d in await broker.closed_since(pos.opened_at) if d.deal_id == pos.deal_id]
+        assert len(closed) == 1
+        assert (closed[0].epic, closed[0].reason, closed[0].exit_level) == (self.epic, "TARGET", pos.target_level)
