@@ -31,6 +31,8 @@ from gwstock.types import (
     OpenPosition,
     SessionExpired,
     Side,
+    TargetedEntryRequest,
+    TargetedOpenPosition,
     WorkingOrder,
 )
 from tests.unit.broker_contract import BrokerContract
@@ -829,6 +831,7 @@ def test_position_row_requires_the_stop_level_reported_flag():
     fields = dict(
         deal_id="D-1", working_order_id=None, epic="DE40", side=Side.BUY, size=Decimal("0.001"), level=OFFER,
         opened_at=at(0.2), stop_reported=True, stop_level=OFFER - 30,
+        target_reported=False, target_level=None, target_level_reported=False,
     )  # fmt: skip
     with pytest.raises(TypeError, match="stop_level_reported"):
         capitalcom_parse.PositionRow(**fields)
@@ -2350,3 +2353,389 @@ async def test_a_lookback_row_without_a_deal_id_is_rejected_too(server, broker):
     await broker.login()
     with pytest.raises(BrokerError, match="filter not honoured"):
         await broker.closed_since(since)
+
+
+# =============================================================================================================
+# Cel zysku (zadanie 7, R4, projekt §3.1). Nazwy pól celu w odpowiedziach brokera (`profitLevel`, `profitDistance`),
+# przypisanie `TP` i skutek `PUT` bez `profitLevel` (C5d) są NIEPOTWIERDZONE na rachunku (research/diag_fx.py);
+# serwer testowy (`fake_capital_server`) przyjmuje je jako założenia z notatek API §2.10–§2.15, §2.19.
+# =============================================================================================================
+
+
+def targeted(
+    side: Side = Side.BUY, size: str = "0.001", stop: str = "30", target: str = "45", epic: str = "DE40"
+) -> TargetedEntryRequest:
+    return TargetedEntryRequest("gws-20261102-DE40-1-entry", epic, side, Decimal(size), Decimal(stop), Decimal(target))
+
+
+async def open_targeted(broker, side: Side = Side.BUY, **kwargs) -> tuple[str, OpenPosition]:
+    ack = await broker.open_position(targeted(side, **kwargs))
+    pos = await broker.confirm(ack.deal_reference)
+    assert pos is not None
+    return ack.deal_reference, pos
+
+
+PLAIN_BUY_BODY = (
+    '{"epic":"DE40","direction":"BUY","size":0.001,"guaranteedStop":false,"trailingStop":false,"stopDistance":30.0}'
+)
+PLAIN_SELL_BODY = (
+    '{"epic":"DE40","direction":"SELL","size":0.010,"guaranteedStop":false,"trailingStop":false,"stopDistance":25.5}'
+)
+
+
+@pytest.mark.parametrize(
+    ("req", "body"),
+    [
+        (entry(Side.BUY, size="0.001", stop="30.0"), PLAIN_BUY_BODY),
+        (entry(Side.SELL, size="0.010", stop="25.5"), PLAIN_SELL_BODY),
+    ],
+)
+async def test_plain_entry_body_is_byte_identical_and_has_no_profit_key(server, broker, req, body):
+    await broker.login()
+    await broker.open_position(req)
+    [post] = server.requests("POST", "/positions")
+    assert post.raw == body  # DE40 v1: ciało żądania bez zmian co do bajta (R2)
+    assert "profit" not in post.raw.lower()
+
+
+async def test_targeted_entry_adds_only_profit_distance_after_stop_distance(server, broker):
+    await broker.login()
+    await broker.open_position(targeted(Side.BUY, size="0.001", stop="30.0", target="45.5"))
+    [post] = server.requests("POST", "/positions")
+    assert post.raw == PLAIN_BUY_BODY[:-1] + ',"profitDistance":45.5}'
+    assert post.raw.startswith(PLAIN_BUY_BODY[:-1])  # część wspólna z wejściem bez celu jest ta sama
+
+
+@pytest.mark.parametrize("target", ["45", "1.5E+1", "12.345", "3.50", "2.57813"])
+async def test_profit_distance_decimals_round_trip_exactly(server, broker, target):
+    await broker.login()
+    await broker.open_position(targeted(Side.SELL, target=target, stop="30"))
+    [post] = server.requests("POST", "/positions")
+    sent = json.loads(post.raw, parse_float=Decimal, parse_int=Decimal)
+    assert post.raw.endswith(f'"profitDistance":{format(Decimal(target), "f")}}}')
+    assert sent["profitDistance"] == Decimal(target)
+
+
+async def test_targeted_entry_never_sends_profit_level_or_amount_or_stop_level(server, broker):
+    await broker.login()
+    await broker.open_position(targeted())
+    [post] = server.requests("POST", "/positions")
+    assert sorted(post.body) == sorted(
+        ["epic", "direction", "size", "guaranteedStop", "trailingStop", "stopDistance", "profitDistance"]
+    )
+
+
+@pytest.mark.parametrize("target", ["0", "-1", "-0.5"])
+async def test_targeted_entry_validates_the_target_distance_before_sending(server, broker, target):
+    await broker.login()
+    with pytest.raises(ValueError, match="target_distance"):
+        await broker.open_position(targeted(target=target))
+    assert server.count("POST", "/positions") == 0
+
+
+@pytest.mark.parametrize("bad", [None, 45.0, "45"])
+async def test_a_targeted_request_without_a_usable_target_is_never_sent_as_a_plain_entry(server, broker, bad):
+    # zamrożony dataclass da się obejść: adapter i tak nie otwiera cicho pozycji bez celu
+    req = targeted()
+    object.__setattr__(req, "target_distance", bad)
+    await broker.login()
+    with pytest.raises((TypeError, ValueError), match="target_distance"):
+        await broker.open_position(req)
+    assert server.count("POST", "/positions") == 0 and server.positions == {}
+
+
+async def test_a_rejected_target_is_never_retried_without_the_target(server, broker):
+    await broker.login()
+    server.fail_next("/positions", 400, {"errorCode": "error.invalid.takeprofit.maxvalue: 25783.0"}, method="POST")
+    with pytest.raises(BrokerRejected) as info:
+        await broker.open_position(targeted())
+    assert info.value.reason == "error.invalid.takeprofit.maxvalue: 25783.0"
+    assert server.count("POST", "/positions") == 1 and server.positions == {}
+
+
+async def test_target_closer_than_the_broker_minimum_is_rejected_by_the_server_without_a_position(server, broker):
+    await broker.login()
+    with pytest.raises(BrokerRejected) as info:
+        await broker.open_position(targeted(target="1.0"))
+    assert info.value.reason == "error.invalid.takeprofit.maxvalue: 2.57813"
+    assert server.positions == {}
+
+
+async def test_the_resend_after_401_still_carries_the_target(server, broker):
+    await broker.login()
+    server.fail_next("/positions", 401, {"errorCode": "error.invalid.session.token"}, method="POST")
+    await broker.open_position(targeted(target="45.5"))
+    first, second = server.requests("POST", "/positions")
+    assert (first.status, second.status) == (401, 200)
+    assert first.raw == second.raw and '"profitDistance":45.5' in second.raw
+    assert only_position(server).target_level == OFFER + Decimal("45.5")
+
+
+async def test_a_timeout_on_a_targeted_open_is_never_resent(server, make_broker):
+    broker = make_broker(request_timeout_s=0.1)
+    await broker.login()
+    server.apply_then_drop_response("/positions", method="POST")
+    with pytest.raises(BrokerTimeout):
+        await broker.open_position(targeted())
+    assert server.count("POST", "/positions") == 1 and len(server.positions) == 1
+
+
+# --- confirm i list_positions z celem -----------------------------------------------------------------------
+
+
+async def test_confirm_of_a_targeted_entry_is_a_targeted_position_with_a_derived_target(server, broker):
+    await broker.login()
+    ack = await broker.open_position(targeted(Side.BUY))
+    fake = only_position(server)
+    mark = since_mark(server)
+    pos = await broker.confirm(ack.deal_reference)
+    assert type(pos) is TargetedOpenPosition
+    assert pos == TargetedOpenPosition(
+        fake.deal_id, "DE40", Side.BUY, Decimal("0.001"), OFFER, OFFER - 30, at(0.2), True, OFFER + 45, True
+    )
+    assert seq(server, mark) == [f"GET /confirms/{ack.deal_reference}", f"GET /positions/{fake.deal_id}"]
+    assert_no_float(pos)
+
+
+async def test_confirm_of_a_targeted_sell_derives_the_target_below_the_fill(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker, Side.SELL, stop="25.5", target="40.5")
+    assert (pos.open_level, pos.stop_level, pos.target_level, pos.target_derived) == (
+        BID, BID + Decimal("25.5"), BID - Decimal("40.5"), True,
+    )  # fmt: skip
+
+
+async def test_confirm_of_a_plain_entry_stays_a_plain_open_position(server, broker):
+    await broker.login()
+    _, pos = await open_confirmed(broker)
+    assert type(pos) is OpenPosition and (pos.target_level, pos.target_derived) == (None, False)
+    [listed] = await broker.list_positions()
+    assert type(listed) is OpenPosition
+
+
+@pytest.mark.parametrize(
+    ("keys", "side", "expected_level"),
+    [
+        ("present", Side.BUY, OFFER + 45),
+        ("when-set", Side.BUY, OFFER + 45),
+        ("distance", Side.BUY, OFFER + 45),  # sam `profitDistance`: poziom wykonania + odległość (BUY plus)
+        ("distance", Side.SELL, BID - 45),  # SELL minus
+    ],
+)
+async def test_confirm_uses_the_broker_target_fields_when_they_are_present(server, broker, keys, side, expected_level):
+    server.position_target_keys = keys
+    await broker.login()
+    _, pos = await open_targeted(broker, side)
+    assert type(pos) is TargetedOpenPosition
+    assert (pos.target_level, pos.target_derived) == (expected_level, False)
+
+
+async def test_confirm_shows_the_target_of_the_broker_not_ours(server, broker):
+    server.position_target_keys = "present"
+    await broker.login()
+    ack = await broker.open_position(targeted())
+    only_position(server).target_level = OFFER + 50  # broker ma inny cel niż nasze wyliczenie
+    pos = await broker.confirm(ack.deal_reference)
+    assert (pos.target_level, pos.target_derived) == (OFFER + 50, False)
+
+
+async def test_a_null_target_key_means_no_target_and_is_not_replaced_by_our_record(server, broker):
+    server.position_target_keys = "null"  # broker pokazuje klucz z jawnym null: pozycja bez celu
+    await broker.login()
+    ack = await broker.open_position(targeted())
+    pos = await broker.confirm(ack.deal_reference)
+    # uczciwa migawka: cel, o który prosiliśmy, nie istnieje (silnik zobaczy brak celu i zareaguje), żadnego udawania
+    assert type(pos) is OpenPosition and (pos.target_level, pos.target_derived) == (None, False)
+
+
+async def test_confirm_target_level_in_the_confirmation_matching_our_request_is_accepted(server, broker):
+    server.confirm_target_keys = True
+    await broker.login()
+    ack = await broker.open_position(targeted())
+    pos = await broker.confirm(ack.deal_reference)
+    assert (pos.target_level, pos.target_derived) == (OFFER + 45, True)  # zgodny z wyliczeniem
+
+
+@pytest.mark.parametrize("reported", [OFFER + 44, OFFER - 45, None])
+async def test_confirm_with_a_target_level_differing_from_our_request_is_a_broker_error(server, broker, reported):
+    await broker.login()
+    ack = await broker.open_position(targeted())
+    payload = dict(server.confirms[ack.deal_reference])
+    payload["profitLevel"] = reported
+    server.fail_next(f"/confirms/{ack.deal_reference}", 200, payload)
+    with pytest.raises(BrokerError) as info:
+        await broker.confirm(ack.deal_reference)
+    assert type(info.value) is BrokerError and "profitLevel" in str(info.value)
+
+
+async def test_confirm_of_a_closed_by_target_position_still_returns_the_derived_target(server, broker):
+    await broker.login()
+    ack = await broker.open_position(targeted())
+    server.trigger_target(only_position(server).deal_id)  # cel zadziałał, zanim zapytaliśmy o potwierdzenie
+    pos = await broker.confirm(ack.deal_reference)
+    assert type(pos) is TargetedOpenPosition
+    assert (pos.stop_level, pos.target_level, pos.stop_derived, pos.target_derived) == (OFFER - 30, OFFER + 45, True, True)
+    assert pos.opened_at == at(0.2)  # z wiersza otwarcia w historii
+
+
+async def test_confirm_without_our_record_uses_the_reported_target_and_otherwise_none(
+    server, broker, make_broker, clock
+):
+    await broker.login()
+    ref, _ = await open_targeted(broker)
+    restarted = await restart(make_broker, clock)
+    assert (await restarted.confirm(ref)).target_level is None  # brak kluczy i brak zapisu: nie wiadomo
+    server.position_target_keys = "present"
+    again = await restart(make_broker, clock)
+    snapshot = await again.confirm(ref)
+    assert (type(snapshot), snapshot.target_level, snapshot.target_derived) == (
+        TargetedOpenPosition, OFFER + 45, False,
+    )  # fmt: skip
+
+
+async def test_list_positions_returns_the_derived_target_from_our_record(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    assert await broker.list_positions() == [pos]
+    [listed] = await broker.list_positions()
+    assert type(listed) is TargetedOpenPosition and (listed.target_level, listed.target_derived) == (OFFER + 45, True)
+
+
+async def test_list_positions_after_a_restart_has_no_target_when_the_broker_does_not_show_it(
+    server, broker, make_broker, clock
+):
+    await broker.login()
+    await open_targeted(broker)
+    restarted = await restart(make_broker, clock)
+    [listed] = await restarted.list_positions()
+    assert type(listed) is OpenPosition and (listed.target_level, listed.target_derived) == (None, False)
+
+
+async def test_list_positions_shows_the_target_of_the_broker_not_ours(server, broker):
+    server.position_target_keys = "present"
+    await broker.login()
+    await open_targeted(broker)
+    only_position(server).target_level = OFFER + 60
+    [listed] = await broker.list_positions()
+    assert (listed.target_level, listed.target_derived) == (OFFER + 60, False)
+
+
+async def test_once_target_keys_were_seen_a_position_without_them_has_no_target(server, broker):
+    server.position_target_keys = "when-set"  # API pokazuje klucz tylko przy pozycji z celem
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    assert (pos.target_level, pos.target_derived) == (OFFER + 45, False)
+    only_position(server).target_level = None  # właściciel usunął cel w aplikacji: klucz znika z odpowiedzi
+    [listed] = await broker.list_positions()
+    assert type(listed) is OpenPosition and (listed.target_level, listed.target_derived) == (None, False)
+
+
+async def test_target_keys_seen_in_a_list_also_disable_derivation_for_other_positions(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)  # klucze nieobecne: cel wyliczony z naszego zapisu
+    item = server._position_item(only_position(server))
+    other = position_item(position__dealId="D-2", position__profitLevel=Decimal("25900.0"))
+    server.fail_next("/positions", 200, {"positions": [item, other]}, method="GET")
+    first = await broker.list_positions()
+    assert [(p.deal_id, p.target_level, p.target_derived) for p in first] == [
+        (pos.deal_id, None, False),  # w tej samej odpowiedzi klucze celu widać przy innej pozycji
+        ("D-2", Decimal("25900.0"), False),
+    ]
+    [again] = await broker.list_positions()
+    assert (again.target_level, again.target_derived) == (None, False)
+
+
+async def test_a_manual_target_set_by_the_owner_on_a_plain_position_is_reported(server, broker):
+    server.position_target_keys = "when-set"
+    await broker.login()
+    await open_confirmed(broker)  # wejście bez celu (DE40 v1)
+    only_position(server).target_level = OFFER + 100  # właściciel dodał cel ręcznie (projekt §3.5)
+    [listed] = await broker.list_positions()
+    assert type(listed) is TargetedOpenPosition and listed.target_level == OFFER + 100 and not listed.target_derived
+
+
+async def test_closing_a_position_forgets_its_target_record(server, broker):
+    await broker.login()
+    _, pos = await open_targeted(broker)
+    assert pos.deal_id in broker._deal_targets
+    await broker.close_position(pos.deal_id)
+    assert pos.deal_id not in broker._deal_targets
+
+
+# --- PositionRow i parsowanie pól celu ---------------------------------------------------------------------
+
+
+def test_position_row_requires_the_target_flags():
+    # brak wartości domyślnych: każdy, kto buduje wiersz, mówi wprost, czy broker pokazał klucze celu
+    fields = dict(
+        deal_id="D-1", working_order_id=None, epic="DE40", side=Side.BUY, size=Decimal("0.001"), level=OFFER,
+        opened_at=at(0.2), stop_reported=True, stop_level=OFFER - 30, stop_level_reported=True,
+    )  # fmt: skip
+    with pytest.raises(TypeError, match="target_reported"):
+        capitalcom_parse.PositionRow(**fields)
+    row = capitalcom_parse.PositionRow(**fields, target_reported=True, target_level=None, target_level_reported=False)
+    assert (row.target_reported, row.target_level, row.target_level_reported) == (True, None, False)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({}, (False, None, False)),
+        ({"position__profitLevel": Decimal("25827.3")}, (True, Decimal("25827.3"), True)),
+        ({"position__profitLevel": None}, (True, None, True)),
+        ({"position__profitDistance": Decimal("45")}, (True, OFFER + 45, False)),  # BUY: poziom + odległość
+        ({"position__profitDistance": None}, (True, None, False)),
+        (
+            {"position__profitLevel": Decimal("25830.0"), "position__profitDistance": Decimal("45")},
+            (True, Decimal("25830.0"), True),  # `profitLevel` wygrywa z `profitDistance`
+        ),
+        ({"position__profitLevel": None, "position__profitDistance": Decimal("45")}, (True, None, True)),
+    ],
+)
+def test_parse_position_reads_the_target_like_the_stop(changes, expected):
+    row = capitalcom_parse.parse_position(position_item(**changes))
+    assert (row.target_reported, row.target_level, row.target_level_reported) == expected
+
+
+def test_parse_position_target_distance_of_a_sell_is_below_the_level():
+    item = position_item(position__direction="SELL", position__profitDistance=Decimal("40.5"))
+    assert capitalcom_parse.parse_position(item).target_level == OFFER - Decimal("40.5")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"position__profitLevel": "25827.3"},
+        {"position__profitLevel": Decimal("0")},
+        {"position__profitLevel": Decimal("-1")},
+        {"position__profitLevel": True},
+        {"position__profitDistance": "45"},
+        {"position__profitDistance": Decimal("0")},
+        {"position__profitDistance": Decimal("-3")},
+    ],
+)
+def test_parse_position_rejects_a_malformed_target(changes):
+    with pytest.raises(capitalcom_parse.ParseError, match="profit"):
+        capitalcom_parse.parse_position(position_item(**changes))
+
+
+async def test_list_positions_with_a_malformed_target_is_a_broker_error(server, broker):
+    await broker.login()
+    server.fail_next("/positions", 200, {"positions": [position_item(position__profitLevel="x")]}, method="GET")
+    with pytest.raises(BrokerError, match="profitLevel"):
+        await broker.list_positions()
+
+
+def test_parse_opening_reads_the_profit_level_of_the_confirmation():
+    base = {
+        "affectedDeals": [{"dealId": "D-1", "status": "OPENED"}], "dealId": "W-1", "epic": "DE40",
+        "direction": "BUY", "size": Decimal("0.001"), "level": OFFER,
+    }  # fmt: skip
+    plain = capitalcom_parse.parse_opening(dict(base))
+    assert (plain.target_reported, plain.target_level) == (False, None)
+    shown = capitalcom_parse.parse_opening({**base, "profitLevel": Decimal("25827.3")})
+    assert (shown.target_reported, shown.target_level) == (True, Decimal("25827.3"))
+    null = capitalcom_parse.parse_opening({**base, "profitLevel": None})
+    assert (null.target_reported, null.target_level) == (True, None)
+    with pytest.raises(capitalcom_parse.ParseError, match="profitLevel"):
+        capitalcom_parse.parse_opening({**base, "profitLevel": Decimal("-1")})

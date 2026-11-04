@@ -24,6 +24,13 @@ Zasady:
   minus, SELL plus; sprawdzony ze `stopLevel` potwierdzenia, jeśli je ma) albo poziom z potwierdzonego `set_stop`,
   `stop_derived=True`; brak zapisu (np. po restarcie) → None (C5, C24); gdy JAKAKOLWIEK odpowiedź z pozycją
   pokazała już klucze stopu, brak klucza znaczy brak stopu (None), a zapis adaptera nie jest już używany;
+- cel zysku (zadanie 7, R4, projekt §3.1; pola celu NIEPOTWIERDZONE na rachunku, C5/C5d/C7, do sprawdzenia skryptem
+  research/diag_fx.py): `TargetedEntryRequest` dodaje do `POST /positions` `profitDistance` (po `stopDistance`; zwykły
+  `EntryRequest` ma ciało bez zmian co do bajta) i NIGDY nie idzie bez celu; cel pozycji tą samą regułą co stop:
+  klucz `profitLevel`/`profitDistance` w odpowiedzi → wartość brokera (jawny `null` → brak celu), kluczy brak →
+  zapis adaptera (wykonanie ± wysłana odległość, `target_derived=True`, sprawdzony z `profitLevel` potwierdzenia),
+  a gdy JAKAKOLWIEK odpowiedź pokazała klucze celu, brak klucza znaczy brak celu; pozycja z celem to
+  `TargetedOpenPosition`, bez celu zwykły `OpenPosition`;
 - `close_position`: ZAWSZE `DELETE /positions/{dealId}` (nigdy przeciwne zlecenie), potem `GET /confirms` z
   referencją z odpowiedzi i `GET /positions/{dealId}`: sukces tylko przy ACCEPTED, które przypisuje zamknięcie
   naszemu dealId (`PUT` i `DELETE` dzielą referencję `p_<dealId>`, C3), i 404 pozycji; REJECTED →
@@ -40,8 +47,8 @@ Zasady:
   którego otwarcia nie ma w zakresie, jest szukany wstecz z filtrem `dealId` (do 14 dni, wspólny limit zapytań;
   wyniki okien w całości przed `since` i skończonych co najmniej `LOOKBACK_CACHE_MIN_AGE` temu są zapamiętywane,
   najwyżej `LOOKBACK_CACHE_LIMIT` okien);
-- pamięć adaptera (wysłane odległości stopu, stopy deali, strony deali, migawki potwierdzeń) jest ograniczona do
-  `RECORD_LIMIT` wpisów na tablicę (najstarsze wypadają).
+- pamięć adaptera (wysłane odległości stopu i celu, stopy i cele deali, strony deali, migawki potwierdzeń) jest
+  ograniczona do `RECORD_LIMIT` wpisów na tablicę (najstarsze wypadają).
 """
 
 from __future__ import annotations
@@ -80,6 +87,8 @@ from gwstock.types import (
     MarketClosed,
     OpenPosition,
     Side,
+    TargetedEntryRequest,
+    TargetedOpenPosition,
     WorkingOrder,
 )
 
@@ -122,6 +131,12 @@ def _stop_from(level: Decimal, side: Side, distance: Decimal) -> Decimal:
     return level - distance if side is Side.BUY else level + distance
 
 
+def _target_from(level: Decimal, side: Side, distance: Decimal) -> Decimal:
+    """Cel pozycji kupna leży powyżej ceny wykonania, sprzedaży poniżej (po stronie zysku; odwrotnie niż stop).
+    NIEPOTWIERDZONE, że `profitDistance` liczy się od ceny wykonania, a nie od notowania (jak C6 dla stopu)."""
+    return level + distance if side is Side.BUY else level - distance
+
+
 def _since_arg(value: object) -> datetime:
     if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValueError("closed_since: since must be a timezone-aware datetime")
@@ -147,6 +162,9 @@ class TradingMixin:
         self._sent_stops: OrderedDict[str, tuple[Side, Decimal]] = OrderedDict()  # dealReference → (strona, odległość)
         self._deal_stops: OrderedDict[str, Decimal] = OrderedDict()  # dealId → nasz stop (wyliczony albo z set_stop)
         self._deal_sides: OrderedDict[str, Side] = OrderedDict()  # dealId → strona (potwierdzenie, lista pozycji)
+        # dealReference → (strona, odległość celu) wysłane w `POST /positions` (tylko wejścia z celem)
+        self._sent_targets: OrderedDict[str, tuple[Side, Decimal]] = OrderedDict()
+        self._deal_targets: OrderedDict[str, Decimal] = OrderedDict()  # dealId → nasz cel (wyliczony albo z set_protection)
         self._snapshots: OrderedDict[str, OpenPosition] = OrderedDict()  # dealReference → migawka potwierdzenia
         self._unknown_seen: OrderedDict[tuple, None] = OrderedDict()  # zamknięcia o nieznanym źródle już policzone
         # (rachunek, dealId, początek, koniec) → wiersze okna wyszukiwania wstecz w całości przed `since`
@@ -154,11 +172,21 @@ class TradingMixin:
         # czy jakakolwiek odpowiedź z pozycją pokazała klucze stopu: od tej chwili brak klucza = brak stopu, a zapis
         # adaptera nie może już udawać ochrony (stop_derived=True tylko, dopóki klucze nigdy nie wystąpiły)
         self._stop_keys_seen = False
+        # to samo dla kluczy celu (`profitLevel`/`profitDistance`): po pierwszym ich pojawieniu brak klucza = brak celu
+        self._target_keys_seen = False
 
     # --- wejście i potwierdzenie ---------------------------------------------------------------------
 
     async def open_position(self, req: EntryRequest) -> EntryAck:
-        """`POST /positions` ze stopem atomowo; zwraca wyłącznie referencję (`o_...`), wynik zna dopiero `confirm`."""
+        """`POST /positions` ze stopem atomowo; zwraca wyłącznie referencję (`o_...`), wynik zna dopiero `confirm`.
+
+        Zwykły `EntryRequest` (DE40 v1): ciało bez zmian co do bajta. `TargetedEntryRequest` (pasma z celem, R4):
+        do ciała dochodzi `profitDistance` (odległość celu w punktach, dokładnie taka, jaką podał wywołujący; kroku
+        brokera pilnuje wywołujący: w dół, cel bliżej, nigdy dalej), po `stopDistance`. Wejście z celem NIGDY nie
+        idzie bez celu: odległość niedodatnia albo bez wartości to błąd PRZED wysyłką, a odmowa celu przez brokera
+        (`error.invalid.takeprofit.*`) kończy się `BrokerRejected` bez ponowienia bez celu. NIEPOTWIERDZONE: nazwa
+        pola `profitDistance` w `POST` (notatki §2.10) i punkt odniesienia odległości (wypełnienie czy notowanie).
+        """
         if not isinstance(req, EntryRequest):
             raise TypeError(f"open_position: expected EntryRequest, got {type(req).__name__}")
         epic = check_ident("epic", req.epic)
@@ -172,9 +200,17 @@ class TradingMixin:
             "trailingStop": False,
             "stopDistance": req.stop_distance,
         }
+        target_distance = None
+        if isinstance(req, TargetedEntryRequest):
+            target_distance = req.target_distance
+            if not isinstance(target_distance, Decimal) or not target_distance.is_finite() or target_distance <= 0:
+                raise ValueError("open_position: target_distance must be a positive finite Decimal for a targeted entry")
+            body["profitDistance"] = target_distance
         payload = await self._request("POST", "/positions", body=body, order=True)
         reference = self._parse("POST /positions", parse_reference, payload)
         _remember(self._sent_stops, reference, (req.side, req.stop_distance))
+        if target_distance is not None:
+            _remember(self._sent_targets, reference, (req.side, target_distance))
         return EntryAck(reference)
 
     async def confirm(self, deal_reference: str) -> OpenPosition | None:
@@ -202,6 +238,7 @@ class TradingMixin:
         path = f"/positions/{opening.deal_id}"
         reply = await self._request("GET", path, not_found=NOT_FOUND_DEAL)
         stop_reported, stop = False, None
+        target_reported, target = False, None
         if reply is not None:
             row = self._parse(f"GET {path}", parse_position, reply)
             checks = (
@@ -221,17 +258,30 @@ class TradingMixin:
                     BrokerError, f"GET {path}: the position does not match the confirmation ({'; '.join(mismatch)})"
                 )
             self._note_stop_keys([row])
+            self._note_target_keys([row])
             opened_at, stop_reported, stop = row.opened_at, row.stop_reported, row.stop_level
-        else:  # pozycja już zamknięta (stop, ręcznie): czas otwarcia z wiersza otwarcia w historii
+            target_reported, target = row.target_reported, row.target_level
+        else:  # pozycja już zamknięta (stop, cel, ręcznie): czas otwarcia z wiersza otwarcia w historii
             opened_at = await self._opened_at_from_history(opening, where)
         stop, derived = self._snapshot_stop(reference, opening, where, reply is not None, stop_reported, stop)
-        snapshot = self._parse(
-            where, build, OpenPosition, "confirm", opening.deal_id, opening.epic, opening.side, opening.size,
-            opening.level, stop, opened_at, derived,
-        )  # fmt: skip
+        target, target_derived = self._snapshot_target(
+            reference, opening, where, reply is not None, target_reported, target
+        )
+        if target is None:  # bez celu zawsze zwykły `OpenPosition` (DE40 v1: bez zmian)
+            snapshot = self._parse(
+                where, build, OpenPosition, "confirm", opening.deal_id, opening.epic, opening.side, opening.size,
+                opening.level, stop, opened_at, derived,
+            )  # fmt: skip
+        else:
+            snapshot = self._parse(
+                where, build, TargetedOpenPosition, "confirm", opening.deal_id, opening.epic, opening.side,
+                opening.size, opening.level, stop, opened_at, derived, target, target_derived,
+            )  # fmt: skip
         _remember(self._deal_sides, opening.deal_id, opening.side)
         if not stop_reported and stop is not None:
             _remember(self._deal_stops, opening.deal_id, stop)
+        if not target_reported and target is not None:
+            _remember(self._deal_targets, opening.deal_id, target)
         return snapshot
 
     def _snapshot_stop(
@@ -267,6 +317,42 @@ class TradingMixin:
             return candidate, True
         return (opening.stop_level if opening.stop_reported else None), False
 
+    def _snapshot_target(
+        self,
+        reference: str,
+        opening: Opening,
+        where: str,
+        position_read: bool,
+        position_reported: bool,
+        position_target: Decimal | None,
+    ) -> tuple[Decimal | None, bool]:
+        """(cel migawki, target_derived); ta sama kolejność co `_snapshot_stop`: cel pokazany przez brokera w odczycie
+        pozycji (jawny `null` → brak celu); odczyt pozycji BEZ kluczy celu, choć broker je już kiedyś pokazywał → brak
+        celu (nie udajemy go zapisem adaptera); inaczej nasz zapis (wykonanie ± wysłana odległość, `target_derived`),
+        sprawdzony z `profitLevel` potwierdzenia, gdy je ma (różnica albo `null` → `BrokerError`, jak C6 dla stopu);
+        bez zapisu `profitLevel` potwierdzenia albo None. Wejście bez celu nie ma zapisu, więc wynik to None, chyba że
+        broker sam pokazał cel (np. ręczny cel właściciela, projekt §3.5). Pozycji już nie ma (zamknięta celem przed
+        odczytem): migawka niesie wyliczony cel (oznaczony). Wejście z celem, po którym broker pokazuje pozycję bez
+        celu, daje uczciwą migawkę bez celu (silnik widzi brak i go uzupełnia), nigdy wyliczony cel dla pozycji, której
+        broker go nie ma. NIEPOTWIERDZONE: nazwy kluczy i ich obecność w żywych odpowiedziach (C5)."""
+        if position_reported:
+            return position_target, False
+        candidate = None
+        sent = self._sent_targets.get(reference)
+        if sent is not None and sent[0] is opening.side:
+            candidate = self._parse(where, _target_from, opening.level, opening.side, sent[1])
+        if opening.target_reported and candidate is not None and opening.target_level != candidate:
+            raise self._error(
+                BrokerError,
+                f"{where}: the confirmation's profitLevel {opening.target_level} differs from the target {candidate} "
+                "derived from our request (fill level ± profitDistance)",
+            )
+        if position_read and self._target_keys_seen:
+            return None, False
+        if candidate is not None:
+            return candidate, True
+        return (opening.target_level if opening.target_reported else None), False
+
     async def _opened_at_from_history(self, opening: Opening, where: str) -> datetime:
         """`dateUTC` jedynego wiersza otwarcia (kierunek pozycji) tego dealId w ostatniej dobie; inaczej wyjątek."""
         end = history.ceil_second(self._clock.now_utc())
@@ -288,16 +374,27 @@ class TradingMixin:
         where = "GET /positions"
         rows = self._parse(where, parse_positions, await self._request("GET", "/positions"))
         self._note_stop_keys(rows)
+        self._note_target_keys(rows)
         result: list[OpenPosition] = []
         for row in rows:
             stop, derived = row.stop_level, False
             if not row.stop_reported and not self._stop_keys_seen:
                 stop = self._deal_stops.get(row.deal_id)
                 derived = stop is not None
-            position = self._parse(
-                where, build, OpenPosition, "positions", row.deal_id, row.epic, row.side, row.size, row.level, stop,
-                row.opened_at, derived,
-            )  # fmt: skip
+            target, target_derived = row.target_level, False
+            if not row.target_reported and not self._target_keys_seen:
+                target = self._deal_targets.get(row.deal_id)
+                target_derived = target is not None
+            if target is None:
+                position = self._parse(
+                    where, build, OpenPosition, "positions", row.deal_id, row.epic, row.side, row.size, row.level,
+                    stop, row.opened_at, derived,
+                )  # fmt: skip
+            else:
+                position = self._parse(
+                    where, build, TargetedOpenPosition, "positions", row.deal_id, row.epic, row.side, row.size,
+                    row.level, stop, row.opened_at, derived, target, target_derived,
+                )  # fmt: skip
             result.append(position)
         for row in rows:
             _remember(self._deal_sides, row.deal_id, row.side)
@@ -306,6 +403,10 @@ class TradingMixin:
     def _note_stop_keys(self, rows: list) -> None:
         if any(row.stop_reported for row in rows):
             self._stop_keys_seen = True
+
+    def _note_target_keys(self, rows: list) -> None:
+        if any(row.target_reported for row in rows):
+            self._target_keys_seen = True
 
     async def set_protection(self, deal_id: str, stop_level: Decimal, target_level: Decimal | None) -> None:
         """ZAŚLEPKA zadania 6 (pełna implementacja: zadanie 7). Istnieje tylko po to, żeby adapter spełniał protokół
@@ -392,6 +493,7 @@ class TradingMixin:
         if problem is not None:
             raise self._error(BrokerTimeout, f"DELETE {path}: close outcome unknown ({problem})")
         self._deal_stops.pop(deal_id, None)
+        self._deal_targets.pop(deal_id, None)
 
     async def _outcome(self, payload: Any) -> tuple[Any, str | None]:
         """Potwierdzenie `PUT`/`DELETE` po referencji z odpowiedzi: (treść, None) przy ACCEPTED, (None, problem) gdy

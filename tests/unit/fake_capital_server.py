@@ -38,6 +38,17 @@ odpowiedzią, do wywołania przekroczenia czasu), `apply_then_drop_response(...)
 dostaje odpowiedzi), `reject_next_order(...)`, `set_market_closed(...)`, `trigger_stop(...)`, `add_activity(...)`,
 `activity_limit(...)`, `add_working_order(...)`, `accounts`, `set_quote(...)`, `set_candles(...)`.
 
+Cel zysku (zadanie 7; kształty NIEPOTWIERDZONE na rachunku, notatki §2.10–§2.13, C5, C5d, C7):
+- `POST /positions` przyjmuje `profitDistance` (cel = wypełnienie ± odległość, po stronie zysku); zbyt bliski →
+  400 `error.invalid.takeprofit.maxvalue: <granica>`; pozycja zapamiętuje `target_level`;
+- `GET /positions` pokazuje klucze celu wg `position_target_keys`: "absent" (domyślnie, jak w oficjalnych przykładach),
+  "present" (`profitLevel`, null przy braku celu), "null" (zawsze `profitLevel: null`), "when-set" (klucz tylko przy
+  pozycji z celem), "distance" (tylko `profitDistance`, przy pozycji z celem); potwierdzenia niosą `profitLevel` przy
+  `confirm_target_keys = True`;
+- `PUT /positions/{dealId}` przyjmuje `stopLevel` i/lub `profitLevel` ATOMOWO (oba poziomy sprawdzone przed zmianą);
+  `put_clears_target = True` symuluje najgorszą odpowiedź na C5d: PUT bez `profitLevel` kasuje cel;
+- `trigger_target(deal_id)`: broker zamyka pozycję celem; wiersz historii ze źródłem `TP`.
+
 Rozszerzanie (Zadanie 13, część 2): nowy endpoint rejestruje się wywołaniem `self.route(method, path, handler)`
 (ścieżka względem `/api/v1`, wzorce `aiohttp`, np. `"/positions/{deal_id}"`) w `__init__` podklasy albo tej klasy,
 zawsze PRZED `start()`. Handler ma postać `async def h(request, body) -> web.Response` (`body` to sparsowany JSON
@@ -313,6 +324,7 @@ class FakePosition:
     level: Decimal
     created: datetime
     stop_level: Decimal | None
+    target_level: Decimal | None = None
 
 
 class FakeCapitalServer:
@@ -346,6 +358,10 @@ class FakeCapitalServer:
         # tylko przy pozycji, która ma stop: tak mogłoby wyglądać API, które pomija klucz przy braku stopu)
         self.position_stop_keys = "absent"
         self.confirm_stop_keys = False  # `stopLevel` w potwierdzeniach (pole znane tylko z [S3], notatki §2.15)
+        # klucze celu w GET /positions: "absent" | "present" | "null" | "when-set" | "distance" (patrz docstring modułu)
+        self.position_target_keys = "absent"
+        self.confirm_target_keys = False  # `profitLevel` w potwierdzeniach (pole znane tylko z [S3], notatki §2.15)
+        self.put_clears_target = False  # C5d: czy PUT bez `profitLevel` kasuje cel (NIEPOTWIERDZONE; domyślnie nie)
         self.hedging_mode = False
         self.market_closed = False
         self.max_activities: int | None = None
@@ -458,6 +474,14 @@ class FakeCapitalServer:
                 epic=pos.epic,
             )
         )
+
+    def trigger_target(self, deal_id: str, level: str | Decimal | None = None, *, source: str = "TP") -> None:
+        """Broker zamyka pozycję jej celem zysku (źródło `TP`, NIEPOTWIERDZONE: C7) po poziomie celu albo `level`."""
+        pos = self.positions[deal_id]
+        if pos.target_level is None and level is None:
+            raise ValueError(f"trigger_target: position {deal_id!r} has no target")
+        exit_level = pos.target_level if level is None else Decimal(level)
+        self.trigger_stop(deal_id, exit_level, source=source)
 
     def add_working_order(
         self, epic: str, direction: str, size: Decimal, level: Decimal, *, account: str | None = None
@@ -828,6 +852,15 @@ class FakeCapitalServer:
         elif self.position_stop_keys == "null":
             position["trailingStop"] = False
             position["stopLevel"] = None
+        mode, target = self.position_target_keys, pos.target_level
+        if mode == "present":
+            position["profitLevel"] = target
+        elif mode == "null":
+            position["profitLevel"] = None
+        elif mode == "when-set" and target is not None:
+            position["profitLevel"] = target
+        elif mode == "distance" and target is not None:
+            position["profitDistance"] = abs(target - pos.level)
         return {"position": position, "market": self._market_summary(pos.epic)}
 
     def _confirm_payload(self, ref: str, pos: FakePosition, *, status: str, deal_status: str = "ACCEPTED",
@@ -850,6 +883,8 @@ class FakeCapitalServer:
         }
         if self.confirm_stop_keys and affected in ("OPENED", "AMENDED"):
             payload["stopLevel"] = pos.stop_level
+        if self.confirm_target_keys and affected in ("OPENED", "AMENDED"):
+            payload["profitLevel"] = pos.target_level
         return payload
 
     def _own_position(self, request: web.Request) -> FakePosition | None:
@@ -877,6 +912,9 @@ class FakeCapitalServer:
         distance = body.get("stopDistance")
         if distance is not None and (not isinstance(distance, Decimal) or distance < self._min_stop(epic)):
             return self.reply({"errorCode": f"error.invalid.stoploss.minvalue: {self._min_stop(epic)}"}, 400)
+        profit = body.get("profitDistance")
+        if profit is not None and (not isinstance(profit, Decimal) or profit < self._min_stop(epic)):
+            return self.reply({"errorCode": f"error.invalid.takeprofit.maxvalue: {self._min_stop(epic)}"}, 400)
         account = self.session_account(request)
         if not self.hedging_mode and any(
             p.account == account and p.epic == epic and p.direction != direction for p in self.positions.values()
@@ -886,9 +924,10 @@ class FakeCapitalServer:
         snap = self._snapshot(epic)
         fill = snap["offer"] if direction == "BUY" else snap["bid"]
         stop = None if distance is None else (fill - distance if direction == "BUY" else fill + distance)
+        target = None if profit is None else (fill + profit if direction == "BUY" else fill - profit)
         n = next(self._deal_seq)  # pozycja = zlecenie + 2 (relacja z przykładów [S1], notatki §2.15)
         order_id, deal_id = self._deal_id_at(n), self._deal_id_at(n + 2)
-        pos = FakePosition(deal_id, order_id, account, epic, direction, size, fill, self.clock.now_utc(), stop)
+        pos = FakePosition(deal_id, order_id, account, epic, direction, size, fill, self.clock.now_utc(), stop, target)
         if self._rejections:
             reason = self._rejections.popleft()
             payload = self._confirm_payload(ref, pos, status="REJECTED", deal_status="REJECTED")
@@ -916,19 +955,37 @@ class FakeCapitalServer:
         return self.reply(self._position_item(pos))
 
     async def _update_position(self, request: web.Request, body: Any) -> web.Response:
-        """`PUT /positions/{dealId}` ze `stopLevel` (§2.13): `{"dealReference": "p_<dealId>"}`."""
+        """`PUT /positions/{dealId}` ze `stopLevel` i/lub `profitLevel` (§2.13): `{"dealReference": "p_<dealId>"}`.
+
+        Oba poziomy są sprawdzane PRZED jakąkolwiek zmianą, więc odmowa jednego nie zostawia drugiego (oba albo żaden).
+        """
         pos = self._own_position(request)
         if pos is None:
             return self.reply({"errorCode": "error.not-found.dealId"}, 404)
-        level = body.get("stopLevel") if isinstance(body, dict) else None
-        if not isinstance(level, Decimal):
-            return self.reply({"errorCode": "error.invalid.stoploss"}, 400)
+        fields = body if isinstance(body, dict) else {}
+        level, goal = fields.get("stopLevel"), fields.get("profitLevel")
+        if "profitLevel" in fields and not isinstance(goal, Decimal):
+            return self.reply({"errorCode": "error.invalid.takeprofit"}, 400)
+        if "stopLevel" in fields or "profitLevel" not in fields:
+            if not isinstance(level, Decimal):
+                return self.reply({"errorCode": "error.invalid.stoploss"}, 400)
         snap, minimum = self._snapshot(pos.epic), self._min_stop(pos.epic)
-        if pos.direction == "BUY" and level > snap["bid"] - minimum:
-            return self.reply({"errorCode": f"error.invalid.stoploss.maxvalue: {snap['bid'] - minimum}"}, 400)
-        if pos.direction == "SELL" and level < snap["offer"] + minimum:
-            return self.reply({"errorCode": f"error.invalid.stoploss.minvalue: {snap['offer'] + minimum}"}, 400)
-        pos.stop_level = level
+        if isinstance(level, Decimal):
+            if pos.direction == "BUY" and level > snap["bid"] - minimum:
+                return self.reply({"errorCode": f"error.invalid.stoploss.maxvalue: {snap['bid'] - minimum}"}, 400)
+            if pos.direction == "SELL" and level < snap["offer"] + minimum:
+                return self.reply({"errorCode": f"error.invalid.stoploss.minvalue: {snap['offer'] + minimum}"}, 400)
+        if isinstance(goal, Decimal):
+            if pos.direction == "BUY" and goal < snap["bid"] + minimum:
+                return self.reply({"errorCode": f"error.invalid.takeprofit.minvalue: {snap['bid'] + minimum}"}, 400)
+            if pos.direction == "SELL" and goal > snap["offer"] - minimum:
+                return self.reply({"errorCode": f"error.invalid.takeprofit.maxvalue: {snap['offer'] - minimum}"}, 400)
+        if isinstance(level, Decimal):
+            pos.stop_level = level
+        if isinstance(goal, Decimal):
+            pos.target_level = goal
+        elif self.put_clears_target:  # C5d w najgorszym wariancie: pominięcie `profit*` kasuje cel
+            pos.target_level = None
         ref = f"p_{pos.deal_id}"
         self.confirms[ref] = self._confirm_payload(ref, pos, status="OPEN", affected="AMENDED")
         self.add_activity(activity(pos.deal_id, self.clock.now_utc(), direction=pos.direction, level=pos.level,

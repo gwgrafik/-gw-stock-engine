@@ -507,7 +507,8 @@ class Opening:
     """Potwierdzenie otwarcia (ACCEPTED): `order_id` = główne `dealId` (zlecenie), `deal_id` = pozycja (C2).
 
     `stop_reported`: potwierdzenie ma klucz `stopLevel` (pole znane z [S3]); `stop_level` to jego wartość (None dla
-    jawnego `null`).
+    jawnego `null`). `target_reported` / `target_level`: to samo dla klucza `profitLevel` (cel zysku, R4;
+    NIEPOTWIERDZONE, że żywe API go zwraca: C5, do sprawdzenia skryptem research/diag_fx.py).
     """
 
     order_id: str | None
@@ -518,15 +519,27 @@ class Opening:
     level: Decimal
     stop_reported: bool = False
     stop_level: Decimal | None = None
+    target_reported: bool = False
+    target_level: Decimal | None = None
+
+
+def _level_key(root: dict[str, Any], key: str, where: str) -> tuple[bool, Decimal | None]:
+    """(czy klucz poziomu jest, jego wartość albo None dla `null`); wartość inna niż liczba dodatnia → błąd."""
+    if key not in root:
+        return False, None
+    if root[key] is None:
+        return True, None
+    return True, positive(root, key, where)
 
 
 def _stop_key(root: dict[str, Any], where: str) -> tuple[bool, Decimal | None]:
-    """(czy klucz `stopLevel` jest, jego wartość albo None dla `null`); wartość inna niż liczba dodatnia → błąd."""
-    if "stopLevel" not in root:
-        return False, None
-    if root["stopLevel"] is None:
-        return True, None
-    return True, positive(root, "stopLevel", where)
+    """Klucz `stopLevel` (patrz `_level_key`)."""
+    return _level_key(root, "stopLevel", where)
+
+
+def _target_key(root: dict[str, Any], where: str) -> tuple[bool, Decimal | None]:
+    """Klucz `profitLevel` (patrz `_level_key`)."""
+    return _level_key(root, "profitLevel", where)
 
 
 def parse_opening(payload: Any) -> Opening:
@@ -553,6 +566,7 @@ def parse_opening(payload: Any) -> Opening:
         )
     order_id = root.get("dealId")
     stop_reported, stop_level = _stop_key(root, "")
+    target_reported, target_level = _target_key(root, "")
     return Opening(
         order_id=order_id if isinstance(order_id, str) and order_id else None,
         deal_id=opened[0],
@@ -562,6 +576,8 @@ def parse_opening(payload: Any) -> Opening:
         level=positive(root, "level", ""),
         stop_reported=stop_reported,
         stop_level=stop_level,
+        target_reported=target_reported,
+        target_level=target_level,
     )
 
 
@@ -591,12 +607,21 @@ def check_amendment(payload: Any, deal_id: str) -> tuple[bool, Decimal | None]:
     return _stop_key(root, "")
 
 
+def amended_target(payload: Any) -> tuple[bool, Decimal | None]:
+    """Klucz `profitLevel` potwierdzenia `PUT` (jak w `Opening`): (czy jest, wartość albo None dla `null`); wywołujący
+    porównuje go z żądanym celem (`set_protection`). Że potwierdzenie `PUT` w ogóle niesie `profitLevel`, jest
+    NIEPOTWIERDZONE (pole znane z [S3]); jego brak nie jest błędem."""
+    return _target_key(obj(payload, ""), "")
+
+
 @dataclass(frozen=True)
 class PositionRow:
     """Element `GET /positions` / `GET /positions/{dealId}` (§2.11). `stop_reported`: jakikolwiek klucz stopu był w
     odpowiedzi; `stop_level_reported`: był klucz `stopLevel` (poziom podany wprost, nie wyliczony z `stopDistance`,
-    którego punkt odniesienia, wykonanie czy notowanie, jest niepotwierdzony: C6). Wszystkie pola są wymagane: wartość
-    domyślna flagi stopu mogłaby po cichu wyłączyć porównanie poziomu w `set_stop`."""
+    którego punkt odniesienia, wykonanie czy notowanie, jest niepotwierdzony: C6). Cel zysku (R4): `target_reported`:
+    jakikolwiek klucz celu (`profitLevel`, `profitDistance`) był w odpowiedzi; `target_level_reported`: był klucz
+    `profitLevel` (poziom wprost). Pola celu są NIEPOTWIERDZONE na rachunku (C5; research/diag_fx.py). Wszystkie pola
+    są wymagane: wartość domyślna flagi mogłaby po cichu wyłączyć porównanie poziomu w `set_stop`/`set_protection`."""
 
     deal_id: str
     working_order_id: str | None
@@ -608,6 +633,9 @@ class PositionRow:
     stop_reported: bool
     stop_level: Decimal | None
     stop_level_reported: bool
+    target_reported: bool
+    target_level: Decimal | None
+    target_level_reported: bool
 
 
 def parse_position(item: Any, where: str = "") -> PositionRow:
@@ -616,6 +644,13 @@ def parse_position(item: Any, where: str = "") -> PositionRow:
     Stop (C5, C24): klucz `stopLevel` obecny → jego wartość (jawny `null` → brak stopu); inaczej klucz
     `stopDistance` obecny → `level ∓ stopDistance` (BUY minus, SELL plus; `null` → brak stopu); żadnego klucza →
     `stop_reported=False` i adapter sięga do własnego zapisu.
+
+    Cel zysku (R4, projekt §3.1) tą samą regułą: klucz `profitLevel` obecny → jego wartość (jawny `null` → brak celu);
+    inaczej klucz `profitDistance` obecny → `level ± profitDistance` (BUY plus, SELL minus, bo cel leży po stronie
+    zysku; `null` → brak celu); żadnego klucza → `target_reported=False` i adapter sięga do własnego zapisu. Nazwy
+    kluczy i znak `profitDistance` są NIEPOTWIERDZONE (występują w [S3] i w przykładzie zleceń oczekujących, nie w
+    oficjalnym przykładzie pozycji; do sprawdzenia skryptem research/diag_fx.py). Wartość niedodatnia albo nie-liczba
+    → `ParseError`, jak dla stopu.
     """
     entry = obj(item, where)
     pos_where, market_where = path(where, "position"), path(where, "market")
@@ -633,6 +668,16 @@ def parse_position(item: Any, where: str = "") -> PositionRow:
             stop = level - distance if side is Side.BUY else level + distance
     else:
         reported = False
+    target_reported, target = True, None
+    if "profitLevel" in position:
+        if position["profitLevel"] is not None:
+            target = positive(position, "profitLevel", pos_where)
+    elif "profitDistance" in position:
+        if position["profitDistance"] is not None:
+            profit = positive(position, "profitDistance", pos_where)
+            target = level + profit if side is Side.BUY else level - profit
+    else:
+        target_reported = False
     return PositionRow(
         deal_id=ident(position, "dealId", pos_where),
         working_order_id=optional_text(position, "workingOrderId", pos_where),
@@ -644,6 +689,9 @@ def parse_position(item: Any, where: str = "") -> PositionRow:
         stop_reported=reported,
         stop_level=stop,
         stop_level_reported="stopLevel" in position,
+        target_reported=target_reported,
+        target_level=target,
+        target_level_reported="profitLevel" in position,
     )
 
 
