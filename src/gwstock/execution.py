@@ -57,8 +57,8 @@ Niezmienniki (prawdziwe pieniądze):
 - awaryjne spłaszczenie: no-op przy FLAT; inaczej do `EMERGENCY_ATTEMPTS` prób ze skróconym limitem czasu; pozycja
   BLOCKED tylko przy kill switchu HARD w tej chwili i tylko wtedy, gdy jest dowodnie nasza (zapis ma deal_id, a lista
   brokera właśnie go pokazuje; zapis EXITING z widoku brokera); obcej (bez deal_id) nie dotykamy nigdy; nieczytelny
-  dziennik → tylko ostatni NASZ deal tego procesu, który lista brokera właśnie pokazuje (EMERGENCY_FLATTEN_JOURNAL_
-  UNREADABLE); bez FLAT → alarm EMERGENCY_FLATTEN_INCOMPLETE (pozycja pod nadzorem, kill switch zostaje HARD do
+  dziennik → tylko ostatni NASZ deal tego procesu na instrumencie pasma (nigdy deal innego pasma), który lista
+  brokera właśnie pokazuje (EMERGENCY_FLATTEN_JOURNAL_UNREADABLE); bez FLAT → alarm EMERGENCY_FLATTEN_INCOMPLETE (pozycja pod nadzorem, kill switch zostaje HARD do
   decyzji właściciela); alarm JOURNAL_WRITE_FAILED po procedurze zamknięcia mówi, czy zamknięcie poszło do brokera;
 - wyjść nie blokuje ani bramka, ani kill switch; awaria notyfikatora nie przerywa przebiegu; każda surowa odpowiedź
   brokera trafia do dziennika przed interpretacją, a każda zmiana stanu pozycji przechodzi przez automat stanów.
@@ -220,8 +220,10 @@ class ExitMemory:
 
     `closes_sent`: deale, dla których `close_position` poszło do brokera (sukces albo niejasny błąd; odmowa przy
     zamkniętym rynku się nie liczy): kolejna próba zawsze zaczyna od listy pozycji, nawet gdy dziennik nadal mówi OPEN.
-    `last_own_deal`: ostatni NASZ deal widziany w dzienniku (OPEN/EXITING/BLOCKED) albo przekazany zabezpieczeniu;
-    awaryjne spłaszczenie przy nieczytelnym dzienniku zamyka tylko jego (i tylko gdy broker go pokazuje).
+    `last_own_deal_by_epic`: instrument → ostatni NASZ deal na nim widziany w dzienniku (OPEN/EXITING/BLOCKED) albo
+    przekazany zabezpieczeniu; awaryjne spłaszczenie pasma przy nieczytelnym dzienniku zamyka tylko deal SWOJEGO
+    instrumentu (i tylko gdy broker go pokazuje). Pamięć jest wspólna dla wykonawców wszystkich pasm procesu, a klucz
+    per instrument sprawia, że deal jednego pasma nie wypiera deala drugiego (R1: najwyżej jedna pozycja na instrument).
     `exit_intents`: deal → przyczyna wyjścia silnika, zapisywana tam, gdzie `exit_intent:<deal>` w dzienniku: wyjście
     silnika jest FORCED także wtedy, gdy zapis zamiaru zawiódł (po restarcie bez zapisu: MANUAL).
     `alerted_once`: (kod, deal_id) alarmów straży wysłanych już w tym procesie (raz na pozycję, także po odbudowie
@@ -231,7 +233,7 @@ class ExitMemory:
     """
 
     closes_sent: set[str] = field(default_factory=set)
-    last_own_deal: str | None = None
+    last_own_deal_by_epic: dict[str, str] = field(default_factory=dict)
     exit_intents: dict[str, str] = field(default_factory=dict)
     alerted_once: set[tuple[str, str]] = field(default_factory=set)
     guards_run: set[str] = field(default_factory=set)
@@ -923,7 +925,11 @@ class Executor:
         """Ostatni NASZ deal (zapis dziennika z deal_id w stanie OPEN/EXITING/BLOCKED) dla awaryjnego spłaszczenia przy
         nieczytelnym dzienniku."""
         if record is not None and record.deal_id is not None and record.state in _HELD:
-            self._memory.last_own_deal = record.deal_id
+            self._memory.last_own_deal_by_epic[record.epic] = record.deal_id
+
+    def _own_deal(self) -> str | None:
+        """Ostatni NASZ deal na instrumencie tego pasma (nigdy deal innego pasma)."""
+        return self._memory.last_own_deal_by_epic.get(self._epic)
 
     def _to_exiting(self, current: PositionRecord, target: PositionRecord, must: Failures) -> PositionRecord:
         """Przejście do EXITING (automat stanów); w trybie awaryjnym zapis wg możliwości (zwraca stan docelowy)."""
@@ -1065,7 +1071,7 @@ class Executor:
             try:
                 current = self._journal.current_position(self._epic)
             except JournalError:
-                deal_id, state = self._memory.last_own_deal, "UNKNOWN"  # dziennik nieczytelny: nie wiemy, nie FLAT
+                deal_id, state = self._own_deal(), "UNKNOWN"  # dziennik nieczytelny: nie wiemy, nie FLAT
             else:
                 if current is None or current.state is _P.FLAT:
                     return
@@ -1115,12 +1121,12 @@ class Executor:
             return
 
     async def _flatten_without_journal(self, error: JournalError, timeout: float, failures: list[str]) -> str:
-        """Jedna próba awaryjna przy nieczytelnym dzienniku: tylko ostatni NASZ deal tego procesu (widziany w dzienniku
-        albo przekazany zabezpieczeniu), tylko gdy lista brokera go właśnie pokazuje (nigdy wysyłka na ślepo); każdy
+        """Jedna próba awaryjna przy nieczytelnym dzienniku: tylko ostatni NASZ deal tego procesu na instrumencie pasma
+        (widziany w dzienniku albo przekazany zabezpieczeniu), tylko gdy lista brokera go właśnie pokazuje (nigdy wysyłka na ślepo); każdy
         zapis wg możliwości, bez księgowania (zrobi je uzgadnianie z dziennika, który wróci)."""
         why = f"{type(error).__name__}: {error}"
         code = "EMERGENCY_FLATTEN_JOURNAL_UNREADABLE"
-        deal_id = self._memory.last_own_deal
+        deal_id = self._own_deal()
         if deal_id is None:
             self._alert(
                 "ERROR", f"{code}: journal unreadable ({why}) and no own deal seen in this process; nothing closed, "
@@ -1171,7 +1177,7 @@ class Executor:
 
     async def _protect(self, position: OpenPosition, distance: Decimal | None) -> bool:
         # nasza pozycja (z potwierdzenia wejścia albo z uzgadniania: deal z dziennika u brokera)
-        self._memory.last_own_deal = position.deal_id
+        self._memory.last_own_deal_by_epic[position.epic] = position.deal_id
         failures: list[str] = []
         attached = False
         level: Decimal | None = None

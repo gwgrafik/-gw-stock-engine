@@ -273,3 +273,65 @@ async def test_de40_lane_spec_is_byte_identical_to_the_v1_executor(tmp_path):
     lane = await _de40_day(tmp_path, "lane", T_ENTRY, use_lane=True)
     assert lane == v1
     assert "close_position" in v1[0] and v1[2]  # przebieg rzeczywiście coś zamknął i zaksięgował
+
+
+# --- pamięć wyjść per instrument: awaryjne spłaszczenie przy nieczytelnym dzienniku ---------------------
+
+
+def unreadable_positions(journal, monkeypatch):
+    def broken(_epic):
+        raise JournalReadError("database is locked")
+
+    monkeypatch.setattr(journal, "current_position", broken)
+
+
+async def two_held_positions(de, us, fake, journal, kill):
+    """DE40 DEAL-A i US500 DEAL-B otwarte; każdy wykonawca widział swój deal (przebieg straży przy HARD)."""
+    hold(fake, journal, "DE40", "DEAL-A", Side.BUY, D("0.007"), D("25782.3"), D("25752.3"))
+    hold(fake, journal, "US500", "DEAL-B", Side.BUY, D("0.01"), US_FILL, US_STOP)
+    kill.hard("TEST")
+    assert await de.guard_adopted_fill() is False and await us.guard_adopted_fill() is False
+    fake.calls.clear()
+
+
+async def test_exit_memory_keeps_the_last_own_deal_per_instrument(de, us, fake, journal, kill, memory):
+    await two_held_positions(de, us, fake, journal, kill)
+    assert memory.last_own_deal_by_epic == {"DE40": "DEAL-A", "US500": "DEAL-B"}
+
+
+async def test_emergency_flatten_of_two_lanes_with_an_unreadable_journal_closes_both_own_deals(
+    de, us, fake, journal, kill, notifier, monkeypatch
+):
+    await two_held_positions(de, us, fake, journal, kill)
+    unreadable_positions(journal, monkeypatch)
+    await de.emergency_flatten()
+    await us.emergency_flatten()
+    assert fake.positions == {}  # obie pozycje zamknięte: każde pasmo zamknęło SWÓJ deal
+    assert fake.calls == ["list_positions", "close_position", "list_positions", "close_position"]
+    assert [d.deal_id for d in await fake.closed_since(T_ENTRY)] == ["DEAL-A", "DEAL-B"]
+    assert len(alerts(notifier, "EMERGENCY_FLATTEN_JOURNAL_UNREADABLE: DEAL-A closed")) == 1
+    assert len(alerts(notifier, "EMERGENCY_FLATTEN_JOURNAL_UNREADABLE: DEAL-B closed")) == 1
+    assert kill.level() is KillLevel.HARD
+
+
+async def test_a_lane_never_closes_the_deal_of_another_lane_with_an_unreadable_journal(
+    de, us, fake, journal, kill, notifier, monkeypatch
+):
+    hold(fake, journal, "US500", "DEAL-B", Side.BUY, D("0.01"), US_FILL, US_STOP)
+    kill.hard("TEST")
+    await us.guard_adopted_fill()  # tylko pasmo US500 widziało swój deal
+    fake.calls.clear()
+    unreadable_positions(journal, monkeypatch)
+    await de.emergency_flatten()
+    assert fake.calls == [] and "DEAL-B" in fake.positions  # DE40 nie zna własnego deala: nic nie zamyka
+    assert alerts(notifier, "no own deal seen in this process")
+    await us.emergency_flatten()
+    assert fake.positions == {} and fake.calls == ["list_positions", "close_position"]
+
+
+async def test_protection_remembers_the_deal_under_its_own_instrument(fake, memory, lane_build, gate, de_lane):
+    de = lane_build(de_lane, gate)
+    pos = OpenPosition("DEAL-X", "DE40", Side.BUY, D("0.007"), D("25782.3"), None, T_ENTRY)
+    fake.positions["DEAL-X"] = pos
+    assert await de.protect_unprotected(pos) is True
+    assert memory.last_own_deal_by_epic == {"DE40": "DEAL-X"}
