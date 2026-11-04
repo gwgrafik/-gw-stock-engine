@@ -1,6 +1,6 @@
 """Regresja skryptu badawczego research/candle_strategies.py (tylko odczyt, bez sieci)."""
 import importlib.util
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -96,3 +96,23 @@ def test_session_comes_from_env_for_another_market(monkeypatch):
     assert mod.WINDOWS["ALL"] == [(time(9, 45), time(15, 30))]
     assert mod.WINDOWS["SESJE"] == [(time(9, 45), time(11, 45)), (time(14, 0), time(15, 30))]
     assert mod.FLAT == time(15, 55) and str(mod.TZ) == "America/New_York"
+
+
+def _tr(day, pnl, cost=1.0):
+    return (day, None, 1, 100.0, 100.0 + pnl, "TARGET", pnl, pnl, cost, None, pnl + cost)
+
+
+def test_forward_verdict_ignores_trades_before_the_cutoff_and_needs_enough_new_trades(cs):
+    d0 = date(2026, 11, 5)
+    old = [_tr(date(2026, 10, 1), 5.0) for _ in range(80)]  # świetne, ale sprzed daty graniczej: nie liczą się
+    new = [_tr(date(2026, 11, 6), 1.0) for _ in range(49)]
+    verdict, fwd = cs.forward_verdict(old + new, d0)
+    assert verdict == "BRAK WERDYKTU" and len(fwd) == 49  # 49 < 50 nowych transakcji
+
+
+def test_forward_verdict_meets_and_fails_the_frozen_criteria(cs):
+    d0 = date(2026, 11, 5)
+    good = [_tr(date(2026, 11, 6), 3.0, 0.5)] * 20 + [_tr(date(2026, 11, 6), -1.0, 0.5)] * 30  # x1.5: +2,75 i -1,25 => netto +17,5, PF 1,47
+    bad = [_tr(date(2026, 11, 6), 1.0, 0.5)] * 20 + [_tr(date(2026, 11, 6), -1.0, 0.5)] * 30
+    assert cs.forward_verdict(good, d0)[0] == "SPEŁNIA KRYTERIA"
+    assert cs.forward_verdict(bad, d0)[0] == "NIE SPEŁNIA KRYTERIÓW"

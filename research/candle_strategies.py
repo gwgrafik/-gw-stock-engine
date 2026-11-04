@@ -20,13 +20,15 @@ PODZIAŁ CHRONOLOGICZNY: 60% dni = opracowanie, 20% = wybór, 20% = ocena końco
   być samym przypadkiem, więc przyjęcie oznacza tylko "warto badać dalej w dry_run", nie zysk.
 Instrument inny niż DE40: ustaw GW_EPIC, GW_SLIP, GW_STOP_EXTRA, GW_STEP, GW_POINT_EUR (wartość punktu przy minimalnej wielkości;
   0 = nie drukuj przeliczenia na EUR, np. instrumenty w USD bez modelu walutowego).
+Tryb forward (jeden zamrożony wariant, tylko nowe dni): GW_ONLY="B1/M5/SESJE" GW_FORWARD_FROM=RRRR-MM-DD. Werdykt dopiero od 50 NOWYCH
+  transakcji; dane sprzed daty granicznej są tylko drukowane do porównania i nie są dowodem.
 Sesja z env (domyślnie Berlin jak wyżej): GW_TZ, GW_WIN_ALL, GW_WIN_SESJE ("hh:mm-hh:mm,..."), GW_FLAT (zaplanowane wyjście).
   Okna USA zadeklarowane PRZED uruchomieniem: GW_TZ=America/New_York GW_WIN_ALL=09:45-15:30 GW_WIN_SESJE=09:45-11:45,14:00-15:30
   GW_FLAT=15:55 (odpowiednik DE40: sygnały od 15 min po otwarciu do 30 min przed zamknięciem, wyjście 5 min przed zamknięciem).
 """
 import csv, os, statistics
 from collections import namedtuple
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -51,6 +53,8 @@ if EPIC != "DE40" and not all(k in os.environ for k in ("GW_SLIP", "GW_STOP_EXTR
 SLIP = float(os.environ.get("GW_SLIP", "0.5")); STOP_EXTRA = float(os.environ.get("GW_STOP_EXTRA", "1.0"))
 STEP = float(os.environ.get("GW_STEP", "0.1")); POINT_EUR = float(os.environ.get("GW_POINT_EUR", "0.001"))
 ATR_N, MAX_DAY, DAY_STOP_R, MIN_STOP_FRAC = 14, 10, -3.0, 0.0001
+ONLY, FORWARD_FROM = os.environ.get("GW_ONLY"), os.environ.get("GW_FORWARD_FROM")  # tryb "forward": jeden zamrożony wariant, tylko nowe dni
+FORWARD_MIN_N = 50  # kryterium zamrożone z góry: werdykt dopiero od 50 NOWYCH transakcji
 Bar = namedtuple("Bar", "t bo bh bl bc ao ah al ac")
 WINDOWS = {"ALL": _windows(os.environ.get("GW_WIN_ALL", "09:15-17:00")),
            "SESJE": _windows(os.environ.get("GW_WIN_SESJE", "09:15-11:30,15:30-17:00"))}
@@ -263,8 +267,45 @@ def passes(tr, min_n=30):
     return sum(p) > 0 and lo > 0 and w / lo > 1.2
 
 
+def _prep(raw, tf):
+    bars = aggregate(raw, TF[tf]["minutes"])
+    return (bars, atr_series(bars), m5_context(bars) if tf == "M1" else None,
+            ema_series([mid(b)[3] for b in bars], 20) if tf == "M1" else None)
+
+
+def forward_verdict(tr, from_day, min_n=FORWARD_MIN_N):
+    """Tryb forward: liczą się tylko transakcje od `from_day` (dane po zamrożeniu reguły). Kryteria te same co `passes` (x1,5, PF > 1,2)."""
+    fwd = [t for t in tr if t[0] >= from_day]
+    if len(fwd) < min_n:
+        return "BRAK WERDYKTU", fwd
+    return ("SPEŁNIA KRYTERIA" if passes(fwd, min_n) else "NIE SPEŁNIA KRYTERIÓW"), fwd
+
+
+def forward_main(raw, real):
+    """GW_ONLY="B1/M5/SESJE" GW_FORWARD_FROM=2026-11-05: JEDEN zamrożony wariant; podział 60/20/20 i wybór nie są używane."""
+    if not FORWARD_FROM:
+        raise SystemExit("GW_ONLY wymaga GW_FORWARD_FROM (pierwszy dzień NOWYCH danych, RRRR-MM-DD)")
+    name, tf, window = ONLY.split("/")
+    from_day = date.fromisoformat(FORWARD_FROM)
+    bars, atr, ctx, m1ema = _prep(raw, tf)
+    tr, skips = run(name, tf, window, bars, atr, ctx, m1ema)
+    old = [t for t in tr if t[0] < from_day]
+    verdict, fwd = forward_verdict(tr, from_day)
+    print(f"{EPIC} wariant {ONLY} (zamrożony), bid/ask z danych: {'TAK' if real else 'NIE (przybliżenie)'}; pominięte: {skips}")
+    print(f"  dane do {from_day} (już użyte, NIE dowód):", stats(old))
+    print(f"  NOWE dni od {from_day}, koszty x1  :", stats(fwd))
+    print(f"  NOWE dni od {from_day}, koszty x1.5:", stats(fwd, 1.5))
+    print(f"  WERDYKT (n >= {FORWARD_MIN_N} nowych transakcji, netto > 0 przy x1,5, PF > 1,2): {verdict} (nowych transakcji: {len(fwd)})")
+    with OUT.open("w", newline="") as f:
+        w = csv.writer(f); w.writerow(["wariant", "dzien", "wejscie_utc", "kierunek", "cena_wej", "cena_wyj", "powod", "wynik_pkt", "wynik_R", "brutto_pkt"])
+        for t in tr:
+            w.writerow([ONLY, t[0], t[1].isoformat(), "LONG" if t[2] == 1 else "SHORT", round(t[3], 1), round(t[4], 1), t[5], round(t[6], 2), round(t[7], 2), round(t[10], 2)])
+
+
 def main():
     raw, real = load()
+    if ONLY:
+        return forward_main(raw, real)
     days = sorted({b.t.astimezone(TZ).date() for b in raw})
     print(f"{EPIC}: świece M1: {len(raw)}, dni: {len(days)} ({days[0]} .. {days[-1]}); bid/ask z danych: {'TAK' if real else 'NIE (rekonstrukcja ze spreadu, wynik przybliżony)'}")
     c1, c2 = days[int(len(days) * 0.6)], days[int(len(days) * 0.8)]
@@ -274,9 +315,7 @@ def main():
         w = csv.writer(f); w.writerow(["wariant", "dzien", "wejscie_utc", "kierunek", "cena_wej", "cena_wyj", "powod", "wynik_pkt", "wynik_R", "brutto_pkt"])
         for tf in ("M1", "M5"):
             if tf not in cache:
-                bars = aggregate(raw, TF[tf]["minutes"])
-                cache[tf] = (bars, atr_series(bars), m5_context(bars) if tf == "M1" else None,
-                             ema_series([mid(b)[3] for b in bars], 20) if tf == "M1" else None)
+                cache[tf] = _prep(raw, tf)
             bars, atr, ctx, m1ema = cache[tf]
             for window in ("ALL", "SESJE"):
                 for name in ("B1", "B2", "B3", "B4"):
