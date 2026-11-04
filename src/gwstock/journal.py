@@ -940,6 +940,12 @@ class Journal:
         )
         return None if row is None else _decode("position", _position_from_row, row)
 
+    def positions(self) -> list[PositionRecord]:
+        """Zapisy pozycji WSZYSTKICH instrumentów (każdy stan, także FLAT) w kolejności `epic` (tylko odczyt): bramka
+        portfelowa widzi też instrument bez pasma (spec wielu pasm §4.3). Uszkodzony wiersz to `JournalCorruptError`."""
+        rows = self._read(lambda c: c.execute(f"SELECT {_POSITION_COLS} FROM positions ORDER BY epic").fetchall())
+        return [_decode("position", _position_from_row, r) for r in rows]
+
     # --- licznik zrealizowanego wyniku (przeżywa restart) ---
 
     @staticmethod
@@ -1161,6 +1167,17 @@ class Journal:
             sql, params = f"SELECT {_TRADE_COLS} FROM trades WHERE instrument = ? ORDER BY id", (epic,)
         rows = self._read(lambda c: c.execute(sql, params).fetchall())
         return [_decode("trade", _trade_from_row, r) for r in rows]
+
+    def trades_by_deal(self, epic: str | None = None) -> list[tuple[str, TradeRecord]]:
+        """Jak `trades(epic)`, ale z `deal_id` każdej transakcji (silnik pasm: wynik dnia w R z kontekstu wejścia,
+        rozliczenie fazy 2). Tylko odczyt; zły `epic` to błąd, nigdy cicho cała księga."""
+        if epic is None:
+            sql, params = f"SELECT deal_id, {_TRADE_COLS} FROM trades ORDER BY id", ()
+        else:
+            _check_str(epic, "trades_by_deal.epic", non_empty=True)
+            sql, params = f"SELECT deal_id, {_TRADE_COLS} FROM trades WHERE instrument = ? ORDER BY id", (epic,)
+        rows = self._read(lambda c: c.execute(sql, params).fetchall())
+        return [_decode("trade", lambda r: (r[0], _trade_from_row(r[1:])), r) for r in rows]
 
     # --- drobne znaczniki ---
 
