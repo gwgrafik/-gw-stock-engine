@@ -8,6 +8,7 @@ import aiohttp
 
 from gwstock.broker.capitalcom import LIVE_BASE_URL, load_credentials
 
+EPIC = os.environ.get("GW_EPIC", "DE40")
 SAFE = {"accountType", "accountName", "status", "preferred", "currency", "canTransferFrom", "canTransferTo"}
 
 
@@ -36,12 +37,15 @@ async def main():
             bal = a.get("balance", {}) or {}
             print(f"  {i}) " + ", ".join(f"{k}={mask(a[k])}" for k in sorted(a) if k in SAFE) + f", saldo>0={float(bal.get('balance', 0) or 0) > 0}")
             print("     wszystkie klucze:", sorted(a.keys()))
-        async with s.get(base + "/markets/DE40", headers=hdr) as r:
+        async with s.get(base + f"/markets/{EPIC}", headers=hdr) as r:
             m = await r.json()
         ins, snap = m.get("instrument", {}), m.get("snapshot", {})
-        print("== DE40:", {k: mask(ins.get(k)) for k in ("epic", "name", "type", "currency", "marginFactor", "marginFactorUnit", "country")})
+        print(f"== {EPIC}:", {k: mask(ins.get(k)) for k in ("epic", "name", "type", "currency", "lotSize", "marginFactor", "marginFactorUnit", "country")})
+        rules = m.get("dealingRules", {})
+        print("   reguły:", {k: mask((rules.get(k) or {}).get("value")) + " " + mask((rules.get(k) or {}).get("unit", "")) for k in ("minDealSize", "minSizeIncrement", "minStepDistance", "minStopOrProfitDistance", "maxDealSize") if k in rules})
+        print("   notowanie:", {k: snap.get(k) for k in ("bid", "offer", "marketStatus")}, "| spread =", (round(float(snap["offer"]) - float(snap["bid"]), 4) if snap.get("offer") and snap.get("bid") else None))
         print("   marketStatus:", snap.get("marketStatus"), "| marketModes:", snap.get("marketModes"))
-        async with s.get(base + "/markets", headers=hdr, params={"searchTerm": "Germany 40"}) as r:
+        async with s.get(base + "/markets", headers=hdr, params={"searchTerm": os.environ.get("GW_SEARCH", "Germany 40")}) as r:
             found = (await r.json()).get("markets", [])
         print("== wyszukiwanie 'Germany 40' (epic, nazwa, typ, status):")
         for x in found[:10]:
