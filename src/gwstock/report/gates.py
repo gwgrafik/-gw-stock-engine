@@ -2,8 +2,15 @@
 
 L1 (po `fixed_min_size_sessions` = 5 sesjach na wielkości minimalnej): zero niewyjaśnionych rozbieżności
 pozycja/broker starszych niż 60 s, zero nieobsłużonych odrzuceń, koszty zmierzone w granicach 2× modelu. To POMOC
-w decyzji właściciela: kod niczego nie dopuszcza ani nie tworzy `data/L1_PASSED`. Liczby obejmują CAŁY dziennik, a ocena
-wyjaśnień (czy dana rozbieżność została wyjaśniona) należy do właściciela.
+w decyzji właściciela: kod niczego nie dopuszcza ani nie tworzy `data/L1_PASSED`. Ocena wyjaśnień (czy dana rozbieżność
+została wyjaśniona) należy do właściciela.
+
+Pasma (projekt wielu pasm, zadanie 15): bramka jest PER PASMO, a pasmo to instrument. Z parametrem `instrument`
+(`l1_details`, `gate_l1_status`) sesje, wielkość minimalna, próbki kosztu i werdykt kosztów liczą się WYŁĄCZNIE z transakcji
+tego instrumentu. Incydenty portfela (rozbieżności MISMATCH_TIMEOUT, nieobsłużone odrzucenia, ENTRY_EXCEPTION) liczą się
+z CAŁEGO dziennika dla KAŻDEGO pasma: kill switch, dziennik i sesja brokera są wspólne, więc incydent jednego pasma
+zatrzymuje wszystkie (ostrożnie; ocena wyjaśnień należy do właściciela). Bez parametru: cały dziennik, jak dotąd (poprawne
+dla dziennika jednego pasma).
 
 Definicje czterech liczb bramki (`gate_l1_status`, szczegóły i daty incydentów w `l1_details`) i liczby próbek kosztu
 (razem pięć wielkości w `GateL1`):
@@ -316,8 +323,8 @@ def trade_contexts(journal: Journal, trades: list[TradeRecord]) -> list[TradeCon
     po `signal_ts` i `submit_ts`. Bez dopasowania: rola `unknown`; z dopasowaniem, ale z uszkodzoną wartością punktu:
     rola `invalid`. W obu przypadkach wartość punktu to None. Tylko publiczne metody dziennika.
     """
-    index: dict[tuple[datetime, datetime], TradeContext] = {}
-    scanned: set[tuple[str, date]] = set()
+    index: dict[tuple[str, datetime, datetime], TradeContext] = {}  # klucz zawiera instrument: dwa pasma o tej samej chwili
+    scanned: set[tuple[str, date]] = set()  # decyzji nie mogą zamienić się kontekstami
     for trade in trades:
         for offset in (-1, 0, 1):
             day = trade.signal_ts.date() + timedelta(days=offset)
@@ -335,9 +342,9 @@ def trade_contexts(journal: Journal, trades: list[TradeRecord]) -> list[TradeCon
                     if parsed is not None:
                         signal_ts, submit_ts, vpp = parsed
                         usable_role = role if vpp is not None else ROLE_INVALID
-                        index.setdefault((signal_ts, submit_ts), TradeContext(usable_role, vpp))
+                        index.setdefault((trade.instrument, signal_ts, submit_ts), TradeContext(usable_role, vpp))
     unknown = TradeContext(ROLE_UNKNOWN, None)
-    return [index.get((trade.signal_ts, trade.submit_ts), unknown) for trade in trades]
+    return [index.get((trade.instrument, trade.signal_ts, trade.submit_ts), unknown) for trade in trades]
 
 
 def trade_roles(journal: Journal, trades: list[TradeRecord]) -> list[str]:
@@ -463,12 +470,21 @@ def _default_costs() -> CostConfig:
     return load_config(Path(os.environ.get(ENV_CONFIG_DIR) or DEFAULT_CONFIG_DIR))[2]
 
 
+def _check_instrument(instrument: object) -> str:
+    if not isinstance(instrument, str):
+        raise TypeError(f"instrument: expected str, got {type(instrument).__name__} {instrument!r}")
+    if not instrument:
+        raise ValueError("instrument: must not be empty (omit it to count the whole ledger)")
+    return instrument
+
+
 def l1_details(
     journal: Journal,
     *,
     min_size: Decimal | None = None,
     costs: CostConfig | None = None,
     trades: list[TradeRecord] | None = None,
+    instrument: str | None = None,
 ) -> L1Details:
     """Status bramki L1 z danymi pomocniczymi (definicje w docstringu modułu).
 
@@ -476,11 +492,21 @@ def l1_details(
     (domyślnie `costs_v1.toml` z `GW_CONFIG_DIR` albo `config/`). `trades`: księga już odczytana przez wywołującego
     (domyślnie `journal.trades()`). Rola `no_quote` trafia do transakcji z poprawnym kontekstem (`entry`, `smoke`), ale
     z notowaniem decyzji ask <= bid: nie jest sesją ani próbką, tak samo jak `unknown` i `invalid`.
+
+    `instrument`: bramka JEDNEGO pasma. Księga (podana w `trades` albo cały dziennik) jest zawężona do tego instrumentu,
+    więc sesje, wielkość minimalna, próbki i werdykt kosztów pochodzą tylko z jego transakcji; incydenty portfela
+    (`mismatch_days`, `rejection_days`) zostają z całego dziennika. Pusty napis albo wartość spoza `str` to błąd, nigdy
+    po cichu cały dziennik.
     """
     if min_size is not None and (not isinstance(min_size, Decimal) or min_size <= 0):
         raise ValueError(f"min_size: expected a positive Decimal, got {min_size!r}")
+    if instrument is not None:
+        _check_instrument(instrument)
     costs = costs if costs is not None else _default_costs()
-    trades = journal.trades() if trades is None else trades
+    if trades is None:
+        trades = journal.trades() if instrument is None else journal.trades(instrument)
+    elif instrument is not None:
+        trades = [t for t in trades if t.instrument == instrument]
     contexts = trade_contexts(journal, trades)
     roles = tuple(
         ROLE_NO_QUOTE if context.role in COST_ROLES and not trade.decision_ask > trade.decision_bid else context.role
@@ -491,7 +517,10 @@ def l1_details(
     sessions = len({trade_day(t) for t in entries if t.size == floor})
     mismatches, rejections = _mismatch_days(journal), _rejection_days(journal)
     points = cost_points(trades, costs, [role in COST_ROLES for role in roles])
-    eur_ratio, eur_samples = _eur_ratio(trades, roles, contexts, costs)
+    if len({trade.instrument for trade in trades}) > 1:  # kwoty kilku pasm nie mają wspólnej waluty: koszt w walucie
+        eur_ratio, eur_samples = Decimal(0), 0  # księgi liczymy tylko per pasmo (`instrument`)
+    else:
+        eur_ratio, eur_samples = _eur_ratio(trades, roles, contexts, costs)
     return L1Details(
         gate=GateL1(sessions, len(mismatches), len(rejections), points.ratio, cost_samples=points.trades),
         roles=roles,
@@ -503,6 +532,14 @@ def l1_details(
     )
 
 
-def gate_l1_status(journal: Journal, *, min_size: Decimal | None = None, costs: CostConfig | None = None) -> GateL1:
-    """Liczby bramki L1 z dziennika (definicje w docstringu modułu); szczegóły: `l1_details`."""
-    return l1_details(journal, min_size=min_size, costs=costs).gate
+def gate_l1_status(
+    journal: Journal,
+    *,
+    min_size: Decimal | None = None,
+    costs: CostConfig | None = None,
+    instrument: str | None = None,
+) -> GateL1:
+    """Liczby bramki L1 z dziennika (definicje w docstringu modułu); szczegóły: `l1_details`.
+
+    `instrument`: bramka jednego pasma (jego transakcje; incydenty portfela z całego dziennika)."""
+    return l1_details(journal, min_size=min_size, costs=costs, instrument=instrument).gate
