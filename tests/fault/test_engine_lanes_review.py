@@ -441,3 +441,114 @@ async def test_journal_unreadable_in_a_dry_run_lane_still_soft_kills(dry_lane_en
     await dry_lane_engine.run_day(DAY)
     assert dry_lane_engine.kill.level() is KillLevel.SOFT
     assert dry_lane_engine.journal.kill_state().reason == "JOURNAL_UNREADABLE"
+
+
+# --- F6: run_forever z pasmami (22:00 → północ, pozostałość po 22:00, start nocą) -----------------------------------
+
+TRADING_CALLS = ("login", "quote", "list_positions", "closed_since", "candles_5m", "open_position", "close_position")
+
+
+def call_times(broker: FakeBroker, clock: SimClock) -> list[tuple[datetime, str]]:
+    seen: list[tuple[datetime, str]] = []
+    for name in TRADING_CALLS:
+        broker.on_call(name, lambda _n=name: seen.append((clock.now_utc(), _n)))
+    return seen
+
+
+def tuesday_de40_data(broker: FakeBroker) -> None:
+    broker.set_daily_candles(daily_candles(TUESDAY), epic=EPIC)
+    broker.set_candles_5m(five_minute_candles(TUESDAY, D("25780"), D("25790")), epic=EPIC)
+
+
+def trades_by_epic(journal) -> dict[str, list]:
+    out: dict[str, list] = {}
+    for _deal, t in journal.trades_by_deal():
+        out.setdefault(t.instrument, []).append(t)
+    return out
+
+
+async def test_run_forever_with_lanes_crosses_2200_and_midnight_into_the_next_session(
+    lane_engine, broker, clock, journal_path
+):
+    """F6. Oczekiwane: `run_forever` od poniedziałku 08:45 Berlin: oba pasma handlują w poniedziałek (DE40 09:05-17:25,
+    US500 14:50-15:40 UTC), dzień portfela kończy się z zamknięciem NYSE (22:00 Berlin), potem spoczynek BEZ wywołań
+    brokera do północy i dalej do przygotowania wtorku (08:50 Berlin), we wtorek pasmo US500 pracuje na dniu wtorku, a
+    DE40 wchodzi o 09:05 wtorku; poniedziałkowe wyniki rozliczone (USD w EUR), księga = liczniki."""
+    swapped: list[bool] = []
+
+    def tuesday_data() -> None:
+        if not swapped and clock.now_utc() >= datetime(2026, 11, 2, 22, 0, tzinfo=UTC):
+            swapped.append(True)
+            tuesday_de40_data(broker)
+
+    clock.hooks.append(tuesday_data)
+    seen = call_times(broker, clock)
+    stop_engine_at(lane_engine, clock, berlin(TUESDAY, 9, 8))
+    await lane_engine.run_forever()
+    j = lane_engine.journal
+    by_epic = trades_by_epic(j)
+    assert len(by_epic[US]) == 1 and len(by_epic[EPIC]) == 1  # poniedziałek; wtorkowa pozycja DE40 jeszcze otwarta
+    assert j.count_entry_orders(TUESDAY, EPIC) == 1 and j.current_position(EPIC).state is P.OPEN
+    assert lane_engine.lanes[0].day is not None and lane_engine.lanes[0].day.day == TUESDAY
+    night = [(ts, m) for ts, m in seen if new_york(DAY, 16, 0) + timedelta(minutes=1) < ts < berlin(TUESDAY, 8, 50)]
+    assert night == [] and any(ts >= berlin(TUESDAY, 8, 50) for ts, _ in seen)
+    assert j.pnl_pending_deals() == [] and lane_engine.kill.level() is KillLevel.NONE
+    assert_portfolio_books_balance(journal_path)
+
+
+async def test_run_forever_started_after_2200_flattens_both_leftovers_at_once(
+    lane_engine, make_engine, lanes, broker, clock, journal_path
+):
+    """F6 (pozostałość US500 po 22:00). Oczekiwane: proces padł o 14:52 UTC z pozycjami DE40 i US500; nowy proces
+    startuje o 22:30 Berlin (po końcu dnia portfela) przez `run_forever`: obie pozostałości spłaszczone `FORCED` w
+    ciągu minuty od startu (pasma nie trzymają nocy), US500 rozliczone w EUR z kursu brokera (ESTIMATED_FX), żadnego
+    nowego wejścia w poniedziałek; potem spoczynek do wtorku 08:50 bez wywołań brokera."""
+    stop_engine_at(lane_engine, clock, US_ENTRY + timedelta(minutes=2))
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    assert j.current_position(EPIC).state is P.OPEN and j.current_position(US).state is P.OPEN
+    clock.hooks.clear()
+    start = berlin(DAY, 22, 30)
+    clock.advance((start - clock.now_utc()).total_seconds())
+    engine = make_engine.restart(lane_engine, Mode.LIVE, lanes=lanes, lane_arming=lane_armed)
+    seen = call_times(broker, clock)
+    stop_engine_at(engine, clock, berlin(TUESDAY, 8, 45))
+    await engine.run_forever()
+    j = engine.journal
+    by_epic = trades_by_epic(j)
+    for epic in (EPIC, US):
+        (t,) = by_epic[epic]
+        assert t.exit_reason == "FORCED" and timedelta(0) <= t.exit_ts - start < timedelta(minutes=1)
+    (us_deal,) = [d for d, _ in j.trades_by_deal(US)]
+    assert j.pnl_pending_deals() == [] and j.trade_fx(us_deal).source == "ESTIMATED_FX"
+    assert j.count_entry_orders(DAY, EPIC) == 1 and j.count_entry_orders(DAY, US) == 1
+    late = [(ts, m) for ts, m in seen if start + timedelta(minutes=2) < ts]
+    assert late == [] and any(m == "close_position" for _, m in seen)
+    assert_portfolio_books_balance(journal_path)
+
+
+@pytest.mark.parametrize(
+    "start", [berlin(DAY, 23, 30), berlin(TUESDAY, 3, 0), berlin(TUESDAY, 8, 54)], ids=["23:30", "03:00", "08:54"]
+)
+async def test_run_forever_started_at_night_waits_for_the_next_session_and_trades_it(
+    make_engine, lanes, broker, clock, start
+):
+    """F6 (start procesu po 22:00 i przed 08:55). Oczekiwane: bez pozycji; proces startuje nocą (23:30 Berlin w
+    poniedziałek, 03:00 albo 08:54 we wtorek): co najwyżej uzgadnianie startowe zaraz po starcie (poniedziałek 23:30:
+    jeden takt dnia, który już się skończył), potem spoczynek bez wywołań brokera do przygotowania wtorku (08:50) i
+    normalny wtorek: DE40 wchodzi o 09:05 wtorku, pasmo US500 na dniu wtorku, żadnego wejścia w poniedziałek."""
+    clock.advance((start - clock.now_utc()).total_seconds())
+    tuesday_de40_data(broker)
+    engine = make_engine(Mode.LIVE, lanes=lanes, lane_arming=lane_armed)
+    seen = call_times(broker, clock)
+    opens = broker_calls(broker, clock, ("open_position",))
+    stop_engine_at(engine, clock, berlin(TUESDAY, 9, 8))
+    await engine.run_forever()
+    j = engine.journal
+    assert [arg for _, _, arg in opens] == [EPIC]
+    assert timedelta(0) <= opens[0][0] - berlin(TUESDAY, 9, 5) < timedelta(seconds=10)
+    assert j.count_entry_orders(DAY) == 0 and j.count_entry_orders(TUESDAY, EPIC) == 1
+    assert engine.lanes[0].day is not None and engine.lanes[0].day.day == TUESDAY
+    idle = [(ts, m) for ts, m in seen if start + timedelta(minutes=1) < ts < berlin(TUESDAY, 8, 50)]
+    assert idle == [] and any(ts >= berlin(TUESDAY, 8, 50) for ts, _ in seen)
+
