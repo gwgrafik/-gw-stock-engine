@@ -269,12 +269,21 @@ class _Probe:
         self.balance_before = await self._balance()
         self.entry_ts = self.clock.now_utc()
         day = engine.trading_day()
+        if engine.shutdown_requested:  # pierwszy Ctrl-C/SIGTERM przed wysyłką: zlecenie nie wychodzi
+            return self.step(2, False, "stop requested (signal) before the entry: nothing was sent")
         try:
             with engine.lane_smoke_entry(epic):
                 rec = await self.executor.enter(self.plan, rules, day, smoke=True)
-        except Exception as exc:
-            self.step(2, False, f"entry failed ({self.error(exc)})")
+        except GeneratorExit:  # zamykana korutyna nie może już czekać
+            raise
+        except BaseException as exc:  # wyjątek, anulowanie, Ctrl-C po wysyłce: wejście mogło zostać przyjęte
+            if isinstance(exc, Exception):
+                self.step(2, False, f"entry failed ({self.error(exc)})")
+            else:
+                self.step(2, False, f"entry interrupted ({type(exc).__name__}); resolving the entry outcome now")
             await self._resolve_unknown()
+            if not isinstance(exc, Exception):
+                raise
             return False
         if rec is None or rec.state is not OrderState.CONFIRMED:
             blocks = journal.events("gate_block")
@@ -310,8 +319,34 @@ class _Probe:
             return None
 
     async def _resolve_unknown(self) -> None:
-        """Wynik wejścia nieznany: uzgadnianie pasma (do `SMOKE_SETTLE_ATTEMPTS` przebiegów) przyjmuje albo blokuje
-        pozycję; nasza otwarta → spłaszczenie; nadal nierozstrzygnięta → głośna linia dla właściciela."""
+        """Wynik wejścia nieznany (UNKNOWN, wyjątek albo przerwanie w trakcie wejścia): uzgadnianie pasma (do
+        `SMOKE_SETTLE_ATTEMPTS` przebiegów) przyjmuje albo blokuje pozycję; nasza otwarta → spłaszczenie. Całość biegnie
+        osłonięta przed kolejnym przerwaniem (`cli._await_shielded`). Błąd albo przerwanie w jej trakcie, albo pozycja
+        nadal nie FLAT przy znanym dealId → procedura awaryjna (`cli._close_after_interrupt`, z linią wyniku); bez
+        dealId i bez pewności, że nic nie zostało → głośna linia dla właściciela (sprawdzić aplikację)."""
+        failed: list[str] = []
+
+        async def settle() -> None:
+            try:
+                await self._adopt_and_flatten()
+            except BaseException as exc:  # w osobnym zadaniu: skutek sprawdzamy niżej, po zapisaniu przyczyny
+                failed.append(type(exc).__name__)
+
+        await cli._await_shielded(self.engine, settle())
+        settled = self._journal_settled()
+        if self.deal_id is not None and (failed or not settled):
+            await cli._close_after_interrupt(
+                self.engine, self.deal_id, self.out, executor=self.executor, step=2, name="the probe position",
+                hint=LANE_LEFT_OPEN_HINT,
+            )  # fmt: skip
+            return
+        if failed or not settled:
+            why = f"{failed[0]} while resolving it" if failed else self._journal_state()
+            self.out(f"FAIL [2] LOUD: the entry outcome is unknown ({why}); a position may exist with its broker stop "
+                     "and target: check the Capital.com app and close it there, or start the engine, whose startup "
+                     "reconciliation adopts or blocks it before anything else")  # fmt: skip
+
+    async def _adopt_and_flatten(self) -> None:
         for attempt in range(cli.SMOKE_SETTLE_ATTEMPTS):
             if attempt:
                 await self.clock.sleep(cli.SMOKE_SETTLE_PAUSE_S)
@@ -321,15 +356,27 @@ class _Probe:
                 self.deal_id = position.deal_id
                 if await self._flatten_position():
                     self.info(2, "the entry was adopted by reconciliation and closed again; the probe stops here")
-                break
+                return
             unresolved = any(o.epic == self.epic for o in self.journal.unresolved_orders())
             if (position is None or position.state is PositionState.FLAT) and not unresolved:
-                break
-        position = self.journal.current_position(self.epic)
-        if position is not None and position.state is not PositionState.FLAT:
-            self.out(f"FAIL [2] LOUD: the entry outcome is unresolved ({position.state.value}); a position may exist "
-                     "with its broker stop: check the Capital.com app and start the engine, whose startup "
-                     "reconciliation adopts or blocks it before anything else")  # fmt: skip
+                return
+
+    def _journal_settled(self) -> bool:
+        """Dziennik pewnie mówi, że nic nie zostało: pozycja FLAT (albo brak) i żadnego nierozstrzygniętego zlecenia
+        instrumentu próby; nieczytelny dziennik: nie."""
+        try:
+            position = self.journal.current_position(self.epic)
+            unresolved = any(o.epic == self.epic for o in self.journal.unresolved_orders())
+        except Exception:
+            return False
+        return (position is None or position.state is PositionState.FLAT) and not unresolved
+
+    def _journal_state(self) -> str:
+        try:
+            position = self.journal.current_position(self.epic)
+        except Exception as exc:
+            return f"journal unreadable: {type(exc).__name__}"
+        return f"journal position {position.state.value if position is not None else 'missing'}, order unresolved"
 
     # --- po wejściu ---
 

@@ -447,3 +447,90 @@ async def test_the_smoke_command_runs_the_lane_probe_with_the_stop_handlers(engi
     paths = cli.Paths(tmp_path / "c", tmp_path / "d", tmp_path / "k.json")
     (tmp_path / "d").mkdir()
     assert await cli._smoke_engine(paths, 30, epic=US) == 0
+
+
+# --- przerwanie w trakcie wejścia (przegląd S1) ----------------------------------------------------------------------
+#
+# OCZEKIWANE: przerwanie (CancelledError, KeyboardInterrupt) albo błąd dziennika między wysłaniem wejścia a końcem
+# `_enter` (także w `_resolve_unknown` i w jego spłaszczeniu) kończy się zamknięciem pozycji próby albo głośną linią
+# LOUD, a wyjątek BaseException idzie dalej; po pierwszym Ctrl-C/SIGTERM (`shutdown_requested`) zlecenie nie wychodzi.
+
+
+def raiser(exc):
+    def raise_it():
+        raise exc()
+
+    return raise_it
+
+
+def blind_after_the_send(broker):
+    """Wysyłka przyjęta, ale ani potwierdzenie, ani lista pozycji nie odpowiadają (wynik wejścia UNKNOWN)."""
+
+    def blind():
+        for _ in range(4):
+            broker.fail_next("confirm", BrokerTimeout("GET /confirms: timeout"))
+            broker.fail_next("list_positions", BrokerTimeout("GET /positions: timeout"))
+
+    broker.on_call("open_position", blind, once=True)
+
+
+@pytest.mark.parametrize("exc", [asyncio.CancelledError, KeyboardInterrupt], ids=["cancelled", "keyboard"])
+async def test_an_interrupt_at_the_confirm_right_after_the_send_closes_the_probe_position(engine, broker, exc):
+    broker.on_call("confirm", raiser(exc), once=True)
+    lines: list[str] = []
+    with pytest.raises(exc):
+        await smoke_lane(engine, US, out=lines.append)
+    assert "open_position" in broker.calls and "close_position" in broker.calls, "\n".join(lines)
+    assert broker.positions == {}, "\n".join(lines)
+    assert f"FAIL [2] entry interrupted ({exc.__name__}); resolving the entry outcome now" in lines
+    assert "INFO [2] the entry was adopted by reconciliation and closed again; the probe stops here" in lines
+    assert not any("LOUD" in x for x in lines) and any(x.startswith("USTALENIA O BROKERZE") for x in lines)
+    no_identifiers(lines)
+
+
+async def test_an_interrupted_entry_that_cannot_be_resolved_is_loud(engine, broker):
+    def blind():
+        for _ in range(40):
+            broker.fail_next("list_positions", BrokerTimeout("GET /positions: timeout"))
+        raise asyncio.CancelledError()
+
+    broker.on_call("confirm", blind, once=True)
+    lines: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        await smoke_lane(engine, US, out=lines.append)
+    assert "close_position" not in broker.calls  # nic na ślepo
+    [loud] = [x for x in lines if "LOUD" in x]
+    assert loud.startswith("FAIL [2] LOUD: the entry outcome is unknown"), loud
+    assert "check the Capital.com app" in loud
+    no_identifiers(lines)
+
+
+async def test_a_stop_request_before_the_entry_sends_nothing(engine, broker):
+    engine.request_shutdown()
+    code, lines = await run(engine)
+    assert code == 1 and "open_position" not in broker.calls
+    assert "FAIL [2] stop requested (signal) before the entry: nothing was sent" in lines
+
+
+async def test_an_interrupt_while_resolving_an_unknown_entry_still_closes_the_position(engine, broker):
+    blind_after_the_send(broker)
+    broker.on_call("close_position", raiser(asyncio.CancelledError), once=True)  # spłaszczenie po przyjęciu przerwane
+    code, lines = await run(engine)
+    assert code == 1 and broker.positions == {}, "\n".join(lines)
+    assert any(x.startswith("INFO [2] the probe position closed after the interrupt") for x in lines), "\n".join(lines)
+    no_identifiers(lines)
+
+
+async def test_a_journal_error_while_resolving_an_unknown_entry_still_closes_the_position(engine, broker, monkeypatch):
+    from gwstock.journal import JournalWriteError
+
+    blind_after_the_send(broker)
+
+    async def broken(self):
+        raise JournalWriteError("disk full")
+
+    monkeypatch.setattr(smoke_lane_mod._Probe, "_flatten_position", broken)
+    code, lines = await run(engine)
+    assert code == 1 and broker.positions == {}, "\n".join(lines)
+    assert any(x.startswith("INFO [2] the probe position closed after the interrupt") for x in lines), "\n".join(lines)
+    no_identifiers(lines)

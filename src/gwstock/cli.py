@@ -627,6 +627,33 @@ async def _still_at_broker(engine: Engine, deal_id: str | None) -> bool | None:
     return any(p.deal_id == deal_id for p in positions)
 
 
+async def _await_shielded(engine: Engine, work: Awaitable[Any]) -> None:
+    """Czeka na `work` uruchomione jako osobne zadanie, osłonięte przed kolejnym anulowaniem: kolejne przerwania (np.
+    drugie Ctrl-C) nie kończą czekania, najwyżej `SMOKE_CLOSE_WAIT_SUBMITS` × submit_timeout_s; potem wraca, a zadanie
+    biegnie dalej. Wyjątek samego `work` zostaje w zadaniu (wywołujący sprawdza skutek, nie wyjątek)."""
+    task = asyncio.ensure_future(work)
+    loop = asyncio.get_running_loop()
+    wait_s = SMOKE_CLOSE_WAIT_SUBMITS * engine.risk.submit_timeout_s
+    deadline = loop.time() + wait_s
+    while not task.done():  # kolejne przerwania nie kończą czekania: wynik dopiero po zamknięciu (albo po limicie)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            _LOG.warning("smoke close after an interrupt still running after %s s; reporting now", wait_s)
+            break
+        try:
+            await asyncio.wait_for(asyncio.shield(task), remaining)
+        except asyncio.TimeoutError:
+            _LOG.warning("smoke close after an interrupt still running after %s s; reporting now", wait_s)
+            break
+        except BaseException as exc:  # np. drugie Ctrl-C: zamknięcie biegnie dalej, czekamy na nie
+            if task.done():  # wyjątek samego zadania (nie przerwanie czekania): skutek sprawdza wywołujący
+                break
+            _LOG.warning("smoke close after an interrupt was itself interrupted: %s; still waiting for the close",
+                         type(exc).__name__)  # fmt: skip
+    if task.done() and not task.cancelled():
+        task.exception()  # odebrany: bez ostrzeżenia „exception was never retrieved"
+
+
 async def _close_after_interrupt(
     engine: Engine,
     deal_id: str | None,
@@ -662,23 +689,7 @@ async def _close_after_interrupt(
             except Exception as exc:
                 _LOG.warning("smoke direct close failed: %s: %s", type(exc).__name__, exc)
 
-    task = asyncio.ensure_future(attempt())
-    loop = asyncio.get_running_loop()
-    wait_s = SMOKE_CLOSE_WAIT_SUBMITS * engine.risk.submit_timeout_s
-    deadline = loop.time() + wait_s
-    while not task.done():  # kolejne przerwania nie kończą czekania: wynik dopiero po zamknięciu (albo po limicie)
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            _LOG.warning("smoke close after an interrupt still running after %s s; reporting now", wait_s)
-            break
-        try:
-            await asyncio.wait_for(asyncio.shield(task), remaining)
-        except asyncio.TimeoutError:
-            _LOG.warning("smoke close after an interrupt still running after %s s; reporting now", wait_s)
-            break
-        except BaseException as exc:  # np. drugie Ctrl-C: zamknięcie biegnie dalej, czekamy na nie
-            _LOG.warning("smoke close after an interrupt was itself interrupted: %s; still waiting for the close",
-                         type(exc).__name__)  # fmt: skip
+    await _await_shielded(engine, attempt())
     if await _still_at_broker(engine, deal_id) is not False:
         out(f"FAIL [{step}] LOUD: {name} {hint}")
     else:
