@@ -80,7 +80,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from gwstock.broker.base import Broker
 from gwstock.calendar import ExchangeCalendar
@@ -96,6 +96,7 @@ from gwstock.journal import (
     PositionRecord,
     TradeRecord,
 )
+from gwstock.lanes import LaneSpec
 from gwstock.notify import Notifier
 from gwstock.orders.fsm import check_position_transition
 from gwstock.orders.ids import make_client_id
@@ -236,6 +237,32 @@ class ExitMemory:
     guards_run: set[str] = field(default_factory=set)
 
 
+class FxView(Protocol):
+    """Przeliczenia walut wstrzykiwane wykonawcy pasma w walucie obcej (projekt §7.3). Kurs wyłącznie od brokera (np.
+    notowanie EURUSD, nie starsze niż limit z konfiguracji portfela); wykonawca nie zgaduje kursu.
+
+    - `account_currency`: waluta rachunku (kod ISO 4217);
+    - `to_account(amount, currency)`: kwota w walucie `currency` przeliczona na walutę rachunku po kursie NIEKORZYSTNYM
+      dla nas (większa kwota: ryzyko i wartość punktu nigdy nie wychodzą zaniżone), z ważnego kursu; None: brak
+      ważnego kursu (wykonawca nie zgaduje, patrz niżej);
+    - `par_is_upper_bound(currency)`: czy ostatni znany kurs (także nieaktualny) daje 1 jednostkę `currency` za
+      najwyżej 1 jednostkę waluty rachunku; wtedy kwota w `currency` jest górnym ograniczeniem kwoty w walucie
+      rachunku, więc straże po wypełnieniu i odległość stopu z limitu straty mogą ją przyjąć bez kursu.
+
+    Brak ważnego kursu: wejście zablokowane (FX_UNAVAILABLE); straż wielkości po wypełnieniu przyjmuje kwotę bez
+    przeliczenia tylko przy `par_is_upper_bound`, inaczej zamyka pozycję; odległość stopu z limitu straty tak samo,
+    inaczej brak odległości (kill switch twardy i awaryjne spłaszczenie). Wyjątek albo wartość niebędąca skończonym
+    `Decimal` > 0 z `to_account` znaczy to samo co None.
+    """
+
+    @property
+    def account_currency(self) -> str: ...
+
+    def to_account(self, amount: Decimal, currency: str) -> Decimal | None: ...
+
+    def par_is_upper_bound(self, currency: str) -> bool: ...
+
+
 async def _with_timeout(call: Awaitable[T], timeout: float) -> T:
     """Wywołanie brokera z limitem czasu; przekroczenie to `TimeoutError` (niejasność, nie porażka)."""
     return await asyncio.wait_for(call, timeout)
@@ -246,7 +273,13 @@ class Executor:
 
     `live=True` (dokładnie `True`) uzbraja wysyłkę zleceń; domyślnie wykonawca pracuje jak `dry_run`. Jeden wywołujący
     naraz (silnik szereguje wykonawcę i uzgadnianie jedną blokadą). `memory`: pamięć wyjść poprzedniego wykonawcy tego
-    samego procesu (silnik przy zejściu do dry_run); domyślnie pusta.
+    samego procesu (silnik przy zejściu do dry_run) albo wspólna pamięć wykonawców wszystkich pasm procesu; domyślnie
+    pusta.
+
+    Pasmo: `lane` (`LaneSpec`: instrument, straż poślizgu, limit straty transakcji, kalendarz dnia księgowania, waluta
+    instrumentu, cel zysku) ALBO konfiguracje v1 `strat` i `calendar` (pasmo DE40 `LaneSpec.from_v1`, dokładnie
+    zachowanie v1); nigdy oba naraz. `risk` zawsze: limity czasu, tolerancja rozbieżności i limity strat dnia
+    (wspólne). `fx`: przeliczenia walut, wymagane dla pasma w walucie innej niż waluta rachunku (`FxView`).
     """
 
     def __init__(
@@ -258,16 +291,27 @@ class Executor:
         kill: KillSwitch,
         cost_model: CostModel,
         clock: Clock,
-        strat: StrategyConfig,
+        strat: StrategyConfig | None,
         risk: RiskConfig,
-        calendar: ExchangeCalendar,
+        calendar: ExchangeCalendar | None,
         notifier: Notifier,
         live: bool = False,
         *,
         memory: ExitMemory | None = None,
+        lane: LaneSpec | None = None,
+        fx: FxView | None = None,
     ) -> None:
         if not risk.submit_timeout_s > 0:
             raise ValueError(f"submit_timeout_s must be positive, got {risk.submit_timeout_s!r}")
+        if lane is None:
+            if strat is None or calendar is None:
+                raise ValueError("Executor: without a lane, strat and calendar (the v1 configs) are required")
+            lane = LaneSpec.from_v1(strat, risk, calendar)
+        elif strat is not None or calendar is not None:
+            raise ValueError("Executor: pass either a lane or the v1 strat and calendar, not both")
+        if not isinstance(lane, LaneSpec):
+            raise TypeError(f"Executor: lane: expected LaneSpec, got {lane!r}")
+        self._foreign = _foreign(lane, fx)
         self._manager = manager
         self._broker = broker
         self._journal = journal
@@ -275,15 +319,50 @@ class Executor:
         self._kill = kill
         self._cost_model = cost_model
         self._clock = clock
-        self._strat = strat
+        self._lane = lane
+        self._fx = fx
         self._risk = risk
-        self._calendar = calendar
+        self._calendar = lane.calendar
         self._notifier = notifier
         self._live = live is True
-        self._epic = strat.instrument
+        self._epic = lane.epic
         self._timeout = risk.submit_timeout_s
         self._memory = memory if memory is not None else ExitMemory()
         self._closes_started = 0  # wywołania `close_position` w tym wykonawcy (czy procedura cokolwiek wysłała)
+
+    @classmethod
+    def for_lane(
+        cls,
+        manager: OrderManager,
+        broker: Broker,
+        journal: Journal,
+        gate: RiskGate,
+        kill: KillSwitch,
+        cost_model: CostModel,
+        clock: Clock,
+        lane: LaneSpec,
+        risk: RiskConfig,
+        notifier: Notifier,
+        live: bool = False,
+        *,
+        memory: ExitMemory | None = None,
+        fx: FxView | None = None,
+    ) -> Executor:
+        """Wykonawca pasma `lane` (silnik z pasmami); `gate` i `cost_model` to bramka i model kosztów TEGO pasma."""
+        return cls(
+            manager, broker, journal, gate, kill, cost_model, clock, None, risk, None, notifier, live, memory=memory,
+            lane=lane, fx=fx,
+        )  # fmt: skip
+
+    @property
+    def lane(self) -> LaneSpec:
+        """Pasmo tego wykonawcy."""
+        return self._lane
+
+    @property
+    def foreign(self) -> bool:
+        """Czy instrument pasma jest w walucie innej niż waluta rachunku (przeliczenia `FxView`, dwufazowa księga)."""
+        return self._foreign
 
     @property
     def live(self) -> bool:
@@ -658,7 +737,7 @@ class Executor:
                 deviation = position.open_level - decision_ask  # BUY kupuje po ask: gorzej = wyżej
             else:
                 deviation = decision_bid - position.open_level  # SELL sprzedaje po bid: gorzej = niżej
-            limit = self._strat.slippage_guard_fraction * stop_distance
+            limit = self._lane.slippage_guard_fraction * stop_distance
             if deviation > limit:
                 causes.append(SLIPPAGE_GUARD)
                 self._event(
@@ -673,11 +752,11 @@ class Executor:
         else:  # wywołujący gwarantuje stop albo odległość: straży ryzyka nigdy nie pomijamy po cichu
             raise ValueError(f"fill guard of {position.deal_id}: neither a stop level nor a stop distance")
         risk = position.size * distance * value_per_point
-        if risk > self._risk.max_loss_per_trade:
+        if risk > self._lane.max_loss_per_trade:
             causes.append(SIZE_MISMATCH_RISK)
             self._event(
                 SIZE_MISMATCH_RISK, best_effort=failures, deal_id=position.deal_id, size=position.size,
-                requested=requested_size, distance=distance, risk=risk, limit=self._risk.max_loss_per_trade,
+                requested=requested_size, distance=distance, risk=risk, limit=self._lane.max_loss_per_trade,
                 adopted=adopted, **extra,
             )  # fmt: skip
         if causes:
@@ -1204,7 +1283,7 @@ class Executor:
             self._raw_error(SOURCE_RULES, exc, best_effort=failures, deal_id=position.deal_id, context="protection")
             return None
         self._raw(SOURCE_RULES, best_effort=failures, deal_id=position.deal_id, context="protection", response=rules)
-        return _max_loss_distance(self._risk.max_loss_per_trade, position.size, position.open_level, rules)
+        return _max_loss_distance(self._lane.max_loss_per_trade, position.size, position.open_level, rules)
 
     # --- księgowanie --------------------------------------------------------------------------------------
 
@@ -1526,6 +1605,19 @@ class Executor:
     def _entry_exception(self, where: str, exc: BaseException) -> None:
         self._kill.soft(ENTRY_EXCEPTION)
         self._alert("ERROR", f"{ENTRY_EXCEPTION} {where}: {type(exc).__name__}: {exc}")
+
+
+def _foreign(lane: LaneSpec, fx: FxView | None) -> bool:
+    """Czy pasmo jest w walucie obcej; pasmo z walutą instrumentu wymaga `FxView` z poprawną walutą rachunku."""
+    if lane.currency is None:
+        return False
+    if fx is None:
+        raise ValueError(f"Executor: lane {lane.epic} in {lane.currency} needs an FxView (no FX rate is ever guessed)")
+    account = fx.account_currency
+    if not (isinstance(account, str) and len(account) == 3 and account.isascii() and account.isalpha()
+            and account.isupper()):  # fmt: skip
+        raise ValueError(f"Executor: FxView account_currency: expected a 3-letter ISO 4217 code, got {account!r}")
+    return lane.currency != account
 
 
 def _as_open(rec: PositionRecord) -> OpenPosition:
