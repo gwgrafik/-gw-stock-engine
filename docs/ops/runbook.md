@@ -878,7 +878,13 @@ Silnik zatrzymany (jak w punkcie 5), proces uzbrojony na czas próby. Uruchom pr
 docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock smoke --epic US500 --hold 30
 ```
 
-**Nie przerywaj polecenia** (bez Ctrl+C). Gdyby jednak zostało przerwane, program sam zamyka pozycję próby i pisze `INFO [7] the probe position closed after the interrupt ...`; gdy nie może (np. zamknięty rynek), pisze głośną linię `FAIL [7] LOUD: the probe position left open with its stop (and target) ...`. Wtedy działa reguła przerwania z punktu 5: zdejmij uzbrojenie i zamknij pozycję ręcznie w aplikacji.
+**Nie przerywaj polecenia** (bez Ctrl+C). Gdyby jednak zostało przerwane, program zachowuje się tak:
+
+- **Pierwszy Ctrl+C (albo `docker stop`, SIGTERM)** nie przerywa programu od razu, tylko prosi o zatrzymanie. Przed wysłaniem zlecenia: zlecenie nie wychodzi (`FAIL [2] stop requested (signal) before the entry: nothing was sent`). W trakcie wstrzymania: wstrzymanie kończy się od razu (`INFO [3] hold stopped: stop requested (signal) ...`), program **pomija** sprawdzanie pól celu i zmiany ochrony (`FAIL [4] diagnostics skipped: hold stopped (...); flattening at once`), od razu zamyka pozycję (krok `[7]`), wykonuje jeszcze kroki `[8]` do `[10]` i **pomija** kilkukrotny odczyt historii transakcji (`INFO [11] skipped: stop requested ...`). Poczekaj na wynik i blok `USTALENIA`; **nie naciskaj Ctrl+C drugi raz**.
+- **Drugi Ctrl+C** przerywa program, ale ten najpierw zamyka pozycję próby i pisze `INFO [7] the probe position closed after the interrupt ...`; gdy nie może (np. zamknięty rynek), pisze głośną linię `FAIL [7] LOUD: the probe position left open with its stop (and target) ...` (albo `... with its stop (its target may be gone ...)`, gdy przerwanie wypadło w kroku `[6]` między zmianą stopu a przywróceniem celu).
+- **Przerwanie albo błąd tuż po wysłaniu zlecenia** (zanim broker potwierdził wejście): program sprawdza u brokera, czy pozycja powstała, i jeśli tak, zamyka ją (`INFO [2] the entry was adopted by reconciliation and closed again ...` albo `INFO [2] the probe position closed after the interrupt ...`). Gdy nie da się tego ustalić, pisze `FAIL [2] LOUD: the entry outcome is unknown ...`: **od razu sprawdź w aplikacji**, czy jest pozycja US500, i jeśli jest, zamknij ją ręcznie.
+
+Po każdej linii `LOUD` działa reguła przerwania z punktu 5: zdejmij uzbrojenie i zamknij pozycję ręcznie w aplikacji. Ta sama ochrona działa przy wątpliwości w trakcie wstrzymania (kill switch, także `data/HARD_STOP`, nieudane uzgadnianie, brak kursu): diagnostyka jest pomijana, a pozycja zamykana od razu.
 
 #### Co zobaczysz
 
@@ -888,7 +894,7 @@ Wydruk nie zawiera numerów transakcji, referencji ani numeru rachunku. Kroki:
 - `[1]` rachunek; `[2]` wejście przyjęte: wielkość, poziom otwarcia, poziom stopu i celu (z dopiskiem, czy podało je API, czy silnik wyliczył je z żądania) oraz żądane odległości stopu i celu; `[3]` pozycja widoczna ze stopem i celem, potem odliczanie `holding ... s more`;
 - `[4]` surowe pola celu z `GET /positions` i `GET /confirms` (linie `INFO [4] ... target fields: ...; other fields: ...`);
 - `[5]` zmiana ochrony ze stopem i celem naraz; **cel przesuwa się o jeden krok (0,1 pkt) bliżej** ceny, żeby zmiana była prawdziwa;
-- `[6]` zmiana samego stopu (ten sam poziom), odczyt, czy cel przetrwał (`target after it: kept`, `removed` albo `not shown by the API`), i przywrócenie celu;
+- `[6]` zmiana samego stopu: **stop przesuwa się o jeden krok (0,1 pkt) bliżej ceny** (prawdziwa zmiana; broker mógłby zignorować ten sam poziom), odczyt, czy cel przetrwał (`target after it: kept`, `removed` albo `not shown by the API`), i przywrócenie stopu do poziomu sprzed kroku razem z celem. Jeśli stopu nie da się przybliżyć (za blisko ceny wobec minimum brokera), krok pisze `(unchanged: ...)`, a ustalenie `C5d` zaczyna się od „dla PUT bez zmiany stopu”. Gdy krok `[5]` się nie udał, `C5d` jest **NIE USTALONO** (stan celu przed krokiem `[6]` niepewny);
 - `[7]` zamknięcie przez silnik; `[8]` pozycja zniknęła, transakcja zaksięgowana w USD, a linia `INFO [8] broker close reason: ...` podaje przyczynę z historii brokera; `[9]` wynik w EUR z szacunku kursu EURUSD brokera (`ESTIMATED_FX`); `[10]` drugie zamknięcie odrzucone jako „nie znaleziono” (wymagane);
 - `INFO [11]` wiersze historii transakcji z okresu próby (typ, kwota, waluta) oraz saldo przed i po;
 - wynik `PASS smoke --epic US500: 10/10 checks passed` albo `FAIL ...`, a pod nim blok `USTALENIA O BROKERZE` z liniami `C5`, `C5d`, `C7`, `C8`, każda ze statusem **POTWIERDZONE**, **ROZBIEŻNE** albo **NIE USTALONO** i szczegółami.
@@ -899,13 +905,14 @@ Wydruk nie zawiera numerów transakcji, referencji ani numeru rachunku. Kroki:
 
 1. Pozycja US500 0,01 ma **stop loss i take profit**. Zapisz oba poziomy i porównaj z `stop level` i `target level` z kroku `[2]`.
 2. Po kroku `[5]` take profit przesunął się o 0,1 pkt bliżej ceny (np. z 7592,9 na 7592,8). Zapisz, czy to widzisz.
-3. Po kroku `[6]` take profit **nadal jest** przy pozycji (to jest C5d widziane w aplikacji; w historii aktywności zmiany stopu i celu mają typ w rodzaju „edycja stop/limit”).
+3. W kroku `[6]` stop loss przesuwa się na chwilę o 0,1 pkt bliżej ceny i wraca; po kroku take profit **nadal jest** przy pozycji (to jest C5d widziane w aplikacji; w historii aktywności zmiany stopu i celu mają typ w rodzaju „edycja stop/limit”).
 4. Po próbie, w historii: **dokładnie jedna** transakcja US500 0,01, otwarta i zamknięta, i **żadnej** otwartej pozycji.
 5. W historii transakcji (rozliczenia) przy tej transakcji: **waluta i kwota wyniku** (EUR czy USD) oraz ewentualne osobne wiersze przewalutowania albo prowizji walutowej. Porównaj z linią `C8` i z saldem rachunku przed i po.
 
 #### Co wkleić Claude
 
-- **Cały wydruk** od linii `INFO [0]` do ostatniej linii bloku `USTALENIA O BROKERZE` (wydruk nie zawiera identyfikatorów ani numeru rachunku, więc można go wkleić w całości).
+- **Tylko linie wydruku próby**: zaczynające się od `PASS`, `FAIL`, `INFO [`, `WARN [` (także linie `LOUD`), wynik `PASS/FAIL smoke --epic ...` i cały blok `USTALENIA O BROKERZE` (od jego nagłówka do ostatniej linii `C8` ze szczegółami). Te linie nie zawierają identyfikatorów ani numeru rachunku.
+- **Bez linii logu**: linii zaczynających się od daty i godziny (np. `2026-11-05 17:12:03,123 INFO gwstock...` albo `... WARNING gwstock.cli ...`). Log idzie do tego samego terminala, a jego linie mogą zawierać teksty błędów brokera; nie wklejaj ich, chyba że Claude o nie poprosi (wtedy zamaskuj numery transakcji i rachunku).
 - Twoje odczyty z aplikacji z punktów 1 do 5 powyżej: poziomy stopu i celu, czy cel przesunął się w kroku 5 i przetrwał krok 6, waluta i kwota wyniku w historii transakcji, saldo przed i po. **Bez** numeru rachunku i numerów transakcji.
 
 #### Po próbie
