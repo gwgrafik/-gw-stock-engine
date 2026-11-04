@@ -28,7 +28,7 @@ from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.clock import FakeClock
 from gwstock.config import load_config
 from gwstock.costs import CostModel
-from gwstock.execution import Executor, ExitMemory, emergency_flatten_lanes
+from gwstock.execution import BookingError, Executor, ExitMemory, emergency_flatten_lanes
 from gwstock.journal import Journal, JournalReadError, PositionRecord
 from gwstock.lanes import LaneSpec
 from gwstock.orders.manager import OrderManager
@@ -59,6 +59,7 @@ T_ENTRY = datetime(2026, 11, 2, 8, 6, tzinfo=timezone.utc)  # 09:06 w Berlinie
 DE_CID = "gws-20261102-DE40-1-entry"
 US_CID = "gws-20261102-US500-1-entry"
 US_RULES = InstrumentRules("US500", D("0.01"), D("0.01"), D("1"), D("0.05"), D("0.5"), D("0.1"), "USD")
+UT_RULES = replace(US_RULES, currency=None)  # ten sam instrument w walucie rachunku (pasmo z celem bez przeliczeń)
 US_BID, US_ASK = D("7583.0"), D("7583.6")
 US_FILL = US_ASK  # BUY po ask
 US_STOP_D, US_TARGET_D = D("10"), D("15")
@@ -344,7 +345,13 @@ async def test_protection_remembers_the_deal_under_its_own_instrument(fake, memo
 
 
 @pytest.fixture
-def ut(lane_build, us_gate, calendar) -> Executor:
+def domestic(fake) -> None:
+    """Broker podaje US500 w walucie rachunku (reguły bez waluty): spójne z pasmem bez `currency`."""
+    fake._instruments["US500"] = UT_RULES
+
+
+@pytest.fixture
+def ut(lane_build, us_gate, calendar, domestic) -> Executor:
     """Pasmo z celem w walucie rachunku (bez przeliczeń): przyczyna wyjścia i limit czasu bez dwufazowej księgi."""
     return lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate)
 
@@ -408,7 +415,7 @@ async def test_time_limit_flatten_is_never_blocked_by_the_kill_switch(ut, fake, 
     ],
 )
 async def test_exit_reason_order_is_stop_then_target_then_engine_intent_then_broker(
-    lane_build, us_gate, calendar, journal, uses_target, broker_reason, intent, expected
+    lane_build, us_gate, calendar, journal, domestic, uses_target, broker_reason, intent, expected
 ):
     ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=uses_target), us_gate)
     record = PositionRecord("US500", P.EXITING, "DEAL-T", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
@@ -419,7 +426,7 @@ async def test_exit_reason_order_is_stop_then_target_then_engine_intent_then_bro
     assert journal.trades()[0].exit_reason == expected
 
 
-async def test_target_exit_costs_no_extra_stop_slippage_in_the_ledger(lane_build, us_gate, calendar, journal):
+async def test_target_exit_costs_no_extra_stop_slippage_in_the_ledger(lane_build, us_gate, calendar, journal, domestic):
     ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate)
     record = PositionRecord("US500", P.EXITING, "DEAL-T", Side.BUY, D("1"), US_FILL, US_STOP, T_ENTRY)
     await ex.book(record, ClosedDeal("DEAL-T", "US500", US_TARGET, "TARGET", T_ENTRY))
@@ -462,7 +469,7 @@ async def test_target_lane_enters_with_a_targeted_request_and_the_target_attache
     ut, fake, journal, plan, kill, monkeypatch
 ):
     sent = spy_requests(fake, monkeypatch)
-    rec = await ut.enter(plan, US_RULES, DAY)
+    rec = await ut.enter(plan, UT_RULES, DAY)
     assert rec.state is O.CONFIRMED and rec.order_id == US_CID and rec.deal_id == "DEAL-1"
     assert fake.calls == ["account", "open_position", "confirm"]
     [req] = sent
@@ -477,7 +484,7 @@ async def test_target_lane_enters_with_a_targeted_request_and_the_target_attache
 
 async def test_target_lane_never_opens_a_position_without_a_target(ut, fake, journal, notifier, us_quote, kill):
     signal = EntrySignal(Side.BUY, US_STOP_D, D("0.01"), us_quote)  # sygnał bez celu
-    assert await ut.enter(signal, US_RULES, DAY) is None
+    assert await ut.enter(signal, UT_RULES, DAY) is None
     assert fake.calls == [] and fake.positions == {}  # nic nie poszło do brokera, nawet odczyt konta
     [refused] = events(journal, "ENTRY_REFUSED")
     assert refused["reason"] == "TARGET_MISSING" and refused["epic"] == "US500"
@@ -496,7 +503,7 @@ async def test_a_lane_without_a_target_refuses_a_plan_with_one(de, fake, journal
 
 async def test_target_lane_in_dry_run_records_the_targeted_request(lane_build, us_gate, calendar, plan, fake, journal):
     ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate, live=False)
-    assert await ex.enter(plan, US_RULES, DAY) is None
+    assert await ex.enter(plan, UT_RULES, DAY) is None
     assert fake.calls == ["account"]
     [decision] = payloads(journal, "decision")
     assert decision["request"]["target_distance"] == "15" and decision["request"]["client_id"] == US_CID
@@ -504,7 +511,7 @@ async def test_target_lane_in_dry_run_records_the_targeted_request(lane_build, u
 
 async def test_target_lane_protects_with_stop_and_target_together(ut, fake, journal, plan, kill, monkeypatch, notifier):
     strip_stop_on_confirm(fake, monkeypatch)
-    rec = await ut.enter(plan, US_RULES, DAY)
+    rec = await ut.enter(plan, UT_RULES, DAY)
     assert rec.state is O.CONFIRMED
     assert fake.calls == ["account", "open_position", "confirm", "set_protection"]  # nigdy sam set_stop
     pos = fake.positions["DEAL-1"]
@@ -517,7 +524,7 @@ async def test_target_lane_protects_with_stop_and_target_together(ut, fake, jour
 
 
 async def test_protect_unprotected_on_a_target_lane_keeps_the_target_from_the_entry(ut, fake, journal, plan, kill):
-    await ut.enter(plan, US_RULES, DAY)
+    await ut.enter(plan, UT_RULES, DAY)
     fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
     fake.calls.clear()
     assert await ut.protect_unprotected(fake.positions["DEAL-1"]) is True
@@ -543,7 +550,7 @@ async def test_protection_without_a_known_target_still_sets_the_stop_and_alarms(
 
 
 async def test_failed_protection_of_a_target_lane_goes_hard_and_flattens(ut, fake, journal, plan, kill, clock):
-    await ut.enter(plan, US_RULES, DAY)
+    await ut.enter(plan, UT_RULES, DAY)
     fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
     for _ in range(3):
         fake.fail_next("set_protection", BrokerError("HTTP 500"))
@@ -555,7 +562,7 @@ async def test_failed_protection_of_a_target_lane_goes_hard_and_flattens(ut, fak
 
 
 async def test_a_rejected_target_never_blocks_the_stop(ut, fake, journal, plan, kill, clock, notifier):
-    await ut.enter(plan, US_RULES, DAY)
+    await ut.enter(plan, UT_RULES, DAY)
     # cena podeszła pod cel bliżej niż minimum brokera: cel zostanie odrzucony (MIN_TARGET_DISTANCE), stop nie
     fake.set_quote(Quote("US500", US_TARGET - D("0.2"), US_TARGET + D("0.4"), clock.now_utc()))
     fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
@@ -574,7 +581,7 @@ async def test_a_rejected_target_never_blocks_the_stop(ut, fake, journal, plan, 
 
 
 async def test_ensure_target_sets_stop_and_target_together_for_an_untargeted_position(ut, fake, journal, plan, notifier):
-    await ut.enter(plan, US_RULES, DAY)
+    await ut.enter(plan, UT_RULES, DAY)
     fake.positions["DEAL-1"] = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
     fake.calls.clear()
     assert await ut.ensure_target(fake.positions["DEAL-1"]) is True
@@ -585,7 +592,7 @@ async def test_ensure_target_sets_stop_and_target_together_for_an_untargeted_pos
 
 
 async def test_ensure_target_does_nothing_when_not_needed_or_not_possible(ut, de, fake, journal, plan, notifier):
-    await ut.enter(plan, US_RULES, DAY)
+    await ut.enter(plan, UT_RULES, DAY)
     fake.calls.clear()
     assert await ut.ensure_target(fake.positions["DEAL-1"]) is True  # cel już jest
     stopless = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, None, T_ENTRY)
@@ -598,7 +605,7 @@ async def test_ensure_target_does_nothing_when_not_needed_or_not_possible(ut, de
 
 
 async def test_ensure_target_failure_is_an_alarm_never_a_kill(ut, fake, journal, plan, notifier, kill):
-    await ut.enter(plan, US_RULES, DAY)
+    await ut.enter(plan, UT_RULES, DAY)
     plain = OpenPosition("DEAL-1", "US500", Side.BUY, D("0.01"), US_FILL, US_STOP, T_ENTRY)
     fake.positions["DEAL-1"] = plain
     fake.fail_next("set_protection", BrokerError("HTTP 500"))
@@ -875,11 +882,13 @@ async def test_exits_of_a_foreign_lane_never_wait_for_a_rate_or_a_settlement(us,
     assert journal.pnl_pending_deals() == [("DEAL-1", DAY), ("DEAL-B", DAY)]
 
 
-async def test_slippage_guard_uses_the_fraction_of_the_lane(lane_build, us_gate, calendar, fake, journal, us_quote):
+async def test_slippage_guard_uses_the_fraction_of_the_lane(
+    lane_build, us_gate, calendar, fake, journal, us_quote, domestic
+):
     lane = LaneSpec("US500", calendar, D("0.10"), D("1.00"), uses_target=True)  # 10% z 10 pkt = 1 pkt
     ex = lane_build(lane, us_gate)
     fake.fill_slippage = D("1.5")  # gorzej o 1,5 pkt: ponad 1 pkt pasma (przy 0,25 z DE40 byłoby w normie)
-    await ex.enter(BarEntryPlan(Side.BUY, D("0.01"), US_STOP_D, US_TARGET_D, us_quote), US_RULES, DAY)
+    await ex.enter(BarEntryPlan(Side.BUY, D("0.01"), US_STOP_D, US_TARGET_D, us_quote), UT_RULES, DAY)
     [slip] = events(journal, "SLIPPAGE_GUARD")
     assert D(slip["limit"]) == D("1.00") and D(slip["deviation"]) == D("1.5")
     assert fake.positions == {}
@@ -896,3 +905,73 @@ async def test_de40_protection_records_keep_exactly_the_v1_fields(de, fake, jour
     [event] = events(journal, "STOP_ATTACHED")
     assert set(event) == {"event", "deal_id", "stop_level", "attempt", "verified_by"}
     assert journal.events("broker.set_protection") == []
+
+
+# --- waluta reguł brokera kontra waluta pasma (obrona w głąb, scenariusz A13) ----------------------------------
+
+
+async def test_entry_is_refused_when_the_broker_rules_currency_differs_from_a_domestic_lane(
+    lane_build, us_gate, calendar, fake, journal, plan, notifier, kill
+):
+    # konfiguracja pasma pominęła walutę, a broker podaje US500 w USD: bramka liczyłaby USD jak EUR
+    ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate)
+    assert await ex.enter(plan, US_RULES, DAY) is None
+    assert fake.calls == [] and journal.count_orders(DAY) == 0
+    [block] = payloads(journal, "gate_block")
+    assert block["reasons"] == ["CURRENCY_MISMATCH"] and block["rules_currency"] == "USD"
+    assert block["lane_currency"] == "EUR" and block["epic"] == "US500"
+    assert [level for level, _ in alerts(notifier, "CURRENCY_MISMATCH")] == ["ERROR"]
+    assert kill.level() is KillLevel.NONE
+
+
+async def test_entry_is_refused_when_the_broker_rules_currency_differs_from_a_foreign_lane(us, fake, journal, plan):
+    assert await us.enter(plan, replace(US_RULES, currency="GBP"), DAY) is None
+    assert fake.calls == []
+    [block] = payloads(journal, "gate_block")
+    assert block["reasons"] == ["CURRENCY_MISMATCH"] and block["lane_currency"] == "USD"
+
+
+async def test_a_lane_without_currency_compares_with_the_fx_account_currency(
+    lane_build, us_gate, calendar, fake, journal, plan, fx
+):
+    ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate, fx=fx)
+    rec = await ex.enter(plan, replace(US_RULES, currency="EUR"), DAY)  # waluta reguł = waluta rachunku z FxView
+    assert rec is not None and rec.state is O.CONFIRMED
+
+
+async def test_de40_rules_in_the_account_currency_enter_as_before(de, fake, journal, signal, rules):
+    rec = await de.enter(signal, replace(rules, currency="EUR"), DAY)
+    assert rec.state is O.CONFIRMED and fake.calls == ["account", "open_position", "confirm"]
+
+
+async def test_booking_with_mismatched_broker_currency_fails_closed_but_the_close_goes_through(
+    lane_build, us_gate, calendar, fake, journal, notifier
+):
+    ex = lane_build(LaneSpec("US500", calendar, D("0.25"), D("1.00"), uses_target=True), us_gate)
+    hold_targeted(fake, journal)  # bez kontekstu wejścia: księga sięga po reguły brokera (USD)
+    assert await ex.flatten(journal.current_position("US500"), "TIME_LIMIT") is None
+    assert fake.positions == {} and fake.calls.count("close_position") == 1  # zamknięcie poszło
+    assert journal.trades() == [] and journal.realized_pnl(DAY) == D("0")  # nic w liczniku EUR
+    assert journal.current_position("US500").state is P.EXITING  # zostaje do decyzji właściciela
+    assert [level for level, _ in alerts(notifier, "CURRENCY_MISMATCH")] == ["ERROR"]
+
+
+async def test_booking_another_instrument_is_refused(ut, journal, notifier):
+    record = PositionRecord("DE40", P.EXITING, "DEAL-Z", Side.BUY, D("0.007"), D("25782.3"), D("25752.3"), T_ENTRY)
+    with pytest.raises(BookingError, match="DE40"):
+        await ut.book(record, ClosedDeal("DEAL-Z", "DE40", D("25790"), "MANUAL", T_ENTRY))
+    assert journal.trades() == [] and journal.realized_pnl(DAY) == D("0")
+    assert alerts(notifier, "LANE_MISMATCH")
+
+
+async def test_booking_with_an_entry_context_in_another_currency_is_refused(us, fake, journal, plan, notifier):
+    await us.enter(plan, US_RULES, DAY)
+    key = f"entry_ctx:{US_CID}"
+    ctx = json.loads(journal.get_meta(key))
+    journal.set_meta(key, json.dumps({**ctx, "currency": "GBP"}))
+    fake.trigger_target("DEAL-1")
+    record = journal.current_position("US500")
+    with pytest.raises(BookingError, match="GBP"):
+        await us.book(record, (await fake.closed_since(T_ENTRY))[0])
+    assert journal.trades() == [] and journal.pnl_pending_deals() == []
+    assert alerts(notifier, "CURRENCY_MISMATCH")

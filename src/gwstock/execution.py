@@ -180,6 +180,11 @@ FX_NONE = "UNAVAILABLE"  # bez kursu i bez ograniczenia: straż zamyka
 # Pasmo w walucie obcej z transakcją czekającą na rozliczenie w walucie rachunku (faza 2): licznik strat niepełny,
 # więc kolejne wejście tego pasma jest zablokowane (bramka portfelowa blokuje wszystkie pasma: PORTFOLIO_PNL_PENDING).
 PNL_PENDING = "PNL_PENDING"
+# Obrona w głąb (scenariusz A13): waluta reguł brokera inna niż waluta pasma (np. konfiguracja pasma pominęła walutę
+# instrumentu w USD): wejście zablokowane, a księgowanie odmawia (BookingError) zamiast dopisać obcą kwotę do licznika.
+CURRENCY_MISMATCH = "CURRENCY_MISMATCH"
+LANE_MISMATCH = "LANE_MISMATCH"  # księgowanie pozycji innego instrumentu niż instrument pasma
+_V1_ACCOUNT_CURRENCY = "EUR"  # waluta rachunku v1 (jak `app.ACCOUNT_CURRENCY`), gdy pasmo nie ma `FxView`
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 GUARD_EXIT_UNPERSISTED = "GUARD_EXIT_UNPERSISTED"  # straż chce zamknąć, a dziennik nie zapisze EXITING: HARD i awaryjne
 DAILY_LOSS = "DAILY_LOSS"
@@ -463,6 +468,9 @@ class Executor:
         if self._lane.uses_target != (target is not None):
             self._refuse(TARGET_MISSING if self._lane.uses_target else TARGET_NOT_SUPPORTED, day)
             return None
+        if rules.currency is not None and rules.currency != self._lane_currency():
+            self._currency_block(rules.currency, day, smoke)
+            return None
         quote = signal.decision_quote
         vpp_account = rules.value_per_point
         if self._foreign:  # bramka liczy w walucie rachunku: wartość punktu po kursie niekorzystnym (projekt §7.3)
@@ -540,6 +548,56 @@ class Executor:
         self._journal.set_meta(ctx_key, dump(context))
         self._journal.set_meta(META_ENTRY_LAST.format(self._epic), client_id)
         return request
+
+    def _lane_currency(self) -> str:
+        """Waluta, w której pasmo liczy instrument: `LaneSpec.currency`, a bez niej waluta rachunku (z `FxView`, bez
+        niego waluta rachunku v1)."""
+        if self._lane.currency is not None:
+            return self._lane.currency
+        return self._fx.account_currency if self._fx is not None else _V1_ACCOUNT_CURRENCY
+
+    def _currency_block(self, rules_currency: str, day: date, smoke: bool) -> None:
+        """Reguły brokera w innej walucie niż pasmo: bramka liczyłaby obcą kwotę jak walutę pasma; nic do brokera."""
+        lane_currency = self._lane_currency()
+        self._alert(
+            "ERROR",
+            f"{CURRENCY_MISMATCH}: broker rules of {self._epic} are in {rules_currency}, the lane counts in "
+            f"{lane_currency}; no entry (check the lane configuration)",
+        )
+        block: dict[str, Any] = {
+            "reasons": [CURRENCY_MISMATCH], "epic": self._epic, "rules_currency": rules_currency,
+            "lane_currency": lane_currency, "day": day.isoformat(),
+        }  # fmt: skip
+        if smoke:
+            block["smoke"] = True
+        self._append(SOURCE_GATE_BLOCK, block)
+
+    def _booking_mismatch(self, code: str, deal_id: str, detail: str) -> BookingError:
+        """Księgowanie odmawia (fail-closed): alarm raz na deal i wyjątek; nic nie trafia do księgi ani licznika.
+        Zamknięcie u brokera już poszło albo idzie niezależnie (księgowanie jest po nim)."""
+        self._alert_once(
+            code, deal_id, "ERROR",
+            f"{code} {deal_id}: {detail}; not booked (nothing added to the loss counters), the position stays for "
+            "the owner (check the lane configuration and the broker history)",
+        )  # fmt: skip
+        return BookingError(f"cannot book {deal_id}: {detail}")
+
+    def _check_context_currency(self, ctx: dict[str, Any], deal_id: str) -> None:
+        """Waluta zapisana w kontekście wejścia (tylko pasma w walucie obcej) musi być walutą księgi pasma."""
+        recorded = ctx.get("currency")
+        expected = self._lane.currency if self._foreign else None
+        if recorded != expected:
+            raise self._booking_mismatch(
+                CURRENCY_MISMATCH, deal_id,
+                f"entry context currency {recorded} differs from the lane ledger currency {expected or 'account'}",
+            )  # fmt: skip
+
+    def _check_rules_currency(self, rules: InstrumentRules, deal_id: str) -> None:
+        if rules.currency is not None and rules.currency != self._lane_currency():
+            raise self._booking_mismatch(
+                CURRENCY_MISMATCH, deal_id,
+                f"broker rules currency {rules.currency} differs from the lane currency {self._lane_currency()}",
+            )  # fmt: skip
 
     def _foreign_block(self, reason: str, day: date, smoke: bool) -> None:
         """Wejście pasma w walucie obcej zablokowane (jak bramka), nic do brokera: brak ważnego kursu (nie zgadujemy)
@@ -1493,6 +1551,11 @@ class Executor:
         self, position: PositionRecord, closed: ClosedDeal, timeout: float, *, estimated: bool = False,
         by_owner: bool = False,
     ) -> None:  # fmt: skip
+        if position.epic != self._epic or closed.epic != self._epic:
+            raise self._booking_mismatch(
+                LANE_MISMATCH, closed.deal_id,
+                f"position {position.epic} / closure {closed.epic} is not the lane instrument {self._epic}",
+            )  # fmt: skip
         exit_day = self._calendar.to_local(closed.ts).date()
         if self._journal.has_trade(closed.deal_id):
             self._enforce_loss_limits(exit_day, announce=False)  # domyka okno przerwania między księgą a kill switchem
@@ -1590,6 +1653,7 @@ class Executor:
         ctx = self._context(closed.deal_id, position.epic)
         if ctx is None:
             raise _NoContext(NO_ENTRY_CONTEXT)
+        self._check_context_currency(ctx, closed.deal_id)
         bid, ask = _ctx_decimal(ctx, "decision_bid"), _ctx_decimal(ctx, "decision_ask")
         vpp = _ctx_decimal(ctx, "value_per_point")
         signal_ts, submit_ts = _ctx_time(ctx, "signal_ts"), _ctx_time(ctx, "submit_ts")
@@ -1641,22 +1705,28 @@ class Executor:
         return quote.ask - quote.bid
 
     async def _fallback_vpp(self, epic: str, deal_id: str, timeout: float) -> Decimal:
+        ctx: dict[str, Any] | None = None
         try:
             ctx = self._context(deal_id, epic)
-            if ctx is not None:
-                vpp = _ctx_decimal(ctx, "value_per_point")
-                if vpp > 0:
-                    return vpp
         except (JournalReadError, JournalWriteError):
             raise
         except Exception:
-            pass
+            ctx = None
+        if ctx is not None:
+            self._check_context_currency(ctx, deal_id)
+            try:
+                vpp = _ctx_decimal(ctx, "value_per_point")
+                if vpp > 0:
+                    return vpp
+            except Exception:
+                pass
         try:
             rules = await _with_timeout(self._broker.instrument_rules(epic), timeout)
         except Exception as exc:
             self._raw_error(SOURCE_RULES, exc, deal_id=deal_id, context="booking")
             raise
         self._raw(SOURCE_RULES, deal_id=deal_id, context="booking", response=rules)
+        self._check_rules_currency(rules, deal_id)
         return rules.value_per_point
 
     def _confirm_ts(self, ctx: dict[str, Any], deal_id: str, position: PositionRecord, submit_ts: datetime) -> datetime:
