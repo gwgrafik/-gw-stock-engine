@@ -140,6 +140,7 @@ class _Probe:
         self.position_other: dict[str, Any] = {}
         self.estimate_eur: Decimal | None = None
         self.target_now: Decimal | None = None
+        self.protection_failed: str | None = None  # krok [5] nieudany: C5d nie ustalono
         self.adopted = False
         self.gone = False  # pozycja próby potwierdzona jako zniknięta u brokera (krok 8)
 
@@ -607,10 +608,13 @@ class _Probe:
             await engine.probe(engine.raw_broker.set_protection, self.deal_id, stop, target)
         except Exception as exc:
             self.step(5, False, f"set_protection(stop {stop}, target {target}) failed ({self.error(exc)})")
+            self.protection_failed = "zmiana ochrony odrzucona albo bez odpowiedzi"
             return await self._still_open()
         self.target_now = target
         ok, text = await self._verify(stop, target)
         self.step(5, ok, f"set_protection with both levels: {text}")
+        if not ok:
+            self.protection_failed = "poziomy po zmianie ochrony niezgodne z żądanymi"
         return await self._still_open()
 
     async def _verify(self, stop: Decimal, target: Decimal) -> tuple[bool, str]:
@@ -645,11 +649,20 @@ class _Probe:
     async def _c5d_step(self, before: TargetFieldsReport | None) -> None:
         engine = self.engine
         at_broker = await cli._find_position(engine, self.deal_id)
-        if at_broker is None or at_broker.stop_level is None or self.target_now is None:
+        try:  # punkt odniesienia: świeży odczyt tuż przed set_stop (krok [5] mógł zostać przyjęty mimo błędu u klienta)
+            fresh = await self._read_fields()
+        except Exception as exc:
+            fresh = None
+            self.info(6, f"read before set_stop failed ({self.error(exc)})")
+        if fresh is not None:
+            before = fresh
+        shown_now, level_now = _shown_target(fresh.position if fresh is not None else None, self.side, self.open_level)
+        target = level_now if shown_now and level_now is not None else self.target_now
+        if at_broker is None or at_broker.stop_level is None or target is None:
             self.info(6, "C5d skipped: no position with a stop and a known target")
             self.finding("C5d", UNKNOWN, "nie sprawdzono (brak pozycji ze stopem i znanym celem)")
             return
-        stop, target = at_broker.stop_level, self.target_now
+        stop = at_broker.stop_level
         try:  # stop o krok bliżej ceny: prawdziwa zmiana dla PUT (ten sam poziom broker mógłby uznać za „nic do zmiany”)
             rules = await engine.broker.instrument_rules(self.epic)
             sent = self._closer_stop(stop, rules, await engine.broker.quote(self.epic))
@@ -691,6 +704,11 @@ class _Probe:
             kept = "not shown by the API"
             self.finding("C5d", UNKNOWN, f"{how}API nie pokazuje celu: sprawdź w aplikacji (historia: "
                                          "EDIT_STOP_AND_LIMIT), czy po zmianie stopu cel został")  # fmt: skip
+        if self.protection_failed is not None and set_stop_error is None:  # stan celu przed [6] niepewny
+            seen = self.findings["C5d"]
+            self.finding("C5d", UNKNOWN, f"krok [5] nieudany ({self.protection_failed}): stan celu przed zmianą stopu "
+                                         "niepewny, więc C5d nie ustalono",
+                         [f"obserwacja mimo to: {seen.summary}", *seen.details])  # fmt: skip
         restored, text = False, "not attempted"
         try:
             await engine.probe(engine.raw_broker.set_protection, self.deal_id, stop, target)

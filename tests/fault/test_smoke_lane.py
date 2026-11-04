@@ -627,3 +627,26 @@ async def test_the_stop_is_not_moved_closer_than_the_broker_minimum(engine, brok
     probe.side = Side.SELL
     assert probe._closer_stop(D("7591.8"), rules, q) == D("7591.7")
     assert probe._closer_stop(D("7590.4"), rules, q) == D("7590.4")
+
+
+async def test_a_set_stop_timeout_leaves_c5d_unknown_and_restores_both_levels(engine, broker, monkeypatch):
+    broker.fail_next("set_stop", BrokerTimeout("PUT timeout"))
+    protections = recording(monkeypatch, broker, "set_protection")
+    code, lines = await run(engine)
+    assert code == 1 and broker.positions == {}
+    assert finding(lines, "C5d") == "C5d NIE USTALONO: set_stop z samym stopem nieudane (BrokerTimeout: PUT timeout)"
+    assert any(x.startswith("FAIL [6]") and "set_protection restored: stop 7587.8 (confirmed" in x for x in lines)
+    assert len(protections) == 2 and protections[-1][1:] == (D("7587.8"), D("7592.7"))
+    no_identifiers(lines)
+
+
+async def test_a_protection_change_accepted_despite_a_timeout_never_reads_as_a_changed_target(engine, broker):
+    broker.fail_next("set_protection", BrokerTimeout("PUT timeout"), applied=True)  # u brokera: cel o krok bliżej
+    code, lines = await run(engine)
+    assert code == 1 and broker.positions == {}
+    assert any(x.startswith("FAIL [5] set_protection") for x in lines)
+    c5d = finding(lines, "C5d")
+    assert c5d.startswith("C5d NIE USTALONO: krok [5] nieudany"), c5d
+    # punkt odniesienia to świeży odczyt tuż przed set_stop (7592,7), nie poziom sprzed nieudanego [5] (7592,8)
+    assert any(x.startswith("PASS [6]") and "target after it: kept" in x for x in lines), "\n".join(lines)
+    assert any("cel po zmianie stopu: 7592.7 (przed: 7592.7)" in x for x in lines), "\n".join(lines)
