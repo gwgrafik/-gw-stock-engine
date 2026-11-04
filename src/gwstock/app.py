@@ -1277,7 +1277,11 @@ class Engine:
         potem HARD → awaryjne spłaszczenie WSZYSTKICH pasm z próbami przeplatanymi (`emergency_flatten_lanes`), a bez
         HARD wyjścia każdego pasma (EXITING → ponowienie, DE40 po godzinie spłaszczenia, pasmo B1: limit czasu pozycji
         i godzina spłaszczenia pasma). Zamknięty rynek wstrzymuje tylko swój instrument (A6). Wyjść nie blokuje ani
-        bramka, ani kurs walut; błąd jednego pasma nie zatrzymuje drugiego."""
+        bramka, ani kurs walut; błąd jednego pasma nie zatrzymuje drugiego.
+
+        Kolejność DE40 jak w v1 (`_manage`): uzgadnianie DE40, a bez HARD od razu jego wyjście (EXITING albo godzina
+        spłaszczenia 17:25), dopiero potem uzgadnianie kolejnych pasm (ochrona, cel, rozliczenie walut). Wolny krok
+        pasma (np. przekroczenie czasu `set_protection` US500) nie opóźnia spłaszczenia DE40 (przegląd zadania 12, F3)."""
         if primary:
             result = await self.reconcile_once()
             if result is not None and not result.skipped:
@@ -1285,6 +1289,15 @@ class Engine:
                 self._note_unmanaged(result)
             if st.times is not None and now >= st.times.close:
                 st.primary_final = True
+            if self._shutdown:
+                return
+            if self.kill.level() is not KillLevel.HARD and not self._market_closed_backoff():
+                position = self._position()
+                if position is not None and (
+                    position.state is _P.EXITING
+                    or (position.state is _P.OPEN and self._must_flatten(st, position, now))
+                ):
+                    await self._safe("flatten", self.executor.flatten, position, FLATTEN_REASON)
         for lane in lanes:
             if self._shutdown:
                 return
@@ -1297,12 +1310,6 @@ class Engine:
             if executors:
                 await self._safe("emergency_flatten", emergency_flatten_lanes, executors)
             return
-        if primary and not self._market_closed_backoff():
-            position = self._position()
-            if position is not None and (
-                position.state is _P.EXITING or (position.state is _P.OPEN and self._must_flatten(st, position, now))
-            ):
-                await self._safe("flatten", self.executor.flatten, position, FLATTEN_REASON)
         for lane in lanes:
             if self._shutdown:
                 return

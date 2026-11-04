@@ -20,7 +20,7 @@ from gwstock.broker.fake import FakeBroker
 from gwstock.config import LANES_FILE, load_lanes
 from gwstock.journal import TradeRecord
 from gwstock.risk import KILL, LOSS_PER_TRADE
-from gwstock.types import KillLevel, PositionState, Side
+from gwstock.types import BrokerRejected, KillLevel, OpenPosition, PositionState, Side
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     DAY,
     EPIC,
@@ -240,3 +240,48 @@ async def test_a_pending_marker_without_a_trade_of_any_lane_is_reported_not_skip
     assert event["deal_id"] == "GHOST-1" and event["exit_day"] == PENDING_DAY.isoformat()
     assert j.pnl_pending_deals() == [("GHOST-1", PENDING_DAY)]
     assert j.count_entry_orders(DAY, EPIC) == 0
+
+
+# --- F3: spłaszczenie DE40 nie czeka na pasma --------------------------------------------------------------------------
+
+DE_FLATTEN = berlin(DAY, 17, 25)  # 16:25 UTC = 11:25 NY
+
+
+@pytest.mark.parametrize("us_market", [UsMarket(signals=[new_york(DAY, 11, 15)])], ids=["us500-signal-11:15-ny"])
+async def test_a_slow_us500_target_repair_does_not_delay_the_de40_flatten_at_1725(lane_engine, broker, clock):
+    """F3. Oczekiwane: pozycja US500 (sygnał 11:15 NY, wejście 16:20 UTC) traci cel u brokera o 16:23 UTC; od 16:25
+    UTC każde `set_protection` trwa 10 s czasu symulacji i kończy się przekroczeniem czasu (wcześniej szybka odmowa).
+    W przebiegu zarządzania z godziną spłaszczenia DE40 (17:25 Berlin) wyjście DE40 idzie zaraz po uzgadnianiu DE40,
+    PRZED uzgadnianiem pasm: `close_position` DE40 w ciągu kilku sekund po 16:25 UTC i przed pierwszym wolnym
+    `set_protection`, a nie dopiero po nim (kolejność v1 dla DE40: uzgadnianie, potem wyjście)."""
+    stripped: list[bool] = []
+
+    def strip_target() -> None:
+        if stripped or clock.now_utc() < datetime(2026, 11, 2, 16, 23, tzinfo=UTC):
+            return
+        stripped.append(True)
+        deal = next(d for d, p in broker.positions.items() if p.epic == US)
+        p = broker.positions[deal]
+        broker.positions[deal] = OpenPosition(p.deal_id, p.epic, p.side, p.size, p.open_level, p.stop_level,
+                                              p.opened_at)  # fmt: skip
+
+    clock.hooks.append(strip_target)
+
+    async def slow_protection(deal_id, stop_level, target_level):
+        if clock.now_utc() >= DE_FLATTEN:
+            clock.advance(10)
+            raise TimeoutError("set_protection timed out")
+        raise BrokerRejected("error.service.busy")
+
+    broker.set_protection = slow_protection  # type: ignore[method-assign]
+    calls = broker_calls(broker, clock, ("close_position", "set_protection"))
+    stop_engine_at(lane_engine, clock, DE_FLATTEN + timedelta(minutes=2))
+    await lane_engine.run_day(DAY)
+    j = lane_engine.journal
+    assert stripped
+    (de_deal,) = [d for d, t in j.trades_by_deal(EPIC)]
+    de_close = [i for i, (_, m, arg) in enumerate(calls) if m == "close_position" and arg == de_deal]
+    slow = [i for i, (ts, m, _) in enumerate(calls) if m == "set_protection" and ts >= DE_FLATTEN]
+    assert de_close and slow and de_close[0] < slow[0]
+    assert timedelta(0) <= calls[de_close[0]][0] - DE_FLATTEN < timedelta(seconds=6)
+    assert j.current_position(EPIC).state is P.FLAT
