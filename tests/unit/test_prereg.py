@@ -620,3 +620,314 @@ def test_preregistration_document_states_the_known_limits_of_the_l1_numbers():
     assert "pięć wielkości" in text
     # gdy wszystkie wejścia o wielkości minimalnej nie mają użytecznego kontekstu, próg przesuwa się dalej
     assert "przesuwa się na kolejną wielkość" in text and "ostrożnie" in text
+
+
+# --- pre-rejestracja kolejnych pasm (projekt wielu pasm §6.1, zadanie 13) -----------------------------------------
+
+LANES_TOML = """enabled = true
+
+[[lane]]
+rule = "bar_b1_m5"
+rule_file = "lane_us500_b1_m5.toml"
+exchange_profile = "NYSE"
+currency = "USD"
+slippage_guard_fraction = "0.25"
+max_loss_per_trade = "1.00"
+costs_file = "costs_v1.toml"
+"""
+LANE = "US500"
+LANE_FILE_NAMES = ("lanes.toml", "portfolio.toml", "lane_us500_b1_m5.toml", "costs_v1.toml")
+PLUGIN_NAMES = ("gwstock/strategy_bars.py", "gwstock/lanes.py")
+
+
+@pytest.fixture
+def lane_dir(config_dir) -> Path:
+    (config_dir / "lanes.toml").write_text(LANES_TOML)
+    return config_dir
+
+
+@pytest.fixture
+def source_dir(tmp_path) -> Path:
+    """Kopia źródeł wtyku pasma (odcisk liczy ich surowe bajty)."""
+    target = tmp_path / "src"
+    target.mkdir()
+    for name in ("strategy_bars.py", "lanes.py"):
+        shutil.copy(REPO / "src" / "gwstock" / name, target / name)
+    return target
+
+
+def reference_lane_fingerprint(lane: str, files: list[tuple[str, bytes]], adapter: str, instrument_class: str) -> str:
+    """Niezależna implementacja kodowania odcisku pasma z docstringu `prereg` (przypina format)."""
+    h = hashlib.sha256()
+    h.update(b"gwstock-prereg-lane/1\n")
+    h.update(_field(lane.encode("utf-8")))
+    h.update(len(files).to_bytes(8, "big"))
+    for name, content in files:
+        h.update(_field(name.encode("utf-8")))
+        h.update(_field(content))
+    h.update(_field(adapter.encode("utf-8")))
+    h.update(_field(instrument_class.encode("utf-8")))
+    return h.hexdigest()
+
+
+def lane_inputs(config_dir: Path, source_dir: Path) -> list[tuple[str, bytes]]:
+    files = [(name, (config_dir / name).read_bytes()) for name in LANE_FILE_NAMES]
+    files += [(name, (source_dir / name.split("/")[1]).read_bytes()) for name in PLUGIN_NAMES]
+    return files
+
+
+def test_lane_fingerprint_matches_the_documented_encoding(lane_dir, source_dir):
+    expected = reference_lane_fingerprint(
+        "US500/bar_b1_m5", lane_inputs(lane_dir, source_dir), "capitalcom-live", "index-cfd"
+    )
+    assert prereg.lane_fingerprint(lane_dir, LANE, source_dir=source_dir) == expected
+    assert prereg.lane_fingerprint(lane_dir, LANE) == reference_lane_fingerprint(
+        "US500/bar_b1_m5", lane_inputs(lane_dir, REPO / "src" / "gwstock"), "capitalcom-live", "index-cfd"
+    )
+
+
+def test_lane_fingerprint_is_never_the_v1_fingerprint_and_v1_ignores_the_lane_files(lane_dir):
+    assert prereg.config_fingerprint(lane_dir) == FROZEN_V1_FINGERPRINT
+    assert prereg.lane_fingerprint(lane_dir, LANE) != FROZEN_V1_FINGERPRINT
+    for name in ("lanes.toml", "portfolio.toml", "lane_us500_b1_m5.toml"):
+        with open(lane_dir / name, "a", encoding="utf-8") as handle:
+            handle.write("# zmiana pliku pasma\n")
+    assert prereg.config_fingerprint(lane_dir) == FROZEN_V1_FINGERPRINT  # odcisk DE40 v1 bez zmian
+
+
+@pytest.mark.parametrize("name", LANE_FILE_NAMES)
+def test_lane_fingerprint_changes_with_any_lane_input_file(lane_dir, source_dir, name):
+    base = prereg.lane_fingerprint(lane_dir, LANE, source_dir=source_dir)
+    with open(lane_dir / name, "a", encoding="utf-8") as handle:
+        handle.write("# komentarz zmienia bajty\n")
+    assert prereg.lane_fingerprint(lane_dir, LANE, source_dir=source_dir) != base
+
+
+@pytest.mark.parametrize("name", ["strategy_bars.py", "lanes.py"])
+def test_lane_fingerprint_changes_with_the_rule_plugin_code(lane_dir, source_dir, name):
+    base = prereg.lane_fingerprint(lane_dir, LANE, source_dir=source_dir)
+    with open(source_dir / name, "a", encoding="utf-8") as handle:
+        handle.write("# zmiana kodu reguły to nowy wariant\n")
+    assert prereg.lane_fingerprint(lane_dir, LANE, source_dir=source_dir) != base
+
+
+def test_lane_fingerprint_ignores_runtime_toml(lane_dir):
+    base = prereg.lane_fingerprint(lane_dir, LANE)
+    (lane_dir / "runtime.toml").write_text("live_allowed = true\n")
+    assert prereg.lane_fingerprint(lane_dir, LANE) == base
+
+
+def test_lane_fingerprint_of_a_lane_that_is_not_enabled_is_an_error(config_dir):
+    with pytest.raises(LookupError, match="lanes.toml"):
+        prereg.lane_fingerprint(config_dir, LANE)  # brak lanes.toml
+    (config_dir / "lanes.toml").write_text(LANES_TOML.replace("enabled = true", "enabled = false"))
+    with pytest.raises(LookupError, match="not enabled"):
+        prereg.lane_fingerprint(config_dir, LANE)
+    (config_dir / "lanes.toml").write_text(LANES_TOML)
+    with pytest.raises(LookupError, match="US100"):
+        prereg.lane_fingerprint(config_dir, "US100")
+    with pytest.raises(LookupError, match="DE40"):
+        prereg.lane_fingerprint(config_dir, "DE40")  # pasmo v1 ma własną pre-rejestrację (--write bez --lane)
+
+
+@pytest.mark.parametrize("epic", ["", "../US500", "US500/x", "a b", ".hidden", None, 5])
+def test_lane_names_are_plain_instrument_names(lane_dir, data_dir, epic):
+    with pytest.raises(ValueError):
+        prereg.lane_prereg_path(data_dir, epic)
+    with pytest.raises(ValueError):
+        prereg.lane_fingerprint(lane_dir, epic)
+
+
+def test_a_broken_lanes_file_is_an_error_naming_it(lane_dir):
+    (lane_dir / "lanes.toml").write_text(LANES_TOML.replace('rule = "bar_b1_m5"', 'rule = "x"'))
+    with pytest.raises(ValueError, match="lanes.toml"):
+        prereg.lane_fingerprint(lane_dir, LANE)
+
+
+def test_lane_file_hashes_are_sha256_per_input(lane_dir):
+    hashes = prereg.lane_file_hashes(lane_dir, LANE)
+    assert list(hashes) == list(LANE_FILE_NAMES) + list(PLUGIN_NAMES)
+    assert hashes["portfolio.toml"] == hashlib.sha256((lane_dir / "portfolio.toml").read_bytes()).hexdigest()
+    assert hashes["gwstock/lanes.py"] == hashlib.sha256((REPO / "src/gwstock/lanes.py").read_bytes()).hexdigest()
+
+
+# --- zamrożony odcisk pasma -------------------------------------------------------------------------------------
+
+
+def test_lane_preregistration_is_written_only_to_its_own_file(lane_dir, data_dir):
+    prereg.write_preregistration(lane_dir, data_dir, NOW)
+    v1 = (data_dir / "preregistration.json").read_bytes()
+    record = prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    path = data_dir / "preregistration-US500.json"
+    assert prereg.lane_prereg_path(data_dir, LANE) == path
+    assert json.loads(path.read_text()) == record
+    assert record["fingerprint"] == prereg.lane_fingerprint(lane_dir, LANE)
+    assert record["lane"] == "US500/bar_b1_m5" and record["epic"] == LANE
+    assert record["files"] == prereg.lane_file_hashes(lane_dir, LANE)
+    assert record["adapter"] == "capitalcom-live" and record["instrument_class"] == "index-cfd"
+    assert record["written_at"] == "2026-11-02T07:00:00Z"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert (data_dir / "preregistration.json").read_bytes() == v1  # odcisk DE40 v1 nietknięty
+    assert prereg.frozen_fingerprint(data_dir) == FROZEN_V1_FINGERPRINT
+    assert sorted(p.name for p in data_dir.iterdir()) == ["preregistration-US500.json", "preregistration.json"]
+
+
+def test_writing_the_same_lane_configuration_again_keeps_the_original_record(lane_dir, data_dir):
+    first = prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    stored = prereg.lane_prereg_path(data_dir, LANE).read_bytes()
+    assert prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW + timedelta(days=3)) == first
+    assert prereg.lane_prereg_path(data_dir, LANE).read_bytes() == stored
+
+
+def test_a_changed_lane_is_refused_without_force_and_nothing_is_overwritten(lane_dir, data_dir):
+    prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    stored = prereg.lane_prereg_path(data_dir, LANE).read_bytes()
+    text = (lane_dir / "lane_us500_b1_m5.toml").read_text()
+    (lane_dir / "lane_us500_b1_m5.toml").write_text(text.replace('target_r = "1.5"', 'target_r = "2.0"'))
+    with pytest.raises(prereg.PreregistrationConflict, match="K\\+1"):
+        prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW + timedelta(days=1))
+    assert prereg.lane_prereg_path(data_dir, LANE).read_bytes() == stored
+
+
+def test_force_replaces_a_lane_fingerprint_and_keeps_the_trail(lane_dir, data_dir):
+    first = prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    with open(lane_dir / "portfolio.toml", "a", encoding="utf-8") as handle:
+        handle.write("# zmiana\n")
+    record = prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW + timedelta(days=1), force=True)
+    assert record["fingerprint"] != first["fingerprint"]
+    assert record["previous"] == {"fingerprint": first["fingerprint"], "written_at": first["written_at"]}
+    assert prereg.frozen_lane_fingerprint(data_dir, LANE) == record["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "{", "[]", '{"fingerprint": ""}', '{"fingerprint": 5, "epic": "US500"}', '{"fingerprint": "abc"}',
+     '{"fingerprint": "abc", "epic": "US100"}'],
+    ids=["empty", "broken", "list", "empty_fp", "number_fp", "no_epic", "other_epic"],
+)  # fmt: skip
+def test_a_malformed_lane_record_is_an_error_and_never_overwritten_without_force(lane_dir, data_dir, content):
+    path = prereg.lane_prereg_path(data_dir, LANE)
+    path.write_text(content)
+    with pytest.raises(ValueError):
+        prereg.frozen_lane_fingerprint(data_dir, LANE)
+    with pytest.raises(prereg.PreregistrationConflict):
+        prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    assert path.read_text() == content
+    assert prereg.lane_preregistration_problem(lane_dir, data_dir, LANE).startswith(prereg.LANE_UNREADABLE)
+
+
+def test_frozen_lane_fingerprint_missing_is_none(data_dir):
+    assert prereg.frozen_lane_fingerprint(data_dir, LANE) is None
+
+
+def test_lane_preregistration_problem_names_each_reason(lane_dir, data_dir):
+    assert prereg.lane_preregistration_problem(lane_dir, data_dir, LANE).startswith(prereg.LANE_NOT_FROZEN)
+    prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    assert prereg.lane_preregistration_problem(lane_dir, data_dir, LANE) is None
+    with open(lane_dir / "lanes.toml", "a", encoding="utf-8") as handle:
+        handle.write("# zmiana\n")
+    assert prereg.lane_preregistration_problem(lane_dir, data_dir, LANE).startswith(prereg.LANE_MISMATCH)
+    (lane_dir / "lanes.toml").write_text(LANES_TOML.replace('rule = "bar_b1_m5"', 'rule = "x"'))
+    assert prereg.lane_preregistration_problem(lane_dir, data_dir, LANE).startswith(prereg.LANE_UNAVAILABLE)
+    (lane_dir / "lanes.toml").unlink()
+    assert prereg.lane_preregistration_problem(lane_dir, data_dir, LANE).startswith(prereg.LANE_UNAVAILABLE)
+
+
+def test_a_lane_record_renamed_to_another_lane_never_matches(lane_dir, data_dir):
+    """Odcisk zawiera nazwę pasma, a rekord swój instrument: kopia rekordu US500 pod inną nazwą nie uzbroi pasma."""
+    record = prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    lanes = LANES_TOML + LANES_TOML.split("\n", 2)[2].replace("lane_us500_b1_m5.toml", "lane_us100.toml")
+    text = (lane_dir / "lane_us500_b1_m5.toml").read_text().replace('instrument = "US500"', 'instrument = "US100"')
+    (lane_dir / "lane_us100.toml").write_text(text)
+    (lane_dir / "lanes.toml").write_text(lanes)
+    prereg.lane_prereg_path(data_dir, "US100").write_text(json.dumps(dict(record, epic="US100")))
+    assert prereg.frozen_lane_fingerprint(data_dir, "US100") == record["fingerprint"]
+    assert prereg.lane_fingerprint(lane_dir, "US100") != record["fingerprint"]
+    assert prereg.lane_preregistration_problem(lane_dir, data_dir, "US100").startswith(prereg.LANE_MISMATCH)
+
+
+def test_the_v1_writer_never_touches_lane_records_and_the_lane_writer_never_touches_v1(lane_dir, data_dir):
+    prereg.write_lane_preregistration(lane_dir, data_dir, LANE, NOW)
+    assert not (data_dir / "preregistration.json").exists()
+    assert prereg.frozen_fingerprint(data_dir) is None  # pasmo nie zamraża DE40
+    lane = prereg.lane_prereg_path(data_dir, LANE).read_bytes()
+    prereg.write_preregistration(lane_dir, data_dir, NOW)
+    assert prereg.lane_prereg_path(data_dir, LANE).read_bytes() == lane
+
+
+def test_nothing_in_the_engine_writes_a_preregistration_automatically():
+    """Zamraża WYŁĄCZNIE polecenie właściciela (`python -m gwstock.prereg`): żaden inny moduł nie woła zapisu."""
+    import ast
+
+    writers = {"write_preregistration", "write_lane_preregistration"}
+    offenders = []
+    for path in sorted((REPO / "src" / "gwstock").rglob("*.py")):
+        if path.name == "prereg.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+            if name in writers:
+                offenders.append(f"{path.name}:{node.lineno} {name}")
+    assert offenders == []
+
+
+# --- polecenie pasma --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def lane_env(monkeypatch, lane_dir, data_dir):
+    monkeypatch.setenv("GW_CONFIG_DIR", str(lane_dir))
+    monkeypatch.setenv("GW_DATA_DIR", str(data_dir))
+
+
+def test_cli_lane_write_check_print(lane_env, lane_dir, data_dir, capsys):
+    assert prereg.main(["--lane", LANE, "--check"]) == 2
+    assert "NOT FROZEN" in capsys.readouterr().out
+    assert prereg.main(["--lane", LANE, "--print"]) == 0
+    assert prereg.lane_fingerprint(lane_dir, LANE) in capsys.readouterr().out
+    assert list(data_dir.iterdir()) == []  # --print i --check niczego nie zapisują
+    assert prereg.main(["--lane", LANE, "--write"], now=NOW) == 0
+    out = capsys.readouterr().out
+    record = json.loads(prereg.lane_prereg_path(data_dir, LANE).read_text())
+    assert f"fingerprint: {record['fingerprint']}" in out and "US500/bar_b1_m5" in out
+    assert f"| `config/portfolio.toml` | `{record['files']['portfolio.toml']}` |" in out
+    assert f"| `src/gwstock/lanes.py` | `{record['files']['gwstock/lanes.py']}` |" in out
+    assert not (data_dir / "preregistration.json").exists()  # pasmo nie zamraża v1
+    assert prereg.main(["--lane", LANE, "--check"]) == 0
+    assert "OK" in capsys.readouterr().out
+    with open(lane_dir / "lane_us500_b1_m5.toml", "a", encoding="utf-8") as handle:
+        handle.write("# zmiana\n")
+    assert prereg.main(["--lane", LANE, "--check"]) == 1
+    assert "lane_us500_b1_m5.toml" in capsys.readouterr().out
+    assert prereg.main(["--lane", LANE, "--write"], now=NOW) == 1
+    assert "K+1" in capsys.readouterr().err
+
+
+def test_cli_lane_force_needs_the_word_force(lane_env, lane_dir, data_dir, monkeypatch, capsys):
+    prereg.main(["--lane", LANE, "--write"], now=NOW)
+    old = prereg.frozen_lane_fingerprint(data_dir, LANE)
+    with open(lane_dir / "portfolio.toml", "a", encoding="utf-8") as handle:
+        handle.write("# zmiana\n")
+    for answer in ("force\n", "\n", ""):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(answer))
+        assert prereg.main(["--lane", LANE, "--write", "--force"], now=NOW) == 1
+        assert prereg.frozen_lane_fingerprint(data_dir, LANE) == old
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("FORCE\n"))
+    assert prereg.main(["--lane", LANE, "--write", "--force"], now=NOW) == 0
+    assert old in capsys.readouterr().out
+    assert prereg.frozen_lane_fingerprint(data_dir, LANE) == prereg.lane_fingerprint(lane_dir, LANE) != old
+
+
+def test_cli_lane_errors(lane_env, data_dir, capsys):
+    assert prereg.main(["--lane", "US100", "--write"], now=NOW) == 1
+    assert "US100" in capsys.readouterr().err
+    assert prereg.main(["--lane", "../x", "--print"]) == 1
+    assert list(data_dir.iterdir()) == []
+
+
+def test_cli_without_lane_still_writes_only_v1(lane_env, data_dir):
+    assert prereg.main(["--write"], now=NOW) == 0
+    assert sorted(p.name for p in data_dir.iterdir()) == ["preregistration.json"]
+    assert prereg.frozen_fingerprint(data_dir) == FROZEN_V1_FINGERPRINT
