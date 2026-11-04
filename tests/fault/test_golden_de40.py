@@ -37,6 +37,8 @@ SCENARIUSZE (źródło w nawiasie to test, którego sytuację nagrywa; ślad bie
 - `full_day_long_flat_1725`: wejście BUY o 09:05, spłaszczenie FORCED o 17:25 i raport (test_engine_day);
 - `full_day_short_flat_1725`: to samo dla SELL (test_engine_day: short_entry);
 - `full_day_long_odd_atr`: to samo przy ATR14 = 277,7, więc stop 27,77 pkt zaokrąglony w górę do kroku (27,8);
+- `full_day_long_half_cent_gain` i `full_day_long_half_cent_loss`: to samo, ale wynik brutto dokładnie ±0,025 EUR,
+  czyli połówka grosza (zaokrąglenie połówką od zera: +0,03 i −0,03);
 - `stop_hit_by_broker`: stop u brokera o 11:00 księgowany raz, reszta dnia bez pozycji (test_engine_day);
 - `restart_mid_position`: proces ginie o 11:00 z otwartą pozycją, nowy silnik na tym samym brokerze i dzienniku
   doprowadza dzień do spłaszczenia (test_trade_lifecycle_e2e: test_h);
@@ -477,6 +479,21 @@ async def _full_day_odd_atr(sim: Sim) -> None:
     # ATR14 = 277,7 → stop 27,77 pkt zaokrąglony W GÓRĘ do kroku brokera (27,8): pilnuje zaokrąglenia, którego
     # okrągłe dane dnia wzorcowego (ATR 300, stop 30) nie ruszają
     sim.broker.set_daily_candles(daily_candles(DAY, atr=D("277.7")))
+    await sim.run_day("day", sim.engine(Mode.LIVE))
+
+
+@scenario("full_day_long_half_cent_gain")
+async def _full_day_half_cent_gain(sim: Sim) -> None:
+    # zysk brutto 25 pkt × 0,001 = 0,025 EUR: dokładnie połówka grosza, więc tryb zaokrąglenia wyniku (połówka od zera:
+    # 0,03) jest widoczny w księdze; w innych dniach wynik wychodzi okrągły (30 i 20 pkt)
+    sim.market.late_mid = MID + 25
+    await sim.run_day("day", sim.engine(Mode.LIVE))
+
+
+@scenario("full_day_long_half_cent_loss")
+async def _full_day_half_cent_loss(sim: Sim) -> None:
+    # strata brutto 0,025 EUR: połówka od zera także dla strat (−0,03), spłaszczenie silnika, nie stop brokera
+    sim.market.late_mid = MID - 25
     await sim.run_day("day", sim.engine(Mode.LIVE))
 
 
