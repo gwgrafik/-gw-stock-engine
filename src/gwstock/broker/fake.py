@@ -11,8 +11,15 @@ Model:
 - cel zysku (`TargetedEntryRequest`, R4): dołączony atomowo, wypełnienie + `target_distance` (BUY) lub − (SELL);
   odległość <= 0 albo mniejsza niż `min_stop_distance` instrumentu (wspólne minimum stopu i celu) →
   `BrokerRejected("MIN_TARGET_DISTANCE")` bez skutku; pozycja z celem to `TargetedOpenPosition`, bez celu zwykłe
-  `OpenPosition`; `set_stop` zachowuje cel (UPROSZCZENIE: czy Capital.com go kasuje, nie ustalono, C5d);
-  `set_protection` ustawia stop i cel naraz (oba albo żaden);
+  `OpenPosition`; `set_stop` zachowuje cel (UPROSZCZENIE: czy Capital.com go kasuje, nie ustalono, C5d), a z
+  `set_stop_clears_target = True` go kasuje (symulacja wariantu C5d dla próby pasma); `set_protection` ustawia stop i
+  cel naraz (oba albo żaden);
+- odczyty diagnostyczne próby pasma (`gwstock.broker.diagnostics`, poza protokołem `Broker`):
+  `diagnose_target_fields(deal_id, deal_reference)` pokazuje cel pozycji i migawki potwierdzenia pod kluczami
+  `target_keys` (domyślnie `("profitLevel",)`; `()` = API nie pokazuje celu; klucz `*Level` → poziom celu, `*Distance`
+  → odległość od ceny wykonania, inny → None; pozycja bez celu → jawny `null`) oraz `currency`, `upl`, `level`,
+  `stopLevel`; `diagnose_transactions(start, end)` zwraca wiersze z `transactions` (wstawia test) o czasie w [start,
+  end]; obie metody przechodzą przez `calls`, `on_call`, `fail_next` i wygasłą sesję jak metody brokera;
 - referencje "REF-{n}" i identyfikatory pozycji "DEAL-{n}" z osobnych liczników (od 1, wspólnych dla instrumentów);
   wejście odrzucone od razu (walidacja, `MarketClosed`) nie zużywa żadnego numeru, odrzucenie odroczone zużywa
   tylko referencję;
@@ -64,6 +71,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from gwstock.broker.base import Broker, Capabilities
+from gwstock.broker.diagnostics import FieldsRead, SettlementRow, TargetFieldsReport
 from gwstock.clock import Clock
 from gwstock.types import (
     AccountInfo,
@@ -84,6 +92,7 @@ from gwstock.types import (
 )
 
 BROKER_METHODS = frozenset(name for name, member in vars(Broker).items() if inspect.iscoroutinefunction(member))
+DIAGNOSTIC_METHODS = frozenset({"diagnose_target_fields", "diagnose_transactions"})  # poza protokołem `Broker`
 _FIVE_MINUTES = timedelta(minutes=5)
 _ONE_DAY = timedelta(days=1)
 _TRIGGER_REASONS = frozenset({"STOP", "FORCED"})
@@ -135,6 +144,9 @@ class FakeBroker:
         self._netting = netting
         self.fill_size_factor = Decimal(1)
         self.fill_slippage = Decimal(0)
+        self.target_keys: tuple[str, ...] = ("profitLevel",)  # klucze celu w odczytach diagnostycznych (C5)
+        self.set_stop_clears_target = False  # symulacja C5d: `set_stop` kasuje cel pozycji
+        self.transactions: list[SettlementRow] = []  # historia transakcji dla `diagnose_transactions` (C8)
         self.accounts: list[AccountInfo] = [
             AccountInfo("ACC-0", "EUR", "ENABLED", Decimal(0), Decimal(0), Decimal(0)),
             AccountInfo("ACC-1", "EUR", "ENABLED", Decimal(40), Decimal(40), Decimal(0)),
@@ -384,7 +396,10 @@ class FakeBroker:
             pos = self._require_position(deal_id)
             if not self._stop_allowed(pos, stop_level):
                 raise BrokerRejected("MIN_STOP_DISTANCE")
-            self.positions[deal_id] = replace(pos, stop_level=stop_level, stop_derived=False)
+            if self.set_stop_clears_target and pos.target_level is not None:
+                self.positions[deal_id] = _protected(pos, stop_level, None)
+            else:
+                self.positions[deal_id] = replace(pos, stop_level=stop_level, stop_derived=False)
 
     async def set_protection(self, deal_id: str, stop_level: Decimal, target_level: Decimal | None) -> None:
         with self._call("set_protection"):
@@ -427,6 +442,42 @@ class FakeBroker:
                 raise BrokerError(f"unknown account {account_id!r}")
             self._active_account_id = account_id
 
+    # --- odczyty diagnostyczne próby pasma (poza protokołem `Broker`) --------------------
+
+    async def diagnose_target_fields(self, deal_id: str, deal_reference: str | None) -> TargetFieldsReport:
+        with self._call("diagnose_target_fields"):
+            pos = self.positions.get(deal_id)
+            position = FieldsRead(False) if pos is None else self._fields_of(pos, with_upl=True)
+            snapshot = self._confirms.get(deal_reference) if deal_reference is not None else None
+            confirm = FieldsRead(False)
+            if isinstance(snapshot, OpenPosition):
+                confirm = self._fields_of(snapshot, with_upl=False)
+        return TargetFieldsReport(position, confirm)
+
+    async def diagnose_transactions(self, start: datetime, end: datetime) -> list[SettlementRow]:
+        with self._call("diagnose_transactions"):
+            rows = [r for r in self.transactions if r.ts is not None and start <= r.ts <= end]
+        return rows
+
+    def _fields_of(self, pos: OpenPosition, *, with_upl: bool) -> FieldsRead:
+        target: dict[str, Decimal | None] = {}
+        for key in self.target_keys:
+            value = None
+            if pos.target_level is not None and key.lower().endswith("level"):
+                value = pos.target_level
+            elif pos.target_level is not None and key.lower().endswith("distance"):
+                value = abs(pos.target_level - pos.open_level)
+            target[key] = value
+        rules = self._instruments[self._sim_epic(pos.epic)]
+        other: dict[str, object] = {"currency": rules.currency or "EUR"}
+        if with_upl:
+            q = self._current_quote(self._sim_epic(pos.epic))
+            move = q.bid - pos.open_level if pos.side is Side.BUY else pos.open_level - q.ask
+            other["upl"] = move * pos.size * rules.value_per_point
+        other["level"] = pos.open_level
+        other["stopLevel"] = pos.stop_level
+        return FieldsRead(True, target, other)
+
     # --- mechanika -----------------------------------------------------------------
 
     @contextmanager
@@ -449,7 +500,7 @@ class FakeBroker:
 
     @staticmethod
     def _require_method(method: str) -> None:
-        if method not in BROKER_METHODS:
+        if method not in BROKER_METHODS | DIAGNOSTIC_METHODS:
             raise ValueError(f"{method!r} is not a Broker method; expected one of {sorted(BROKER_METHODS)}")
 
     def _initial_quotes(self, quote: Quote | Sequence[Quote]) -> dict[str, Quote]:
