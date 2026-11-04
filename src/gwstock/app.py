@@ -50,6 +50,8 @@ na instrumencie bez pasma jest tylko zgłaszana (UNMANAGED_POSITION raz na deal)
 pozostałych ani wyjść. Kolejne pasmo jest live tylko przy procesie live I spełnionym warunku uzbrojenia pasma
 (`lane_arming`; domyślnie nigdy: pre-rejestracja pasm to zadanie 13), inaczej dry_run (także `GuardedBroker` po
 `req.epic`). Wynik pasma w USD: faza 1 w walucie instrumentu, faza 2 z szacunku kursu brokera (ESTIMATED_FX).
+Próba pasma (`smoke --epic`, zadanie 17) dostaje osobnego wykonawcę (`smoke_executor`, live przy procesie live) i
+jednorazowe przepuszczenie wejścia roli `smoke` w bloku `lane_smoke_entry`; tryb i wykonawca pasma się nie zmieniają.
 
 Zatrzymanie (`request_shutdown`, sygnał): koniec wywołań brokera przy najbliższej granicy kroku taktu; otwarta pozycja
 zostaje u brokera ze stopem, co trafia do logu. Anulowanie (`CancelledError`) przechodzi dalej po wpisie do logu.
@@ -84,11 +86,12 @@ from gwstock.config import (
 )
 from gwstock.costs import CostModel
 from gwstock.engine_lanes import LANE_DECISION, BarLane, LaneArming, default_lane_arming
-from gwstock.execution import KILL_CHECK_FAILED, Executor, ExitMemory, emergency_flatten_lanes
+from gwstock.execution import KILL_CHECK_FAILED, ROLE_SMOKE, Executor, ExitMemory, emergency_flatten_lanes
 from gwstock.fx import ESTIMATED_FX, QuoteFxView
 from gwstock.journal import Journal, JournalError, JournalWriteError, PositionRecord
 from gwstock.lanes import STALE_SIGNAL, LaneSpec, decide_entry
 from gwstock.notify import FileNotifier, Notifier
+from gwstock.orders.ids import parse_client_id
 from gwstock.orders.manager import OrderManager
 from gwstock.portfolio import PortfolioGate, PortfolioLane
 from gwstock.reconcile import Reconciler, ReconcileResult
@@ -323,6 +326,7 @@ class GuardedBroker:
         clock: Clock | None = None,
         lane_block: Callable[[str], str | None] | None = None,
         close_key: Callable[[str], str | None] | None = None,
+        smoke_pass: Callable[[EntryRequest], bool] | None = None,
     ) -> None:
         self._inner = inner
         self._guard = guard
@@ -332,6 +336,7 @@ class GuardedBroker:
         self._clock = clock
         self._lane_block = lane_block  # silnik z pasmami: tryb pasma po `req.epic` (druga linia obrony R7)
         self._close_key = close_key  # silnik z pasmami: klucz zamkniętego rynku zamykanego deala (per instrument)
+        self._smoke_pass = smoke_pass  # próba pasma (`smoke --epic`): jedno wejście roli smoke mimo pasma dry_run
 
     @property
     def inner(self) -> Broker:
@@ -367,6 +372,8 @@ class GuardedBroker:
         blocked = self._entry_block()  # druga linia obrony: dry_run albo rachunek niesprawdzony w tej sesji
         if blocked is None and self._lane_block is not None:
             blocked = self._lane_block(req.epic)  # pasmo bez uzbrojenia: najwyżej dry_run (R7)
+            if blocked is not None and self._smoke_pass is not None and self._smoke_pass(req):
+                blocked = None  # wyłącznie wejście próby pasma w bloku `Engine.lane_smoke_entry` (zadanie 17)
         if blocked is not None:
             raise BrokerRejected(blocked)
         return await self._guard.call("open_position", self._inner.open_position, req, retry=False)
@@ -467,7 +474,9 @@ class Engine:
             broker, self._guard, self._entry_block, on_account=self._check_session_account,
             on_quote=self._on_quote, clock=clock,
             lane_block=self._lane_block if lanes_mode else None, close_key=self._close_key if lanes_mode else None,
+            smoke_pass=self._smoke_pass if lanes_mode else None,
         )  # fmt: skip
+        self._smoke_entry_epic: str | None = None  # instrument próby pasma w bloku `lane_smoke_entry` (zadanie 17)
         self.manager = OrderManager(journal, self.broker, clock, risk)
         # Bramka pasma DE40: v1 bez zmian; z kolejnymi pasmami wejścia dnia liczone per instrument (A3).
         gate_cls = LaneRiskGate if lanes_mode else RiskGate
@@ -658,6 +667,73 @@ class Engine:
         if lane.executor is None or not lane.executor.live:
             return "LANE_DRY_RUN_NO_ORDERS"
         return None
+
+    # --- próba pasma (`smoke --epic`, zadanie 17) ---
+
+    def lane_for(self, epic: str) -> BarLane | None:
+        """Włączone kolejne pasmo instrumentu `epic` (`config/lanes.toml`) albo None (brak, także DE40 v1)."""
+        return self._lane_by_epic.get(epic)
+
+    def _require_lane(self, epic: str) -> BarLane:
+        lane = self._lane_by_epic.get(epic)
+        if lane is None:
+            raise ValueError(f"no enabled lane for {epic!r} in config/lanes.toml")
+        return lane
+
+    def smoke_executor(self, epic: str) -> Executor:
+        """Wykonawca próby pasma: części pasma (bramka, koszty, pasmo z celem, kurs, bramka portfelowa, wspólna pamięć
+        wyjść), live dokładnie wtedy, gdy PROCES jest live, niezależnie od uzbrojenia pasma (próba poprzedza zamrożenie
+        odcisku). Nie podmienia wykonawcy ani uzgadniania pasma: tryb pasma się nie zmienia (R7)."""
+        lane = self._require_lane(epic)
+        return Executor.for_lane(
+            self.manager, self.broker, self.journal, lane.gate, self.kill, lane.cost_model, self.clock,
+            self._lane_spec(lane), self.risk, self.alerts, live=self._mode is Mode.LIVE, memory=self.executor.memory,
+            fx=self._fx, portfolio=self._portfolio,
+        )  # fmt: skip
+
+    @contextlib.contextmanager
+    def lane_smoke_entry(self, epic: str):
+        """Blok jednego wejścia próby pasma: druga linia obrony `GuardedBroker` przepuszcza w nim WYŁĄCZNIE zlecenie
+        roli `smoke` instrumentu `epic` przy procesie live (`_smoke_pass`); dry_run i niesprawdzony rachunek blokuje
+        nadal `_entry_block`. Po bloku (także po wyjątku) przepuszczenie znika."""
+        self._require_lane(epic)
+        self._smoke_entry_epic = epic
+        try:
+            yield
+        finally:
+            self._smoke_entry_epic = None
+
+    def _smoke_pass(self, req: EntryRequest) -> bool:
+        if self._mode is not Mode.LIVE or self._smoke_entry_epic is None or req.epic != self._smoke_entry_epic:
+            return False
+        if req.epic not in self._lane_by_epic:
+            return False
+        try:
+            role = parse_client_id(req.client_id)[3]
+        except (TypeError, ValueError):
+            return False
+        return role == ROLE_SMOKE
+
+    async def reconcile_lane_once(self, epic: str) -> ReconcileResult | None:
+        """Jeden przebieg uzgadniania pasma `epic` z jego reakcjami (stop, straże, cel, pozycje bez pasma, rozliczenie
+        wyniku w walucie obcej); None: brak pasma albo przebieg nieudany."""
+        lane = self._lane_by_epic.get(epic)
+        if lane is None:
+            return None
+        return await self._reconcile_lane(lane)
+
+    async def refresh_fx(self) -> Quote | None:
+        """Notowanie pary walutowej portfela (`fx_quote_epic`) przez `GuardedBroker` (karmi kurs `QuoteFxView`); None:
+        bez pasm albo notowanie niedostępne (kursu nigdy nie zgadujemy)."""
+        if self._fx is None:
+            return None
+        try:
+            return await self.broker.quote(self._fx.pair_epic)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOG.warning("fx quote %s unavailable: %s: %s", self._fx.pair_epic, type(exc).__name__, exc)
+            return None
 
     def _lane_measure_only(self, epic: str) -> bool:
         """Czy kolejne pasmo `epic` tylko mierzy (rozstrzygnięcie kontrolera, F5): wykonawca dry_run (nieuzbrojone
@@ -1327,10 +1403,11 @@ class Engine:
                 return
             await self._safe(f"lane_exit_{lane.epic}", self._lane_exit, lane, now)
 
-    async def _reconcile_lane(self, lane: BarLane) -> None:
+    async def _reconcile_lane(self, lane: BarLane) -> ReconcileResult | None:
         """Jeden przebieg uzgadniania pasma (klucze per instrument) z jego reakcjami: stop dla pozycji bez stopu,
         straże wypełnienia, cel dla pozycji bez celu (`ensure_target`, raz na przebieg; porażka to alarm, nie HARD),
-        pozycje bez pasma, rozliczenie wyniku w walucie obcej. Nigdy nie rzuca (poza anulowaniem)."""
+        pozycje bez pasma, rozliczenie wyniku w walucie obcej. Nigdy nie rzuca (poza anulowaniem). Zwraca wynik
+        przebiegu (także pominiętego) albo None, gdy przebieg zawiódł."""
         epic = lane.epic
         try:
             result = await lane.reconciler.run_once()
@@ -1339,30 +1416,31 @@ class Engine:
         except JournalWriteError as exc:
             self.kill.soft(JOURNAL_WRITE_FAILED)
             self._alert(f"RECONCILE_JOURNAL:{epic}", "ERROR", f"{JOURNAL_WRITE_FAILED} in reconciliation of {epic}: {exc}")
-            return
+            return None
         except Exception as exc:
             self.watchdog.note_reconcile_error(type(exc).__name__, str(exc), epic=epic)
-            return
+            return None
         if result.skipped:
             self.watchdog.note_reconcile_skipped(epic=epic)
-            return
+            return result
         self.watchdog.note_reconcile_ok(epic=epic)
         if lane.day is not None:
             lane.day.reconciled = True
         self._note_unmanaged(result)
         for p in result.unprotected:
             if self._shutdown:
-                return
+                return result
             await self._safe(f"protect_unprotected_{epic}", lane.executor.protect_unprotected, p)
         if self._shutdown:
-            return
+            return result
         await self._safe(f"guard_adopted_fill_{epic}", lane.executor.guard_adopted_fill)
         for p in {q.deal_id: q for q in result.untargeted}.values():
             if self._shutdown:
-                return
+                return result
             await self._safe(f"ensure_target_{epic}", lane.executor.ensure_target, p)
         if lane.foreign and not self._shutdown:
             await self._safe(f"settle_{epic}", self._settle_foreign, lane)
+        return result
 
     async def _lane_exit(self, lane: BarLane, now: datetime) -> None:
         """Wyjście pasma: EXITING → ponowienie; OPEN po limicie czasu (`lanes.exit_due` → TIME_LIMIT) albo o godzinie
