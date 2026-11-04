@@ -645,3 +645,51 @@ async def test_a_usd_gain_is_settled_by_the_ask_rounded_down(lane_engine, broker
     assert seen == [(KillLevel.NONE, KillLevel.NONE, fx.net_eur)]
     assert_portfolio_books_balance(journal_path)
 
+
+# --- F6: wyjątek w warunku uzbrojenia pasma → dry_run -----------------------------------------------------------------
+
+
+def broken_arming(_lane):
+    raise OSError("prereg file unreadable")
+
+
+async def test_an_exception_in_the_lane_arming_check_at_start_leaves_the_lane_dry_run(make_engine, lanes, broker, clock):
+    """F6. Oczekiwane: warunek uzbrojenia pasma rzuca przy budowie silnika → pasmo najwyżej dry_run z problemem
+    LANE_ARMING_CHECK_FAILED (z typem wyjątku), proces live dla DE40; w dniu decyzja ENTER pasma w trybie dry_run i
+    zero `open_position` US500 (DE40 wchodzi live)."""
+    engine = make_engine(Mode.LIVE, lanes=lanes, lane_arming=broken_arming)
+    (lane,) = engine.lanes
+    assert lane.arming_problem == "LANE_ARMING_CHECK_FAILED (OSError)" and not lane.executor.live
+    assert engine.executor.live
+    opens = broker_calls(broker, clock, ("open_position",))
+    stop_engine_at(engine, clock, US_ENTRY + timedelta(minutes=2))
+    await engine.run_day(DAY)
+    assert [arg for _, _, arg in opens] == [EPIC]
+    entered = [d for d in lane_decisions(engine.journal) if d["outcome"] == "ENTER"]
+    assert entered and all(d["mode"] == "dry_run" for d in entered)
+
+
+async def test_an_exception_in_the_lane_arming_check_before_an_entry_downgrades_the_lane(
+    make_engine, lanes, broker, clock
+):
+    """F6. Oczekiwane: warunek uzbrojenia pasma spełniony przy starcie (pasmo live), ale rzuca przy kontroli tuż przed
+    wejściem US500 → pasmo zdegradowane do dry_run na stałe (zdarzenie LANE_DOWNGRADED z powodem
+    LANE_ARMING_CHECK_FAILED), zero `open_position` US500, zero zleceń US500 w dzienniku; DE40 live bez zmian."""
+    calls: list[int] = []
+
+    def arming(_lane):
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("prereg check bug")
+        return None
+
+    engine = make_engine(Mode.LIVE, lanes=lanes, lane_arming=arming)
+    assert engine.lanes[0].executor.live
+    opens = broker_calls(broker, clock, ("open_position",))
+    stop_engine_at(engine, clock, US_ENTRY + timedelta(minutes=2))
+    await engine.run_day(DAY)
+    lane = engine.lanes[0]
+    assert lane.downgraded and not lane.executor.live and engine.executor.live
+    (event,) = engine_events(engine.journal, "LANE_DOWNGRADED")
+    assert event["reason"] == "LANE_ARMING_CHECK_FAILED (RuntimeError)"
+    assert [arg for _, _, arg in opens] == [EPIC] and engine.journal.count_entry_orders(DAY, US) == 0
