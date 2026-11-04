@@ -198,6 +198,29 @@ def test_modified_risk_copy_changes_the_fingerprint_but_modified_runtime_copy_do
     assert prereg.config_fingerprint(runtime_copy) == base
 
 
+# Odcisk v1 i skróty plików zamrożone na VPS 2026-11-01 (docs/preregistration/v1.md, commit b3d6893), policzone tu
+# PRZED dodaniem odcisków pasm (zadanie 13 projektu wielu pasm). Zmiana tej wartości to nowy wariant DE40 (K+1).
+FROZEN_V1_FINGERPRINT = "23046a64369dca0aa6055238bc0d55668ca19e0411cd5faccdb693ea0b6a0850"
+FROZEN_V1_FILES = {
+    "strategy_v1.toml": "fc3390cc333a04ee97f6773bcb331196fac86ec34b8ac3ba3a1bf0ed304c9a27",
+    "risk_v1.toml": "6f320cf34be9bc76e4f8cc99b7a34f62d7b0af5a18c290873dd3d75f19a08687",
+    "costs_v1.toml": "4e89f918991c20411fa7f45613c6544b6ce1844e263c6245c610e5764702e564",
+}
+
+
+def test_the_repository_v1_fingerprint_is_the_one_frozen_on_the_vps():
+    assert prereg.config_fingerprint(REPO / "config") == FROZEN_V1_FINGERPRINT
+    assert prereg.file_hashes(REPO / "config") == FROZEN_V1_FILES
+    assert prereg.CONFIG_FILES == ("strategy_v1.toml", "risk_v1.toml", "costs_v1.toml")
+    assert (prereg.ADAPTER, prereg.INSTRUMENT_CLASS) == ("capitalcom-live", "index-cfd")
+
+
+@needs_repo_docs
+def test_the_frozen_v1_fingerprint_is_the_one_in_the_preregistration_document():
+    text = (REPO / "docs" / "preregistration" / "v1.md").read_text(encoding="utf-8")
+    assert f"| Odcisk konfiguracji (fingerprint) | `{FROZEN_V1_FINGERPRINT}` |" in text
+
+
 @pytest.mark.parametrize("name", CONFIG_NAMES)
 def test_config_fingerprint_missing_file_names_the_file(config_dir, name):
     (config_dir / name).unlink()
