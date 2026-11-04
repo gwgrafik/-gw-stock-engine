@@ -21,6 +21,7 @@ from gwstock.journal import (
     OrderRecord,
     PositionRecord,
     RawEvent,
+    TradeFx,
     TradeRecord,
 )
 from gwstock.types import KillLevel, OrderState, PositionState, Side
@@ -1329,3 +1330,189 @@ def test_per_instrument_reads_report_a_closed_journal_as_a_read_error(journal, c
     journal.close()
     with pytest.raises(JournalReadError):
         call(journal)
+
+
+# --- księgowanie dwufazowe dla waluty obcej (sekcja 7.4 projektu) ------------------------------------------------
+
+
+def book_pending(journal, deal_id="DEAL-1", day=DAY, **over) -> TradeRecord:
+    trade = make_trade(instrument="US500", net_pnl=Decimal("-1.50"), **over)
+    assert journal.record_trade_pending(trade, deal_id, day) is True
+    return trade
+
+
+def test_record_trade_pending_books_the_row_and_the_marker_but_not_the_realized_pnl(journal):
+    trade = book_pending(journal)
+    assert journal.trades() == [trade] and journal.has_trade("DEAL-1") is True
+    assert journal.realized_pnl(DAY) == Decimal("0") and journal.realized_pnl_total() == Decimal("0")
+    assert journal.get_meta("pnl_pending:DEAL-1") == "2026-11-02"  # dzień wyjścia, do którego trafi kwota w EUR
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY)]
+
+
+def test_record_trade_pending_is_idempotent_and_never_reopens_a_settled_deal(journal):
+    book_pending(journal)
+    assert journal.record_trade_pending(make_trade(net_pnl=Decimal("-9")), "DEAL-1", NEXT_DAY) is False
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY)] and len(journal.trades()) == 1  # nic się nie zmieniło
+    assert journal.settle_trade_pnl("DEAL-1", Decimal("-1.38"), source="HISTORY_TRANSACTIONS") is True
+    assert journal.record_trade_pending(make_trade(), "DEAL-1", DAY) is False  # powtórka po rozliczeniu
+    assert journal.pnl_pending_deals() == [] and journal.get_meta("pnl_pending:DEAL-1") is None
+    # deal zaksięgowany zwykłą drogą (waluta rachunku) też nie dostaje znacznika
+    assert journal.record_trade(make_trade(), "DEAL-2", DAY) is True
+    assert journal.record_trade_pending(make_trade(), "DEAL-2", DAY) is False
+    assert journal.pnl_pending_deals() == []
+
+
+def test_record_trade_pending_writes_row_marker_and_flags_in_one_transaction(journal):
+    journal._conn.execute("CREATE TRIGGER boom BEFORE INSERT ON meta BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    with pytest.raises(JournalWriteError):
+        journal.record_trade_pending(make_trade(), "DEAL-1", DAY, flags="ESTIMATED_FX")
+    assert journal.trades() == [] and journal.has_trade("DEAL-1") is False  # ani wiersz, ani znacznik, ani flagi
+    assert journal.trade_flags("DEAL-1") is None
+    journal._conn.execute("DROP TRIGGER boom")
+    assert journal.pnl_pending_deals() == []
+    assert journal.record_trade_pending(make_trade(), "DEAL-1", DAY, flags="ESTIMATED_FX") is True
+    assert journal.trade_flags("DEAL-1") == "ESTIMATED_FX" and journal.pnl_pending_deals() == [("DEAL-1", DAY)]
+
+
+@pytest.mark.parametrize("args", [("", DAY), ("DEAL-1", T0)])
+def test_record_trade_pending_rejects_an_empty_deal_id_and_a_datetime_day_before_writing(journal, args):
+    with pytest.raises(ValueError if args[0] == "" else TypeError):
+        journal.record_trade_pending(make_trade(), *args)
+    assert journal.trades() == [] and journal.pnl_pending_deals() == []
+
+
+@pytest.mark.parametrize("flags", ["estimated", "ESTIMATED  FX", " ESTIMATED", "ESTIMATED\n", 7])
+def test_record_trade_pending_rejects_malformed_flags_before_writing(journal, flags):
+    with pytest.raises(TypeError if isinstance(flags, int) else ValueError):
+        journal.record_trade_pending(make_trade(), "DEAL-1", DAY, flags=flags)
+    assert journal.trades() == [] and journal.pnl_pending_deals() == []
+
+
+def test_settle_trade_pnl_adds_the_eur_amount_to_the_exit_day_and_clears_the_marker(journal):
+    book_pending(journal, day=DAY)
+    book_pending(journal, "DEAL-2", NEXT_DAY)
+    assert journal.settle_trade_pnl(
+        "DEAL-1", Decimal("-1.38"), source="HISTORY_TRANSACTIONS", rate=Decimal("1.0870")
+    ) is True
+    assert journal.realized_pnl(DAY) == Decimal("-1.38")  # kwota w EUR od brokera, nie wynik wiersza księgi w USD
+    assert journal.realized_pnl(NEXT_DAY) == Decimal("0") and journal.realized_pnl_total() == Decimal("-1.38")
+    assert journal.pnl_pending_deals() == [("DEAL-2", NEXT_DAY)]  # drugi nadal czeka
+    assert journal.get_meta("pnl_pending:DEAL-1") is None
+    assert journal.trade_fx("DEAL-1") == TradeFx(Decimal("-1.38"), "HISTORY_TRANSACTIONS", Decimal("1.0870"))
+    assert str(journal.trade_fx("DEAL-1").rate) == "1.0870"  # dokładny zapis Decimal
+    assert journal.trade_fx("DEAL-2") is None
+    assert journal.settle_trade_pnl("DEAL-2", Decimal("2.5"), source="ESTIMATED_FX") is True
+    assert journal.realized_pnl(NEXT_DAY) == Decimal("2.5") and journal.realized_pnl_total() == Decimal("1.12")
+    assert journal.trade_fx("DEAL-2") == TradeFx(Decimal("2.5"), "ESTIMATED_FX", None)  # kurs efektywny opcjonalny
+    assert journal.pnl_pending_deals() == []
+
+
+def test_settle_trade_pnl_is_idempotent_and_ignores_deals_that_are_not_pending(journal):
+    book_pending(journal)
+    assert journal.settle_trade_pnl("DEAL-1", Decimal("-1.38"), source="HISTORY_TRANSACTIONS") is True
+    assert journal.settle_trade_pnl("DEAL-1", Decimal("-9"), source="OTHER") is False  # powtórka: bez drugiego dopisania
+    assert journal.realized_pnl_total() == Decimal("-1.38")
+    assert journal.trade_fx("DEAL-1") == TradeFx(Decimal("-1.38"), "HISTORY_TRANSACTIONS", None)
+    journal.record_trade(make_trade(net_pnl=Decimal("-2")), "DEAL-2", DAY)  # waluta rachunku: bez fazy 2
+    assert journal.settle_trade_pnl("DEAL-2", Decimal("-7"), source="HISTORY_TRANSACTIONS") is False
+    assert journal.realized_pnl_total() == Decimal("-3.38") and journal.trade_fx("DEAL-2") is None
+
+
+def test_settle_trade_pnl_for_a_deal_that_was_never_booked_is_a_key_error_and_writes_nothing(journal):
+    with pytest.raises(KeyError):
+        journal.settle_trade_pnl("DEAL-9", Decimal("-1"), source="HISTORY_TRANSACTIONS")
+    assert journal.realized_pnl_total() == Decimal("0") and journal.trade_fx("DEAL-9") is None
+
+
+@pytest.mark.parametrize("trigger", [
+    "BEFORE INSERT ON realized_pnl", "BEFORE UPDATE ON realized_pnl", "BEFORE INSERT ON meta",
+    "BEFORE DELETE ON meta",
+])  # fmt: skip
+def test_settle_trade_pnl_is_one_transaction_whichever_step_fails(journal, trigger):
+    # dopisanie do licznika, zapis kursu i zdjęcie znacznika: awaria któregokolwiek kroku cofa wszystkie
+    book_pending(journal)
+    if "UPDATE" in trigger:
+        journal.add_realized_pnl(DAY, Decimal("-5"))  # dzień z istniejącym wierszem licznika (ścieżka UPDATE)
+    before = journal.realized_pnl(DAY)
+    journal._conn.execute(f"CREATE TRIGGER boom {trigger} BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    with pytest.raises(JournalWriteError):
+        journal.settle_trade_pnl("DEAL-1", Decimal("-1.38"), source="HISTORY_TRANSACTIONS", rate=Decimal("1.087"))
+    journal._conn.execute("DROP TRIGGER boom")
+    assert journal.realized_pnl(DAY) == before
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY)] and journal.trade_fx("DEAL-1") is None
+    assert journal.settle_trade_pnl("DEAL-1", Decimal("-1.38"), source="HISTORY_TRANSACTIONS") is True  # ponowienie
+    assert journal.realized_pnl(DAY) == before + Decimal("-1.38")
+
+
+@pytest.mark.parametrize("net", [0.5, "1.0", None, Decimal("NaN"), Decimal("Infinity")])
+def test_settle_trade_pnl_rejects_a_non_decimal_or_non_finite_amount_before_writing(journal, net):
+    book_pending(journal)
+    with pytest.raises((TypeError, ValueError)):
+        journal.settle_trade_pnl("DEAL-1", net, source="HISTORY_TRANSACTIONS")
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY)] and journal.realized_pnl_total() == Decimal("0")
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"source": ""}, {"source": 5}, {"source": None},
+    {"source": "X", "rate": Decimal("0")}, {"source": "X", "rate": Decimal("-1.08")}, {"source": "X", "rate": 1.08},
+    {"source": "X", "rate": Decimal("NaN")}, {"source": "X", "rate": Decimal("Infinity")},
+])  # fmt: skip
+def test_settle_trade_pnl_rejects_a_bad_source_or_rate_before_writing(journal, kwargs):
+    book_pending(journal)
+    with pytest.raises((TypeError, ValueError)):
+        journal.settle_trade_pnl("DEAL-1", Decimal("-1"), **kwargs)
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY)] and journal.realized_pnl_total() == Decimal("0")
+    with pytest.raises(ValueError):
+        journal.settle_trade_pnl("", Decimal("-1"), source="X")
+
+
+def test_a_corrupt_pending_marker_is_reported_and_nothing_is_settled(journal):
+    book_pending(journal)
+    journal.set_meta("pnl_pending:DEAL-1", "not-a-date")
+    with pytest.raises(JournalCorruptError):
+        journal.pnl_pending_deals()  # bramka nie może uznać, że nic nie czeka
+    with pytest.raises(JournalCorruptError):
+        journal.settle_trade_pnl("DEAL-1", Decimal("-1"), source="HISTORY_TRANSACTIONS")
+    assert journal.realized_pnl_total() == Decimal("0") and journal.get_meta("pnl_pending:DEAL-1") == "not-a-date"
+
+
+@pytest.mark.parametrize("stored", [
+    "{", "[]", '{"net_eur": "1"}', '{"net_eur": "x", "source": "S", "rate": null}',
+    '{"net_eur": "1", "source": 5, "rate": null}', '{"net_eur": "1", "source": "S", "rate": "NaN"}',
+    '{"net_eur": "1", "source": "S", "rate": "0"}',
+])  # fmt: skip
+def test_a_corrupt_stored_fx_record_is_a_corrupt_error(journal, stored):
+    journal.set_meta("trade_fx:DEAL-1", stored)
+    with pytest.raises(JournalCorruptError):
+        journal.trade_fx("DEAL-1")
+
+
+def test_pnl_pending_deals_lists_exactly_the_markers_in_key_order_and_ignores_lookalike_keys(journal):
+    for key in ("pnl_pending", "pnl_pending;DEAL-0", "pnl_pending9:DEAL-0", "xpnl_pending:DEAL-0", "trade_fx:DEAL-0"):
+        journal.set_meta(key, "not-a-date")
+    book_pending(journal, "DEAL-2", NEXT_DAY)
+    book_pending(journal, "DEAL-1", DAY)
+    assert journal.pnl_pending_deals() == [("DEAL-1", DAY), ("DEAL-2", NEXT_DAY)]
+
+
+def test_pending_and_settlement_survive_close_and_reopen(tmp_path):
+    path = str(tmp_path / "j.sqlite")
+    j = Journal.open(path)
+    book_pending(j)
+    j.close()
+    j = Journal.open(path)
+    assert j.pnl_pending_deals() == [("DEAL-1", DAY)] and j.realized_pnl_total() == Decimal("0")
+    assert j.settle_trade_pnl("DEAL-1", Decimal("-1.38"), source="HISTORY_TRANSACTIONS") is True
+    j.close()
+    j = Journal.open(path)
+    assert j.pnl_pending_deals() == [] and j.realized_pnl(DAY) == Decimal("-1.38")
+    assert j.trade_fx("DEAL-1") == TradeFx(Decimal("-1.38"), "HISTORY_TRANSACTIONS", None)
+    j.close()
+
+
+def test_the_journal_schema_is_unchanged_by_the_per_instrument_additions(journal):
+    tables = {r[0] for r in journal._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert tables == {"raw_events", "orders", "positions", "realized_pnl", "kill_state", "trades", "meta",
+                      "sqlite_sequence"}  # fmt: skip
+    assert journal.pragma("user_version") == 1
+    assert [r[1] for r in journal._conn.execute("PRAGMA table_info(trades)")][:3] == ["id", "deal_id", "exit_day"]

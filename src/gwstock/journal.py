@@ -16,6 +16,7 @@ Zasady (spec §3, §6, §9, §10):
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -264,6 +265,25 @@ class TradeRecord:
 
 
 @dataclass(frozen=True)
+class TradeFx:
+    """Rozliczenie transakcji w walucie obcej (spec wielu pasm §7.4), zapisane przez `settle_trade_pnl`.
+
+    `net_eur`: wynik w walucie rachunku od brokera (to on trafia do licznika `realized_pnl`, nie wynik wiersza księgi
+    w walucie instrumentu); `source`: skąd kwota (np. `HISTORY_TRANSACTIONS`, `ESTIMATED_FX`); `rate`: kurs efektywny
+    (informacyjny, opcjonalny, dodatni)."""
+
+    net_eur: Decimal
+    source: str
+    rate: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        _require_decimal(self, "net_eur")
+        _require_str(self, "source", non_empty=True)
+        _require_decimal(self, "rate", optional=True)
+        _require_positive(self, "rate", optional=True)
+
+
+@dataclass(frozen=True)
 class RawEvent:
     """Surowe zdarzenie (odpowiedź brokera lub zdarzenie strukturalne jako JSON) w kolejności `id`."""
 
@@ -340,6 +360,9 @@ _DAY_PREFIX = "gws-{:%Y%m%d}-"  # prefiks identyfikatora z `make_client_id` (dzi
 _ENTRY_SUFFIX = "-entry"  # rola wejścia strategii (ostatni segment identyfikatora)
 _SMOKE_SUFFIX = "-smoke"  # rola próby akceptacyjnej L0
 _TRADE_FLAGS = "trade_flags:{}"  # deal_id → znaczniki wiersza księgi (`record_trade(..., flags=)`)
+# Księgowanie dwufazowe dla instrumentu w walucie obcej (spec wielu pasm §7.4), oba klucze w `meta` (bez zmiany schematu):
+_PNL_PENDING = "pnl_pending:{}"  # deal_id → dzień wyjścia (ISO): wiersz księgi jest, kwoty w EUR w liczniku jeszcze nie
+_TRADE_FX = "trade_fx:{}"  # deal_id → JSON {net_eur, rate, source}: rozliczenie po fazie 2 (`TradeFx`)
 _FLAGS = re.compile(r"[A-Z_]+(?: [A-Z_]+)*")
 _EPIC_TOKEN = re.compile(r"[A-Za-z0-9]+")  # człon instrumentu identyfikatora zlecenia (`orders.ids`): bez "-"
 
@@ -410,6 +433,41 @@ def _trade_params(t: TradeRecord) -> tuple:
 
 def _opt_str(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
+
+
+def _day_from_text(text: str) -> date:
+    """Dzień zapisany jako `date.isoformat()`; każdy inny zapis (także „20261102”) to uszkodzenie danych."""
+    value = date.fromisoformat(text)
+    if value.isoformat() != text:
+        raise ValueError(f"stored day {text!r} is not in YYYY-MM-DD form")
+    return value
+
+
+def _fx_to_text(fx: TradeFx) -> str:
+    """Kanoniczny JSON rozliczenia: kwoty jako napisy (Decimal bez float), klucze posortowane."""
+    return json.dumps(
+        {"net_eur": str(fx.net_eur), "rate": None if fx.rate is None else str(fx.rate), "source": fx.source},
+        sort_keys=True, separators=(",", ":"),
+    )  # fmt: skip
+
+
+def _fx_from_text(text: str) -> TradeFx:
+    data = json.loads(text)
+    if not isinstance(data, dict) or set(data) != {"net_eur", "rate", "source"}:
+        raise ValueError(f"unexpected fx record {text!r}")
+    if not isinstance(data["net_eur"], str) or not (data["rate"] is None or isinstance(data["rate"], str)):
+        raise ValueError(f"fx amounts must be stored as strings, got {text!r}")
+    rate = data["rate"]
+    return TradeFx(net_eur=_dec(data["net_eur"]), source=data["source"], rate=None if rate is None else _dec(rate))
+
+
+def _check_booking(where: str, deal_id: str, exit_day: date, flags: str) -> None:
+    """Wspólne sprawdzenie argumentów księgowania (`record_trade`, `record_trade_pending`) przed jakimkolwiek zapisem."""
+    _check_str(deal_id, f"{where}.deal_id", non_empty=True)
+    _check_day(exit_day)
+    _check_str(flags, f"{where}.flags")
+    if flags and not _FLAGS.fullmatch(flags):
+        raise ValueError(f"{where}.flags: expected words of A-Z and _ separated by one space, got {flags!r}")
 
 
 # --- schemat ---------------------------------------------------------------------------------
@@ -949,11 +1007,7 @@ class Journal:
         nie ma wiersza bez znacznika ani znacznika bez wiersza. Zwraca True, gdy zaksięgowano; False (bez żadnej
         zmiany, także znacznika), gdy `deal_id` był już zaksięgowany.
         """
-        _check_str(deal_id, "record_trade.deal_id", non_empty=True)
-        _check_day(exit_day)
-        _check_str(flags, "record_trade.flags")
-        if flags and not _FLAGS.fullmatch(flags):
-            raise ValueError(f"record_trade.flags: expected words of A-Z and _ separated by one space, got {flags!r}")
+        _check_booking("record_trade", deal_id, exit_day, flags)
 
         def op(conn: sqlite3.Connection) -> bool:
             cur = conn.execute(_TRADE_INSERT, (deal_id, exit_day.isoformat(), *_trade_params(t)))
@@ -961,13 +1015,87 @@ class Journal:
                 return False
             self._add_pnl(conn, exit_day, t.net_pnl)
             if flags:
-                conn.execute(
-                    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (_TRADE_FLAGS.format(deal_id), flags),
-                )
+                self._put_meta(conn, _TRADE_FLAGS.format(deal_id), flags)
             return True
 
         return self._write(op)
+
+    @staticmethod
+    def _put_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+        """Zapis znacznika `meta` wewnątrz transakcji `_write` (to samo co `set_meta`, ale bez własnej transakcji)."""
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def record_trade_pending(self, t: TradeRecord, deal_id: str, exit_day: date, *, flags: str = "") -> bool:
+        """Faza 1 księgowania instrumentu w walucie obcej (spec wielu pasm §7.4): wiersz księgi + `pnl_pending:<deal_id>`.
+
+        Wiersz `t` jest w walucie instrumentu, więc NIE jest dopisywany do `realized_pnl` (licznik jest w walucie
+        rachunku): znacznik trzyma dzień wyjścia i czeka na kwotę od brokera (`settle_trade_pnl`). Wiersz, znacznik
+        i ewentualne `flags` powstają w JEDNEJ transakcji. Zwraca True, gdy zaksięgowano; False (bez żadnej zmiany),
+        gdy `deal_id` był już zaksięgowany, także rozliczony: rozliczona transakcja nigdy nie wraca do oczekujących.
+        Instrument w walucie rachunku (DE40) księguje się dalej przez `record_trade`.
+        """
+        _check_booking("record_trade_pending", deal_id, exit_day, flags)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(_TRADE_INSERT, (deal_id, exit_day.isoformat(), *_trade_params(t)))
+            if cur.rowcount == 0:
+                return False
+            self._put_meta(conn, _PNL_PENDING.format(deal_id), exit_day.isoformat())
+            if flags:
+                self._put_meta(conn, _TRADE_FLAGS.format(deal_id), flags)
+            return True
+
+        return self._write(op)
+
+    def settle_trade_pnl(self, deal_id: str, net_eur: Decimal, *, source: str, rate: Decimal | None = None) -> bool:
+        """Faza 2 księgowania (spec wielu pasm §7.4): kwota `net_eur` od brokera trafia do `realized_pnl` DNIA WYJŚCIA
+        (zapisanego w znaczniku), zapisuje się `trade_fx:<deal_id>` (kwota, `source`, kurs efektywny `rate`) i znika
+        `pnl_pending:<deal_id>`, wszystko w JEDNEJ transakcji (awaria któregokolwiek kroku cofa pozostałe).
+
+        Zwraca True, gdy rozliczono; False (bez żadnej zmiany), gdy transakcja nie czeka na rozliczenie (już rozliczona
+        albo zaksięgowana zwykłą drogą). Transakcja, której w księdze nie ma, to `KeyError`. Uszkodzony znacznik to
+        `JournalCorruptError`. Limity strat (`enforce_loss_limits`) liczy wywołujący po powrocie.
+        """
+        _check_str(deal_id, "settle_trade_pnl.deal_id", non_empty=True)
+        fx = TradeFx(net_eur, source, rate)  # walidacja typów i wartości przed jakimkolwiek zapisem
+        key = _PNL_PENDING.format(deal_id)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                if conn.execute("SELECT 1 FROM trades WHERE deal_id = ?", (deal_id,)).fetchone() is None:
+                    raise KeyError(deal_id)
+                return False
+            exit_day = _decode("pending marker", lambda r: _day_from_text(r[0]), row)
+            self._add_pnl(conn, exit_day, fx.net_eur)
+            self._put_meta(conn, _TRADE_FX.format(deal_id), _fx_to_text(fx))
+            conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+            return True
+
+        return self._write(op)
+
+    def pnl_pending_deals(self) -> list[tuple[str, date]]:
+        """Transakcje czekające na fazę 2 (`pnl_pending:<deal_id>`): `(deal_id, dzień wyjścia)` w kolejności `deal_id`.
+
+        Niepusta lista znaczy, że licznik `realized_pnl` jest niepełny, więc bramka portfelowa blokuje wejścia
+        (`PORTFOLIO_PNL_PENDING`). Uszkodzony znacznik to `JournalCorruptError`, nigdy cicho „nic nie czeka”."""
+        prefix = _PNL_PENDING.format("")
+        low, high = prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)  # zakres klucza głównego `meta`, bez przeglądania
+        rows = self._read(
+            lambda c: c.execute(
+                "SELECT key, value FROM meta WHERE key >= ? AND key < ? ORDER BY key", (low, high)
+            ).fetchall()
+        )
+        return [_decode("pending marker", lambda r: (r[0][len(prefix):], _day_from_text(r[1])), row) for row in rows]
+
+    def trade_fx(self, deal_id: str) -> TradeFx | None:
+        """Rozliczenie z `settle_trade_pnl` albo None (brak: nie rozliczono lub księgowano w walucie rachunku)."""
+        _check_str(deal_id, "trade_fx.deal_id", non_empty=True)
+        text = self.get_meta(_TRADE_FX.format(deal_id))
+        return None if text is None else _decode("trade fx", lambda r: _fx_from_text(r[0]), (text,))
 
     @overload
     def trade_flags(self, deal_id: str) -> str | None: ...
