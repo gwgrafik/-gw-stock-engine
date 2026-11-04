@@ -7,6 +7,11 @@ Inaczej `dry_run`. Odcisk liczy moduł `gwstock.prereg` (Zadanie 15), importowan
 pliku z zamrożonym odciskiem = None = `dry_run`. Silnik przy każdym starcie dnia sprawdza jeszcze rachunek u brokera
 (`Engine.verify_account`) i w razie problemu zostaje w `dry_run`.
 
+Kolejne pasma (`config/lanes.toml`, projekt wielu pasm §6): pasmo jest live tylko przy uzbrojonym procesie (cztery
+warunki wyżej) ORAZ zamrożonym przez właściciela i zgodnym odcisku pasma (`python -m gwstock.prereg --lane EPIC
+--write`; `lane_arming_problem`), inaczej `dry_run` z powodem w `status`. Wielkość pasma zawsze minimalna. Polecenia
+`status`, `clear-kill`, `reset-position` i `resolve-lost-trade` przyjmują `--epic` (domyślnie pasmo DE40).
+
 Zmienne środowiskowe: `GW_CONFIG_DIR` (domyślnie `config`), `GW_DATA_DIR` (domyślnie `data`),
 `GW_CAPITALCOM_KEY_FILE` (domyślnie `/secrets/capitalcom.json`). Sekretów nie ma w logu ani w wyjściu poleceń;
 saldo rachunków `bind-account` wypisuje wyłącznie na terminal właściciela.

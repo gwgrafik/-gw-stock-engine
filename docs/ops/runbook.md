@@ -931,6 +931,74 @@ docker logs --tail 20 gw-stock-engine
 
 Pozycja otwarta w chwili rozbrojenia nadal jest zarządzana (stop u brokera, spłaszczenie o 17:25), bo wyjść nie blokujemy nigdy.
 
+### 6.1 Kolejne pasma (np. US500 B1/M5): pre-rejestracja i uzbrojenie pasma
+
+Kolejne pasmo pracuje wyłącznie wtedy, gdy na serwerze istnieje plik `config/lanes.toml` z `enabled = true` (bez tego pliku silnik jest dokładnie wersją v1 z samym DE40). Włączenie pasma **nie** uzbraja go. To osobny wariant (K+1) z **własną** pre-rejestracją: odcisk DE40 v1 (`data/preregistration.json`) zostaje bez zmian i nie obejmuje plików pasm.
+
+**Kiedy pasmo handluje na żywo.** Tylko wtedy, gdy spełnione są naraz:
+
+1. wszystkie cztery warunki uzbrojenia procesu z punktu 6 (`live_allowed = true`, plik `data/ARM_LIVE`, powiązany rachunek, zgodny odcisk DE40 v1);
+2. odcisk pasma zamrożony przez Ciebie (plik `data/preregistration-US500.json`) i zgodny z bieżącymi plikami pasma: `config/lanes.toml`, `config/portfolio.toml`, plik reguły pasma (`config/lane_us500_b1_m5.toml`), plik kosztów pasma oraz kod reguły (`src/gwstock/strategy_bars.py`, `src/gwstock/lanes.py`);
+3. silnik pracuje na tym samym pliku pasma, który jest na dysku (zmiana pliku w trakcie pracy obniża pasmo do `dry_run` do restartu), a dla instrumentu w USD adapter dostaje reguły w walucie instrumentu (silnik składa to sam z `config/lanes.toml`).
+
+Gdy czegoś brakuje, pasmo pracuje jako `dry_run`: liczy decyzje i zapisuje je w dzienniku, ale nie wysyła żadnego zlecenia. DE40 nie zależy od odcisku pasma. Usunięcie `data/ARM_LIVE` albo zmiana `live_allowed` obniża **wszystkie** pasma naraz. Pasmo zawsze handluje wielkością minimalną (dla US500 0,01); bramki wielkości per pasmo nie ma. Kill switch, limity straty dnia i łączny oraz depozyt są wspólne dla wszystkich pasm.
+
+**Kod nigdy niczego nie zamraża sam.** Odcisk pasma zapisuje wyłącznie to polecenie (poza sesją, silnik może pracować). Najpierw podgląd (nic nie zapisuje):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --lane US500 --print
+```
+
+Zamrożenie (jeśli ten sam odcisk jest już zamrożony, niczego nie zmienia; inny odcisk odmawia bez `--force`):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --lane US500 --write
+```
+
+Wklej cały wydruk w czacie (same skróty, bezpieczne): Claude wpisze go do pre-rejestracji pasma w `docs/preregistration/`. Kontrola zgodności (kody wyjścia jak w punkcie 2.0: 0 zgodny, 1 niezgodny z nazwą różniącego się pliku, 2 nic nie zamrożono):
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --lane US500 --check
+```
+
+Nowy wariant pasma (zmieniony plik pasma albo kod reguły) to K+1 i tylko na wyraźne polecenie Claude, po dopisaniu wariantu do dokumentu:
+
+```bash
+echo FORCE | docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock.prereg --lane US500 --write --force
+```
+
+**Kontrola przed startem.** Polecenie `status` pokazuje po stanie DE40 sekcję każdego pasma: tryb z plików (linia `lane US500 (bar_b1_m5, NYSE, USD): mode (files) live ...` albo `dry_run` z powodem), pozycję, niewyjaśnione zlecenia, wejścia dnia (dzień lokalny Nowego Jorku) i wynik dnia w walucie instrumentu. Sam stan jednego pasma:
+
+```bash
+docker compose -f docker/compose.yml run --rm -T gw-stock-engine python -m gwstock status --epic US500
+```
+
+Najczęstsze powody `dry_run` pasma w tej linii:
+
+- `PROCESS_NOT_ARMED: ...`: proces nie jest uzbrojony (punkt 6); dalej wymienione brakujące warunki;
+- `LANE_PREREGISTRATION_NOT_FROZEN`: nie zamroziłeś odcisku pasma (polecenie wyżej);
+- `LANE_FINGERPRINT_MISMATCH`: plik pasma albo kod reguły zmienił się od zamrożenia (nowy wariant K+1; zapytaj Claude);
+- `LANE_PREREGISTRATION_UNREADABLE`: plik odcisku pasma jest uszkodzony (zapytaj Claude; nie edytuj go ręcznie);
+- `LANE_ACCOUNT_NOT_BOUND`: powiązany rachunek zmienił się od startu silnika (restart po `bind-account`);
+- `LANE_CONFIG_CHANGED`: plik pasma zmienił się w trakcie pracy silnika (restart w dwóch krokach, punkt 8.1);
+- `LANE_FOREIGN_CURRENCY_NOT_ENABLED` albo `LANE_FINGERPRINT_UNAVAILABLE`: błąd złożenia albo konfiguracji (zapytaj Claude).
+
+**Polecenia właściciela dla pasma.** `reset-position`, `resolve-lost-trade` i `clear-kill` przyjmują opcję `--epic` (bez niej dotyczą DE40, jak dotąd). Procedura i odmowy są takie same jak w punkcie 8.5, tylko z instrumentem pasma. `resolve-lost-trade` dla pasma w USD księguje wynik w walucie instrumentu, a kwotę w EUR rozlicza potem silnik (do tego czasu wejścia wszystkich pasm są zablokowane). `clear-kill` z `--epic` pokazuje pozycję pasma i przypomina, że kill switch jest wspólny: zdjęcie odblokowuje wejścia **każdego** pasma.
+
+```bash
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock reset-position --by wlasciciel --epic US500
+```
+
+```bash
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock resolve-lost-trade --by wlasciciel --epic US500
+```
+
+```bash
+docker compose -f docker/compose.yml run --rm gw-stock-engine python -m gwstock clear-kill --by wlasciciel --epic US500
+```
+
+Zasada operacyjna: nie handluj ręcznie instrumentem, który ma pasmo (DE40, US500); pozycja właściciela na instrumencie pasma blokuje to pasmo, a przez wspólny kill switch także pozostałe.
+
 ---
 
 ## 7. Pierwsze 5 sesji i bramka L1
