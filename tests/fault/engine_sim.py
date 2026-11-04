@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
@@ -25,9 +26,9 @@ import pytest
 
 from gwstock.app import ARM_FILE, Engine, Mode
 from gwstock.broker.fake import FakeBroker
-from gwstock.calendar import XETRA, ExchangeCalendar
+from gwstock.calendar import NYSE, XETRA, ExchangeCalendar
 from gwstock.clock import FakeClock
-from gwstock.config import RuntimeConfig
+from gwstock.config import LANES_FILE, RuntimeConfig
 from gwstock.journal import Journal
 from gwstock.types import Candle, InstrumentRules, Quote
 
@@ -338,3 +339,170 @@ def calls_at(broker: FakeBroker, clock: FakeClock, method: str) -> list[datetime
 def with_risk(cfgs, **over):
     strat, risk, costs = cfgs
     return (strat, replace(risk, **over), costs)
+
+
+# --- wiele pasm (zadanie 14, projekt wielu pasm §9.1) ----------------------------------------------------------------
+#
+# Rynek US500 (pasmo B1/M5, kalendarz NYSE, waluta USD) i notowanie EURUSD (kurs przeliczeń portfela) obok rynku DE40.
+# Świece M5 US500 są płaskie (zakres 2 pkt) poza świecami wybicia B1, których początki (czas lokalny Nowego Jorku) poda
+# test; po każdej świecy wybicia rynek przenosi się 10 pkt wyżej i notowanie mid = zamknięcie tej świecy. Wejście B1:
+# ask = zamknięcie + 0,3, stop = minimum świecy wybicia (odległość 10,8 pkt), cel = 1,5 R. Pliki pasma i portfela to
+# kopie `config/lane_us500_b1_m5.toml` i `config/portfolio.toml`, `lanes.toml` włącza jedno pasmo US500 (NYSE, USD).
+# Uzbrajanie: wyłącznie `EngineFactory` (funkcja `arm` w katalogu tymczasowym); pasmo US500 jest live tylko z jawnym
+# warunkiem uzbrojenia pasma testu (`lane_armed`), bez niego dry_run (R7).
+
+US = "US500"
+FX = "EURUSD"
+NY = ExchangeCalendar(NYSE)
+US_RULES = InstrumentRules(US, D("0.01"), D("0.01"), D("1"), D("0.05"), D("0.5"), D("0.1"), "USD")
+FX_RULES = InstrumentRules(FX, D("100"), D("100"), D("0.0001"), D("0.0333"), D("0"), D("0"), None)
+US_BASE = D("7580")
+US_HALF_SPREAD = D("0.3")
+FX_BID, FX_ASK = D("1.0800"), D("1.0802")
+LANES_TOML = """enabled = true
+
+[[lane]]
+rule = "bar_b1_m5"
+rule_file = "lane_us500_b1_m5.toml"
+exchange_profile = "NYSE"
+currency = "USD"
+slippage_guard_fraction = "0.25"
+max_loss_per_trade = "1.00"
+costs_file = "costs_v1.toml"
+"""
+
+
+def new_york(day: date, hh: int, mm: int, ss: int = 0) -> datetime:
+    """Czas lokalny Nowego Jorku dnia `day` jako UTC (strefa kalendarza NYSE, ze zmianami czasu)."""
+    return NY.local_to_utc(day, time(hh, mm, ss))
+
+
+@dataclass
+class UsMarket:
+    """Rynek US500: świece wybicia B1 o początkach `signals` (UTC, rosnąco), notowanie świeże (ts = teraz)."""
+
+    day: date = DAY
+    signals: list[datetime] = field(default_factory=lambda: [new_york(DAY, 9, 45)])
+    overrides: list[tuple[datetime, Decimal]] = field(default_factory=list)  # od chwili: mid = wartość
+    frozen_from: datetime | None = None  # od tej chwili notowanie się nie zmienia (cisza notowań US500)
+    span: timedelta = timedelta(minutes=5)
+
+    def level_after(self, k: int) -> Decimal:
+        """Poziom płaskiego rynku po `k` świecach wybicia (przed pierwszą: `US_BASE`)."""
+        return US_BASE + 10 * k
+
+    def signal_close(self, k: int) -> Decimal:
+        """Zamknięcie `k`-tej (od 1) świecy wybicia: poziom poprzedni + 9,5."""
+        return self.level_after(k - 1) + D("9.5")
+
+    def mid_at(self, now: datetime) -> Decimal:
+        done = [s for s in self.signals if s + self.span <= now]
+        mid = self.signal_close(len(done)) if done else US_BASE
+        for when, value in self.overrides:
+            if now >= when:
+                mid = value
+        return mid
+
+    def quote(self, now: datetime) -> Quote:
+        ts = now
+        if self.frozen_from is not None and now >= self.frozen_from:
+            now = ts = self.frozen_from
+        mid = self.mid_at(now)
+        return Quote(US, mid - US_HALF_SPREAD, mid + US_HALF_SPREAD, ts)
+
+    def candles(self) -> list[Candle]:
+        """Świece M5 US500 od 3 godzin przed otwarciem NYSE do jego zamknięcia (dzień `day`)."""
+        open_utc = NY.local_to_utc(self.day, NY.open_time(self.day)) if NY.is_session_day(self.day) else None
+        start = (open_utc or new_york(self.day, 9, 30)) - timedelta(hours=3)
+        end = new_york(self.day, 16, 0)
+        out, t, k = [], start, 0
+        while t < end:
+            if k < len(self.signals) and t == self.signals[k]:
+                lo = self.level_after(k)
+                out.append(Candle(US, t, lo, lo + 10, lo - 1, self.signal_close(k + 1)))
+                k += 1
+            else:
+                lvl = self.level_after(k) if k == 0 else self.signal_close(k) + D("0.5")
+                out.append(Candle(US, t, lvl, lvl + 1, lvl - 1, lvl))
+            t += self.span
+        return out
+
+
+def fx_quote_at(now: datetime) -> Quote:
+    return Quote(FX, FX_BID, FX_ASK, now)
+
+
+def build_lane_broker(clock, day_rules: InstrumentRules, market: Market, us_market: UsMarket,
+                      day: date = DAY, *, netting: bool = False) -> FakeBroker:  # fmt: skip
+    """FakeBroker trzech instrumentów (DE40, US500, EURUSD) związany z ACC-1; świeca DE40 09:00 rosnąca (BUY)."""
+    now = clock.now_utc()
+    fake = FakeBroker(
+        clock, [day_rules, US_RULES, FX_RULES], [market.quote(now), us_market.quote(now), fx_quote_at(now)],
+        account_id="ACC-1", netting=netting,
+    )  # fmt: skip
+    fake.set_quote_fn(market.quote, epic=EPIC)
+    fake.set_quote_fn(us_market.quote, epic=US)
+    fake.set_quote_fn(fx_quote_at, epic=FX)
+    fake.set_daily_candles(daily_candles(day), epic=EPIC)
+    fake.set_candles_5m(five_minute_candles(day, D("25780"), D("25790")), epic=EPIC)
+    fake.set_candles_5m(us_market.candles(), epic=US)
+    return fake
+
+
+def write_lane_files(config_dir: Path, portfolio_toml: str | None = None) -> Path:
+    """Pliki pasm w `config/` symulacji: reguła US500, portfel (kopia albo podana treść) i `lanes.toml`."""
+    shutil.copy(Path("config") / "lane_us500_b1_m5.toml", config_dir / "lane_us500_b1_m5.toml")
+    if portfolio_toml is None:
+        shutil.copy(Path("config") / "portfolio.toml", config_dir / "portfolio.toml")
+    else:
+        (config_dir / "portfolio.toml").write_text(portfolio_toml)
+    (config_dir / LANES_FILE).write_text(LANES_TOML)
+    return config_dir
+
+
+def lane_armed(_lane) -> None:
+    """Warunek uzbrojenia pasma testu: pasmo wolno uzbroić (prawdziwy warunek: pre-rejestracja pasm, zadanie 13)."""
+    return None
+
+
+def engine_events(journal: Journal, code: str | None = None) -> list[dict]:
+    """Zdarzenia silnika i wykonawcy (źródła `engine` i `event`), opcjonalnie tylko o kodzie `code`."""
+    found = [p for src in ("engine", "event") for p in payloads(journal, src)]
+    return found if code is None else [e for e in found if e.get("event") == code]
+
+
+def lane_decisions(journal: Journal, epic: str = US) -> list[dict]:
+    return [p for p in payloads(journal, "decision") if p.get("event") == "LANE_DECISION" and p.get("epic") == epic]
+
+
+def assert_portfolio_books_balance(journal_file: Path) -> None:
+    """Księga portfela zgadza się z licznikami co do grosza: licznik dnia = suma netto transakcji w EUR z tym dniem
+    wyjścia (transakcja w walucie rachunku: jej wynik; w walucie obcej: kwota rozliczenia `trade_fx`, a czekająca na
+    rozliczenie nic); każdy deal zaksięgowany raz; licznik łączny = suma dni; żaden deal nie jest jednocześnie
+    rozliczony i oczekujący."""
+    j = Journal.open_readonly(str(journal_file))
+    raw = sqlite3.connect(f"{Path(journal_file).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        rows = [tuple(r) for r in raw.execute("SELECT deal_id, exit_day, net_pnl FROM trades ORDER BY id")]
+        pnl = {date.fromisoformat(d): Decimal(n) for d, n in raw.execute("SELECT day, net FROM realized_pnl")}
+        deals = [r[0] for r in rows]
+        assert len(deals) == len(set(deals)), rows
+        pending = dict(j.pnl_pending_deals())
+        expected: dict[date, Decimal] = {}
+        for deal, day_text, net in rows:
+            fx = j.trade_fx(deal)
+            assert not (fx is not None and deal in pending), deal
+            if deal in pending:
+                assert pending[deal] == date.fromisoformat(day_text)
+                continue
+            amount = fx.net_eur if fx is not None else Decimal(net)
+            key = date.fromisoformat(day_text)
+            expected[key] = expected.get(key, Decimal(0)) + amount
+        nonzero = {d: v for d, v in pnl.items() if v != 0 or d in expected}
+        assert nonzero == expected, (pnl, expected)
+        assert j.realized_pnl_total() == sum(expected.values(), Decimal(0))
+        for t in j.trades():
+            assert t.net_pnl == t.gross_pnl - t.spread_cost - t.slippage_penalty - t.financing - t.fees
+    finally:
+        raw.close()
+        j.close()
