@@ -86,7 +86,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -1143,65 +1143,14 @@ class Executor:
         deala tego procesu i tylko wtedy, gdy lista brokera go właśnie pokazuje (alarm
         EMERGENCY_FLATTEN_JOURNAL_UNREADABLE; zaksięguje uzgadnianie, gdy dziennik wróci); nieznanego nie zamykamy.
         Po wysłanym zamknięciu pozycji OPEN, której straż wypełnienia nie sprawdziła (przy HARD nie biegnie): ślad
-        straży z kontekstu wejścia (`_audit_emergency_fill`).
+        straży z kontekstu wejścia (`_audit_emergency_fill`). Wiele pasm naraz: `emergency_flatten_lanes` (próby
+        przeplatane); to jest ta sama procedura dla jednego pasma.
         """
-        timeout = max(EMERGENCY_MIN_TIMEOUT_S, self._risk.submit_timeout_s / 2)
-        failures: list[str] = []
-        outcome, attempts = "", 0
-        closes_before = self._closes_started
-        unguarded: PositionRecord | None = None  # zapis OPEN z pierwszego odczytu: kandydat do śladu straży
-        try:
-            for attempt in range(1, EMERGENCY_ATTEMPTS + 1):
-                if attempt > 1:
-                    await self._clock.sleep(EMERGENCY_PAUSE_S)
-                try:
-                    current = self._journal.current_position(self._epic)
-                except JournalError as exc:  # ochrona nie czeka na dziennik
-                    attempts = attempt
-                    outcome = await self._flatten_without_journal(exc, timeout, failures)
-                    if outcome == OUTCOME_CLOSED_UNBOOKED:
-                        return
-                    if outcome not in _EMERGENCY_RETRY:
-                        break
-                    continue
-                if current is None or current.state is _P.FLAT:
-                    return
-                if current.state not in _FLATTENABLE | {_P.BLOCKED} or current.deal_id is None:
-                    outcome = f"STATE_{current.state.value}"  # BLOCKED bez deal_id (obca) albo ENTERING: nie ruszamy
-                    break
-                if unguarded is None and current.state is _P.OPEN:
-                    unguarded = current
-                attempts = attempt
-                # STILL_OPEN: lista sprzed sekundy potwierdziła otwartą pozycję, więc zamknięcie bez kolejnego odczytu
-                _, outcome = await self._flatten(
-                    current, "EMERGENCY", timeout, failures=failures, verified=outcome == OUTCOME_STILL_OPEN,
-                    emergency=True,
-                )  # fmt: skip
-                if outcome == OUTCOME_FLAT:
-                    return
-                if outcome not in _EMERGENCY_RETRY:
-                    break
-            try:
-                current = self._journal.current_position(self._epic)
-            except JournalError:
-                deal_id, state = self._own_deal(), "UNKNOWN"  # dziennik nieczytelny: nie wiemy, nie FLAT
-            else:
-                if current is None or current.state is _P.FLAT:
-                    return
-                deal_id, state = current.deal_id, current.state.value
-            self._alert(
-                "ERROR",
-                f"EMERGENCY_FLATTEN_INCOMPLETE: position {deal_id} {state} after {attempts} attempt(s) ({outcome}); "
-                "kept under watch",
-            )
-            self._event(
-                "EMERGENCY_FLATTEN_INCOMPLETE", best_effort=failures, deal_id=deal_id, state=state, attempts=attempts,
-                outcome=outcome,
-            )  # fmt: skip
-        finally:
-            if self._closes_started > closes_before:
-                self._audit_emergency_fill(unguarded, failures)
-            self._report_journal_failures(failures, "emergency flatten", closes_before=closes_before)
+        await emergency_flatten_lanes([self])
+
+    def _emergency_run(self) -> _EmergencyRun:
+        """Nowa procedura awaryjnego spłaszczenia tego pasma (próby wykonuje `emergency_flatten_lanes`)."""
+        return _EmergencyRun(self)
 
     def _audit_emergency_fill(self, record: PositionRecord | None, failures: list[str]) -> None:
         """Ślad straży wypełnienia (spec §5 pkt 7) dla pozycji OPEN, którą awaryjne spłaszczenie właśnie zamknęło, zanim
@@ -1895,6 +1844,141 @@ def _foreign(lane: LaneSpec, fx: FxView | None) -> bool:
             and account.isupper()):  # fmt: skip
         raise ValueError(f"Executor: FxView account_currency: expected a 3-letter ISO 4217 code, got {account!r}")
     return lane.currency != account
+
+
+_RUNNING = "RUNNING"  # procedura pasma ma jeszcze próby
+_DONE = "DONE"  # pozycja FLAT, brak pozycji albo zamknięcie przy nieczytelnym dzienniku: bez alarmu
+_STOPPED = "STOPPED"  # koniec prób bez FLAT (wynik bez ponowienia albo wyczerpane próby): sprawdzenie i alarm
+_FAILED = "FAILED"  # próba przerwana wyjątkiem: bez dalszych prób i bez alarmu niepełnego spłaszczenia
+
+
+class _EmergencyRun:
+    """Jedna procedura awaryjnego spłaszczenia pasma (`Executor.emergency_flatten`), rozłożona na próby, żeby
+    `emergency_flatten_lanes` mogło przeplatać próby wielu pasm. Kolejność kroków jednej próby i decyzje o ponowieniu
+    są dokładnie te z opisu `Executor.emergency_flatten`."""
+
+    def __init__(self, executor: Executor) -> None:
+        self.ex = executor
+        self.timeout = max(EMERGENCY_MIN_TIMEOUT_S, executor._risk.submit_timeout_s / 2)
+        self.failures: list[str] = []
+        self.outcome = ""
+        self.attempts = 0
+        self.closes_before = executor._closes_started
+        self.unguarded: PositionRecord | None = None  # zapis OPEN z pierwszego odczytu: kandydat do śladu straży
+        self.state = _RUNNING
+
+    async def step(self, attempt: int) -> None:
+        """Jedna próba (numer `attempt` od 1); ustawia `state` na koniec procedury albo zostawia RUNNING."""
+        ex = self.ex
+        try:
+            current = ex._journal.current_position(ex._epic)
+        except JournalError as exc:  # ochrona nie czeka na dziennik
+            self.attempts = attempt
+            self.outcome = await ex._flatten_without_journal(exc, self.timeout, self.failures)
+            if self.outcome == OUTCOME_CLOSED_UNBOOKED:
+                self.state = _DONE
+            elif self.outcome not in _EMERGENCY_RETRY:
+                self.state = _STOPPED
+            return
+        if current is None or current.state is _P.FLAT:
+            self.state = _DONE
+            return
+        if current.state not in _FLATTENABLE | {_P.BLOCKED} or current.deal_id is None:
+            self.outcome = f"STATE_{current.state.value}"  # BLOCKED bez deal_id (obca) albo ENTERING: nie ruszamy
+            self.state = _STOPPED
+            return
+        if self.unguarded is None and current.state is _P.OPEN:
+            self.unguarded = current
+        self.attempts = attempt
+        # STILL_OPEN: lista sprzed sekundy potwierdziła otwartą pozycję, więc zamknięcie bez kolejnego odczytu
+        _, self.outcome = await ex._flatten(
+            current, "EMERGENCY", self.timeout, failures=self.failures, verified=self.outcome == OUTCOME_STILL_OPEN,
+            emergency=True,
+        )  # fmt: skip
+        if self.outcome == OUTCOME_FLAT:
+            self.state = _DONE
+        elif self.outcome not in _EMERGENCY_RETRY:
+            self.state = _STOPPED
+
+    def finish(self, check: bool) -> None:
+        """Koniec procedury: przy `check` (próby skończone bez FLAT) alarm EMERGENCY_FLATTEN_INCOMPLETE, gdy dziennik
+        nie mówi FLAT; zawsze ślad straży po wysłanym zamknięciu i raport nieudanych zapisów (jak `finally`)."""
+        ex = self.ex
+        try:
+            if check:
+                self._incomplete()
+        finally:
+            if ex._closes_started > self.closes_before:
+                ex._audit_emergency_fill(self.unguarded, self.failures)
+            ex._report_journal_failures(self.failures, "emergency flatten", closes_before=self.closes_before)
+
+    def _incomplete(self) -> None:
+        ex = self.ex
+        try:
+            current = ex._journal.current_position(ex._epic)
+        except JournalError:
+            deal_id, state = ex._own_deal(), "UNKNOWN"  # dziennik nieczytelny: nie wiemy, nie FLAT
+        else:
+            if current is None or current.state is _P.FLAT:
+                return
+            deal_id, state = current.deal_id, current.state.value
+        ex._alert(
+            "ERROR",
+            f"EMERGENCY_FLATTEN_INCOMPLETE: position {deal_id} {state} after {self.attempts} attempt(s) "
+            f"({self.outcome}); kept under watch",
+        )
+        ex._event(
+            "EMERGENCY_FLATTEN_INCOMPLETE", best_effort=self.failures, deal_id=deal_id, state=state,
+            attempts=self.attempts, outcome=self.outcome,
+        )  # fmt: skip
+
+
+async def emergency_flatten_lanes(executors: Sequence[Executor]) -> None:
+    """Awaryjne spłaszczenie wielu pasm z próbami PRZEPLATANYMI (projekt §5.4): runda k to próba k każdego pasma, które
+    jeszcze ma próby, w kolejności `executors` (stała kolejność pasm z konfiguracji), a między rundami jedna przerwa
+    `EMERGENCY_PAUSE_S`. Pasmo, którego zamknięcie ciągle zawodzi, nie opóźnia pierwszej próby kolejnego (sekwencyjnie
+    czekałoby do ok. 30 s). Dla jednego pasma to dokładnie `Executor.emergency_flatten`.
+
+    Każde pasmo zachowuje własne zasady (tylko własny instrument, przy nieczytelnym dzienniku tylko własny deal z
+    pamięci wyjść). Wyjątek w próbie jednego pasma kończy tylko jego procedurę: pozostałe pasma dostają swoje próby,
+    a pierwszy wyjątek wychodzi na końcu. Anulowanie przerywa wszystko (z raportem zapisów każdego pasma). Dwa
+    wykonawców tego samego instrumentu: ValueError przed jakimkolwiek wywołaniem (R1).
+    """
+    epics = [ex._epic for ex in executors]
+    duplicates = sorted({e for e in epics if epics.count(e) > 1})
+    if duplicates:
+        raise ValueError(f"emergency_flatten_lanes: several executors for {duplicates}")
+    if not executors:
+        return
+    runs = [ex._emergency_run() for ex in executors]
+    clock = executors[0]._clock
+    error: Exception | None = None
+    interrupted = True
+    try:
+        for attempt in range(1, EMERGENCY_ATTEMPTS + 1):
+            active = [run for run in runs if run.state == _RUNNING]
+            if not active:
+                break
+            if attempt > 1:
+                await clock.sleep(EMERGENCY_PAUSE_S)
+            for run in active:
+                try:
+                    await run.step(attempt)
+                except Exception as exc:  # błąd jednego pasma nie zatrzymuje ochrony pozostałych
+                    run.state = _FAILED
+                    error = error or exc
+        for run in runs:
+            if run.state == _RUNNING:
+                run.state = _STOPPED  # wyczerpane próby
+        interrupted = False
+    finally:
+        for run in runs:
+            try:
+                run.finish(check=not interrupted and run.state == _STOPPED)
+            except Exception as exc:
+                error = error or exc
+    if error is not None:
+        raise error
 
 
 def _as_open(rec: PositionRecord) -> OpenPosition:

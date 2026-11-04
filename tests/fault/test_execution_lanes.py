@@ -28,7 +28,7 @@ from gwstock.calendar import XETRA, ExchangeCalendar
 from gwstock.clock import FakeClock
 from gwstock.config import load_config
 from gwstock.costs import CostModel
-from gwstock.execution import Executor, ExitMemory
+from gwstock.execution import Executor, ExitMemory, emergency_flatten_lanes
 from gwstock.journal import Journal, JournalReadError, PositionRecord
 from gwstock.lanes import LaneSpec
 from gwstock.orders.manager import OrderManager
@@ -773,3 +773,71 @@ async def test_domestic_lanes_still_book_straight_into_the_eur_counter(ut, fake,
     fake.trigger_target("DEAL-T")
     await ut.flatten(journal.current_position("US500"), "FORCED")
     assert journal.pnl_pending_deals() == [] and journal.realized_pnl(DAY) == journal.trades()[0].net_pnl != D("0")
+
+
+# --- awaryjne spłaszczenie wielu pasm: próby przeplatane (projekt §5.4, załącznik A15) ------------------------
+
+
+def close_log(fake, clock, monkeypatch, failing=()):
+    """Zapis (deal, sekundy od startu) każdej próby zamknięcia; deale z `failing` zawsze dostają błąd brokera."""
+    log = []
+    real = fake.close_position
+    start = clock.now_utc()
+
+    async def close_position(deal_id):
+        log.append((deal_id, (clock.now_utc() - start).total_seconds()))
+        if deal_id in failing:
+            fake.calls.append("close_position")
+            raise BrokerError("HTTP 500")
+        return await real(deal_id)
+
+    monkeypatch.setattr(fake, "close_position", close_position)
+    return log
+
+
+async def test_emergency_flatten_of_two_lanes_interleaves_the_attempts(de, us, fake, journal, kill, clock, monkeypatch):
+    hold(fake, journal, "DE40", "DEAL-A", Side.BUY, D("0.007"), D("25782.3"), D("25752.3"))
+    hold(fake, journal, "US500", "DEAL-B", Side.BUY, D("0.01"), US_FILL, US_STOP)
+    kill.hard("TEST")
+    log = close_log(fake, clock, monkeypatch, failing={"DEAL-A"})  # DE40 nie da się zamknąć
+    await emergency_flatten_lanes([de, us])
+    assert log[:2] == [("DEAL-A", 0.0), ("DEAL-B", 0.0)]  # US500 dostaje próbę w pierwszej rundzie, nie po 30 s
+    assert [deal for deal, _ in log] == ["DEAL-A", "DEAL-B"] + ["DEAL-A"] * 4  # 5 prób DE40, jedno zamknięcie US500
+    assert "DEAL-B" not in fake.positions and "DEAL-A" in fake.positions
+    assert journal.current_position("US500") == PositionRecord("US500", P.FLAT)
+    assert events(journal, "EMERGENCY_FLATTEN_INCOMPLETE")[0]["deal_id"] == "DEAL-A"
+    assert kill.level() is KillLevel.HARD
+
+
+async def test_emergency_flatten_of_two_lanes_with_an_unreadable_journal_interleaved(
+    de, us, fake, journal, kill, monkeypatch
+):
+    await two_held_positions(de, us, fake, journal, kill)
+    unreadable_positions(journal, monkeypatch)
+    await emergency_flatten_lanes([de, us])
+    assert fake.positions == {}
+    assert fake.calls == ["list_positions", "close_position", "list_positions", "close_position"]
+
+
+async def test_emergency_flatten_lanes_refuses_two_executors_of_one_instrument(de, lane_build, de_lane, gate):
+    with pytest.raises(ValueError, match="DE40"):
+        await emergency_flatten_lanes([de, lane_build(de_lane, gate)])
+
+
+async def test_a_failing_lane_does_not_stop_the_emergency_flatten_of_the_other(
+    de, us, fake, journal, kill, monkeypatch
+):
+    hold(fake, journal, "DE40", "DEAL-A", Side.BUY, D("0.007"), D("25782.3"), D("25752.3"))
+    hold(fake, journal, "US500", "DEAL-B", Side.BUY, D("0.01"), US_FILL, US_STOP)
+    kill.hard("TEST")
+    real = journal.current_position
+
+    def broken_for_de40(epic):
+        if epic == "DE40":
+            raise RuntimeError("bug")
+        return real(epic)
+
+    monkeypatch.setattr(journal, "current_position", broken_for_de40)
+    with pytest.raises(RuntimeError, match="bug"):
+        await emergency_flatten_lanes([de, us])
+    assert "DEAL-B" not in fake.positions  # US500 zamknięte mimo błędu pasma DE40; błąd i tak wychodzi dalej
