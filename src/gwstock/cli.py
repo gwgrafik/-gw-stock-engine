@@ -191,6 +191,83 @@ def runtime_mode(config_dir: Path, data_dir: Path, runtime: RuntimeConfig) -> tu
     )
 
 
+# --- uzbrojenie kolejnych pasm (projekt wielu pasm §6.2, zadanie 13) -------------------------------------------------
+
+LANE_PROCESS_NOT_ARMED = "PROCESS_NOT_ARMED"
+LANE_ACCOUNT_NOT_BOUND = "LANE_ACCOUNT_NOT_BOUND"
+LANE_FOREIGN_CURRENCY_NOT_ENABLED = "LANE_FOREIGN_CURRENCY_NOT_ENABLED"
+LANE_CONFIG_CHANGED = "LANE_CONFIG_CHANGED"
+LANE_FINGERPRINT_UNAVAILABLE = "LANE_FINGERPRINT_UNAVAILABLE"
+LANE_ARMING_CHECK_FAILED = "LANE_ARMING_CHECK_FAILED"
+
+
+def foreign_currency_epics(lanes: Any) -> tuple[str, ...]:
+    """Epiki włączonych pasm w walucie innej niż rachunek (EUR): tylko one dostają od adaptera reguły w walucie
+    instrumentu (`CapitalComBroker(foreign_currency_epics=...)`); każdy inny instrument zachowuje odmowę v1."""
+    return tuple(lane.epic for lane in lanes if lane.cfg.currency != ACCOUNT_CURRENCY)
+
+
+def lane_arming_problem(
+    config_dir: Path, data_dir: Path, loaded: Any, *, bound_account: str | None, foreign_epics: Any
+) -> str | None:
+    """Warunek uzbrojenia kolejnego pasma (R7, projekt §6.2): None = wolno je uzbroić; inaczej powód dry_run.
+
+    Pasmo jest live wyłącznie, gdy JEDNOCZEŚNIE: (1) proces spełnia WSZYSTKIE warunki uzbrojenia z plików (`live_allowed
+    = true`, plik uzbrojenia właściciela, związany rachunek, odcisk DE40 v1 zgodny z zamrożonym; `runtime_mode`); (2)
+    związany rachunek to ten, z którym silnik wystartował; (3) pasmo w walucie obcej ma reguły instrumentu w tej walucie
+    od adaptera (`foreign_epics`); (4) pasmo na dysku jest tym samym, które silnik wczytał; (5) odcisk pasma jest
+    zamrożony przez właściciela i równy bieżącemu (`prereg.lane_preregistration_problem`). Wielkość pasma to zawsze
+    minimalna (silnik: `rule_size_allowed=False`); tu nie ma żadnej bramki wielkości. Nigdy nie rzuca: każdy błąd to
+    powód (pasmo najwyżej dry_run). Niczego nie zapisuje.
+    """
+    try:
+        return _lane_arming_problem(Path(config_dir), Path(data_dir), loaded, bound_account, foreign_epics)
+    except Exception as exc:
+        return f"{LANE_ARMING_CHECK_FAILED} ({type(exc).__name__}: {exc})"
+
+
+def _lane_arming_problem(
+    config_dir: Path, data_dir: Path, loaded: Any, bound_account: str | None, foreign_epics: Any
+) -> str | None:
+    from gwstock.config import load_lanes
+
+    try:
+        runtime = load_runtime(config_dir, data_dir)
+    except Exception as exc:
+        return f"{LANE_PROCESS_NOT_ARMED}: runtime/account file unreadable ({type(exc).__name__})"
+    _, missing = runtime_mode(config_dir, data_dir, runtime)
+    if missing:
+        return f"{LANE_PROCESS_NOT_ARMED}: {'; '.join(missing)}"
+    if bound_account is None or runtime.account_id != bound_account:
+        return f"{LANE_ACCOUNT_NOT_BOUND}: the bound account is not the one the engine started with"
+    epic = loaded.epic
+    if loaded.cfg.currency != ACCOUNT_CURRENCY and epic not in set(foreign_epics):
+        return (f"{LANE_FOREIGN_CURRENCY_NOT_ENABLED}: {epic} is in {loaded.cfg.currency}, but the adapter refuses "
+                "its instrument rules (not in foreign_currency_epics)")  # fmt: skip
+    on_disk = [lane for lane in (load_lanes(config_dir) or ()) if lane.epic == epic]
+    if on_disk != [loaded]:
+        return f"{LANE_CONFIG_CHANGED}: lane {epic} on disk differs from the one the engine loaded; restart the engine"
+    try:
+        prereg = importlib.import_module("gwstock.prereg")
+        check = prereg.lane_preregistration_problem
+    except (ImportError, AttributeError) as exc:
+        return f"{LANE_FINGERPRINT_UNAVAILABLE}: gwstock.prereg unavailable ({type(exc).__name__})"
+    return check(config_dir, data_dir, epic)
+
+
+def make_lane_arming(
+    config_dir: Path, data_dir: Path, *, bound_account: str | None, foreign_epics: Any
+) -> Callable[[Any], str | None]:
+    """`lane_arming` dla `Engine`: `lane_arming_problem` z plików przy każdym wywołaniu (przy złożeniu pasma i przed
+    każdym jego wejściem live)."""
+    foreign = tuple(foreign_epics)
+
+    def lane_arming(loaded: Any) -> str | None:
+        return lane_arming_problem(config_dir, data_dir, loaded, bound_account=bound_account, foreign_epics=foreign)
+
+    return lane_arming
+
+
 # --- bind-account ---------------------------------------------------------------------------------------------
 
 
@@ -1619,14 +1696,36 @@ def build_engine(
 
     `config_dir`: silnik live ponownie sprawdza w nim `live_allowed` (na początku dnia i przed wejściem).
     `lock`: blokada instancji wzięta już przez polecenie (przed dziennikiem i siecią).
+
+    Kolejne pasma (`config_dir/lanes.toml`, wczytane RAZ tutaj): adapter dostaje `foreign_currency_epics` wyłącznie z
+    epików włączonych pasm w walucie innej niż EUR, a silnik warunek uzbrojenia pasm z `make_lane_arming` (pasmo live
+    tylko przy uzbrojonym procesie i zamrożonym, zgodnym odcisku pasma). Bez pliku pasm: dokładnie złożenie v1.
     """
+    from gwstock.app import EngineMisconfigured
     from gwstock.broker.capitalcom import LIVE_BASE_URL, CapitalComBroker
     from gwstock.calendar import XETRA, ExchangeCalendar
+    from gwstock.config import load_lanes
 
-    broker = CapitalComBroker(ctx.creds, http, clock, base_url=LIVE_BASE_URL)
+    lanes: tuple = ()
+    if config_dir is not None:
+        try:
+            lanes = load_lanes(Path(config_dir)) or ()
+        except Exception as exc:  # jak `Engine`: zły plik pasm to odmowa startu, nigdy cicha praca bez niego
+            raise EngineMisconfigured(f"lanes configuration refused: {type(exc).__name__}: {exc}") from exc
+    if not lanes:  # dokładnie złożenie v1
+        broker = CapitalComBroker(ctx.creds, http, clock, base_url=LIVE_BASE_URL)
+        return Engine(
+            broker, journal, clock, ExchangeCalendar(XETRA), ctx.cfgs, data_dir, ctx.runtime, ctx.mode,
+            config_dir=config_dir, lock=lock,
+        )  # fmt: skip
+    foreign = foreign_currency_epics(lanes)
+    broker = CapitalComBroker(ctx.creds, http, clock, base_url=LIVE_BASE_URL, foreign_currency_epics=foreign)
+    arming = make_lane_arming(
+        Path(config_dir), Path(data_dir), bound_account=ctx.runtime.account_id, foreign_epics=foreign
+    )  # fmt: skip
     return Engine(
         broker, journal, clock, ExchangeCalendar(XETRA), ctx.cfgs, data_dir, ctx.runtime, ctx.mode,
-        config_dir=config_dir, lock=lock,
+        config_dir=config_dir, lock=lock, lanes=lanes, lane_arming=arming,
     )  # fmt: skip
 
 

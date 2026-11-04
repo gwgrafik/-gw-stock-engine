@@ -42,13 +42,16 @@ from gwstock.types import (
     Side,
 )
 from gwstock.watchdog import AlreadyRunning, InstanceLock
+from tests.fault import test_engine_lanes as lanes_sim
 from tests.fault.engine_sim import (  # noqa: F401  (fixtures)
     DAY,
     DECISION_UTC,
     MID,
     D,
+    arm,
     at_time,
     berlin,
+    bind,
     broker,
     calls_at,
     cfgs,
@@ -2210,3 +2213,294 @@ def test_the_arming_scanner_catches_creation(snippet):
 def test_the_arming_scanner_allows_checking():
     snippet = f"from pathlib import Path\nok = (Path('data') / '{ARMING_NAMES[0]}').exists()\n"
     assert arming_writes(snippet) == []
+
+
+# --- uzbrojenie kolejnych pasm (zadanie 13, projekt wielu pasm §6) -------------------------------------------------
+# Uzbrojenie procesu WYŁĄCZNIE przez `engine_sim.arm` (fabryka silnika albo jawne wywołanie) w katalogu tymczasowym;
+# odciski zamraża test w roli właściciela (funkcje polecenia `python -m gwstock.prereg`).
+
+US = lanes_sim.US
+PREREG_NOW = datetime(2026, 11, 1, 14, 38, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def lane_broker(clock, day_rules, market) -> FakeBroker:
+    now = clock.now_utc()
+    fake = FakeBroker(
+        clock, [day_rules, lanes_sim.US_RULES, lanes_sim.FX_RULES],
+        [market.quote(now), lanes_sim.us_quote_at(now), lanes_sim.fx_quote_at(now)], account_id="ACC-1",
+    )  # fmt: skip
+    fake.set_quote_fn(market.quote, epic="DE40")
+    fake.set_quote_fn(lanes_sim.us_quote_at, epic=US)
+    fake.set_quote_fn(lanes_sim.fx_quote_at, epic="EURUSD")
+    fake.set_daily_candles(daily_candles(DAY), epic="DE40")
+    fake.set_candles_5m(five_minute_candles(DAY, D("25780"), D("25790")), epic="DE40")
+    fake.set_candles_5m(lanes_sim.us_candles(), epic=US)
+    return fake
+
+
+def enable_lanes(config_dir: Path) -> None:
+    for name in ("lane_us500_b1_m5.toml", "portfolio.toml"):
+        (config_dir / name).write_text(Path("config", name).read_text())
+    (config_dir / "lanes.toml").write_text(lanes_sim.LANES_TOML)
+
+
+def freeze_v1(config_dir: Path, data_dir: Path) -> None:
+    from gwstock import prereg
+
+    prereg.write_preregistration(config_dir, data_dir, PREREG_NOW)  # polecenie właściciela --write
+
+
+def freeze_lane(config_dir: Path, data_dir: Path, epic: str = US) -> None:
+    from gwstock import prereg
+
+    prereg.write_lane_preregistration(config_dir, data_dir, epic, PREREG_NOW)  # polecenie właściciela --lane --write
+
+
+def lane_of(config_dir: Path):
+    from gwstock.config import load_lanes
+
+    (loaded,) = load_lanes(config_dir)
+    return loaded
+
+
+def cli_arming(config_dir: Path, data_dir: Path, account: str | None = "ACC-1", foreign=(US,)):
+    return cli.make_lane_arming(config_dir, data_dir, bound_account=account, foreign_epics=foreign)
+
+
+@pytest.fixture
+def armed_lane(config_dir, data_dir):
+    """Proces uzbrojony jak przez właściciela (`engine_sim.arm`, związany rachunek, odcisk v1) i pasmo US500 włączone
+    i zamrożone. Każdy test psuje dokładnie jeden warunek."""
+    enable_lanes(config_dir)
+    arm(data_dir, config_dir)
+    bind(data_dir, "ACC-1")
+    freeze_v1(config_dir, data_dir)
+    freeze_lane(config_dir, data_dir)
+    return config_dir, data_dir
+
+
+def test_a_lane_is_armable_only_with_every_process_and_lane_condition(armed_lane):
+    config_dir, data_dir = armed_lane
+    assert cli.lane_arming_problem(config_dir, data_dir, lane_of(config_dir), bound_account="ACC-1",
+                                   foreign_epics=(US,)) is None  # fmt: skip
+    assert cli_arming(config_dir, data_dir)(lane_of(config_dir)) is None
+
+
+def _strategy_changed(config_dir, data_dir):
+    path = config_dir / "strategy_v1.toml"
+    path.write_text(path.read_text() + "# zmiana wariantu v1\n")
+
+
+def _lane_file_changed(config_dir, data_dir):
+    path = config_dir / "portfolio.toml"
+    path.write_text(path.read_text() + "# zmiana pasma\n")
+
+
+@pytest.mark.parametrize(
+    ("spoil", "reason"),
+    [
+        (lambda c, d: set_live_allowed(c, False), "live_allowed"),
+        (lambda c, d: disarm(d), ARMING_NAMES[0]),
+        (lambda c, d: bind(d, None), "bind-account"),
+        (lambda c, d: (d / "preregistration.json").unlink(), "no frozen pre-registration"),
+        (_strategy_changed, "fingerprint differs"),
+        (lambda c, d: (d / "preregistration-US500.json").unlink(), "LANE_PREREGISTRATION_NOT_FROZEN"),
+        (_lane_file_changed, "LANE_FINGERPRINT_MISMATCH"),
+        (lambda c, d: (d / "preregistration-US500.json").write_text("{"), "LANE_PREREGISTRATION_UNREADABLE"),
+        (lambda c, d: bind(d, "ACC-2"), "LANE_ACCOUNT_NOT_BOUND"),
+    ],
+    ids=["live_allowed", "arm_file", "unbound", "v1_not_frozen", "v1_mismatch", "lane_not_frozen", "lane_mismatch",
+         "lane_record_broken", "account_changed"],
+)  # fmt: skip
+def test_any_missing_condition_keeps_the_lane_in_dry_run_with_a_clear_reason(armed_lane, spoil, reason):
+    config_dir, data_dir = armed_lane
+    loaded = lane_of(config_dir)
+    spoil(config_dir, data_dir)
+    problem = cli_arming(config_dir, data_dir)(loaded)
+    assert problem is not None and reason in problem
+
+
+def test_a_usd_lane_without_foreign_currency_rules_is_never_armed(armed_lane):
+    config_dir, data_dir = armed_lane
+    problem = cli_arming(config_dir, data_dir, foreign=())(lane_of(config_dir))
+    assert problem is not None and "LANE_FOREIGN_CURRENCY_NOT_ENABLED" in problem
+
+
+def test_a_lane_changed_on_disk_after_the_start_is_not_the_running_lane(armed_lane):
+    config_dir, data_dir = armed_lane
+    running = lane_of(config_dir)
+    from gwstock import prereg
+
+    text = (config_dir / "lane_us500_b1_m5.toml").read_text()
+    (config_dir / "lane_us500_b1_m5.toml").write_text(text.replace('target_r = "1.5"', 'target_r = "2.0"'))
+    (data_dir / "preregistration-US500.json").unlink()
+    prereg.write_lane_preregistration(config_dir, data_dir, US, PREREG_NOW)  # właściciel zamraża nowy wariant
+    problem = cli_arming(config_dir, data_dir)(running)  # silnik nadal pracuje na wczytanym starym paśmie
+    assert problem is not None and "LANE_CONFIG_CHANGED" in problem
+    assert cli_arming(config_dir, data_dir)(lane_of(config_dir)) is None
+
+
+def test_the_lane_arming_never_raises(armed_lane, monkeypatch):
+    config_dir, data_dir = armed_lane
+    monkeypatch.setitem(sys.modules, "gwstock.prereg", None)
+    problem = cli_arming(config_dir, data_dir)(lane_of(config_dir))
+    assert problem is not None  # bez modułu pre-rejestracji: najwyżej dry_run, nigdy wyjątek
+
+
+def test_the_foreign_currency_epics_are_exactly_the_enabled_lanes_in_another_currency(armed_lane):
+    config_dir, _ = armed_lane
+    assert cli.foreign_currency_epics((lane_of(config_dir),)) == (US,)
+    eur = replace(lane_of(config_dir), cfg=replace(lane_of(config_dir).cfg, currency="EUR"))
+    assert cli.foreign_currency_epics((eur,)) == ()
+    assert cli.foreign_currency_epics(()) == ()
+
+
+# --- silnik złożony z warunkiem uzbrojenia pasm z cli -------------------------------------------------------------
+
+
+def lane_engine_with(make_engine, lane_broker, config_dir, data_dir, mode=Mode.LIVE):
+    from gwstock.config import load_lanes
+
+    return make_engine(mode, broker=lane_broker, lanes=load_lanes(config_dir),
+                       lane_arming=cli_arming(config_dir, data_dir))  # fmt: skip
+
+
+def test_a_frozen_lane_of_an_armed_process_is_live(make_engine, lane_broker, armed_lane):
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    (lane,) = engine.lanes
+    assert engine.executor.live and lane.executor.live and lane.arming_problem is None
+    engine.check_wiring()
+
+
+def test_a_lane_without_a_frozen_fingerprint_is_dry_run_and_de40_stays_live(make_engine, lane_broker, armed_lane):
+    config_dir, data_dir = armed_lane
+    (data_dir / "preregistration-US500.json").unlink()
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    (lane,) = engine.lanes
+    assert engine.executor.live and not lane.executor.live
+    assert lane.arming_problem.startswith("LANE_PREREGISTRATION_NOT_FROZEN")
+
+
+def test_the_lane_of_a_dry_run_process_is_never_live_even_when_frozen(make_engine, lane_broker, armed_lane):
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir, mode=Mode.DRY_RUN)
+    assert not engine.lanes[0].executor.live and not engine.executor.live
+
+
+def test_global_disarm_downgrades_every_lane(make_engine, lane_broker, armed_lane):
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    assert engine.lanes[0].executor.live
+    disarm(data_dir)
+    engine._check_armed()
+    assert engine.mode is Mode.DRY_RUN and not engine.executor.live and not engine.lanes[0].executor.live
+
+
+def test_a_lane_changed_during_the_run_downgrades_only_that_lane(make_engine, lane_broker, armed_lane):
+    config_dir, data_dir = armed_lane
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    _lane_file_changed(config_dir, data_dir)
+    engine._check_lane_arming(engine.lanes[0])
+    assert engine.executor.live and engine.mode is Mode.LIVE
+    assert not engine.lanes[0].executor.live and "LANE_FINGERPRINT_MISMATCH" in engine.lanes[0].arming_problem
+
+
+async def test_only_a_frozen_lane_sends_its_entry_and_always_at_the_minimum_size(
+    make_engine, lane_broker, armed_lane, clock, monkeypatch
+):
+    import gwstock.app as app_mod
+
+    config_dir, data_dir = armed_lane
+    # bramka wielkości v1 „przeszła” (nazwa pliku podmieniona tylko w tym teście: żaden prawdziwy plik bramki)
+    monkeypatch.setattr(app_mod, "L1_PASSED_FILE", "size-gate-for-this-test")
+    (data_dir / "size-gate-for-this-test").write_text("")
+    seen: list[bool] = []
+    real = app_mod.decide_entry
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["rule_size_allowed"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(app_mod, "decide_entry", spy)
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    stop_engine_at(engine, clock, lanes_sim.SIGNAL_END + timedelta(minutes=2))
+    await engine.run_day(DAY)
+    assert seen and not any(seen)  # pasmo: wielkość wg reguł NIGDY (bez bramki L1 per pasmo)
+    assert engine.journal.count_entry_orders(DAY, US) == 1
+    (us_pos,) = [p for p in lane_broker.positions.values() if p.epic == US]
+    assert us_pos.size == lanes_sim.US_RULES.min_size
+
+
+async def test_an_unfrozen_lane_decides_but_sends_nothing(make_engine, lane_broker, armed_lane, clock):
+    config_dir, data_dir = armed_lane
+    (data_dir / "preregistration-US500.json").unlink()
+    engine = lane_engine_with(make_engine, lane_broker, config_dir, data_dir)
+    stop_engine_at(engine, clock, lanes_sim.SIGNAL_END + timedelta(minutes=2))
+    await engine.run_day(DAY)
+    decided = [p for p in payloads(engine.journal, "decision") if p.get("event") == "LANE_DECISION"]
+    assert any(d["outcome"] == "ENTER" and d["mode"] == "dry_run" for d in decided)
+    assert engine.journal.count_entry_orders(DAY, US) == 0 and engine.journal.count_entry_orders(DAY, "DE40") == 1
+    assert not any(p.epic == US for p in lane_broker.positions.values())
+
+
+# --- build_engine: adapter z walutą obcą tylko dla epików pasm, warunek uzbrojenia z cli ------------------------
+
+
+async def _built(config_dir, data, tmp_path, clock):
+    import aiohttp
+
+    key = tmp_path / "capitalcom.json"
+    key.write_text(SECRETS)
+    key.chmod(0o600)
+    ctx = cli.prepare_run(cli.Paths(config_dir, data, key))
+    journal = Journal.open(str(tmp_path / "j.sqlite"))
+    try:
+        async with aiohttp.ClientSession() as http:
+            engine = cli.build_engine(ctx, http, journal, clock, data, config_dir=config_dir)  # bez sieci
+    except BaseException:
+        journal.close()
+        raise
+    return ctx, engine, journal
+
+
+async def test_build_engine_without_lanes_is_the_v1_composition(armed_dirs, tmp_path, clock):
+    config_dir, data = armed_dirs
+    ctx, engine, journal = await _built(config_dir, data, tmp_path, clock)
+    try:
+        assert engine.lanes == [] and engine.raw_broker._foreign_currency_epics == frozenset()
+    finally:
+        journal.close()
+
+
+async def test_build_engine_gives_foreign_currency_rules_only_to_lane_epics_and_arms_lanes_by_the_cli(
+    armed_dirs, tmp_path, clock
+):
+    config_dir, data = armed_dirs
+    enable_lanes(config_dir)
+    freeze_v1(config_dir, data)
+    freeze_lane(config_dir, data)
+    ctx, engine, journal = await _built(config_dir, data, tmp_path, clock)
+    try:
+        assert ctx.mode is Mode.LIVE
+        assert engine.raw_broker._foreign_currency_epics == frozenset({US})
+        (lane,) = engine.lanes
+        assert lane.arming_problem is None and lane.executor.live
+        (data / "preregistration-US500.json").unlink()
+    finally:
+        journal.close()
+    ctx, engine, journal = await _built(config_dir, data, tmp_path, clock)
+    try:
+        assert engine.lanes[0].arming_problem.startswith("LANE_PREREGISTRATION_NOT_FROZEN")
+        assert not engine.lanes[0].executor.live and engine.executor.live
+    finally:
+        journal.close()
+
+
+async def test_build_engine_refuses_a_broken_lanes_file(armed_dirs, tmp_path, clock):
+    config_dir, data = armed_dirs
+    enable_lanes(config_dir)
+    (config_dir / "lanes.toml").write_text(lanes_sim.LANES_TOML.replace('rule = "bar_b1_m5"', 'rule = "x"'))
+    with pytest.raises(EngineMisconfigured, match="lanes"):
+        await _built(config_dir, data, tmp_path, clock)
