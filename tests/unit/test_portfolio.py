@@ -589,7 +589,7 @@ def test_currency_from_the_entry_context_wins_over_the_lane(journal, clock, pcfg
     assert PORTFOLIO_FX_UNAVAILABLE in got
 
 
-@pytest.mark.parametrize("rate", [None, D("NaN"), D("-0.9"), 0.9, "0.9", D("Infinity")])
+@pytest.mark.parametrize("rate", [None, D("NaN"), D("-0.9"), D("0"), 0.9, "0.9", D("Infinity")])
 def test_unusable_fx_answer_blocks(journal, clock, pcfg, rate):
     got = reasons(build(journal, clock, pcfg, lanes=(DE40, US500), fx=Fx(rate)), cand(epic="US500"))
     assert PORTFOLIO_FX_UNAVAILABLE in got and PORTFOLIO_DAILY_LOSS in got

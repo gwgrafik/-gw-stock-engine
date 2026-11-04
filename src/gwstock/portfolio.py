@@ -376,7 +376,9 @@ class PortfolioGate:
         if self._fx is None:
             raise _Unevaluable(f"no FX view for {currency}")
         converted = self._fx.to_eur(amount, currency)
-        if not isinstance(converted, Decimal) or not converted.is_finite() or converted < 0:
+        # zero za dodatnią kwotę to też brak kursu: ryzyko kandydata w EUR zawsze > 0, gdy da się je ocenić
+        usable = isinstance(converted, Decimal) and converted.is_finite() and converted >= 0
+        if not usable or (amount > 0) != (converted > 0):
             raise _Unevaluable(f"no usable {currency}->EUR rate (got {converted!r})")
         return converted
 
